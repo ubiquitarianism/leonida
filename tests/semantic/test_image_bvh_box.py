@@ -88,6 +88,48 @@ class EmptyBox(unittest.TestCase):
             with self.subTest(node_type=node_type):
                 self.assertEqual(run(node_type, CHILDREN, boxes), [MISS, 0x28, MISS, MISS])
 
+    def test_inactive_lane_skips_memory_reads_and_preserves_dst(self):
+        # Masked-off lanes (EXEC == 0) in a divergent BVH traversal loop hold stale or null node pointers;
+        # image_bvh64_intersect_ray must not issue PhysicalStorageBuffer loads or overwrite vdst.
+        class TrackingMemory(dict):
+            def __init__(self):
+                super().__init__()
+                self.reads = []
+
+            def get(self, key, default=0):
+                self.reads.append(key)
+                return super().get(key, default)
+
+            def __getitem__(self, key):
+                self.reads.append(key)
+                return super().__getitem__(key)
+
+        sentinel = [0x11111111, 0x22222222, 0x33333333, 0x44444444]
+        for node_type in (0, 4, 5):
+            with self.subTest(node_type=node_type):
+                lines = []
+                mov = lambda r, v: lines.append(f"v_mov_b32_e32 v{r}, 0x{v:x}")   # noqa: E731
+                for k, val in enumerate(sentinel):
+                    mov(20 + k, val)
+                mov(1, 0x08 | node_type)
+                mov(2, 0)
+                mov(3, f2u(100.0))
+                for i, v in enumerate([f2u(0.0), f2u(0.0), f2u(-1.0), 0, 0, f2u(1.0), INF_WORD, INF_WORD, f2u(1.0)]):
+                    mov(4 + i, v)
+                lines += [
+                    "s_mov_b32 s4, 0x10", "s_mov_b32 s5, 0", "s_mov_b32 s6, -1", "s_mov_b32 s7, 0",
+                    "s_mov_b32 exec_lo, 0",
+                    "image_bvh64_intersect_ray v[20:23], [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12], s[4:7]",
+                    "s_mov_b32 exec_lo, 1",
+                    "exp mrt0 v20, v21, v22, v23 done vm",
+                    "s_endpgm",
+                ]
+                spv = translate_lines(f"ps_bvh_inactive_{node_type}", lines)
+                mem = TrackingMemory()
+                got = list(mrt0_words(spv, memory=mem))
+                self.assertEqual(mem.reads, [], f"inactive lane issued {len(mem.reads)} PSB reads")
+                self.assertEqual(got, sentinel)
+
 
 if __name__ == "__main__":
     unittest.main()

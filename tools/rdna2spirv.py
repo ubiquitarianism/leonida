@@ -15698,6 +15698,13 @@ class Gen:
         e(f"{nm} = OpBitwiseAnd %ulong {node} {self.cl(0xFFFFFFFFFFFFFFF8)}")
         e(f"{off} = OpShiftLeftLogical %ulong {nm} {self.cl(3)}")
         e(f"{addr} = OpIAdd %ulong {base} {off}")
+        act = self.active_b()
+        L = {k: T() + "_" + k for k in ("act", "tri", "nt", "box", "oth", "end1", "end2", "act_end")}
+        # Inactive lanes (EXEC == 0) in a divergent traversal loop can hold stale or null node pointers;
+        # guard all PhysicalStorageBuffer loads so masked-off lanes never fault and leave vdst untouched.
+        e(f"OpSelectionMerge {L['act_end']} None")
+        e(f"OpBranchConditional {act} {L['act']} {L['act_end']}")
+        e(f"{L['act']} = OpLabel")
         ptr = T()
 
         def node_delta():
@@ -15748,7 +15755,6 @@ class Gen:
         bx16 = T()
         e(f"{bx16} = OpIEqual %bool {ntype} {self.cu(5)}")
         e(f"{is_box} = OpLogicalOr %bool {is_b16} {bx16}")
-        L = {k: T() + "_" + k for k in ("tri", "nt", "box", "oth", "end1", "end2")}
         e(f"OpSelectionMerge {L['end1']} None")
         e(f"OpBranchConditional {is_tri} {L['tri']} {L['nt']}")
 
@@ -15948,6 +15954,8 @@ class Gen:
         e(f"{L['end2']} = OpLabel")
         e(f"OpBranch {L['end1']}")
         e(f"{L['end1']} = OpLabel")
+        e(f"OpBranch {L['act_end']}")
+        e(f"{L['act_end']} = OpLabel")
 
     def export_misc_pos1(self, srcs, act, layer_var, viewport_var):
         """GFX9+ misc vector at pos1: z[10:0] = Layer, z[19:16] = ViewportIndex. Stages the lanes on in `act` into the
