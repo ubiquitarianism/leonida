@@ -1194,7 +1194,12 @@ if(BUILD_TESTING)
     target_link_libraries(tiny_game_fixed PRIVATE xgameruntime_stub)
     target_compile_definitions(tiny_game_fixed PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
     target_compile_options(tiny_game_fixed PRIVATE /W4 /permissive- /utf-8 /EHsc)
-    target_link_options(tiny_game_fixed PRIVATE /FIXED /DYNAMICBASE:NO /BASE:0x140000000)
+    # /INCREMENTAL:NO, here and on the fixtures linked with /NODEFAULTLIB below: such an image can have no base
+    # relocations, and VS 2026 18.6's linker (MSVC 14.51) crashes on an incremental relink of one ("LNK1000: Internal
+    # error during IncrCalcPtrs"). CMake's Ninja and Makefile generators relink every target once in each clean Debug
+    # or RelWithDebInfo build (/debug /INCREMENTAL by default), with only its manifest resource changed, to embed it.
+    # Fixed in VS 2026 18.7; tests/test_runtime_incremental_link.py keeps a new fixture of this kind covered.
+    target_link_options(tiny_game_fixed PRIVATE /FIXED /DYNAMICBASE:NO /BASE:0x140000000 /INCREMENTAL:NO)
     set_target_properties(tiny_game_fixed PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
@@ -1314,7 +1319,7 @@ if(BUILD_TESTING)
     add_library(tiny_tls_cb_only SHARED test/fixtures/tiny_tls_cb_only.cpp)
     target_compile_definitions(tiny_tls_cb_only PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_tls_cb_only PRIVATE /W4 /permissive- /utf-8 /GS-)
-    target_link_options(tiny_tls_cb_only PRIVATE /NODEFAULTLIB /ENTRY:DllMainCRTStartup)
+    target_link_options(tiny_tls_cb_only PRIVATE /NODEFAULTLIB /ENTRY:DllMainCRTStartup /INCREMENTAL:NO)
     target_link_libraries(tiny_tls_cb_only PRIVATE kernel32)
     set_target_properties(tiny_tls_cb_only PROPERTIES
       OUTPUT_NAME tiny_tls_cb_only
@@ -1399,7 +1404,7 @@ if(BUILD_TESTING)
     # DllMain's only work is that one call. No game files.
     add_library(dll_thread_calls SHARED test/fixtures/dll_thread_calls.cpp)
     target_compile_options(dll_thread_calls PRIVATE /W4 /permissive- /utf-8 /GS-)
-    target_link_options(dll_thread_calls PRIVATE /NODEFAULTLIB /ENTRY:dll_thread_calls_main)
+    target_link_options(dll_thread_calls PRIVATE /NODEFAULTLIB /ENTRY:dll_thread_calls_main /INCREMENTAL:NO)
     target_link_libraries(dll_thread_calls PRIVATE kernel32)
     set_target_properties(dll_thread_calls PROPERTIES
       OUTPUT_NAME dll_thread_calls
@@ -1434,7 +1439,7 @@ if(BUILD_TESTING)
     if(GAMEINPUT_LIBRARY)
       add_library(gameinput_host SHARED test/fixtures/gameinput_host.cpp)
       target_compile_options(gameinput_host PRIVATE /W4 /permissive- /utf-8 /GS-)
-      target_link_options(gameinput_host PRIVATE /NODEFAULTLIB /ENTRY:gameinput_host_main)
+      target_link_options(gameinput_host PRIVATE /NODEFAULTLIB /ENTRY:gameinput_host_main /INCREMENTAL:NO)
       target_link_libraries(gameinput_host PRIVATE kernel32 ${GAMEINPUT_LIBRARY})
       set_target_properties(gameinput_host PROPERTIES
         OUTPUT_NAME gameinput_host
