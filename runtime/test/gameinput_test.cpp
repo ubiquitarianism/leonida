@@ -1742,6 +1742,47 @@ void test_haptic_motors(IGameInput* input) {
     dev->Release();
 }
 
+void test_buffered_gamepad_input(IGameInput* input) {
+    Pad pad;
+    attach(pad, "Leonida buffered input pad", 0x045E, 0x0B12, true);
+    rt::gameinput::poll();
+    IGameInputReading* idle = current(input, nullptr);
+    IGameInputDevice* dev = device_of(idle);
+
+    GameInputCallbackToken token = 0;
+    const int callbacks_before = g_reading_events;
+    check(dev && input->RegisterReadingCallback(dev, GameInputKindGamepad, 0.0f, nullptr, on_reading, &token) == S_OK,
+          "buffered input: register a reading callback for the virtual pad");
+
+    // SDL sees two hardware samples before the shim's next poll. Both end states are neutral again.
+    SDL_SetJoystickVirtualButton(pad.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    SDL_SetJoystickVirtualAxis(pad.js, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, 32767);
+    SDL_UpdateGamepads();
+    SDL_SetJoystickVirtualButton(pad.js, SDL_GAMEPAD_BUTTON_SOUTH, false);
+    SDL_SetJoystickVirtualAxis(pad.js, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, -32768);
+    rt::gameinput::poll();
+
+    HRESULT end = S_OK;
+    auto readings = walk(input, idle, dev, true, 8, &end);
+    GameInputGamepadState pressed{}, released{};
+    check(readings.size() == 2 && end == GAMEINPUT_E_READING_NOT_FOUND &&
+              readings[0]->GetGamepadState(&pressed) && pressed.buttons == GameInputGamepadA &&
+              approx(pressed.leftTrigger, 1.0f) && readings[1]->GetGamepadState(&released) &&
+              released.buttons == 0 && approx(released.leftTrigger, 0.0f),
+          "buffered input: history delivers both the short A/trigger press and its release");
+    IGameInputReading* latest = current(input, dev);
+    check(latest && readings.size() == 2 && latest == readings.back() &&
+              g_reading_events - callbacks_before == 2,
+          "buffered input: two callbacks fire and the current reading stays released");
+
+    if (token) input->UnregisterCallback(token, 0);
+    if (latest) latest->Release();
+    release_all(readings);
+    if (idle) idle->Release();
+    detach(pad);
+    rt::gameinput::poll();
+}
+
 }  // namespace
 
 // A pad plugged in after the title started, with the title holding a dispatcher (RT-GAMEINPUT-LATE-PAD). The title
@@ -2509,6 +2550,7 @@ int main(int argc, char** argv) {
     test_haptic_motors(input);
     test_raw_hid(input);
     test_raw_report_during_reconnect(input);
+    test_buffered_gamepad_input(input);
     test_late_pad_behind_dispatcher(input);
     input->Release();
 

@@ -639,8 +639,10 @@ holds stays valid after it leaves the history.
 | nothing newer, or nothing older after the horizon | `GAMEINPUT_E_READING_NOT_FOUND` |
 
 After a pad is plugged back in, its last reading before the unplug leads to the reconnect snapshot, older ones are
-`REFERENCE_READING_TOO_OLD`, and sequence numbers carry on. Timestamps are poll times, so a change shorter than one poll
-(2 ms with the thread) is not seen.
+`REFERENCE_READING_TOO_OLD`, and sequence numbers carry on. Each poll drains SDL's gamepad button and axis events.
+For each connected pad, events with the same SDL timestamp form one sample. Intermediate samples reach the history
+and reading or Guide callbacks, while the final reading uses the current pad snapshot. GameInput timestamps still
+record when the shim polled. A short press is recoverable when the SDL backend reports its two edges with distinct timestamps.
 
 ### Device identity
 
@@ -700,8 +702,8 @@ rests on a transcription rather than on a side-by-side compile.
 - `gameinput_test` (CTest, no controller): turns SDL's real backends off and drives the shim through
   `rt::shims::find` with SDL virtual joysticks, an Xbox-style pad with trigger motors, a DualSense (Sony
   `054c:0ce6`) and a pad without trigger motors. It checks enumeration and device callbacks, the button, stick,
-  trigger and UI-navigation mapping, reading callbacks and sequence numbers, the reading history (a tap read after
-  the fact, both directions, two pads interleaved and filtered by device, ageing out, held readings, unplug and
+  trigger and UI-navigation mapping, reading callbacks and sequence numbers, the reading history (a button and trigger
+  tapped between two shim polls, both directions, two pads interleaved and filtered by device, ageing out, held readings, unplug and
   replug), the guide button, motor and trigger
   rumble as SDL receives them, the DualSense effect bytes in each `LEONIDA_DS_TRIGGERS` mode, the lightbar, a
   dispatcher and its quota, async and blocking enumeration, unregistering, unplugging and replugging, and three identical pads
@@ -751,7 +753,7 @@ These need the game executable or a test on hardware:
   built against one of those, the vtables need a second set.
 - **IIDs.** `QueryInterface` answers the v0 IIDs from the public header.
 - **Reading history.** Microsoft's [next reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getnextreading)
-  and [previous reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getpreviousreading) pages describe half a second of readings per device and failure when old readings leave the stream. The table above records the shim's HRESULT choices. Changes faster than the poll are not seen.
+  and [previous reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getpreviousreading) pages describe half a second of readings per device and failure when old readings leave the stream. The table above records the shim's HRESULT choices.
   `GetTemporalReading` returns `E_NOTIMPL` with a null reading on purpose: Microsoft's
   [reference page](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/deprecated/interfaces/igameinput/methods/igameinput_gettemporalreading)
   says it "was never implemented in v0" and returns `E_NOTIMPL`, and v1 removed it. The v0 header (NuGet
