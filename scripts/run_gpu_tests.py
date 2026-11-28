@@ -33,6 +33,7 @@ from check import (CS_SMEM_VCC, CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_W
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, table_fetch_test, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST, UINT_MIP_TEST
+from check import SAMPLE_DIMS_TESTS, sample_dims_test   # SHADER-1404: integer 2D-array and volume samples
 from check import cbv_modulate_test
 from check import IMAGE_STORE_CASES, texture_uav_test
 from check import salu_ext_test   # 38 scalar ALU ops on operands seeded through VKC_SGPRS
@@ -721,6 +722,7 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_persp_
               SIGNED_MIP_TEST: "vs_ids.asm", UINT_MIP_TEST: "vs_ids.asm",
               "vs_base_ids": "ps_flat.asm", "ps_cbv_modulate": "vs_ids.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
+DRAWN_WITH.update({name: "vs_ids.asm" for name in SAMPLE_DIMS_TESTS})
 
 
 def with_draw_shaders(asm_files: list[str]) -> list[str]:
@@ -1422,6 +1424,10 @@ def run_suite(a, work: str) -> int:
             problem = table_fetch_test(a.build, spirv_dir)
             results.append((name, None if isinstance(problem, Skip) else not problem,
                             problem or "4096 exact pixels each for SINT, UINT and descriptor miss"))
+        elif name in SAMPLE_DIMS_TESTS:
+            problem = sample_dims_test(a.build, spirv_dir, name)
+            results.append((name, None if isinstance(problem, Skip) else not problem,
+                            problem or "4096 exact pixels (image_sample, _l and _lz of the integer texture)"))
         elif name in GRADIENT_TESTS:
             problem = texture_gradient_a16_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem

@@ -1547,6 +1547,25 @@ GRADIENT_TESTS = ("ps_texture_grad_a16", "ps_texture_bias_a16", "ps_texture_grad
 CLAMP_TESTS = ("ps_texture_cl", "ps_texture_b_cl")
 
 
+# SHADER-1404: image_sample, _l and _lz of an integer 2D array and volume. vk_texture_test's mode binds the texture
+# in the format the T# names and checks every pixel against the texels the .asm header derives.
+SAMPLE_DIMS_TESTS = {"ps_sample_array_uint": "array-uint", "ps_sample_array_sint": "array-sint",
+                     "ps_sample_volume_uint": "volume-uint", "ps_sample_volume_sint": "volume-sint"}
+
+
+def sample_dims_test(tools, spirv, name):
+    tool = os.path.abspath(os.path.join(tools, "vk_texture_test" + EXE))
+    mode = SAMPLE_DIMS_TESTS[name]
+    with tempfile.TemporaryDirectory(prefix="sample-dims-") as tmp:
+        raw = os.path.join(tmp, mode + ".raw")
+        code, output = run_readback(raw, run, tool, mode, raw, cwd=spirv)
+        if code == UNSUPPORTED:
+            return Skip(output.strip())
+        if code or f"{mode}: 4096 exact pixels" not in output:
+            return failure(code, output, 3)
+    return ""
+
+
 def table_fetch_test(tools, spirv):
     tool = os.path.abspath(os.path.join(tools, "vk_texture_test" + EXE))
     with tempfile.TemporaryDirectory(prefix="table-fetch-") as tmp:
@@ -2326,6 +2345,8 @@ def main():
     for name in MIP_TEST_PASSES:
         results.append((name, texture_mip_test(tools, spirv, name)))
     results.append(("ps_table_fetch", table_fetch_test(tools, spirv)))
+    for name in SAMPLE_DIMS_TESTS:
+        results.append((name, sample_dims_test(tools, spirv, name)))
     for name in GRADIENT_TESTS:
         results.append((name, texture_gradient_a16_test(tools, spirv, name)))
     for name, problem in results:

@@ -15,6 +15,10 @@
 //   1.0 or 0.0 the reference 0.5 gives against the texel each pixel reads.
 //   vk_texture_test dref_a16 [out.raw]: the same with ps_sample_c_lz_a16 (16-bit coordinates).
 //   vk_texture_test dref_c / dref_c_b [out.raw]: the same with ps_sample_c (implicit LOD) / ps_sample_c_b (LOD bias).
+//   vk_texture_test array-uint / array-sint / volume-uint / volume-sint [out.raw] (SHADER-1404): ps_sample_array_* or
+//   ps_sample_volume_* (image_sample, _l and _lz) against an integer texture whose T# names R8G8B8A8_UINT or _SINT: a
+//   12-layer 128x128 2D array at binding 3 index 1, or a 128x128x4 volume at a binding 6 added for it, each with a
+//   half-size mip 1. Every pixel must hold the integer texels the .asm header derives.
 //   VKT_HEAP_MB=<n>: size of the heap in MiB (default 64 KiB)
 //   VKT_NEED_MAINTENANCE8=1: the shader has a non-constant texel Offset outside gather (image_sample*_o, see
 //   ps_texoff.asm); print "unsupported: ..." and exit 77 when VK_KHR_maintenance8 cannot be enabled.
@@ -99,6 +103,13 @@ int main(int argc, char** argv) {
     const bool fetch_miss = argc >= 2 && !std::strcmp(argv[1], "fetch-miss");
     const bool fetch = fetch_uint || fetch_miss || (argc >= 2 && !std::strcmp(argv[1], "fetch-sint"));
     const bool cube = argc >= 2 && !std::strcmp(argv[1], "cube");
+    // SHADER-1404: an integer 2D array or volume sampled outside 2D (see the usage above).
+    const char* dims_mode = nullptr;
+    for (const char* m : {"array-uint", "array-sint", "volume-uint", "volume-sint"})
+        if (argc >= 2 && !std::strcmp(argv[1], m)) dims_mode = m;
+    const bool dims = dims_mode != nullptr;
+    const bool dims_volume = dims && !std::strncmp(dims_mode, "volume", 6);
+    const bool dims_sint = dims && std::strstr(dims_mode, "sint") != nullptr;
     // dref_c / dref_c_b: image_sample_c / image_sample_c_b (implicit LOD, bias), same texture and expected results.
     const char* dref_ps = nullptr;
     if (argc >= 2) {
@@ -117,7 +128,7 @@ int main(int argc, char** argv) {
         out_path = argv[3];
         ptr_sgpr = std::atoi(argv[4]);
         for (int i = 0; i < 4; ++i) ssharp[i] = (uint32_t)strtoul(argv[5 + i], 0, 16);
-    } else if (argc <= 2 || ((cube || dref || fetch) && argc == 3)) {
+    } else if (argc <= 2 || ((cube || dref || fetch || dims) && argc == 3)) {
         // Autonomous mode using synthetic hand-written shaders (no game files required)
         autonomous = true;
         auto find_spv = [](const char* name) -> std::string {
@@ -136,21 +147,24 @@ int main(int argc, char** argv) {
             return std::string("runtime/build/shaders/spirv/") + name;
         };
         vs_path = find_spv("vs_ids.spv");
-        fs_path = find_spv(fetch ? "ps_table_fetch.spv" : cube ? "ps_cube_sample.spv" : dref ? dref_ps : "ps_texture_sample.spv");
-        const int out_arg = cube || dref || fetch ? 2 : 1;
+        const std::string dims_ps = dims ? std::string("ps_sample_") + (dims_volume ? "volume" : "array") +
+                                               (dims_sint ? "_sint.spv" : "_uint.spv") : std::string();
+        fs_path = find_spv(fetch ? "ps_table_fetch.spv" : cube ? "ps_cube_sample.spv" : dref ? dref_ps :
+                           dims ? dims_ps.c_str() : "ps_texture_sample.spv");
+        const int out_arg = cube || dref || fetch || dims ? 2 : 1;
         out_path = argc > out_arg ? argv[out_arg] : "runtime/build/vk_texture_test_out.raw";
         ptr_sgpr = 0;
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|fetch-uint|fetch-sint|fetch-miss] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|fetch-uint|fetch-sint|fetch-miss|array-uint|array-sint|volume-uint|volume-sint] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key. Word 3 keeps BASE_LEVEL [15:12]
     // at 0, as the views here start at level 0: image_get_resinfo minifies a 2D array's layers from BASE_LEVEL.
     const VkFormat sampled_format = dref ? VK_FORMAT_D32_SFLOAT :
-        (uint_mips || fetch_uint) ? VK_FORMAT_R8G8B8A8_UINT :
-        (signed_mips || fetch) ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UNORM;
+        (uint_mips || fetch_uint || (dims && !dims_sint)) ? VK_FORMAT_R8G8B8A8_UINT :
+        (signed_mips || fetch || dims_sint) ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UNORM;
     uint32_t tsharp[8] = {0x11111111, leonida::gfx10::format_from_vulkan(sampled_format) << 20, 0x33333333, 0x44440444,
                           0x55555555, 0x66666666, 0x77777777, 0x88888888};
     const uint32_t tsharp_va = 256;
@@ -344,9 +358,10 @@ int main(int argc, char** argv) {
                                          : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
     };
     auto make_tex = [&](uint32_t w, uint32_t h, uint32_t mip_levels, uint32_t layers, VkImageViewType type,
-                        VkFormat format, VkImage* img, VkImageView* view) {
+                        VkFormat format, VkImage* img, VkImageView* view, uint32_t depth = 1) {
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = format; ii.extent = {w, h, 1};
+        ii.imageType = type == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+        ii.format = format; ii.extent = {w, h, depth};
         ii.mipLevels = mip_levels; ii.arrayLayers = layers; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
         ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         VkResult r = vkCreateImage(dev, &ii, nullptr, img); if (r) return r;
@@ -388,21 +403,48 @@ int main(int argc, char** argv) {
             for (uint32_t l = 0; l < CUBE_LAYERS; l++)
                 cubes[(l * TW + y) * TW + x] = (x * 32u) | ((y * 32u) << 8) | ((l * 20u) << 16) | (255u << 24);
         }
-    const VkFormat tfmt[4] = {VK_FORMAT_R8G8B8A8_UNORM, sampled_format,
-                              VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
-    VkImage timg[4]; VkImageView tview[4];
+    // SHADER-1404 (array-* / volume-*): the integer texture replaces the 12 cube layers at binding 3 index 1, or is
+    // the volume at binding 6 index 1 (texture 5, after its fallback, texture 4). Side DS at mip 0, DS / 2 at mip 1;
+    // texel (x, y) of layer or slice l at mip m (side S) = bytes (32 * (8x / S), 32 * (8y / S), 20l + m, 255 - 2m).
+    const uint32_t DS = 128, DIMS_LAYERS = dims_volume ? 4 : CUBE_LAYERS;
+    std::vector<uint32_t> dims_texels;
+    if (dims)
+        for (uint32_t m = 0; m < 2; m++) {
+            const uint32_t side = DS >> m, count = dims_volume ? DIMS_LAYERS >> m : DIMS_LAYERS;
+            for (uint32_t l = 0; l < count; l++)
+                for (uint32_t y = 0; y < side; y++)
+                    for (uint32_t x = 0; x < side; x++)
+                        dims_texels.push_back((32u * (8 * x / side)) | ((32u * (8 * y / side)) << 8) |
+                                              ((20u * l + m) << 16) | ((255u - 2 * m) << 24));
+        }
+    const int tex_count = dims_volume ? 6 : 4;
+    const VkFormat tfmt[6] = {VK_FORMAT_R8G8B8A8_UNORM, sampled_format, VK_FORMAT_R8G8B8A8_UNORM,
+                              dims && !dims_volume ? sampled_format : VK_FORMAT_R8G8B8A8_UNORM,
+                              VK_FORMAT_R8G8B8A8_UNORM, sampled_format};
+    VkImage timg[6]; VkImageView tview[6];
     CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[0], &timg[0], &tview[0]));
     CHECK(make_tex(texture_side, texture_side, levels, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[1], &timg[1], &tview[1]));
     CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[2], &timg[2], &tview[2]));
-    CHECK(make_tex(TW, TW, 1, CUBE_LAYERS, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[3], &timg[3], &tview[3]));
+    if (dims && !dims_volume)
+        CHECK(make_tex(DS, DS, 2, DIMS_LAYERS, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[3], &timg[3], &tview[3]));
+    else
+        CHECK(make_tex(TW, TW, 1, CUBE_LAYERS, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[3], &timg[3], &tview[3]));
+    if (dims_volume) {
+        CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_3D, tfmt[4], &timg[4], &tview[4]));
+        CHECK(make_tex(DS, DS, 2, 1, VK_IMAGE_VIEW_TYPE_3D, tfmt[5], &timg[5], &tview[5], DIMS_LAYERS));
+    }
     VkBuffer up; VkDeviceMemory upm; void* upp;
     const VkDeviceSize texture_offset = 256;
     const VkDeviceSize texture_bytes = texels.size() * sizeof(uint32_t);
     const VkDeviceSize cube_offset = texture_offset + texture_bytes;
-    CHECK(make_buffer(cube_offset + cubes.size() * sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &up, &upm, &upp));
+    const VkDeviceSize dims_offset = cube_offset + cubes.size() * sizeof(uint32_t);
+    CHECK(make_buffer(dims_offset + dims_texels.size() * sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      &up, &upm, &upp));
     std::memcpy(upp, &magenta, sizeof(magenta));
     std::memcpy(static_cast<char*>(upp) + texture_offset, texels.data(), texture_bytes);
     std::memcpy(static_cast<char*>(upp) + cube_offset, cubes.data(), cubes.size() * sizeof(uint32_t));
+    if (dims)
+        std::memcpy(static_cast<char*>(upp) + dims_offset, dims_texels.data(), dims_texels.size() * sizeof(uint32_t));
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
     sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
@@ -415,6 +457,8 @@ int main(int argc, char** argv) {
         sci1.minLod = sampler.min_lod;
         sci1.maxLod = sampler.max_lod;
     }
+    if (dims)
+        sci1.maxLod = 1;                       // the integer texture's mip 1 is reachable
     if (dref) {
         sci1.compareEnable = VK_TRUE;
         sci1.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
@@ -452,15 +496,19 @@ int main(int argc, char** argv) {
     VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     fbi.renderPass = rp; fbi.attachmentCount = 1; fbi.pAttachments = &rtv; fbi.width = W; fbi.height = H; fbi.layers = 1;
     VkFramebuffer fb; CHECK(vkCreateFramebuffer(dev, &fbi, nullptr, &fb));
-    // Descriptor set: binding 0 images[2], 1 samplers[2], 2 hash table, 3 2D-array images[2].
-    VkDescriptorSetLayoutBinding b[4]{};
+    // Descriptor set: binding 0 images[2], 1 samplers[2], 2 hash table, 3 2D-array images[2], and in the volume modes
+    // 6 3D images[2].
+    const uint32_t binding_count = dims_volume ? 5 : 4;
+    VkDescriptorSetLayoutBinding b[5]{};
     b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 2, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     b[3] = {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
-    VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; dli.bindingCount = 4; dli.pBindings = b;
+    b[4] = {6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dli.bindingCount = binding_count; dli.pBindings = b;
     VkDescriptorSetLayout dsl; CHECK(vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl));
-    VkDescriptorPoolSize ps[3]{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4}, {VK_DESCRIPTOR_TYPE_SAMPLER, 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+    VkDescriptorPoolSize ps[3]{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 6}, {VK_DESCRIPTOR_TYPE_SAMPLER, 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dpi.maxSets = 1; dpi.poolSizeCount = 3; dpi.pPoolSizes = ps;
     VkDescriptorPool dp; CHECK(vkCreateDescriptorPool(dev, &dpi, nullptr, &dp));
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; dai.descriptorPool = dp; dai.descriptorSetCount = 1; dai.pSetLayouts = &dsl;
@@ -469,15 +517,18 @@ int main(int argc, char** argv) {
                                  {VK_NULL_HANDLE, tview[1], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     VkDescriptorImageInfo ai2[2]{{VK_NULL_HANDLE, tview[2], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                                  {VK_NULL_HANDLE, tview[3], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    VkDescriptorImageInfo vi2[2]{{VK_NULL_HANDLE, dims_volume ? tview[4] : VK_NULL_HANDLE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                 {VK_NULL_HANDLE, dims_volume ? tview[5] : VK_NULL_HANDLE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     VkDescriptorImageInfo si2[2]{{smp[0]}, {smp[1]}};
     VkDescriptorBufferInfo tbi{tb, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet wr[4]{};
+    VkWriteDescriptorSet wr[5]{};
     for (auto& w : wr) { w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w.dstSet = ds; }
     wr[0].dstBinding = 0; wr[0].descriptorCount = 2; wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[0].pImageInfo = ii2;
     wr[1].dstBinding = 1; wr[1].descriptorCount = 2; wr[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; wr[1].pImageInfo = si2;
     wr[2].dstBinding = 2; wr[2].descriptorCount = 1; wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wr[2].pBufferInfo = &tbi;
     wr[3].dstBinding = 3; wr[3].descriptorCount = 2; wr[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[3].pImageInfo = ai2;
-    vkUpdateDescriptorSets(dev, 4, wr, 0, nullptr);
+    wr[4].dstBinding = 6; wr[4].descriptorCount = 2; wr[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[4].pImageInfo = vi2;
+    vkUpdateDescriptorSets(dev, binding_count, wr, 0, nullptr);
     // Pipeline.
     bool tail_block = false;   // a stage reads the --pc-tail-ubo block (declares set 1)
     auto module = [&](const char* p, VkShaderModule* m) {
@@ -528,22 +579,26 @@ int main(int argc, char** argv) {
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; cai.commandPool = pool; cai.commandBufferCount = 1;
     VkCommandBuffer cmd; CHECK(vkAllocateCommandBuffers(dev, &cai, &cmd));
     VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; CHECK(vkBeginCommandBuffer(cmd, &cbi));
-    const VkDeviceSize up_offset[4] = {0, texture_offset, 0, cube_offset};
-    const uint32_t up_size[4] = {1, texture_side, 1, TW}, up_layers[4] = {1, 1, 1, CUBE_LAYERS};
-    for (int t = 0; t < 4; t++) {
+    const bool dims_array = dims && !dims_volume;
+    const VkDeviceSize up_offset[6] = {0, texture_offset, 0, dims_array ? dims_offset : cube_offset, 0, dims_offset};
+    const uint32_t up_size[6] = {1, texture_side, 1, dims_array ? DS : TW, 1, DS};
+    const uint32_t up_layers[6] = {1, 1, 1, dims_array ? DIMS_LAYERS : CUBE_LAYERS, 1, 1};
+    const uint32_t up_levels[6] = {1, levels, 1, dims_array ? 2u : 1u, 1, 2};
+    const uint32_t up_depth[6] = {1, 1, 1, 1, 1, DIMS_LAYERS};   // a volume's depth halves with each mip
+    for (int t = 0; t < tex_count; t++) {
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.image = timg[t];
-        const uint32_t mip_levels = t == 1 ? levels : 1;
+        const uint32_t mip_levels = up_levels[t];
         ib.subresourceRange = {aspect_of(tfmt[t]), 0, mip_levels, 0, up_layers[t]}; ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
         VkDeviceSize offset = up_offset[t];
         for (uint32_t level = 0; level < mip_levels; ++level) {
-            const uint32_t side = up_size[t] >> level;
+            const uint32_t side = up_size[t] >> level, depth = std::max(1u, up_depth[t] >> level);
             VkBufferImageCopy c{}; c.bufferOffset = offset; c.imageSubresource = {aspect_of(tfmt[t]), level, 0, up_layers[t]};
-            c.imageExtent = {side, side, 1};
+            c.imageExtent = {side, side, depth};
             vkCmdCopyBufferToImage(cmd, up, timg[t], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-            offset += VkDeviceSize(side) * side * up_layers[t] * sizeof(uint32_t);
+            offset += VkDeviceSize(side) * side * depth * up_layers[t] * sizeof(uint32_t);
         }
         ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -659,7 +714,38 @@ int main(int argc, char** argv) {
         }
         std::printf("%s: %u exact pixels\n", argv[1], W * H);
     }
-    if (autonomous && !cube && !dref && !fetch) {
+    if (dims) {
+        // Pixel (px, py) reads block (px / 8, py / 8) at both mips. The (layer or slice, mip) of image_sample (implicit
+        // LOD 1 on the 64x64 target), image_sample_l (LOD 0) and image_sample_lz, as the .asm headers derive them.
+        const uint32_t read[3][2] = {{dims_volume ? 1u : 3u, 1}, {dims_volume ? 1u : 5u, 0}, {dims_volume ? 3u : 7u, 0}};
+        const uint32_t flip = dims_sint ? 0x808080u : 0;   // a SINT byte plus 128 is the byte with bit 7 flipped
+        const auto* pixels = static_cast<const float*>(rbp);
+        uint32_t wrong = 0;
+        for (uint32_t py = 0; py < H; py++)
+            for (uint32_t px = 0; px < W; px++) {
+                const uint32_t rg = (32u * (px / 8)) | ((32u * (py / 8)) << 8);
+                float expected[4];
+                uint32_t alphas = 0;
+                for (int s = 0; s < 3; s++) {
+                    expected[s] = float((rg | ((20u * read[s][0] + read[s][1]) << 16)) ^ flip);
+                    alphas |= (255u - 2 * read[s][1]) << (8 * s);
+                }
+                expected[3] = float(alphas ^ flip);
+                const float* p = pixels + (py * W + px) * 4;
+                bool ok = true;
+                for (int c = 0; c < 4; c++) ok = ok && p[c] == expected[c];
+                if (!ok && !wrong++)
+                    std::fprintf(stderr, "%s pixel (%u,%u): got (%.0f, %.0f, %.0f, %.0f), expected (%.0f, %.0f, %.0f, %.0f)\n",
+                                 dims_mode, px, py, p[0], p[1], p[2], p[3],
+                                 expected[0], expected[1], expected[2], expected[3]);
+            }
+        if (wrong) {
+            std::fprintf(stderr, "%s: FAILED, %u of %u pixels wrong\n", dims_mode, wrong, W * H);
+            return 1;
+        }
+        std::printf("%s: %u exact pixels\n", dims_mode, W * H);
+    }
+    if (autonomous && !cube && !dref && !fetch && !dims) {
         const float* pixels = static_cast<const float*>(rbp);
         // Sample center pixel (32, 32)
         int idx = (32 * W + 32) * 4;

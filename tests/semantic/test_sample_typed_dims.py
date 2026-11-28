@@ -7,8 +7,8 @@ alias of the dimension's sampled binding in all of them (SHADER-151). Sampling t
 2D-array, 3D, cube or 1D texture was read through the float view and the VGPRs held a converted float instead of the
 integer texel. Here: the alias each dimension loads, the sampled-image type it pairs with the sampler, that the float
 view is still sampled for a float format, and that the modules validate. The GPU pixel fixtures are
-runtime/test/shaders/ps_sample_implicit_uint.asm and ps_sample_implicit_sint.asm (2D); a non-2D integer texture is the
-remaining pixel check.
+runtime/test/shaders/ps_sample_implicit_uint.asm and ps_sample_implicit_sint.asm (2D), and ps_sample_array_*.asm and
+ps_sample_volume_*.asm (2D array and 3D, SHADER-1404).
 """
 import os
 import re

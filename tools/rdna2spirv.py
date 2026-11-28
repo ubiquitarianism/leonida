@@ -14203,10 +14203,13 @@ class Gen:
             sp, smp, si = self.tmp(), self.tmp(), self.tmp()
             self.dynamic_sampled_access(sp, "%_ptr_UC_smp", "%samplers", smp_idx)
             self.emit(f"{smp} = OpLoad %smp {sp}")
-            typed_implicit = op == "image_sample" and self.stage == "ps" and dim == "dim:SQ_RSRC_IMG_2D"
-            # An explicit-LOD sample has the same shape in every dimension, so it takes the typed read too:
-            # image_read_typed picks the UINT/SINT alias of the dimension's sampled binding (image_load does).
-            typed_sample = typed_implicit or op in ("image_sample_l", "image_sample_lz")
+            # The T# FORMAT picks the float, UINT or SINT view in every dimension, so image_sample, image_sample_l and
+            # image_sample_lz take the typed read: image_read_typed picks the UINT/SINT alias of the dimension's
+            # sampled binding (image_load does). The implicit form samples with the quad gradients in the pixel
+            # stage and at LOD 0 elsewhere (SHADER-1404). The other sample forms (_b, _d, _cl, _o, _c*) still read
+            # the float view.
+            typed_implicit = op == "image_sample" and self.stage == "ps"
+            typed_sample = op in ("image_sample", "image_sample_l", "image_sample_lz")
 
             def sampled_image(image, cls, di=0):
                 sampled = self.tmp()
@@ -14449,10 +14452,17 @@ class Gen:
                 di = self.STORE_DIMS[view_dim][0]
                 operands = f"Lod {lod}"
                 if typed_implicit:
-                    # Compute the quad gradients before the per-image format branch.
+                    # Compute the quad gradients before the per-image format branch. Grad takes one component per
+                    # non-layer coordinate: (s, t) of a 2D, 2D-array or cube (its 2D-array view) sample, the
+                    # three of a 3D one, the one of a 1D one.
+                    gty = "%float" if grad_width == 1 else f"%v{grad_width}float"
+                    guv = uv
+                    if ncoord == 3 and not is3d:
+                        guv = self.tmp()
+                        self.emit(f"{guv} = OpVectorShuffle %v2float {uv} {uv} 0 1")
                     dx, dy = self.tmp(), self.tmp()
-                    self.emit(f"{dx} = OpDPdx %v2float {uv}")
-                    self.emit(f"{dy} = OpDPdy %v2float {uv}")
+                    self.emit(f"{dx} = OpDPdx {gty} {guv}")
+                    self.emit(f"{dy} = OpDPdy {gty} {guv}")
                     operands = f"Grad {dx} {dy}"
 
                 def sample(image, cls, ty):
