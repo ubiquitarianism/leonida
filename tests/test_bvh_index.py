@@ -119,6 +119,17 @@ class ClassifyTest(unittest.TestCase):
         self.assertTrue(row["root_node_invalid"])
         self.assertEqual(row["root_node_type_name"], "invalid")
 
+    def test_truncated_head_on_208_byte_payload_does_not_crash(self):
+        for truncated in (b"\0" * 10, instance_payload()[:0x20]):
+            row = bvh_index.classify(truncated, 208)
+            self.assertEqual(row["kind"], "raw")
+            self.assertEqual(row["signature"], "truncated-head")
+            self.assertTrue(row["truncated_head"])
+        # With >= 0x30 bytes, a capped 208-byte instance record falls back to its 48-byte descriptor prefix cleanly.
+        row = bvh_index.classify(instance_payload()[:128], 208)
+        self.assertEqual(row["kind"], "descriptor")
+        self.assertEqual(row["signature"], "desc:0x5000xxxx")
+
     def test_bvh4_chunk(self):
         b = bytearray(65536)
         struct.pack_into("<I", b, 0x100, bvh_index.TAG)
@@ -448,7 +459,19 @@ class ScanTest(unittest.TestCase):
             doc = json.load(f)
         # Only 128 bytes were kept, so the 0x140-byte header cannot be read; the real size is still reported.
         self.assertEqual(doc["streams"][0]["kind"], "raw")
+        self.assertEqual(doc["streams"][0]["signature"], "truncated-head")
+        self.assertTrue(doc["streams"][0]["truncated_head"])
         self.assertEqual(doc["streams"][0]["size"], full)
+
+        with open(os.path.join(self.dir, "one.rpf"), "wb") as f:
+            f.write(make_rpf([instance_payload()]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bvh_index.main([self.dir, "--max-inflate", "128", "--out", out]), 0)
+        with open(out) as f:
+            inst_doc = json.load(f)
+        self.assertEqual(inst_doc["streams"][0]["kind"], "descriptor")
+        self.assertEqual(inst_doc["streams"][0]["signature"], "desc:0x5000xxxx")
+        self.assertEqual(inst_doc["streams"][0]["size"], 208)
 
     def test_cli_rejects_start_or_limit_for_a_directory(self):
         with open(os.path.join(self.dir, "one.rpf"), "wb") as f:
