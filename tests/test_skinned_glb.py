@@ -6,7 +6,9 @@ Every model, skeleton, skin stream and GLB here is built by the test. No game
 file, value or name is used. The fixture is a three-bone ped skeleton, a
 two-entry drawable palette and a three-vertex 8-influence skin buffer.
 """
+import contextlib
 import hashlib
+import io
 import json
 import math
 import os
@@ -882,6 +884,281 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertTrue(_read(out).startswith(b"glTF"))
         self.assertTrue(os.path.exists(new_buf))
         self.assertEqual(hashlib.sha256(_read(new_buf)).hexdigest(), before_hash)
+
+
+class ValidationHardeningTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = self.temp.name
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_read_glb_rejects_bad_version_chunk_types_and_truncation(self):
+        good_json = b'{"asset":{"version":"2.0"}} '
+        good_bin = b"\x00\x01\x02\x03"
+
+        def _make(version=2, total=None, jlen=None, jtype=skinned_glb.CHUNK_JSON,
+                  blen=None, btype=skinned_glb.CHUNK_BIN, tail=None):
+            if jlen is None:
+                jlen = len(good_json)
+            if tail is None:
+                if blen is None:
+                    blen = len(good_bin)
+                tail = struct.pack("<II", blen, btype) + good_bin
+            body = struct.pack("<II", jlen, jtype) + good_json + tail
+            if total is None:
+                total = 12 + len(body)
+            return struct.pack("<4sII", skinned_glb.GLB_MAGIC, version, total) + body
+
+        cases = [
+            ("v1", _make(version=1), "unsupported GLB version"),
+            ("truncated_total", _make(total=999), "truncated GLB"),
+            ("bad_json_type", _make(jtype=0x11223344), "invalid or truncated JSON"),
+            ("truncated_json", _make(jlen=len(good_json) + 100), "invalid or truncated JSON"),
+            ("bad_bin_type", _make(btype=0x55667788), "invalid or truncated BIN"),
+            ("truncated_bin", _make(blen=len(good_bin) + 16), "invalid or truncated BIN"),
+            ("truncated_bin_hdr", _make(tail=b"\x01\x02\x03\x04"), "truncated BIN chunk header"),
+        ]
+        for label, blob, pattern in cases:
+            with self.subTest(case=label):
+                path = os.path.join(self.root, f"{label}.glb")
+                with open(path, "wb") as handle:
+                    handle.write(blob)
+                with self.assertRaisesRegex(skinned_glb.SkinError, pattern):
+                    skinned_glb.read_glb(path)
+
+    def test_accessor_bytes_rejects_negative_bool_and_bufferview_overrun(self):
+        base_gltf = {
+            "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 16}],
+            "accessors": [{"bufferView": 0, "byteOffset": 0, "componentType": 5126,
+                           "count": 2, "type": "VEC2"}],
+        }
+        bin_data = b"\x00" * 64
+        # Valid read succeeds.
+        payload, _ = skinned_glb.accessor_bytes(base_gltf, bin_data, 0)
+        self.assertEqual(len(payload), 16)
+
+        # Negative and bool accessor indices are rejected.
+        for bad_idx in (-1, False, True):
+            with self.subTest(index=bad_idx):
+                with self.assertRaises(skinned_glb.SkinError):
+                    skinned_glb.accessor_bytes(base_gltf, bin_data, bad_idx)
+
+        # Bool / negative bufferView, count, byteStride, byteOffset.
+        for label, view_patch, acc_patch in (
+            ("neg_view", {}, {"bufferView": -1}),
+            ("bool_view", {}, {"bufferView": False}),
+            ("bool_count", {}, {"count": True}),
+            ("bool_stride", {"byteStride": True}, {}),
+            ("neg_view_off", {"byteOffset": -4}, {}),
+            ("bool_view_off", {"byteOffset": True}, {}),
+            ("neg_acc_off", {}, {"byteOffset": -4}),
+            ("bool_acc_off", {}, {"byteOffset": False}),
+            ("past_view_len", {"byteLength": 12}, {}),
+            ("view_past_bin", {"byteOffset": 60, "byteLength": 16}, {}),
+        ):
+            with self.subTest(case=label):
+                gltf = {
+                    "bufferViews": [{**base_gltf["bufferViews"][0], **view_patch}],
+                    "accessors": [{**base_gltf["accessors"][0], **acc_patch}],
+                }
+                with self.assertRaises(skinned_glb.SkinError):
+                    skinned_glb.accessor_bytes(gltf, bin_data, 0)
+
+    def test_joint_set_rejects_cycles_self_parent_non_dict_and_bool_parent(self):
+        # Missing bind_matrix (None) and bool element raise SkinError instead of TypeError.
+        self.assertFalse(skinned_glb._finite_matrix(None))
+        self.assertFalse(skinned_glb._finite_matrix([True] + [0.0] * 15))
+        with self.assertRaises(skinned_glb.SkinError):
+            skinned_glb.JointSet([{"name": "SKEL_ROOT", "parent": None}])
+        with self.assertRaises(skinned_glb.SkinError):
+            skinned_glb.JointSet(["not-a-dict"])
+
+        # Self-parent cycle.
+        self_cycle = [
+            {"name": "SKEL_ROOT", "parent": None, "bind_matrix": _matrix()},
+            {"name": "SKEL_Self", "parent": 1, "bind_matrix": _matrix()},
+        ]
+        with self.assertRaisesRegex(skinned_glb.SkinError, "parent cycle"):
+            skinned_glb.JointSet(self_cycle)
+
+        # Two-bone cycle.
+        two_cycle = [
+            {"name": "SKEL_ROOT", "parent": None, "bind_matrix": _matrix()},
+            {"name": "SKEL_A", "parent": 2, "bind_matrix": _matrix()},
+            {"name": "SKEL_B", "parent": 1, "bind_matrix": _matrix()},
+        ]
+        with self.assertRaisesRegex(skinned_glb.SkinError, "parent cycle"):
+            skinned_glb.JointSet(two_cycle)
+
+        # Bool parent in skeleton is treated as invalid (reparented to root, not bone 1).
+        bool_parent = [
+            {"name": "SKEL_ROOT", "parent": None, "bind_matrix": _matrix()},
+            {"name": "SKEL_Spine", "parent": 0, "bind_matrix": _matrix((0.0, 0.0, 1.0))},
+            {"name": "SKEL_Other", "parent": True, "bind_matrix": _matrix((0.0, 0.0, 2.0))},
+        ]
+        jset = skinned_glb.JointSet(bool_parent)
+        self.assertEqual(jset.parents[2], 0)
+
+        # JointSet.add rejects bool parent.
+        for bad_parent in (False, True):
+            with self.assertRaisesRegex(skinned_glb.SkinError, "invalid parent"):
+                jset.add("Helper", _matrix(), bad_parent)
+
+    def test_read_skin_streams_rejects_short_header_bool_and_malformed_fields(self):
+        component = _component(self.root)
+        # Short 16-byte buffer without mesh_blob.sections raises SkinError (not struct.error).
+        with open(os.path.join(component, "buffers", "01_0.bin"), "wb") as handle:
+            handle.write(b"\x00" * 16)
+        model = _read_model(component)
+        with self.assertRaisesRegex(skinned_glb.SkinError, "23-word section header"):
+            skinned_glb.read_skin_streams(component, model, model["meshes"][0])
+
+        # Restore valid buffer and test malformed JSON field types.
+        component2 = _component(os.path.join(self.root, "c2"))
+        base = _read_model(component2)
+
+        def _clone():
+            return json.loads(json.dumps(base))
+
+        # Bool in bone_palette.
+        m = _clone()
+        m["drawable"]["models"][0]["bone_palette"] = [True, 1]
+        with self.assertRaises(skinned_glb.SkinError):
+            skinned_glb.read_skin_streams(component2, m, m["meshes"][0])
+
+        # Negative vertex_buffer index.
+        m = _clone()
+        m["drawable"]["geometries"][0]["vertex_buffer"] = -1
+        with self.assertRaises(skinned_glb.SkinError):
+            skinned_glb.read_skin_streams(component2, m, m["meshes"][0])
+
+        # Non-int gfx_off and bool gfx_off.
+        for bad_off in ("0x10", True):
+            m = _clone()
+            m["drawable"]["buffers"][0]["gfx_off"] = bad_off
+            with self.assertRaises(skinned_glb.SkinError):
+                skinned_glb.read_skin_streams(component2, m, m["meshes"][0])
+
+        # Malformed mesh_blob.sections elements (string / bool).
+        for bad_sec in ([[6, "bad", 0x26]], [[6, True, 0x26]], "not-a-list"):
+            m = _clone()
+            m["drawable"]["buffers"][0]["mesh_blob"] = {"sections": bad_sec}
+            with self.assertRaises(skinned_glb.SkinError):
+                skinned_glb.read_skin_streams(component2, m, m["meshes"][0])
+
+        # Bool vertex_count.
+        m = _clone()
+        m["meshes"][0]["vertex_count"] = True
+        with self.assertRaises(skinned_glb.SkinError):
+            skinned_glb.read_skin_streams(component2, m, m["meshes"][0])
+
+    def test_palette_resolver_and_own_parent_name_handle_malformed_records(self):
+        resolver = skinned_glb.PaletteResolver({"drawable": ["not-a-dict"]}, {})
+        self.assertEqual(resolver.own_skeleton, [])
+        resolver2 = skinned_glb.PaletteResolver(
+            {"drawable": {"skeleton": [None, "bad", {"name": "BoneA"}], "strings": "not-a-list"}}, {},
+        )
+        self.assertIn("BoneA", resolver2.own_by_name)
+        self.assertIsNone(skinned_glb.own_parent_name({"parent": False}, [{"name": "Root"}]))
+        self.assertIsNone(skinned_glb.own_parent_name({"parent": 0}, ["not-a-dict"]))
+
+    def test_normalise_weights_rejects_bool_arguments(self):
+        j0, j1, w0, w1 = _streams()
+        backends = [None] if skinned_glb._np is None else [None, skinned_glb._np]
+        for backend in backends:
+            with mock.patch.object(skinned_glb, "_np", backend):
+                with self.assertRaises(skinned_glb.SkinError):
+                    skinned_glb.normalise_weights(j0[:4], j1[:4], w0[:4], w1[:4], True, 2, [0, 1], 4)
+                with self.assertRaises(skinned_glb.SkinError):
+                    skinned_glb.normalise_weights(j0, j1, w0, w1, 3, True, [0], 4)
+                with self.assertRaises(skinned_glb.SkinError):
+                    skinned_glb.normalise_weights(j0, j1, w0, w1, 3, 2, [True, 1], 4)
+                with self.assertRaises(skinned_glb.SkinError):
+                    skinned_glb.normalise_weights(j0, j1, w0, w1, 3, 2, [0, 1], True)
+
+    def test_build_skinned_glb_validates_attribute_counts_indices_and_ibm_overflow(self):
+        from anim_glb import pack_glb
+
+        skeleton = _skeleton_dir(self.root)
+
+        # 1) Mismatched NORMAL attribute count vs POSITION count.
+        c_norm = _component(os.path.join(self.root, "norm_mismatch"))
+        glb_path = os.path.join(c_norm, "model.glb")
+        source, source_bin = skinned_glb.read_glb(glb_path)
+        norm_idx = source["meshes"][0]["primitives"][0]["attributes"]["NORMAL"]
+        source["accessors"][norm_idx]["count"] = 2
+        with open(glb_path, "wb") as handle:
+            handle.write(pack_glb(source, source_bin))
+        with self.assertRaisesRegex(skinned_glb.SkinError, "NORMAL count 2 != skin stream count 3"):
+            skinned_glb.build_skinned_glb(skeleton, [c_norm])
+
+        # 2) Out-of-range vertex index in source indices.
+        c_oob = _component(os.path.join(self.root, "idx_oob"))
+        glb_path = os.path.join(c_oob, "model.glb")
+        source, source_bin = skinned_glb.read_glb(glb_path)
+        idx_acc_i = source["meshes"][0]["primitives"][0]["indices"]
+        idx_acc = source["accessors"][idx_acc_i]
+        idx_view = source["bufferViews"][idx_acc["bufferView"]]
+        off = idx_view.get("byteOffset", 0) + idx_acc.get("byteOffset", 0)
+        mut = bytearray(source_bin)
+        struct.pack_into("<H", mut, off + 4, 9)  # vertex 9 >= count 3
+        with open(glb_path, "wb") as handle:
+            handle.write(pack_glb(source, bytes(mut)))
+        with self.assertRaisesRegex(skinned_glb.SkinError, "out of range"):
+            skinned_glb.build_skinned_glb(skeleton, [c_oob])
+
+        # 3) Non-SCALAR index accessor and float index componentType.
+        c_bad_idx = _component(os.path.join(self.root, "idx_type"))
+        glb_path = os.path.join(c_bad_idx, "model.glb")
+        source, source_bin = skinned_glb.read_glb(glb_path)
+        idx_acc_i = source["meshes"][0]["primitives"][0]["indices"]
+        source["accessors"][idx_acc_i]["componentType"] = skinned_glb.COMPONENT_FLOAT
+        # Expand BIN so accessor_bytes succeeds and _validate_indices rejects float indices.
+        idx_view = source["bufferViews"][source["accessors"][idx_acc_i]["bufferView"]]
+        idx_view["byteOffset"] = len(source_bin)
+        idx_view["byteLength"] = 12
+        with open(glb_path, "wb") as handle:
+            handle.write(pack_glb(source, source_bin + b"\x00" * 12))
+        with self.assertRaisesRegex(skinned_glb.SkinError, "unsupported source index component type"):
+            skinned_glb.build_skinned_glb(skeleton, [c_bad_idx])
+
+        # 4) Near-singular bind matrix whose inverse overflows float32 -> SkinError (not OverflowError).
+        sk_ovf = os.path.join(self.root, "sk_ovf")
+        os.makedirs(sk_ovf)
+        tiny = [1e-4, 0.0, 0.0, 0.0,
+                0.0, 1e-4, 0.0, 0.0,
+                0.0, 0.0, 1e-4, 0.0,
+                1e36, 0.0, 0.0, 1.0]
+        _write_json(os.path.join(sk_ovf, "model.json"), {
+            "drawable": {"skeleton": [
+                {"index": 0, "name": "SKEL_ROOT", "parent": None, "bind_matrix": tiny},
+            ]},
+        })
+        c_ok = _component(os.path.join(self.root, "c_ok"))
+        with self.assertRaisesRegex(skinned_glb.SkinError, "overflows float32"):
+            skinned_glb.build_skinned_glb(sk_ovf, [c_ok])
+
+        # 5) Non-dict drawable in skeleton model.json raises SkinError (not AttributeError).
+        sk_bad = os.path.join(self.root, "sk_bad")
+        os.makedirs(sk_bad)
+        _write_json(os.path.join(sk_bad, "model.json"), {"drawable": []})
+        with self.assertRaisesRegex(skinned_glb.SkinError, "no drawable object"):
+            skinned_glb.build_skinned_glb(sk_bad, [c_ok])
+
+    def test_cli_rejects_output_directory_upfront(self):
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        out_dir = os.path.join(self.root, "existing_dir")
+        os.makedirs(out_dir)
+        err = io.StringIO()
+        with mock.patch.object(skinned_glb, "write_skinned_glb",
+                               side_effect=AssertionError("should not build GLB")):
+            with contextlib.redirect_stderr(err):
+                rc = skinned_glb.main([out_dir, "--skeleton", skeleton, "--component", component])
+        self.assertEqual(rc, 2)
+        self.assertIn("output path is a directory", err.getvalue())
 
 
 if __name__ == "__main__":

@@ -73,15 +73,12 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 try:  # optional: the stdlib path below is the fallback and is covered by the tests
     import numpy as _np
 except ImportError:  # pragma: no cover - depends on the interpreter
     _np = None
-
-# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from report_paths import same_report_path  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -201,8 +198,16 @@ def _is_identity(m) -> bool:
     return all(abs(v - (1.0 if i in (0, 5, 10, 15) else 0.0)) <= 1e-9 for i, v in enumerate(m))
 
 
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _finite_matrix(m) -> bool:
-    return len(m) == 16 and all(isinstance(v, (int, float)) and math.isfinite(v) for v in m)
+    return (
+        isinstance(m, (list, tuple))
+        and len(m) == 16
+        and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in m)
+    )
 
 
 # ------------------------------------------------------------------------ files
@@ -280,6 +285,8 @@ def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
     vertex count, local palette length and measured section table. The caller still
     maps local indices to GLB joints.
     """
+    if not isinstance(mesh, dict):
+        raise SkinError("mesh record must be an object")
     drawable = model.get("drawable")
     if not isinstance(drawable, dict):
         raise SkinError("model.json has no drawable object")
@@ -287,51 +294,71 @@ def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
     if not isinstance(meshes, list):
         raise SkinError("model.json has no meshes list")
     try:
-        geometry = drawable["geometries"][mesh["geometry"]]
+        geom_index = mesh["geometry"]
+        model_index = mesh["model"]
+        geometries = drawable["geometries"]
+        buffers = drawable["buffers"]
+        models = drawable["models"]
+        if not (isinstance(geometries, list) and isinstance(buffers, list) and isinstance(models, list)):
+            raise TypeError("drawable tables must be lists")
+        if not (_is_int(geom_index) and geom_index >= 0 and _is_int(model_index) and model_index >= 0):
+            raise TypeError("mesh geometry and model indices must be non-negative integers")
+        geometry = geometries[geom_index]
+        if not isinstance(geometry, dict):
+            raise TypeError("geometry record must be an object")
         vertex_buffer_index = geometry["vertex_buffer"]
-        vertex_buffer = drawable["buffers"][vertex_buffer_index]
-        model_record = drawable["models"][mesh["model"]]
+        if not (_is_int(vertex_buffer_index) and vertex_buffer_index >= 0):
+            raise TypeError("vertex_buffer index must be a non-negative integer")
+        vertex_buffer = buffers[vertex_buffer_index]
+        model_record = models[model_index]
+        if not (isinstance(vertex_buffer, dict) and isinstance(model_record, dict)):
+            raise TypeError("buffer and model records must be objects")
     except (KeyError, IndexError, TypeError) as exc:
         raise SkinError(f"mesh links to a missing drawable record: {exc}") from exc
 
     palette = model_record.get("bone_palette")
     if not isinstance(palette, list) or not palette:
         raise SkinError("model has no bone palette")
-    if not all(isinstance(v, int) and 0 <= v <= 0xFFFFFFFF for v in palette):
+    if not all(_is_int(v) and 0 <= v <= 0xFFFFFFFF for v in palette):
         raise SkinError("bone palette must be u32 hashes")
 
     buffer_name = model.get("buffer_files", [])
+    if not isinstance(buffer_name, list):
+        raise SkinError("vertex buffer has no buffer_files entry")
     try:
         buffer_file = buffer_name[vertex_buffer_index]
     except (IndexError, TypeError) as exc:
         raise SkinError("vertex buffer has no buffer_files entry") from exc
+    if not isinstance(buffer_file, str) or not buffer_file:
+        raise SkinError("vertex buffer has an invalid buffer_files entry")
     buffer_path = os.path.join(model_dir, buffer_file)
     with open(buffer_path, "rb") as handle:
         blob = handle.read()
 
-    raw_off = vertex_buffer.get("gfx_off", 0)
-    if raw_off is None:
+    raw_base = vertex_buffer.get("gfx_off", 0)
+    if raw_base is None:
         base = 0
-    elif isinstance(raw_off, (bool, float)):
-        raise SkinError("vertex buffer offset is not an integer")
+    elif _is_int(raw_base):
+        base = raw_base
     else:
-        try:
-            base = int(raw_off)
-        except (ValueError, TypeError, OverflowError) as exc:
-            raise SkinError("vertex buffer offset is not an integer") from exc
+        raise SkinError("vertex buffer offset is not an integer")
     if base < 0 or base > len(blob):
         raise SkinError("vertex buffer offset is outside its buffer")
 
     sections = {}
     mesh_blob = vertex_buffer.get("mesh_blob")
     raw_sections = mesh_blob.get("sections") if isinstance(mesh_blob, dict) else None
-    if raw_sections:
+    if raw_sections is not None and raw_sections != []:
+        if not isinstance(raw_sections, (list, tuple)):
+            raise SkinError("mesh_blob.sections must be a list")
         for row in raw_sections:
-            if not isinstance(row, (list, tuple)) or len(row) != 3:
+            if not isinstance(row, (list, tuple)) or len(row) != 3 or not all(_is_int(v) for v in row):
                 raise SkinError("mesh_blob.sections entries must be [semantic, offset, format]")
-            semantic, offset, fmt = (int(v) for v in row)
+            semantic, offset, fmt = row
             sections[semantic] = (offset, fmt)
     else:
+        if base + 23 * 4 > len(blob):
+            raise SkinError("graphics buffer shorter than 23-word section header")
         for semantic in range(23):
             word = struct.unpack_from("<I", blob, base + semantic * 4)[0]
             if word:
@@ -344,7 +371,7 @@ def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
         raise SkinError("JOINTS_1 and WEIGHTS_1 must be present together")
 
     vertex_count = mesh.get("vertex_count", model.get("vertex_count"))
-    if isinstance(vertex_count, bool) or not isinstance(vertex_count, int) or vertex_count <= 0:
+    if not _is_int(vertex_count) or vertex_count <= 0:
         raise SkinError("mesh has no positive integer vertex_count")
 
     rows = {}
@@ -388,6 +415,8 @@ def _bone_name_map(skeleton) -> tuple[dict[str, dict], dict[int, dict]]:
         raise SkinError("skeleton has no bones")
     by_name, by_hash = {}, {}
     for bone in skeleton:
+        if not isinstance(bone, dict):
+            raise SkinError("skeleton bone must be an object")
         name = bone.get("name")
         if not isinstance(name, str) or not name:
             raise SkinError("skeleton bone has no name")
@@ -416,12 +445,20 @@ class JointSet:
         for index, bone in enumerate(ped_skeleton):
             bind = bind_to_gltf(bone["bind_matrix"])
             parent = bone.get("parent")
-            if not isinstance(parent, int) or not 0 <= parent < len(ped_skeleton):
+            if not _is_int(parent) or not 0 <= parent < len(ped_skeleton):
                 parent = None if index == self.root else self.root
             self.names.append(bone["name"])
             self.binds.append(bind)
             self.parents.append(parent)
             self._by_name.setdefault(bone["name"], index)
+        for index in range(len(self.parents)):
+            seen: set[int] = set()
+            cursor: int | None = index
+            while cursor is not None:
+                if cursor in seen:
+                    raise SkinError(f"ped skeleton has a parent cycle involving bone {self.names[index]!r}")
+                seen.add(cursor)
+                cursor = self.parents[cursor]
 
     @property
     def count(self) -> int:
@@ -433,7 +470,7 @@ class JointSet:
     def add(self, name: str, bind: list[float], parent: int) -> int:
         if not _finite_matrix(bind):
             raise SkinError(f"joint {name!r} has a non-finite bind matrix")
-        if not 0 <= parent < self.count:
+        if not _is_int(parent) or not 0 <= parent < self.count:
             raise SkinError(f"joint {name!r} has an invalid parent")
         existing = self._by_name.get(name)
         if existing is not None:
@@ -552,17 +589,22 @@ class PaletteResolver:
 
     def __init__(self, component: dict, ped_by_name: dict[str, dict]):
         self.ped_by_name = ped_by_name
-        drawable = component.get("drawable") or {}
-        own = drawable.get("skeleton") or []
+        raw_drawable = component.get("drawable")
+        drawable = raw_drawable if isinstance(raw_drawable, dict) else {}
+        raw_own = drawable.get("skeleton")
+        own = raw_own if isinstance(raw_own, list) else []
         self.own_skeleton = own
         self.own_by_name = {}
         self.by_hash: dict[int, tuple[str, str]] = {}
         for bone in own:
+            if not isinstance(bone, dict):
+                continue
             name = bone.get("name")
             if isinstance(name, str) and name:
                 self.own_by_name.setdefault(name, bone)
                 self.by_hash.setdefault(joaat32(name), (name, "own"))
-        for text in drawable.get("strings") or []:
+        raw_strings = drawable.get("strings")
+        for text in (raw_strings if isinstance(raw_strings, list) else ()):
             if not isinstance(text, str) or not text:
                 continue
             self._add_string(text, "string")
@@ -594,7 +636,7 @@ def own_parent_name(record, own_skeleton) -> str | None:
     parent_name = record.get("parent_name")
     if parent_name is None:
         parent = record.get("parent")
-        if isinstance(parent, int) and 0 <= parent < len(own_skeleton):
+        if _is_int(parent) and 0 <= parent < len(own_skeleton) and isinstance(own_skeleton[parent], dict):
             parent_name = own_skeleton[parent].get("name")
     return parent_name if isinstance(parent_name, str) and parent_name else None
 
@@ -604,11 +646,13 @@ def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
                       local_bones: int, local_to_joint: list[int],
                       joint_count: int | None = None) -> dict:
     """Map local joint bytes to GLB joints and normalise every 8-weight row to 1.0."""
-    if count <= 0 or local_bones <= 0:
+    if not _is_int(count) or count <= 0 or not _is_int(local_bones) or local_bones <= 0:
         raise SkinError("skin stream has no vertices or no local bones")
+    if joint_count is not None and (not _is_int(joint_count) or joint_count <= 0):
+        raise SkinError("joint_count must be a positive integer")
     if len(local_to_joint) != local_bones:
         raise SkinError("joint palette map has the wrong length")
-    if any(not isinstance(v, int) or v < 0 or
+    if any(not _is_int(v) or v < 0 or
            (joint_count is not None and v >= joint_count) for v in local_to_joint):
         raise SkinError("joint palette map contains an invalid joint index")
     expected = 4 * count
@@ -646,7 +690,6 @@ def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
         zero = weights == 0
         indices[zero] = 0
         mapping = _np.asarray(local_to_joint, dtype=_np.uint16)
-        indices[weights == 0] = 0
         indices = mapping[indices]
         indices[zero] = 0
         if joint_count is not None and bool((indices >= joint_count).any()):
@@ -691,42 +734,76 @@ def read_glb(path: str) -> tuple[dict, bytes]:
         data = handle.read()
     if len(data) < 20 or data[:4] != GLB_MAGIC:
         raise SkinError(f"{path}: not a binary glTF file")
-    json_length = struct.unpack_from("<I", data, 12)[0]
+    version, total_length, json_length, json_type = struct.unpack_from("<4I", data, 4)
+    if version != GLB_VERSION:
+        raise SkinError(f"{path}: unsupported GLB version {version}")
+    if total_length < 20 or total_length > len(data):
+        raise SkinError(f"{path}: truncated GLB container")
+    if json_type != CHUNK_JSON or 20 + json_length > total_length:
+        raise SkinError(f"{path}: invalid or truncated JSON chunk")
     try:
         gltf = json.loads(data[20:20 + json_length].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise SkinError(f"{path}: invalid JSON chunk: {exc}") from exc
-    offset = 20 + json_length
-    bin_data = b""
-    if offset + 8 <= len(data):
-        bin_length = struct.unpack_from("<I", data, offset)[0]
-        bin_data = data[offset + 8:offset + 8 + bin_length]
     if not isinstance(gltf, dict):
         raise SkinError(f"{path}: JSON root is not an object")
+    offset = 20 + json_length
+    bin_data = b""
+    if offset < total_length:
+        if offset + 8 > total_length:
+            raise SkinError(f"{path}: truncated BIN chunk header")
+        bin_length, bin_type = struct.unpack_from("<2I", data, offset)
+        if bin_type != CHUNK_BIN or offset + 8 + bin_length > total_length:
+            raise SkinError(f"{path}: invalid or truncated BIN chunk")
+        bin_data = data[offset + 8:offset + 8 + bin_length]
     return gltf, bin_data
 
 
 def accessor_bytes(gltf: dict, bin_data: bytes, index: int) -> tuple[bytes, dict]:
     """Return tightly packed accessor bytes and a copy of its glTF metadata."""
+    if not _is_int(index) or index < 0:
+        raise SkinError(f"invalid accessor index {index!r}")
     try:
-        accessor = gltf["accessors"][index]
-        view = gltf["bufferViews"][accessor["bufferView"]]
+        accessors = gltf["accessors"]
+        views = gltf["bufferViews"]
+        if not (isinstance(accessors, list) and isinstance(views, list)):
+            raise TypeError("accessors and bufferViews must be lists")
+        accessor = accessors[index]
+        if not isinstance(accessor, dict):
+            raise TypeError("accessor must be an object")
+        view_index = accessor["bufferView"]
+        if not _is_int(view_index) or view_index < 0:
+            raise TypeError(f"invalid bufferView index {view_index!r}")
+        view = views[view_index]
+        if not isinstance(view, dict):
+            raise TypeError("bufferView must be an object")
     except (KeyError, IndexError, TypeError) as exc:
         raise SkinError(f"invalid accessor {index}: {exc}") from exc
     if accessor.get("sparse") is not None:
         raise SkinError("sparse accessors are not supported")
     component_type = accessor.get("componentType")
-    if component_type not in COMPONENT_SIZES:
+    if not _is_int(component_type) or component_type not in COMPONENT_SIZES:
         raise SkinError(f"unsupported accessor component type {component_type!r}")
     element = COMPONENT_SIZES[component_type] * TYPE_COMPONENTS.get(accessor.get("type"), 0)
     count = accessor.get("count")
-    if element <= 0 or not isinstance(count, int) or count < 0:
+    if element <= 0 or not _is_int(count) or count < 0:
         raise SkinError(f"invalid accessor {index} shape")
     stride = view.get("byteStride", element)
-    if not isinstance(stride, int) or stride < element:
+    if not _is_int(stride) or stride < element:
         raise SkinError(f"accessor {index} has an invalid byteStride")
-    start = view.get("byteOffset", 0) + accessor.get("byteOffset", 0)
-    end = start + ((count - 1) * stride + element if count else 0)
+    view_offset = view.get("byteOffset", 0)
+    acc_offset = accessor.get("byteOffset", 0)
+    if not _is_int(view_offset) or view_offset < 0 or not _is_int(acc_offset) or acc_offset < 0:
+        raise SkinError(f"accessor {index} has an invalid byteOffset")
+    view_length = view.get("byteLength")
+    if view_length is not None:
+        if not _is_int(view_length) or view_length < 0 or view_offset + view_length > len(bin_data):
+            raise SkinError(f"accessor {index} bufferView is outside the BIN chunk")
+    span = (count - 1) * stride + element if count else 0
+    if view_length is not None and acc_offset + span > view_length:
+        raise SkinError(f"accessor {index} extends past its bufferView")
+    start = view_offset + acc_offset
+    end = start + span
     if start < 0 or end > len(bin_data):
         raise SkinError(f"accessor {index} is outside the BIN chunk")
     if stride == element:
@@ -804,20 +881,44 @@ def _component_geometry(gltf: dict, bin_data: bytes, primitive: dict) -> tuple[d
 
 def _source_meshes(model: dict) -> list[dict]:
     meshes = model.get("meshes")
-    if not isinstance(meshes, list) or not meshes:
+    if not isinstance(meshes, list) or not meshes or not all(isinstance(m, dict) for m in meshes):
         raise SkinError("model.json has no mesh records")
     return meshes
 
 
 def _component_primitives(gltf: dict, wanted: int) -> list[dict]:
+    raw_meshes = gltf.get("meshes") or []
+    if not isinstance(raw_meshes, list):
+        raise SkinError("model.glb meshes field must be a list")
     primitives = []
-    for mesh in gltf.get("meshes") or []:
-        primitives.extend(mesh.get("primitives") or [])
-    if len(primitives) != wanted:
+    for mesh in raw_meshes:
+        if not isinstance(mesh, dict):
+            raise SkinError("model.glb mesh entry must be an object")
+        raw_prims = mesh.get("primitives") or []
+        if not isinstance(raw_prims, list):
+            raise SkinError("model.glb primitives field must be a list")
+        primitives.extend(raw_prims)
+    if len(primitives) != wanted or not all(isinstance(p, dict) for p in primitives):
         raise SkinError(
             f"model.glb has {len(primitives)} primitives for {wanted} mesh records"
         )
     return primitives
+
+
+def _validate_indices(index_payload: bytes, index_accessor: dict, vertex_count: int) -> int:
+    if index_accessor.get("type") != "SCALAR":
+        raise SkinError(f"source index accessor must be SCALAR, got {index_accessor.get('type')!r}")
+    comp = index_accessor.get("componentType")
+    fmt_map = {COMPONENT_BYTE: "B", COMPONENT_UNSIGNED_SHORT: "H", COMPONENT_UNSIGNED_INT: "I"}
+    if comp not in fmt_map:
+        raise SkinError(f"unsupported source index component type {comp!r}")
+    index_count = index_accessor["count"]
+    if index_count == 0 or index_count % 3:
+        raise SkinError("source index count must be a positive multiple of 3")
+    indices = struct.unpack(f"<{index_count}{fmt_map[comp]}", index_payload)
+    if max(indices) >= vertex_count:
+        raise SkinError(f"source index {max(indices)} is out of range for {vertex_count} vertices")
+    return index_count
 
 
 def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
@@ -827,7 +928,10 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
         raise SkinError("at least one --component is required")
     _skeleton_dir, skeleton_json = model_json_path(skeleton_path)
     ped_model = _load_json(skeleton_json)
-    ped_skeleton = (ped_model.get("drawable") or {}).get("skeleton")
+    ped_drawable = ped_model.get("drawable")
+    if not isinstance(ped_drawable, dict):
+        raise SkinError("ped skeleton model.json has no drawable object")
+    ped_skeleton = ped_drawable.get("skeleton")
     joints = JointSet(ped_skeleton)
 
     builder = _GlbBuilder()
@@ -896,6 +1000,12 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
                     f"{mesh.get('name', 'mesh')}: model.glb position count "
                     f"{position.get('count')} != skin stream count {streams['count']}"
                 )
+            for attr_name, (_payload, attr_accessor) in attributes.items():
+                if attr_accessor.get("count") != streams["count"]:
+                    raise SkinError(
+                        f"{mesh.get('name', 'mesh')}: model.glb {attr_name} count "
+                        f"{attr_accessor.get('count')} != skin stream count {streams['count']}"
+                    )
 
             normalised = normalise_weights(
                 streams["j0"], streams["j1"], streams["w0"], streams["w1"],
@@ -914,9 +1024,7 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
                     minimum=minimum, maximum=maximum,
                 )
             index_payload, index_accessor = index_pair
-            index_count = index_accessor["count"]
-            if index_count % 3:
-                raise SkinError("source index count is not a multiple of 3")
+            index_count = _validate_indices(index_payload, index_accessor, streams["count"])
             gltf_attributes["JOINTS_0"] = builder.accessor(
                 normalised["j0"], COMPONENT_UNSIGNED_SHORT, "VEC4", streams["count"], ARRAY_BUFFER)
             gltf_attributes["JOINTS_1"] = builder.accessor(
@@ -960,8 +1068,11 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
         },
     }]
 
-    ibm_payload = b"".join(struct.pack("<16f", *joints.inverse_bind(i))
-                           for i in range(joints.count))
+    try:
+        ibm_payload = b"".join(struct.pack("<16f", *joints.inverse_bind(i))
+                               for i in range(joints.count))
+    except OverflowError as exc:
+        raise SkinError("inverse bind matrix overflows float32") from exc
     ibm_accessor = builder.accessor(ibm_payload, COMPONENT_FLOAT, "MAT4", joints.count, None)
     mesh_node = len(joints.names)
     nodes = []
@@ -1059,6 +1170,10 @@ def main(argv=None) -> int:
                         help="decoded component directory or its model.json (repeatable)")
     parser.add_argument("--generator", default="Leonida skinned_glb")
     args = parser.parse_args(argv)
+
+    if os.path.isdir(args.output):
+        print(f"error: output path is a directory: {args.output}", file=sys.stderr)
+        return 2
 
     # The output must never replace a file the export reads (a source's model.json, its model.glb or a
     # buffer file). same_report_path also catches a case-only spelling on Windows and macOS's default
