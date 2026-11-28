@@ -2819,7 +2819,7 @@ Pipeline creation:
   folders can share one; the file names and the driver's checks keep a pipeline from one build from being taken
   for another's.
   `gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--all] [--smallest-first] [--limit N]
-  [--min-bytes N] [--max-bytes N] [--filter PART]... [--skip-listed] [--list]` fills the journal ahead of play, with
+  [--min-bytes N] [--max-bytes N] [--filter PART]... [--skip-listed] [--list | --verify]` fills the journal ahead of play, with
   no game: it
   creates the Vulkan device as `--run` does (so the same environment gives the same journal names and driver keys:
   LEONIDA_SHADERS, LEONIDA_PIPELINE_CACHE_DIR, and LEONIDA_DEVICE_FAULT/LEONIDA_AFTERMATH, whose diagnostics config
@@ -2843,6 +2843,19 @@ Pipeline creation:
   took them all from the journal (none built in the game) and ended as runs with the skip list do, in an idle-queue
   device loss or a stop with the GPU idle ([running.md](running.md#settings-every-platform-needs)); whether their
   output is correct is not measured.
+  After precompiling, run `gta6rt --precompile-pipelines --verify` in a fresh process with the same environment
+  and selection flags. It reads each selected compute pipeline's local journal file into a separate Vulkan cache
+  and asks the driver to create that pipeline with `FAIL_ON_PIPELINE_COMPILE_REQUIRED`. A verified entry requires a
+  successful creation and valid, pipeline-level `APPLICATION_PIPELINE_CACHE_HIT` feedback for that cache. A driver
+  may return a pipeline without confirming a hit. That entry counts as unverified, as does a response that
+  compilation is required. [Vulkan pipeline creation feedback](https://docs.vulkan.org/refpages/latest/refpages/source/VkPipelineCreationFeedbackFlagBits.html)
+  The verifier makes one probe per selected entry with a usable local file, bypassing the shared and external seed
+  caches, helpers, journal writes, LRU touches and eviction. It exits 0 for a nonempty selection of verified
+  entries, 2 for an empty selection or any missing, unusable, unverified or failed entry, and 1 when setup fails
+  (including disabled journaling or unavailable cache control). After name and explicit `--skip-listed` filtering, a missing or empty
+  module counts as an input error before size filters and leaves the `--limit` slots available for buildable
+  entries. The summary includes counts for filtered, unbuildable and explicitly skipped entries. To test on generated inputs, run
+  `python -I scripts/check_precompile_verify.py <path-to-gta6rt.exe> --require-hit`.
   `LEONIDA_COMPILE_HELPER=1` (`shims/d3d12_compile_helper.h`) keeps first-ever compiles out of the title's process:
   the driver's locks, which a long `vkCreateComputePipelines` holds and a `vkQueueSubmit` of the same process waits
   for, are per process. A compute build of `LEONIDA_COMPILE_HELPER_MIN_BYTES` or more (128 KiB) with no journal file

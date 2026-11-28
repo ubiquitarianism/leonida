@@ -1742,14 +1742,16 @@ std::uint32_t max_queues_per_family(rt::d3d12::QueueTestSettings settings) {
 
 // The pipelines build stage writes its cache beside gta6rt.exe, independently of the working directory.
 // LEONIDA_PIPELINE_CACHE_DIR=<folder> keeps it there instead, so several builds of gta6rt share one warmed cache.
-std::filesystem::path pipeline_cache_path() {
+std::filesystem::path pipeline_cache_path(bool create_directory = true) {
     {
         std::wstring dir(32768, L'\0');
         const DWORD n = GetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE_DIR", dir.data(), static_cast<DWORD>(dir.size()));
         if (n > 0 && n < dir.size()) {
             dir.resize(n);
-            std::error_code ec;
-            std::filesystem::create_directories(dir, ec);
+            if (create_directory) {
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+            }
             return std::filesystem::path(dir) / L"pipeline_cache.bin";
         }
     }
@@ -1899,7 +1901,7 @@ const leonida::pipeline_journal::Roots& pipeline_journal_roots() {
         if (GetEnvironmentVariableW(L"LEONIDA_PIPELINE_JOURNAL", value, 2) == 1 && value[0] == L'0')
             return {};
         if (!pipeline_cache_save_limit()) return {};
-        std::filesystem::path path = pipeline_cache_path();
+        std::filesystem::path path = pipeline_cache_path(false);  // naming a journal file needs no writes
         if (!path.empty()) path.replace_filename(L"pipeline_cache.d");
         std::wstring seed(32768, L'\0');
         const DWORD n = GetEnvironmentVariableW(L"LEONIDA_PIPELINE_JOURNAL_SEED_DIR", seed.data(),
@@ -1938,14 +1940,15 @@ std::size_t pipeline_cache_save_limit() {
 // and deny writers while the view is in use.
 class PipelineCacheSeed {
 public:
-    explicit PipelineCacheSeed(const std::filesystem::path& path) {
+    explicit PipelineCacheSeed(const std::filesystem::path& path, std::size_t limit = SIZE_MAX) {
         if (path.empty()) return;
         file_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file_ == INVALID_HANDLE_VALUE) return;
         LARGE_INTEGER length{};
         constexpr auto header_size = static_cast<LONGLONG>(sizeof(VkPipelineCacheHeaderVersionOne));
-        if (!GetFileSizeEx(file_, &length) || length.QuadPart < header_size)
+        if (!GetFileSizeEx(file_, &length) || length.QuadPart < header_size ||
+            static_cast<ULONGLONG>(length.QuadPart) > limit)
             return;
         const HANDLE mapping = CreateFileMappingW(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
         if (!mapping) return;
@@ -11726,6 +11729,8 @@ private:
     VkResult result_ = VK_SUCCESS;
 };
 
+enum class JournalProbe { error, missing_or_unusable, unverified, verified };
+
 // What one compute pipeline build did (build_compute_pipeline).
 struct ComputeBuild {
     VkPipeline pipeline = VK_NULL_HANDLE;  // the caller's from here on
@@ -11739,6 +11744,7 @@ struct ComputeBuild {
     bool journal_hit = false;  // found in its journal file
     bool journaled = false;    // compiled and written to its journal file
     bool from_shared = false;  // found in the shared cache
+    JournalProbe probe = JournalProbe::error;  // --verify only; early failures never count as hits
 };
 
 struct ComputeBuildOptions {
@@ -11751,7 +11757,45 @@ struct ComputeBuildOptions {
     std::uint64_t helper_priority = 0;       // the request's urgency: 0 a dispatch, else the warm-up's module size
     bool mark_building = false;              // precompile, helper: claim the entry, skip it when another process has it
     bool key_only = false;                   // only name the journal file (journal_path), build nothing
+    bool verify = false;                     // probe this file alone, without upkeep, publishing or fallback
 };
+
+// Probe exactly one local application cache. Only a successful creation with valid application-hit feedback
+// identifies the supplied cache as useful. A driver can succeed using its internal cache without setting that bit.
+void probe_compute_journal(DeviceState& device, const std::vector<std::uint32_t>& words,
+                           VkComputePipelineCreateInfo pipeline_info, ComputeBuild& out) {
+    // Take size, header and payload from one handle, even if a concurrent writer replaces this entry.
+    const PipelineCacheSeed file(out.journal_path, leonida::pipeline_journal::entry_read_limit);
+    if (file.size() <= leonida::pipeline_cache_store::header_bytes || !file.compatible(device.pso_identity)) {
+        out.probe = JournalProbe::missing_or_unusable;
+        return;
+    }
+    auto& vk = device.context->vk;
+    const VkDevice dev = device.info.device;
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    const VkPipelineCacheCreateInfo seed{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0,
+                                         file.size(), file.data()};
+    out.result = vk.vkCreatePipelineCache(dev, &seed, nullptr, &cache);
+    if (out.result != VK_SUCCESS) return;
+    VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    module_info.codeSize = words.size() * sizeof(words[0]);
+    module_info.pCode = words.data();
+    out.result = vk.vkCreateShaderModule(dev, &module_info, nullptr, &pipeline_info.stage.module);
+    if (out.result == VK_SUCCESS) {
+        CompileTrace feedback;
+        feedback.request_feedback(pipeline_info);
+        pipeline_info.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        out.result = vk.vkCreateComputePipelines(dev, cache, 1, &pipeline_info, nullptr, &pipeline);
+        if (out.result == VK_SUCCESS && pipeline)
+            out.probe = feedback.hit() == 1 ? JournalProbe::verified : JournalProbe::unverified;
+        else if (out.result == VK_PIPELINE_COMPILE_REQUIRED)
+            out.probe = JournalProbe::unverified;
+        if (pipeline) vk.vkDestroyPipeline(dev, pipeline, nullptr);
+        vk.vkDestroyShaderModule(dev, pipeline_info.stage.module, nullptr);
+    }
+    vk.vkDestroyPipelineCache(dev, cache, nullptr);
+}
 
 // A compute pipeline from a library entry: what a PSO's first dispatch, the warm-up worker and gta6rt
 // --precompile-pipelines all build, so their journal names and the driver's keys are the same. `layout` is the push
@@ -11796,7 +11840,8 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     leonida::apply_subgroup_request(subgroup, required_size, pipeline_info.stage);
     pipeline_info.layout = layout;
     pipeline_info.flags |= fast_pipeline_flags(true);  // before the journal key, which hashes the flags
-    const VkPipelineCache shared = device.pipeline_cache();
+    // pipeline_cache() also runs upkeep and may start a helper. The verifier uses only the named file.
+    const VkPipelineCache shared = options.verify ? VK_NULL_HANDLE : device.pipeline_cache();
     auto& submits = device.context->submit_mutex();
 
     // LOCAL FIX (pipeline journal, pipeline_cache_journal.h): the pipeline is created against its own cache, made
@@ -11823,9 +11868,15 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
             key.value(std::uint32_t(leonida::aftermath::extra_config_flags()));
         }
         if (entry->binding_count) hash_bindless_layout(key, device.bindless->features());
-        const auto path = leonida::pipeline_journal::entry_path(journal_dir, "cs", key.digest());
-        out.journal_path = path;
-        if (options.key_only) return out;
+        out.journal_path = leonida::pipeline_journal::entry_path(journal_dir, "cs", key.digest());
+    }
+    if (options.verify) {
+        if (!out.journal_path.empty()) probe_compute_journal(device, words, pipeline_info, out);
+        return out;
+    }
+    if (options.key_only) return out;
+    if (!out.journal_path.empty()) {
+        const auto& path = out.journal_path;
         // Precompile: a usable file is there already, so the pipeline is not built (only its header is read).
         if (options.skip_journaled && leonida::pipeline_journal::entry_usable(path, device.pso_identity)) {
             out.skipped = true;
@@ -23445,7 +23496,7 @@ public:
         d3d_->Release();
     }
 
-    bool open() {
+    bool open(bool verify = false) {
         // The GPU address arena holds nothing here and does not change a pipeline: 64 MB, not a title's 2 GB.
         _putenv_s("LEONIDA_ARENA_MB", "64");
         compile_helper::build_host = true;
@@ -23464,13 +23515,25 @@ public:
             std::fprintf(stderr, "%s no translated shader library (LEONIDA_SHADERS)\n", tag_);
             return false;
         }
-        if (pipeline_journal_dir().empty())
-            std::fprintf(stderr, "%s the pipeline journal is off (LEONIDA_PIPELINE_JOURNAL=0 or "
-                                 "LEONIDA_PIPELINE_CACHE_BYTES=0): only the driver's own cache is filled\n", tag_);
-        state.pipeline_cache();  // the shared cache and the journal's upkeep, as at a title's first pipeline
-        // Every pipeline goes into a journal file: one found in the shared cache would not be.
-        state.journal_ask_shared = false;
         auto& vk = state.context->vk;
+        if (verify) {
+            if (pipeline_journal_dir().empty()) {
+                std::fprintf(stderr, "%s verification requires an enabled local pipeline journal\n", tag_);
+                return false;
+            }
+            if (!state.info.pipeline_cache_control || !state.info.pipeline_creation_feedback ||
+                !vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache) {
+                std::fprintf(stderr, "%s verification requires enabled pipelineCreationCacheControl and "
+                                     "pipeline creation feedback\n", tag_);
+                return false;
+            }
+        } else {
+            if (pipeline_journal_dir().empty())
+                std::fprintf(stderr, "%s the pipeline journal is off (LEONIDA_PIPELINE_JOURNAL=0 or "
+                                     "LEONIDA_PIPELINE_CACHE_BYTES=0): only the driver's own cache is filled\n", tag_);
+            state.pipeline_cache();  // the shared cache and the journal's upkeep, as at a title's first pipeline
+            state.journal_ask_shared = false;  // every pipeline goes into its own journal file
+        }
         const VkDevice dev = state.info.device;
         if (state.info.max_push_constants_size && state.info.max_push_constants_size < sizeof(leonida::ShaderUserData)) {
             std::fprintf(stderr, "%s maxPushConstantsSize %u is under the shaders' %zu bytes: the runtime builds no "
@@ -23536,7 +23599,7 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
     using Clock = std::chrono::steady_clock;
     const auto began = Clock::now();
     BuildHost host("[precompile]");
-    if (!host.open()) return 1;
+    if (!host.open(options.verify)) return 1;
     const leonida::ShaderLibrary* library = host.library();
 
     // What to build: every compute entry the runtime could create a pipeline for. LEONIDA_SKIP_COMPUTE is a setting
@@ -23547,7 +23610,7 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
         std::size_t bytes;
     };
     std::vector<Job> jobs;
-    std::size_t not_buildable = 0, filtered = 0, listed = 0, listed_left_out = 0;
+    std::size_t not_buildable = 0, filtered = 0, listed = 0, listed_left_out = 0, input_errors = 0;
     for (const leonida::ShaderEntry* entry : library->stage_entries("cs")) {
         if (!options.filters.empty() &&
             std::none_of(options.filters.begin(), options.filters.end(),
@@ -23556,7 +23619,9 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
             continue;
         }
         const std::size_t bytes = library->spirv_bytes(*entry);
-        if ((options.min_bytes && bytes < options.min_bytes) || (options.max_bytes && bytes > options.max_bytes)) {
+        const bool missing_input = options.verify && !bytes;
+        if (!missing_input && ((options.min_bytes && bytes < options.min_bytes) ||
+                               (options.max_bytes && bytes > options.max_bytes))) {
             ++filtered;
             continue;
         }
@@ -23568,6 +23633,12 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
                              entry->name.c_str());
                 continue;
             }
+        }
+        if (missing_input) {
+            // A missing or empty module has no usable size. Report it without displacing a buildable job at --limit.
+            ++input_errors;
+            std::fprintf(stderr, "[precompile] %s: missing, unreadable or empty SPIR-V file\n", entry->name.c_str());
+            continue;
         }
         if (const char* why = host.unbuildable(*entry, bytes)) {
             ++not_buildable;
@@ -23582,6 +23653,33 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
     if (options.limit && jobs.size() > options.limit) {
         filtered += jobs.size() - options.limit;
         jobs.resize(options.limit);
+    }
+    if (options.verify) {
+        ComputeBuildOptions probe_options;
+        probe_options.verify = true;
+        std::size_t verified = 0, missing = 0, unverified = 0, errors = input_errors;
+        for (const Job& job : jobs) {
+            ComputeBuild build;
+            try {
+                build = host.build(*job.entry, probe_options);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[precompile] %s: %s\n", job.entry->name.c_str(), e.what());
+            }
+            switch (build.probe) {
+                case JournalProbe::verified: ++verified; break;
+                case JournalProbe::missing_or_unusable: ++missing; break;
+                case JournalProbe::unverified: ++unverified; break;
+                case JournalProbe::error: ++errors; break;
+            }
+            if (build.probe == JournalProbe::error || build.probe == JournalProbe::unverified)
+                std::fprintf(stderr, "[precompile] %s: %s (VkResult %d)\n", job.entry->name.c_str(),
+                             build.probe == JournalProbe::error ? "probe failed" : "no confirmed application-cache hit",
+                             int(build.result));
+        }
+        std::fprintf(stderr, "[precompile] verify selected=%zu verified=%zu missing_or_unusable=%zu unverified=%zu "
+                             "errors=%zu filtered=%zu not_buildable=%zu skipped_listed=%zu\n",
+                     jobs.size(), verified, missing, unverified, errors, filtered, not_buildable, listed_left_out);
+        return !jobs.empty() && verified == jobs.size() && !errors ? 0 : 2;
     }
     std::uint64_t total_bytes = 0;
     for (const Job& job : jobs) total_bytes += job.bytes;

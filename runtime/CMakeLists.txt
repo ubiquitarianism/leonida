@@ -4562,6 +4562,11 @@ if(TARGET Vulkan::Headers)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
       )
       if(Python3_FOUND)
+        if(CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING)
+          add_test(NAME precompile_verify COMMAND "${Python3_EXECUTABLE}" -I
+                   "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check_precompile_verify.py" "$<TARGET_FILE:gta6rt>")
+          set_tests_properties(precompile_verify PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
+        endif()
         add_test(NAME run_tiny_frame COMMAND "${Python3_EXECUTABLE}" -I
                  "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_frame.py" "$<TARGET_FILE:gta6rt>"
                  "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" ${_trace_runner})

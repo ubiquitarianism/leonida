@@ -32,6 +32,7 @@ struct PrecompileOptions {
     std::vector<std::string> filters;  // only entries whose name contains one of these
     bool skip_listed = false;          // --skip-listed: leave out the entries LEONIDA_SKIP_COMPUTE names
     bool dry_run = false;              // --list: print the plan, build nothing
+    bool verify = false;               // --verify: require a driver-reported hit from each local journal file
     bool via_helper = false;           // --via-helper: as a title does with LEONIDA_COMPILE_HELPER=1 (a test)
 };
 
@@ -45,7 +46,7 @@ struct CompileServerOptions {
 int compile_server(const CompileServerOptions& options);
 
 // Returns 0 when every selected entry was built or already journaled, 2 when some could not be built, 1 when the
-// device or the library could not be had.
+// device or the library could not be had. Verification returns 0 only for a nonempty selection of confirmed hits.
 int precompile_compute_pipelines(const PrecompileOptions& options);
 
 }  // namespace rt::d3d12
