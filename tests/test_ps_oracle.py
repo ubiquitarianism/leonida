@@ -1,6 +1,8 @@
 """tools/ps_oracle.py: the msgpack subset, the PAL ELF rewrite that puts new pixel-shader code in a pipeline binary,
 the binary file format, and (with LEONIDA_PS_ORACLE_BUILD set to a runtime build and an AMD GPU selected) a real
 draw with patched code. Standard library only."""
+import contextlib
+import io
 import os
 import struct
 import sys
@@ -279,6 +281,42 @@ class Cli(unittest.TestCase):
     def test_no_harness_is_unavailable(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(P.main(["--build", d, "--show-template"]), 77)
+
+    def _run_with_failing_oracle(self, error):
+        """main() with an Oracle whose run() raises `error`; returns (exit code, stdout, stderr)."""
+        class FakeOracle:
+            wave64, device = True, ""
+
+            def __init__(self, *a, **k):
+                pass
+
+            def run(self, lines, sets):
+                raise error
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as d:
+            asm = os.path.join(d, "prog.txt")
+            with open(asm, "w", encoding="utf-8") as f:
+                f.write("s_endpgm\n")
+            out, err = io.StringIO(), io.StringIO()
+            with patch.object(P, "Oracle", FakeOracle), contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                code = P.main(["--build", d, "--asm", asm])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_unavailable_during_run_is_77(self):
+        # assemble() without an AMD clang, or vk_harness returning 77, raises Unavailable from run()
+        code, _, err = self._run_with_failing_oracle(P.Unavailable("no AMD clang (test)"))
+        self.assertEqual(code, 77)
+        self.assertEqual(err, "ps_oracle unavailable: no AMD clang (test)\n")
+        self.assertNotIn("Traceback", err)
+
+    def test_value_error_during_run_is_still_2(self):
+        code, _, err = self._run_with_failing_oracle(ValueError("the assembler rejected the code"))
+        self.assertEqual(code, 2)
+        self.assertEqual(err, "ps_oracle: the assembler rejected the code\n")
 
     def test_json_overwriting_an_input_is_refused(self):
         with tempfile.TemporaryDirectory() as d:

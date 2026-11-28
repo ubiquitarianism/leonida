@@ -833,6 +833,9 @@ def main(argv=None):
             return 0
         try:
             px = o.run(lines, sets)
+        except Unavailable as e:          # no clang or no vk_harness result while running: the documented 77
+            print(f"ps_oracle unavailable: {e}", file=sys.stderr)
+            return 77
         except (ValueError, KeyError, IndexError, TypeError) as e:
             print(f"ps_oracle: {e}", file=sys.stderr)
             return 2
