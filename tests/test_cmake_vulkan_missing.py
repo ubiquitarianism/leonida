@@ -72,5 +72,29 @@ class CMakeListsUsesTheModuleTest(unittest.TestCase):
             self.assertIn("-DLEONIDA_REQUIRE_VULKAN=ON", c)
 
 
+class RuntimeWorkflowJobOwnershipTest(unittest.TestCase):
+    """A conflict during a rebase once moved macOS's Configure/Build/test steps into linux-sanitizers, leaving
+    macOS without them and the Linux job running `brew --prefix`. The workflow still parsed and every Configure
+    still had -DLEONIDA_REQUIRE_VULKAN=ON, so the existing tests passed. Assert which job owns which steps."""
+
+    def test_macos_and_sanitizer_steps_stay_with_their_jobs(self):
+        ci = (ROOT / ".github" / "workflows" / "runtime.yml").read_text(encoding="utf-8")
+        jobs = dict(re.findall(r"^  ([A-Za-z0-9_-]+):\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", ci, re.M | re.S))
+        macos, san = jobs["macos"], jobs["linux-sanitizers"]
+        # Both jobs have their own Configure and Build; the MoltenVK steps belong to macOS only.
+        for step in ("Configure", "Build", "Runtime tests on MoltenVK", "GPU tests on MoltenVK"):
+            self.assertIn(f"name: {step}", macos)
+        for step in ("Configure", "Build"):
+            self.assertIn(f"name: {step}", san)
+        for step in ("Runtime tests on MoltenVK", "GPU tests on MoltenVK"):
+            self.assertNotIn(f"name: {step}", san)
+        self.assertIn("name: Runtime tests under ASan and UBSan", san)
+        self.assertNotIn("Runtime tests under ASan and UBSan", macos)
+        self.assertIn("brew --prefix", macos)       # macOS's MoltenVK include path
+        self.assertNotIn("brew --prefix", san)      # no Homebrew on the Linux runner
+        self.assertIn("-fsanitize=address,undefined", san)
+        self.assertNotIn("-fsanitize=address,undefined", macos)
+
+
 if __name__ == "__main__":
     unittest.main()

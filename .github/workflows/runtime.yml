@@ -1,5 +1,6 @@
-# Builds the loader (runtime/) with MSVC and Vulkan headers (plus GPU tools and llvmpipe tests on Linux, and MoltenVK
-# tests on a Mac) on runtime or translator changes, so a change that breaks the C++ build or tests shows up in CI.
+# Builds the loader (runtime/) with MSVC and Vulkan headers (plus GPU tools and llvmpipe tests on Linux, the same
+# tests under ASan and UBSan, and MoltenVK tests on a Mac) on runtime or translator changes, so a change that
+# breaks the C++ build or tests shows up in CI.
 name: Runtime
 
 on:
@@ -608,3 +609,61 @@ jobs:
           sed -n '/=== GPU TEST RESULTS ===/,$p' "$RUNNER_TEMP/gpu.log" | awk '$1 == "FAIL" { print $2 }' > "$RUNNER_TEMP/failed.txt"
           tail -n 1 "$RUNNER_TEMP/gpu.log" >> "$GITHUB_STEP_SUMMARY"
           python3 -I scripts/ci_expected_failures.py "$RUNNER_TEMP/failed.txt" "$status" "$EXPECTED_FAILURES"
+
+  # The CPU tests again (ctest, including the llvmpipe cases), built with AddressSanitizer, LeakSanitizer and
+  # UndefinedBehaviorSanitizer, so an out-of-bounds read, a leak or undefined behaviour in the parsers and helpers
+  # fails the job instead of only giving wrong results on some machine. This job does not run run_gpu_tests.py.
+  linux-sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      # A smaller quarantine keeps the full ctest run inside a constrained runner's memory: the default let
+      # depth24_convert get OOM-killed in Andretuta's ~7 GB VM reproduction (#3014); public ubuntu-24.04
+      # runners have 16 GB, so this is a safety margin, not a hard requirement.
+      ASAN_OPTIONS: detect_leaks=1:quarantine_size_mb=32
+      UBSAN_OPTIONS: print_stacktrace=1
+      # The Vulkan loader unloads llvmpipe at vkDestroyInstance, and LeakSanitizer then reports the 112 bytes the
+      # driver still holds (vk_command_replay) with no stack it can name. The loader keeps drivers loaded with this
+      # set, for leak sanitizers; the tests' own leaks are still reported.
+      VK_LOADER_DISABLE_DYNAMIC_LIBRARY_UNLOADING: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Cache Vulkan headers
+        id: vulkan-headers-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vulkan-headers/include
+          key: vulkan-headers-6802bb4733b63ed5efd3adb308a6c885ef180ea1
+      - name: Checkout Vulkan headers (vulkan-sdk-1.4.363.0)
+        if: steps.vulkan-headers-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/Vulkan-Headers
+          ref: 6802bb4733b63ed5efd3adb308a6c885ef180ea1 # vulkan-sdk-1.4.363.0
+          path: .vulkan-headers
+          sparse-checkout: include
+          persist-credentials: false
+      - name: Install Vulkan loader and llvmpipe
+        run: |
+          pkgs=(libvulkan-dev mesa-vulkan-drivers)
+          command -v cmake >/dev/null || pkgs+=(cmake)
+          command -v ninja >/dev/null || pkgs+=(ninja-build)
+          command -v g++ >/dev/null || pkgs+=(g++)
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
+      - name: Configure
+        env:
+          VULKAN_SDK: ${{ github.workspace }}/.vulkan-headers
+        run: >-
+          cmake -S runtime -B runtime/build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+          "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined"
+          -DLEONIDA_REQUIRE_VULKAN=ON
+      - name: Build
+        run: cmake --build runtime/build --parallel
+      - name: Runtime tests under ASan and UBSan
+        run: ctest --test-dir runtime/build --output-on-failure
