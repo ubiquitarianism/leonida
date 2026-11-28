@@ -95,6 +95,9 @@ struct XUserLocal {
     uint32_t unused;
 };
 std::mutex g_handles_mutex;
+// Set once the title has added the offline user (XUserAddAsync, or by id). XUserFindForDevice hands out the user only
+// after that: the reference says it cannot return a user that was not signed in with a call to XUserAddAsync (RT-382).
+std::atomic<bool> g_user_added{false};
 std::unordered_set<const void*> g_handles;
 
 XUserHandle new_handle() {
@@ -173,6 +176,7 @@ HRESULT CALLBACK add_provider(XAsyncOp op, const XAsyncProviderData* data) {
     case XAsyncOp::Begin:
         return XAsyncSchedule(data->async, 0);
     case XAsyncOp::DoWork:
+        g_user_added.store(true);   // from here XUserFindForDevice may answer with the user (RT-382)
         XAsyncComplete(data->async, S_OK, sizeof(XUserHandle));
         return S_OK;
     case XAsyncOp::GetResult:
@@ -192,6 +196,7 @@ HRESULT CALLBACK add_by_id_provider(XAsyncOp op, const XAsyncProviderData* data)
         return XAsyncSchedule(data->async, 0);
     case XAsyncOp::DoWork: {
         const bool known = reinterpret_cast<uintptr_t>(data->context) == static_cast<uintptr_t>(kOfflineXuid);
+        if (known) g_user_added.store(true);   // adding the local user by id also signs it in (RT-382)
         XAsyncComplete(data->async, known ? S_OK : E_GAMEUSER_USER_NOT_FOUND, known ? sizeof(XUserHandle) : 0);
         return S_OK;
     }
@@ -620,6 +625,9 @@ bool xgameruntime_user_query(const GUID& class_id, REFIID interface_id, void** o
 // A new handle to the offline user, for the classes that hand one out too (XUserFindForDevice, in
 // xgameruntime_offline.cpp). The title closes it with XUserCloseHandle like any other.
 void* xgameruntime_user_new_handle() { return new_handle(); }
+
+// Whether the title has added the offline user yet; XUserFindForDevice (xgameruntime_offline.cpp) asks (RT-382).
+bool xgameruntime_user_was_added() { return g_user_added.load(); }
 
 // For tests: the XUserHandles a title holds open.
 long xgameruntime_user_open_handles() {

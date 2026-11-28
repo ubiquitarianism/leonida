@@ -62,6 +62,9 @@ using Register = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, voi
 using TryHdr = uint32_t(STDMETHODCALLTYPE*)(void*, uint32_t, float*);
 using FindUser = HRESULT(STDMETHODCALLTYPE*)(void*, const uint8_t*, void**);
 using CloseUser = void(STDMETHODCALLTYPE*)(void*, void*);
+using AddAsync = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, XAsyncBlock*);
+using AddResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void**);
+constexpr HRESULT kUserNotFound = static_cast<HRESULT>(0x89245104);   // E_GAMEUSER_USER_NOT_FOUND
 using Unregister = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueRegistrationToken, bool);
 using Endpoint = HRESULT(STDMETHODCALLTYPE*)(void*, uint64_t, uint32_t, size_t, wchar_t*, size_t*);
 using FindController = HRESULT(STDMETHODCALLTYPE*)(void*, void*, XAsyncBlock*);
@@ -280,11 +283,22 @@ int main() {
     check(query(&kUserDeviceClass, kUserDeviceClass, &device) == S_OK && device, "XUserDeviceImpl for its class id");
     if (!device) return 1;
     uint8_t device_id[32] = {7};
-    void* user = nullptr;
-    check(at<FindUser>(device, 3)(device, device_id, &user) == S_OK && user, "XUserFindForDevice: the offline user");
-    check(rt::shims::xgameruntime_user_open_handles() == 1, "the handle is an XUserHandle the title closes");
+    // RT-382: the reference says XUserFindForDevice cannot return a user who has not been added with XUserAddAsync.
+    void* user = reinterpret_cast<void*>(1);   // a stale value, so "no handle" has to be written
+    check(at<FindUser>(device, 3)(device, device_id, &user) == kUserNotFound && !user,
+          "XUserFindForDevice before XUserAddAsync: E_GAMEUSER_USER_NOT_FOUND and no handle");
+    check(rt::shims::xgameruntime_user_open_handles() == 0, "no XUserHandle was handed out before the add");
+    XAsyncBlock add{};
+    void* added = nullptr;
+    check(at<AddAsync>(user_object(query), 7)(user_object(query), 0x01, &add) == S_OK && finished(&add) &&
+              at<AddResult>(user_object(query), 8)(user_object(query), &add, &added) == S_OK && added,
+          "XUserAddAsync adds the default user");
+    check(at<FindUser>(device, 3)(device, device_id, &user) == S_OK && user,
+          "XUserFindForDevice after XUserAddAsync: the offline user");
+    check(rt::shims::xgameruntime_user_open_handles() == 2, "the add result and the found user are two XUserHandles");
     at<CloseUser>(user_object(query), 4)(user_object(query), user);
-    check(rt::shims::xgameruntime_user_open_handles() == 0, "XUserCloseHandle closes it");
+    at<CloseUser>(user_object(query), 4)(user_object(query), added);
+    check(rt::shims::xgameruntime_user_open_handles() == 0, "XUserCloseHandle closes both");
     check_device_registrations(device);
     wchar_t endpoint[8] = {L'x'};
     size_t used = 99;

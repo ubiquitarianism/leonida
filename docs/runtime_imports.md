@@ -641,8 +641,11 @@ on the executable, the rest is not:
   reference; only the argument counts were measured, from `tools/gdk_runtime_calls.py` on the executable.
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
   answers Enabled with the documented default tone-map luminances (0.01, 1000, 1000 nits).
-- **Devices:** every device belongs to the offline user (`XUserFindForDevice` hands out an `XUserHandle` the title
-  closes). `XUserRegisterForDeviceAssociationChanged` (slot 4) and
+- **Devices:** every device belongs to the offline user, once the title has added it: `XUserFindForDevice` hands out
+  an `XUserHandle` the title closes only after `XUserAddAsync` (or the add-by-id call for the local user) has
+  completed. Before that it answers `E_GAMEUSER_USER_NOT_FOUND` and writes no handle, because the reference says it
+  "cannot return a user handle to a user that hasn't been signed in with a call to `XUserAddAsync`" (RT-382).
+  **ASSUMPTION:** that HRESULT; the reference page names no code for this case. `XUserRegisterForDeviceAssociationChanged` (slot 4) and
   `XUserRegisterForDefaultAudioEndpointUtf16Changed` (7) keep each registration (its queue, duplicated, its context
   and callback) under a token unique across both kinds and never 0; a null callback or token is `E_INVALIDARG`, and
   queue and context are optional. The matching unregister (5, 8) removes it at once, with or without `wait`, and
