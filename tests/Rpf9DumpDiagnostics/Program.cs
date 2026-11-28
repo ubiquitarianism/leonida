@@ -103,11 +103,20 @@ Console.WriteLine("Mesh key tests passed.");
         var pastEnd = Entry(new ArchiveSegment(32, file.Length, system.Length));
         try { RecoveredResource.Read(path, pastEnd); Check(false, "block past the end is rejected"); }
         catch (InvalidDataException) { }
+        var overflow = Entry(new ArchiveSegment(32, long.MaxValue, system.Length));
+        try { RecoveredResource.Read(path, overflow); Check(false, "an overflowing block size is rejected"); }
+        catch (InvalidDataException) { }
         // A raw block reads its own bytes; the 6-byte minimum is the smallest block the recovery step records.
         var shortRaw = Entry(new ArchiveSegment(32 + zblock.Length + 16, 8, 8) { IsRaw = true });
         Check(RecoveredResource.Read(path, shortRaw).SequenceEqual(gfx[..8]), "a raw block reads its own bytes");
         var tooSmall = Entry(new ArchiveSegment(32 + zblock.Length + 16, 4, 4) { IsRaw = true });
         try { RecoveredResource.Read(path, tooSmall); Check(false, "a block under six bytes is rejected"); }
+        catch (InvalidDataException) { }
+        var rawLargerStored = Entry(new ArchiveSegment(32 + zblock.Length + 16, 16, 8) { IsRaw = true });
+        try { RecoveredResource.Read(path, rawLargerStored); Check(false, "a raw block with StoredSize > Size is rejected"); }
+        catch (InvalidDataException) { }
+        var rawSmallerStored = Entry(new ArchiveSegment(32 + zblock.Length + 16, 8, 16) { IsRaw = true });
+        try { RecoveredResource.Read(path, rawSmallerStored); Check(false, "a raw block with StoredSize < Size is rejected"); }
         catch (InvalidDataException) { }
         // An entry that records no blocks is rejected rather than returning an empty resource.
         var oversize = new ArchiveEntry("recovered/models/x.r9modeldata", 1, 1, 32, false, false, false, "Recovered model", 0);

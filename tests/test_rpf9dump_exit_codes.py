@@ -187,6 +187,34 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
                         manifest = json.loads((out / f"tiny_{size}" / mode / "manifest.json").read_text(encoding="utf-8"))
                         self.assertEqual(manifest["Count"], 0)
 
+    def test_unknown_option_reports_unknown_option_before_creating_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "tiny.rpf"
+            src.write_bytes(bytes(16))
+            for idx, extra in enumerate((("--bogus",), ("--bogus", "notanumber"))):
+                with self.subTest(extra=extra):
+                    out = root / f"out-{idx}"
+                    done = run("models", src, out, *extra)
+                    self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                    self.assertIn("Unknown option --bogus", done.stderr)
+                    self.assertNotIn("needs a non-negative byte count", done.stderr)
+                    self.assertFalse(out.exists(), f"unknown option {extra} created {out}")
+
+    def test_jobs_rejects_signed_or_nonpositive_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "tiny.rpf"
+            src.write_bytes(bytes(16))
+            for idx, extra in enumerate((("--jobs", "0"), ("--jobs", "-1"), ("--jobs", "+2"), ("--jobs", "abc"), ("--jobs",))):
+                with self.subTest(extra=extra):
+                    out = root / f"out-{idx}"
+                    done = run("ttpf", src, out, *extra)
+                    self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                    self.assertIn("--jobs", done.stderr)
+                    self.assertNotIn("Unhandled exception", done.stderr)
+                    self.assertFalse(out.exists(), f"bad --jobs {extra} created {out}")
+
 
 if __name__ == "__main__":
     unittest.main()

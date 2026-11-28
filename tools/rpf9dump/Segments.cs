@@ -24,8 +24,11 @@ public static class RecoveredResource
         int written = 0;
         foreach (var block in segments)
         {
-            if (block.Offset < 0 || block.StoredSize < 6 || block.Size < 0 || block.Offset + block.StoredSize > file.Length)
+            if (block.Offset < 0 || block.StoredSize < 6 || block.Size < 0
+                || block.Offset > file.Length || block.StoredSize > file.Length - block.Offset)
                 throw new InvalidDataException("A recovered block runs past the file.");
+            if (block.IsRaw && block.StoredSize != block.Size)
+                throw new InvalidDataException("A raw recovered block's stored and uncompressed sizes disagree.");
             if (block.Size > data.Length - written)
                 throw new InvalidDataException("The recovered blocks exceed the resource size.");
             file.Position = block.Offset;

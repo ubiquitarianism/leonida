@@ -12,7 +12,7 @@ for (int i = 0; i < argv.Count; )
 {
     if (argv[i] == "--jobs")
     {
-        if (i + 1 >= argv.Count || !int.TryParse(argv[i + 1], out jobs) || jobs < 1)
+        if (i + 1 >= argv.Count || !int.TryParse(argv[i + 1], NumberStyles.None, CultureInfo.InvariantCulture, out jobs) || jobs < 1)
         {
             Console.Error.WriteLine("--jobs must be at least 1");
             return 2;
@@ -36,14 +36,18 @@ string mode = argv[0], src = Path.GetFullPath(argv[1]), outRoot = Path.GetFullPa
 long scanStart = 0; long? scanLength = null;
 for (int i = 3; i < argv.Count; i += 2)
 {
+    if (argv[i] is not ("--start" or "--length"))
+    {
+        Console.Error.WriteLine($"Unknown option {argv[i]}.");
+        return 2;
+    }
     if (i + 1 >= argv.Count || !long.TryParse(argv[i + 1], NumberStyles.None, CultureInfo.InvariantCulture, out long bytes) || bytes < 0)
     {
-        Console.WriteLine($"{argv[i]} needs a non-negative byte count.");
+        Console.Error.WriteLine($"{argv[i]} needs a non-negative byte count.");
         return 2;
     }
     if (argv[i] == "--start") scanStart = bytes;
-    else if (argv[i] == "--length") scanLength = bytes;
-    else { Console.WriteLine($"Unknown option {argv[i]}."); return 2; }
+    else scanLength = bytes;
 }
 bool window = scanStart != 0 || scanLength is not null;
 if (window && mode is not ("models" or "textures"))
