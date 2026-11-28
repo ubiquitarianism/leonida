@@ -979,6 +979,21 @@ class MainTest(unittest.TestCase):
                     self.run_main([ctest_entry("ok", self.command("ok.py"))], "--timeout", text)
                 self.assertEqual(ctx.exception.code, 2)
 
+    def test_timeout_over_process_limit_is_rejected_before_launch(self):
+        entries = [ctest_entry("ok", self.command("ok.py"))]
+        with mock.patch.object(rwt, "run_test_process", side_effect=AssertionError("test was launched")):
+            for text in ("2147484", "1e100"):
+                with self.subTest(text=text):
+                    with self.assertRaises(SystemExit) as ctx:
+                        self.run_main(entries, "--timeout", text)
+                    self.assertEqual(ctx.exception.code, 2)
+
+    def test_largest_portable_timeout_runs_a_test(self):
+        entries = [ctest_entry("ok", self.command("ok.py"))]
+        code, out, _ = self.run_main(entries, "--timeout", "2147483", "--require", "ok")
+        self.assertEqual(code, 0, out)
+        self.assertIn("[PASS] ok", out)
+
     def test_a_blank_wine_is_a_usage_error(self):
         with self.assertRaises(SystemExit) as ctx:
             self.run_main([ctest_entry("ok", self.command("ok.py"))], "--wine", "")

@@ -231,10 +231,13 @@ def rbw_registers(insns):
         is_dual_dst = op.startswith("v_") and (
             "_co_" in op or op.startswith(("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64"))
         )
+        # The assembler's short form v_add_co_ci_u32 vD, src0, src1 (also sub/subrev) has VCC as its carry-out and
+        # carry-in and names neither: args[1] is src0, read, not a carry-out destination.
+        is_short_co_ci = op.endswith("_co_ci_u32") and len(args) == 3
         # Carry-out / scale-out forms write the VGPR and scalar mask first, even when they also take a carry-in source.
         if is_lds_load:
             dsts, srcs = [], args
-        elif not is_no_dest and is_dual_dst and len(args) >= 2:
+        elif not is_no_dest and is_dual_dst and len(args) >= 2 and not is_short_co_ci:
             dsts = args[:2]
             srcs = args[2:]
         elif is_no_dest:
