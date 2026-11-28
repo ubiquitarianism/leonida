@@ -4120,13 +4120,16 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_stateful_indirect_pixels COMMAND d3d12_draw_test --stateful-indirect-pixels)
       add_test(NAME d3d12_stateful_indirect_multi_pixels COMMAND d3d12_draw_test --stateful-indirect-multi-pixels)
       add_test(NAME d3d12_stateful_indirect_counted_pixels COMMAND d3d12_draw_test --stateful-indirect-counted-pixels)
+      # A compound signature whose records carry their own state (two vertex buffer views, the index buffer, root
+      # constants and a root CBV): the picture must come from the argument buffer, not from what the list had bound.
+      add_test(NAME d3d12_compound_indirect_pixels COMMAND d3d12_draw_test --compound-indirect-pixels)
       # A device without robust indexed views can still validate each ordinary DRAW pixel oracle.
       add_test(NAME d3d12_stateful_indirect_nonindexed_pixels COMMAND d3d12_draw_test --stateful-indirect-pixels --nonindexed-only)
       add_test(NAME d3d12_stateful_indirect_nonindexed_multi_pixels COMMAND d3d12_draw_test --stateful-indirect-multi-pixels --nonindexed-only)
       add_test(NAME d3d12_stateful_indirect_nonindexed_counted_pixels COMMAND d3d12_draw_test --stateful-indirect-counted-pixels --nonindexed-only)
       set_tests_properties(d3d12_stateful_indirect_pixels d3d12_stateful_indirect_multi_pixels d3d12_stateful_indirect_counted_pixels
                            d3d12_stateful_indirect_nonindexed_pixels d3d12_stateful_indirect_nonindexed_multi_pixels
-                           d3d12_stateful_indirect_nonindexed_counted_pixels PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+                           d3d12_stateful_indirect_nonindexed_counted_pixels d3d12_compound_indirect_pixels PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
       add_test(NAME d3d12_title_index_window COMMAND d3d12_draw_test --title-index-window)
       add_test(NAME d3d12_title_vertex_window COMMAND d3d12_draw_test --title-vertex-window)
       # LEONIDA_STUB_PIPELINES: a pipeline with no translated shader is a stub when the switch is on.

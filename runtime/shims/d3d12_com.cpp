@@ -1037,9 +1037,17 @@ public:
         }
         if (!terminal_only && (kind == leonida::IndirectKind::draw || kind == leonida::IndirectKind::draw_indexed)) {
             if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
-            // Compound draw emission is not yet supported. Reset the written bindings even if no
-            // records execute. Bundle nesting and prefixes were already rejected above for bundles.
-            leonida::indirect_stats::skip(leonida::indirect_stats::Event::record_skip, leonida::indirect_stats::compound);
+            // A compound graphics signature binds state per record (vertex and index buffer views, root constants,
+            // root views) before its DRAW. Vulkan has no indirect call that rebinds state, so the record list is
+            // expanded into the calls it stands for (docs/d3d12_vulkan.md 4.7). Only a host-visible argument and
+            // count buffer can be expanded: a device-local one may be GPU-written, and that list keeps the
+            // reset-only path. Bundle nesting and prefixes were already rejected above for bundles.
+            if (!expand_compound_indirect(*sig, max_command_count, argument_buffer, argument_buffer_offset,
+                                          count_buffer, count_buffer_offset))
+                leonida::indirect_stats::skip(leonida::indirect_stats::Event::record_skip,
+                                              leonida::indirect_stats::compound);
+            // State leakage, as the D3D12 runtime does it: every binding the signature writes is reset after the
+            // call, even when no record ran.
             if (!list_.closed()) reset_indirect_graphics_bindings(sig->graphics_writes());
             return;
         }
@@ -1823,6 +1831,125 @@ private:
         blend_factor_ = {1, 1, 1, 1};
         depth_bounds_ = {0, 1};
         set_pipeline(state);
+    }
+
+    // A compound graphics signature writes state in every record and then draws with it. Neither Vulkan's indirect
+    // draws nor the replay's per-draw state snapshot can carry that, so each record is expanded here into the state
+    // calls the application could have made and the draw they precede; the record layout is packed in the signature's
+    // argument order (D3D12 Indirect Drawing, "Indirect Argument Buffer Structures"). Expansion needs the bytes on the
+    // CPU, which only a host-visible argument and count buffer give. False means no record was expanded: the caller
+    // keeps the reset-only path, which is all a device-local (potentially GPU-written) list can get.
+    bool expand_compound_indirect(const CommandSignature& sig, UINT max_command_count, ID3D12Resource* argument_buffer,
+                                 UINT64 argument_buffer_offset, ID3D12Resource* count_buffer,
+                                 UINT64 count_buffer_offset) {
+        const bool indexed = sig.kind() == leonida::IndirectKind::draw_indexed;
+        // The same prerequisites a direct draw needs; a record list that cannot draw records nothing.
+        if (!graphics_pipeline_ || !graphics_.layout || !topology_) return false;
+        void* base = nullptr;
+        if (FAILED(argument_buffer->Map(0, nullptr, &base)) || !base) return false;
+        // Every argument is checked before the first record is recorded, so a shape this code cannot decode leaves
+        // the list as it was instead of expanding part of it. A creation-valid signature passes all of these.
+        for (const auto& arg : sig.graphics_writes()) {
+            switch (arg.Type) {
+            case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
+                if (arg.VertexBuffer.Slot >= vertex_buffers_.size()) return false;
+                break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
+            case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+            case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+            case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
+            case compat::kIndirectArgumentIncrementingConstant: break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+                if (!arg.Constant.Num32BitValuesToSet || arg.Constant.Num32BitValuesToSet > D3D12_MAX_ROOT_COST)
+                    return false;
+                break;
+            default: return false;  // creation excludes every other non-terminal argument
+            }
+        }
+        UINT records = max_command_count;
+        if (count_buffer) {
+            void* counts = nullptr;
+            if (count_buffer_offset % sizeof(std::uint32_t) ||
+                count_buffer_offset + sizeof(std::uint32_t) > count_buffer->GetDesc().Width ||
+                FAILED(count_buffer->Map(0, nullptr, &counts)) || !counts)
+                return false;
+            std::uint32_t gpu_count = 0;
+            std::memcpy(&gpu_count, static_cast<const std::uint8_t*>(counts) + count_buffer_offset, sizeof gpu_count);
+            records = std::min(records, gpu_count);  // D3D12Core: min(MaxCommandCount, the buffer's uint32)
+        }
+        const auto* base_bytes = static_cast<const std::uint8_t*>(base);
+        for (UINT record = 0; record < records; ++record) {
+            const std::uint8_t* cursor = base_bytes + argument_buffer_offset + std::uint64_t(record) * sig.stride();
+            const auto take = [&cursor](std::size_t bytes) {
+                const std::uint8_t* at = cursor;
+                cursor += bytes;
+                return at;
+            };
+            // Bounds are the caller's: packed_size <= stride and the last record's packed bytes fit the buffer.
+            for (const auto& arg : sig.graphics_writes()) {
+                switch (arg.Type) {
+                case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: {
+                    D3D12_VERTEX_BUFFER_VIEW view{};
+                    std::memcpy(&view, take(sizeof view), sizeof view);
+                    set_vertex_buffers(arg.VertexBuffer.Slot, 1, &view);
+                    break;
+                }
+                case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: {
+                    D3D12_INDEX_BUFFER_VIEW view{};
+                    std::memcpy(&view, take(sizeof view), sizeof view);
+                    set_index_buffer(&view);
+                    break;
+                }
+                case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: {
+                    const UINT count = arg.Constant.Num32BitValuesToSet;
+                    std::array<std::uint32_t, D3D12_MAX_ROOT_COST> words{};
+                    std::memcpy(words.data(), take(sizeof(std::uint32_t) * count), sizeof(std::uint32_t) * count);
+                    constants(graphics_, arg.Constant.RootParameterIndex, count, words.data(),
+                              arg.Constant.DestOffsetIn32BitValues);
+                    break;
+                }
+                case compat::kIndirectArgumentIncrementingConstant: {
+                    // Tier 1.1: the argument occupies no record bytes; the value is the record's index.
+                    constants(graphics_, arg.Constant.RootParameterIndex, 1, &record,
+                              arg.Constant.DestOffsetIn32BitValues);
+                    break;
+                }
+                case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+                case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+                case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: {
+                    D3D12_GPU_VIRTUAL_ADDRESS va = 0;
+                    std::memcpy(&va, take(sizeof va), sizeof va);
+                    const UINT index = arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW
+                                           ? arg.ConstantBufferView.RootParameterIndex
+                                       : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW
+                                           ? arg.ShaderResourceView.RootParameterIndex
+                                           : arg.UnorderedAccessView.RootParameterIndex;
+                    address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
+                    break;
+                }
+                default: return false;  // creation excludes every other non-terminal argument
+                }
+            }
+            // The record's terminal operation, with the state above already in effect.
+            if (indexed) {
+                D3D12_DRAW_INDEXED_ARGUMENTS draw{};
+                std::memcpy(&draw, cursor, sizeof draw);
+                if (!(index_.va && index_.size &&
+                      (index_.format == DXGI_FORMAT_R16_UINT || index_.format == DXGI_FORMAT_R32_UINT))) {
+                    leonida::indirect_stats::skip(leonida::indirect_stats::Event::record_skip,
+                                                  leonida::indirect_stats::index_view);
+                    continue;
+                }
+                record_draw(true, draw.IndexCountPerInstance, draw.InstanceCount, draw.StartIndexLocation,
+                            draw.BaseVertexLocation, draw.StartInstanceLocation);
+            } else {
+                D3D12_DRAW_ARGUMENTS draw{};
+                std::memcpy(&draw, cursor, sizeof draw);
+                record_draw(false, draw.VertexCountPerInstance, draw.InstanceCount, draw.StartVertexLocation, 0,
+                            draw.StartInstanceLocation);
+            }
+        }
+        return true;
     }
 
     void reset_indirect_graphics_bindings(std::span<const D3D12_INDIRECT_ARGUMENT_DESC> writes) {

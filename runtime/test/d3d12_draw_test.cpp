@@ -80,12 +80,17 @@ static_assert(offsetof(Vertex, wrong_color) == 16);
 // Positive-only offscreen variant, sharing the translated-shader fixture, root signature and PSO description.
 int check_stateful_indirect_pixels(ID3D12Device* device, ID3D12RootSignature* root, D3D12_GRAPHICS_PIPELINE_STATE_DESC desc,
                                   bool multi, bool counted, bool nonindexed_only);
+// The compound-signature variant: its records carry their own vertex and index buffer views and root arguments.
+int check_compound_indirect_pixels(ID3D12Device* device, ID3D12RootSignature* root,
+                                  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc);
 
 int main(int argc, char** argv) {
     const bool nonindexed_only = argc == 3 && std::strcmp(argv[2], "--nonindexed-only") == 0;
     const bool indirect_mode = argc == 2 || nonindexed_only;
     const bool multi_pixels = indirect_mode && std::strcmp(argv[1], "--stateful-indirect-multi-pixels") == 0;
     const bool count_pixels = indirect_mode && std::strcmp(argv[1], "--stateful-indirect-counted-pixels") == 0;
+    // Compound signatures need no indirect draw feature: every record is expanded into ordinary draws.
+    const bool compound_pixels = indirect_mode && std::strcmp(argv[1], "--compound-indirect-pixels") == 0;
     const bool indirect_pixels = multi_pixels || count_pixels ||
                                  (indirect_mode && std::strcmp(argv[1], "--stateful-indirect-pixels") == 0);
     if (argc > 2 && !(nonindexed_only && indirect_pixels)) return 1;
@@ -246,6 +251,11 @@ int main(int argc, char** argv) {
         if (indirect_pixels) {
             const int result = check_stateful_indirect_pixels(device.p, root.p, pso_desc, multi_pixels || count_pixels,
                                                               count_pixels, nonindexed_only);
+            EXPECT(d.validation_errors() == 0);
+            return result;
+        }
+        if (compound_pixels) {
+            const int result = check_compound_indirect_pixels(device.p, root.p, pso_desc);
             EXPECT(d.validation_errors() == 0);
             return result;
         }

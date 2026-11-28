@@ -514,8 +514,20 @@ What is implemented (all of it testable without the game):
     operation inherits the graphics state of its command list. The Vulkan replay snapshots the same pipeline, root
     data, render targets, IA bindings and raster state as a direct draw, then reads the records on the GPU inside
     that draw's rendering scope. A padded stride is supported; it is not evidence that a signature is simple.
-    A compound graphics signature still emits no draw, but its written VB/IB and root bindings are reset for the
-    next command, even if no record is interpreted. Untouched slots and previously recorded draws retain their state.
+    A compound graphics signature (root or IA arguments before its DRAW) is expanded on the CPU into the calls its
+    records stand for: each record's vertex buffer views, index buffer view, root constants and root CBVs are
+    applied in the signature's argument order, then its DRAW or DRAW_INDEXED is recorded, so the draw reads the
+    bindings the argument buffer names instead of the ones the list had bound. The expansion needs the record bytes
+    on the CPU, so only a buffer whose memory the CPU can map (an upload or readback heap in practice) is replayed,
+    for the argument bytes and for the count buffer's DWORD alike. Those bytes are read when the call is *recorded*,
+    not when the list executes, so an application that rewrites the argument buffer between recording and execution -
+    a ring buffer filled just before `ExecuteCommandLists`, or a list reused with a new buffer - replays the records
+    that were there at record time; a count the GPU writes (a `CopyBufferRegion` into the count buffer, say) is not
+    seen, and the call replays the count that was there when it was recorded. Keeping the buffer referenced and expanding at
+    replay would match the runtime's timing; until then, fill the buffer before recording. A device-local
+    buffer, which the GPU may have written, still draws nothing. In both cases every binding the signature writes is
+    reset after the call, even if no record is interpreted, as the D3D12 runtime does; untouched slots and previously
+    recorded draws retain their state.
     See the [D3D12 state-leakage contract](https://microsoft.github.io/DirectX-Specs/d3d/IndirectDrawing.html#state-leakage).
     Fixed- and GPU-counted batches use the device's enabled indirect features and limits. The current graphics
     path covers triangle lists on direct command lists. A bundle can defer a single operation with no count
@@ -523,8 +535,8 @@ What is implemented (all of it testable without the game):
     direct parent's state at that call. Count buffers and compound signatures remain invalid in bundles.
     `d3d12_bundle_indirect_warp` and `d3d12_bundle_indirect_layer` compare DRAW and DRAW_INDEXED against direct
     pixels with two different parent bindings; the layer fixture also checks marker order and captured views.
-    Compound graphics signatures, non-unit instance divisors
-    and unsupported capabilities stay guarded. A GPU-counted draw currently requires
+    A compound graphics signature whose record bytes are not host-mappable stays guarded, as do
+    non-unit instance divisors and unsupported capabilities. A GPU-counted draw currently requires
     `maxDrawIndirectCount == UINT32_MAX`: Vulkan also limits the raw counter value, not just the caller's maximum.
     To omit indirect graphics without changing direct drawing or compute, set
     `LEONIDA_INDIRECT_DRAWS=off` before starting the process. This applies to the Vulkan-backed D3D12
@@ -1304,6 +1316,9 @@ and any validation error fails them.
   `d3d12_stateful_indirect_counted_pixels`: positive D3D12-to-Vulkan graphics tests. Compare every readback
   pixel with both a direct-draw reference and a known pattern for each draw kind; the counted variant fills
   its argument and count buffers by GPU copy before use.
+- `d3d12_compound_indirect_pixels`: a compound signature whose two records carry two vertex buffer views, the
+  index buffer view, two root constants and a root CBV each. The picture must match the same calls made by hand
+  and must not match the state the list had bound before the indirect call.
 - `d3d12_indirect_rt_test`: validates `ID3D12Device::CreateCommandSignature` + `ExecuteIndirect` with a GPU
   `CountBuffer` (`vkCmdDrawIndirectCount`, `count = 0` skipped and `count = 1` rendered), a draw whose record asks
   for four billion instances (clamped on the GPU, section 4.7), and a native Vulkan counted-draw reference over the
@@ -5664,3 +5679,4 @@ The public Xbox graphics index retrieved for this document lists interfaces up t
 `ID3D12GraphicsCommandList7`; the shipped DLL names `Device11` and `CommandList8`, which the index does not cover.
 This is why the layer targets the Windows SDK's newer public chain rather than assuming the Xbox public index is
 complete.
+
