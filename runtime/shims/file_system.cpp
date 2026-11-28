@@ -601,6 +601,15 @@ bool writes(DWORD access, DWORD disposition) {
            disposition == TRUNCATE_EXISTING;
 }
 
+}  // namespace
+
+unsigned long host_open_access(unsigned long access) {
+    if ((access & MAXIMUM_ALLOWED) == 0) return access;
+    return access | GENERIC_READ | GENERIC_WRITE;
+}
+
+namespace {
+
 Target open_target(const std::wstring& path, DWORD access, DWORD disposition) {
     if (!writes(access, disposition)) return read_target(path);
     // OPEN_ALWAYS and TRUNCATE_EXISTING read what is already there, and a write-open must not lose a package file's
@@ -885,7 +894,11 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
-    const HANDLE h = ::CreateFileW(t.path.c_str(), access, share, attributes, disposition, flags, template_file);
+    const DWORD host_access = host_open_access(access);
+    HANDLE h = ::CreateFileW(t.path.c_str(), host_access, share, attributes, disposition, flags, template_file);
+    if (h == INVALID_HANDLE_VALUE && host_access != access && GetLastError() == ERROR_ACCESS_DENIED) {
+        h = ::CreateFileW(t.path.c_str(), access, share, attributes, disposition, flags, template_file);
+    }
     if (h == INVALID_HANDLE_VALUE) {
         const DWORD error = GetLastError();
         note_open_failure("CreateFileW", name, error, _ReturnAddress());
@@ -918,7 +931,11 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         SetLastError(t.error);
         return INVALID_HANDLE_VALUE;
     }
-    const HANDLE h = ::CreateFile2(t.path.c_str(), access, share, disposition, params);
+    const DWORD host_access = host_open_access(access);
+    HANDLE h = ::CreateFile2(t.path.c_str(), host_access, share, disposition, params);
+    if (h == INVALID_HANDLE_VALUE && host_access != access && GetLastError() == ERROR_ACCESS_DENIED) {
+        h = ::CreateFile2(t.path.c_str(), access, share, disposition, params);
+    }
     if (h == INVALID_HANDLE_VALUE) {
         const DWORD error = GetLastError();
         note_open_failure("CreateFile2", name, error, _ReturnAddress());

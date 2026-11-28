@@ -42,6 +42,13 @@ std::wstring scratch_stem();
 std::filesystem::path reserve_unique_dir(const std::filesystem::path& base, const std::wstring& stem,
                                          unsigned long& error, unsigned max_tries = 1000);
 
+// The access mask handed to the host for a title's open of an overlay copy. MAXIMUM_ALLOWED names no right, and a host
+// that is Wine gives such a handle read access only (a WriteFile on it fails with ERROR_INVALID_HANDLE), where Windows
+// grants every right the file allows. The shim treats MAXIMUM_ALLOWED as a write-open, so the mask gets GENERIC_READ
+// and GENERIC_WRITE named beside it; any other mask is returned unchanged. A host that refuses the named rights (a
+// read-only overlay copy) is asked again with the title's own mask.
+unsigned long host_open_access(unsigned long access);
+
 // For tests: true makes the CopyFile2 shim use its CopyFileExW fallback even where the host has CopyFile2, so the
 // path Wine 9 takes can be checked on Windows. Off by default; main.cpp never sets it.
 void force_copy_file2_fallback(bool force);

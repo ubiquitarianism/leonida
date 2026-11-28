@@ -1302,6 +1302,35 @@ void run_checks(const std::filesystem::path& root) {
                       read_path(overlay / "data" / "max_2.txt") == "OVg-max",
                   "the write goes to the overlay and not the package (CreateFile2)");
 
+            // What the host is asked for: a host that is Wine gives a MAXIMUM_ALLOWED handle no write right, so the
+            // mask names read and write beside it. Any other mask goes through unchanged.
+            {
+                const DWORD rw = GENERIC_READ | GENERIC_WRITE;
+                check((rt::fs::host_open_access(MAXIMUM_ALLOWED) & rw) == rw &&
+                          (rt::fs::host_open_access(MAXIMUM_ALLOWED) & MAXIMUM_ALLOWED) != 0,
+                      "host_open_access names GENERIC_READ and GENERIC_WRITE for MAXIMUM_ALLOWED");
+                check((rt::fs::host_open_access(MAXIMUM_ALLOWED | GENERIC_READ) & rw) == rw,
+                      "host_open_access adds GENERIC_WRITE to MAXIMUM_ALLOWED | GENERIC_READ");
+                check(rt::fs::host_open_access(GENERIC_READ) == GENERIC_READ &&
+                          rt::fs::host_open_access(GENERIC_WRITE) == GENERIC_WRITE &&
+                          rt::fs::host_open_access(FILE_READ_ATTRIBUTES) == FILE_READ_ATTRIBUTES &&
+                          rt::fs::host_open_access(0) == 0,
+                      "host_open_access leaves a mask without MAXIMUM_ALLOWED unchanged");
+            }
+
+            // A read-only overlay copy refuses the named write right; the open is asked again with the title's own
+            // mask and still succeeds, as MAXIMUM_ALLOWED does on Windows.
+            {
+                write_path(overlay / "data" / "max_ro.txt", "ro-copy");
+                const DWORD attrs = ::GetFileAttributesW((overlay / "data" / "max_ro.txt").c_str());
+                ::SetFileAttributesW((overlay / "data" / "max_ro.txt").c_str(), attrs | FILE_ATTRIBUTE_READONLY);
+                const HANDLE h = create_w(L"GAME:\\data\\max_ro.txt", MAXIMUM_ALLOWED, 0, nullptr, OPEN_EXISTING, 0,
+                                          nullptr);
+                check(h != INVALID_HANDLE_VALUE, "CreateFileW(MAXIMUM_ALLOWED) opens a read-only overlay copy");
+                if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+                ::SetFileAttributesW((overlay / "data" / "max_ro.txt").c_str(), attrs);
+            }
+
             // A plain read still opens the package file in place: no overlay copy appears for it.
             write_path(package / "data" / "max_read.txt", "pkg-max");
             const HANDLE h_plain = create_w(L"GAME:\\data\\max_read.txt", GENERIC_READ, FILE_SHARE_READ, nullptr,
