@@ -784,9 +784,17 @@ joaat of the GTA V class names, and every member below is named by the resource'
 
 Two more grass-list members are named by joaat from a brute force over common engine words: `slodID` (0xB0, member hash `9fe78fd1`) and `SLODArchetypeList` (0x158, `b451fc98`), so grass lists carry their own link to an SLOD archetype set next to `IsSLODList`. The other unnamed members stay as hashes in the schema.
 
-An `InstanceList` is a u64 (low 12 bits: 1-based block index; bits 20+: offset in that block) and a u16 count.
+An `InstanceList` is a u64 (low 20 bits: 1-based block index; bits 20+: offset in that block) and a u16 count.
+That is the pointer form of [psin.md](psin.md) and [ped_catalogues.md](ped_catalogues.md); `instance_lists.py`,
+`world_interior_names.py`, `world_lights_paths.py` and `world_index.py` read it through
+`world_index.split_pointer`. Bits 12-19 are the block number's high bits, so they stay zero below 4,096 blocks. Over the 232,846 `0x7a` resources of `levels.rpf`, `story000.rpf`, `shared_minigame000.rpf` and
+`packs.rpf`, the most blocks one has is 1,760. Every non-null array (`0x52`) and string (`0x42`) pointer there
+has bits 12-19 at zero, so a 12-bit reading would find the same block for each of them.
 Instance blocks are usually in the physical buffer, so the tool joins each resource's virtual and physical
-streams from its block map (+0x08 -> +8 virtual count, +9 physical count).
+streams from its block map (+0x08 -> +8 virtual count, +9 physical count). A list holds at most 65,535 instances
+(u16 count). The tool counts grass fields from strided byte columns and unpacks prop matrices in one pass.
+A matrix that fits in the buffer still counts when its trailing record padding is missing.
+`tools/world_build.py` and `tools/sandbox_scene.py` do not read these lists.
 
 Full run over `levels.rpf`, `story000.rpf` and `shared_minigame000.rpf` (stream occurrences, duplicates
 included):

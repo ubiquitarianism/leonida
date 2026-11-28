@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <limits>
 #include <mutex>
 #include <string>
 
@@ -39,12 +40,18 @@ bool copy_context_and_stack(HANDLE thread, CONTEXT& context, std::byte* buffer, 
         region.State == MEM_COMMIT && !(region.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
         // From RSP (rounded down to keep the 16-byte alignment the copy buffer also has) to the top of the committed
         // run of stack pages, at most kMaxStackBytes.
+        const DWORD64 base = reinterpret_cast<DWORD64>(region.BaseAddress);
         stack.original = context.Rsp & ~DWORD64(15);
-        const DWORD64 top = reinterpret_cast<DWORD64>(region.BaseAddress) + region.RegionSize;
-        stack.size = static_cast<size_t>(std::min<DWORD64>(StackSampler::kMaxStackBytes, top - stack.original));
-        SIZE_T read = 0;
-        copied = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(stack.original), buffer, stack.size,
-                                   &read) && read == stack.size;
+        if (region.RegionSize > 0 && region.RegionSize <= std::numeric_limits<DWORD64>::max() - base) {
+            const DWORD64 top = base + region.RegionSize;
+            if (stack.original >= base && top > stack.original) {
+                stack.size = static_cast<size_t>(std::min<DWORD64>(StackSampler::kMaxStackBytes, top - stack.original));
+                SIZE_T read = 0;
+                copied = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(stack.original), buffer,
+                                           stack.size, &read) &&
+                         read == stack.size;
+            }
+        }
     }
     ResumeThread(thread);
     stack.copy = reinterpret_cast<DWORD64>(buffer);
@@ -79,7 +86,8 @@ size_t walk_copy(CONTEXT& context, const CopiedStack& stack, std::uint64_t* fram
         if (address >= stack.original && address - stack.original < stack.size) address += stack.copy - stack.original;
     };
     const auto in_copy = [&](DWORD64 address) {
-        return address >= stack.copy && address - stack.copy + sizeof(DWORD64) <= stack.size;
+        return stack.size >= sizeof(DWORD64) && address >= stack.copy &&
+               address - stack.copy <= stack.size - sizeof(DWORD64);
     };
     size_t count = 0;
     rebase(context.Rsp);
@@ -102,7 +110,10 @@ std::string thread_label(HANDLE thread, GetDescription describe, QueryThread que
     if (describe) {
         PWSTR description = nullptr;
         if (SUCCEEDED(describe(thread, &description)) && description) {
-            std::string name = startup_trace::detail::utf8_from_wide(description, static_cast<int>(wcslen(description)));
+            const size_t wide_len = wcslen(description);
+            const int clamped = static_cast<int>(
+                std::min<size_t>(wide_len, static_cast<size_t>(std::numeric_limits<int>::max())));
+            std::string name = startup_trace::detail::utf8_from_wide(description, clamped);
             LocalFree(description);
             if (!name.empty()) return name;
         }
@@ -121,10 +132,10 @@ struct ThreadTrace {
     size_t count = 0;
 };
 
-void print_traces(unsigned at, const std::vector<ThreadTrace>& traces) {
-    std::string out = "[rt] stacks t=" + std::to_string(at) + ": " + std::to_string(traces.size()) + " threads\n";
+void print_traces(const std::string& tag, const std::vector<ThreadTrace>& traces) {
+    std::string out = "[rt] stacks " + tag + ": " + std::to_string(traces.size()) + " threads\n";
     for (auto it = traces.begin(); it != traces.end(); ++it) {
-        out += "[rt] stacks t=" + std::to_string(at) + " thread " + std::to_string(it->tid) + " (" + it->label + "):\n";
+        out += "[rt] stacks " + tag + " thread " + std::to_string(it->tid) + " (" + it->label + "):\n";
         const auto same = std::find_if(traces.begin(), it, [&](const ThreadTrace& earlier) {
             return it->count && it->count == earlier.count &&
                    std::equal(it->frames.begin(), it->frames.begin() + it->count, earlier.frames.begin());
@@ -142,10 +153,11 @@ void print_traces(unsigned at, const std::vector<ThreadTrace>& traces) {
     std::fflush(stderr);
 }
 
-void snapshot_threads(unsigned at, StackSampler& sampler, GetDescription describe, QueryThread query) {
+void snapshot_threads(const std::string& tag, StackSampler& sampler, GetDescription describe, QueryThread query,
+                      DWORD only = 0) {
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
-        std::fprintf(stderr, "[rt] stacks t=%u: thread list failed (error %lu)\n", at, GetLastError());
+        std::fprintf(stderr, "[rt] stacks %s: thread list failed (error %lu)\n", tag.c_str(), GetLastError());
         return;
     }
     std::vector<ThreadTrace> traces;
@@ -157,6 +169,7 @@ void snapshot_threads(unsigned at, StackSampler& sampler, GetDescription describ
     for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
         entry.dwSize = sizeof(entry);
         if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) continue;
+        if (only && entry.th32ThreadID != only) continue;
         const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
                                          FALSE, entry.th32ThreadID);
         if (!thread) continue;
@@ -169,7 +182,7 @@ void snapshot_threads(unsigned at, StackSampler& sampler, GetDescription describ
         CloseHandle(thread);
     }
     CloseHandle(snapshot);
-    print_traces(at, traces);
+    print_traces(tag, traces);
 }
 
 }  // namespace
@@ -177,6 +190,7 @@ void snapshot_threads(unsigned at, StackSampler& sampler, GetDescription describ
 StackSampler::StackSampler() : stack_(std::make_unique_for_overwrite<std::byte[]>(kMaxStackBytes)) {}
 
 std::size_t StackSampler::sample(void* thread, std::uint64_t* frames) {
+    if (!thread || !frames) return 0;
     CONTEXT context{};
     CopiedStack stack;
     if (!copy_context_and_stack(static_cast<HANDLE>(thread), context, stack_.get(), stack)) {
@@ -207,6 +221,20 @@ bool parse_stack_times(std::string_view text, std::vector<unsigned>& seconds) {
     return true;
 }
 
+void print_thread_stacks_now(std::uint32_t tid, const char* why) noexcept {
+    static std::mutex mutex;
+    try {
+        std::lock_guard lock(mutex);
+        static StackSampler sampler;
+        const auto describe = reinterpret_cast<GetDescription>(reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription")));
+        const auto query = reinterpret_cast<QueryThread>(reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
+        snapshot_threads(why ? why : "now", sampler, describe, query, tid);
+    } catch (...) {
+    }
+}
+
 std::jthread start_thread_stacks() {
     const auto start = Clock::now();
     char spec[1024];
@@ -218,10 +246,16 @@ std::jthread start_thread_stacks() {
         return {};
     }
     return std::jthread([start, times = std::move(times)](std::stop_token stop) {
-        const auto describe = reinterpret_cast<GetDescription>(reinterpret_cast<void*>(
-            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription")));
-        const auto query = reinterpret_cast<QueryThread>(reinterpret_cast<void*>(
-            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
+        const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        const auto describe =
+            kernel32 ? reinterpret_cast<GetDescription>(
+                           reinterpret_cast<void*>(GetProcAddress(kernel32, "GetThreadDescription")))
+                     : nullptr;
+        const auto query =
+            ntdll ? reinterpret_cast<QueryThread>(
+                        reinterpret_cast<void*>(GetProcAddress(ntdll, "NtQueryInformationThread")))
+                  : nullptr;
         StackSampler sampler;
         std::condition_variable_any wake;
         std::mutex mutex;
@@ -229,7 +263,7 @@ std::jthread start_thread_stacks() {
         for (const unsigned at : times) {
             wake.wait_until(lock, stop, start + std::chrono::seconds(at), [] { return false; });
             if (stop.stop_requested()) break;
-            snapshot_threads(at, sampler, describe, query);
+            snapshot_threads("t=" + std::to_string(at), sampler, describe, query);
         }
     });
 }

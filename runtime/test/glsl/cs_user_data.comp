@@ -38,6 +38,13 @@ Words at(uvec2 va) {
 void main() {
     const uint i = gl_GlobalInvocationID.x;
     Words result = at(uvec2(pc.s[6], pc.s[7]));
+    if (pc.s[5] == 0xFFFFFFFAu) {
+        // Inspect descriptor words without dereferencing a possibly invalid address. 0xFFFFFFFB is the rebound-table
+        // test's indexed CBV mode below.
+        Words view = at(uvec2(pc.s[8], 0u));
+        result.w[i] = view.w[i % 4u];
+        return;
+    }
     if (pc.s[5] == 0xFFFFFFFCu) {
         // Direct resource indexing. The explicit table is unrelated; the heap follows it at s9.
         uint value = 0u;

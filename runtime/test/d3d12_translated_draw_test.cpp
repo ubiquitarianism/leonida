@@ -118,23 +118,31 @@ int main(int argc, char** argv) {
     }
     // The FSSM programs the index entries are keyed by; the shim's device finds the index through LEONIDA_SHADERS.
     const std::filesystem::path root_dir = argv[1];
+    constexpr bool dual = false;  // the guest build draws ps_m15 only
 #else
 int main(int argc, char** argv) {
     const bool derived_zero = argc == 2 && std::strcmp(argv[1], "--derived-zero") == 0;
     const bool derived_restore = argc == 2 && std::strcmp(argv[1], "--derived-restore") == 0;
     const bool native = derived_zero || derived_restore || (argc == 2 && std::strcmp(argv[1], "--native-pso") == 0);
-    EXPECT(argc == 1 || native);
+    // RT-DUAL-SOURCE-BLEND: ps_m15_dual.asm's second export (SV_Target1) as the second blend source, ONE + SRC1.
+    const bool dual = argc == 2 && std::strcmp(argv[1], "--dual-source") == 0;
+    EXPECT(argc == 1 || native || dual);
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
     EXPECT(device_status == vktest::DeviceStatus::ready);
+    if (dual && !d.enabled.dualSrcBlend) return 77;  // a device without dual-source blending: ctest skips
 
     // The translator-style library the build wrote, and the FSSM programs its index entries are keyed by.
     const std::filesystem::path root_dir = LEONIDA_TEST_M15_DIR;
 #endif
     const auto vs_program = read_file(root_dir / "fssm" / "vs_m15.fssm");
+#ifndef LEONIDA_M15_GUEST
+    const auto ps_program = read_file(root_dir / "fssm" / (dual ? "ps_m15_dual.fssm" : "ps_m15.fssm"));
+#else
     const auto ps_program = read_file(root_dir / "fssm" / "ps_m15.fssm");
-    EXPECT(vs_program.size() >= 4 && ps_program.size() == 0x110);
+#endif
+    EXPECT(vs_program.size() >= 4 && ps_program.size() == (dual ? 0x114u : 0x110u));  // ps_m15_dual: one more word
     const float scale[4] = {0.5f, 2.0f, 1.0f, 1.0f};  // ps_m15.asm's table at offset 0x100
     EXPECT(std::memcmp(ps_program.data() + 0x100, scale, sizeof(scale)) == 0);
 #ifndef LEONIDA_M15_GUEST
@@ -185,6 +193,7 @@ int main(int argc, char** argv) {
         rt::d3d12::VulkanDeviceInfo info{};
         info.prepare_on_bind=d.prepare_on_bind;
         info.cold_graphics_compile=d.cold_graphics_compile;
+        info.heavy_pipeline_cache=d.heavy_pipeline_cache;
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
         info.physical = d.physical;
@@ -224,6 +233,16 @@ int main(int argc, char** argv) {
         pso_desc.VS = {vs_container.data(), vs_container.size()};
         pso_desc.PS = {ps_container.data(), ps_container.size()};
         pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+#ifndef LEONIDA_M15_GUEST
+        if (dual) {
+            auto& b = pso_desc.BlendState.RenderTarget[0];
+            b.BlendEnable = TRUE;
+            b.SrcBlend = b.SrcBlendAlpha = D3D12_BLEND_ONE;
+            b.DestBlend = D3D12_BLEND_SRC1_COLOR;
+            b.DestBlendAlpha = D3D12_BLEND_SRC1_ALPHA;
+            b.BlendOp = b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        }
+#endif
         pso_desc.SampleMask = 0xffffffff;
         pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -424,7 +443,7 @@ int main(int argc, char** argv) {
 #endif
         EXPECT(render_frame(1, 0.0f, 0.0f) == 0);
 #ifndef LEONIDA_M15_GUEST
-        if (d.enabled.geometryShader) {
+        if (d.enabled.geometryShader && !dual) {
             // The last draw covers half the lower-left quadrant as a triangle. The Xbox rectangle primitive
             // fills the quadrant through the same PSO. The other three quadrants keep their original values.
             const auto triangles = pixels;
@@ -464,8 +483,14 @@ int main(int argc, char** argv) {
     }
 
     const Pixel clear_color = {0.5f, 0.125f, 0.25f, 0.5f};
-    const Pixel top_left = {0.125f, 1.0f, 0.75f, 1.0f}, bottom_right = {0.25f, 1.125f, 0.875f, 1.0f};
-    const Pixel bottom_left = {0.75f, 0.25f, 0.75f, 1.0f};
+    Pixel top_left = {0.125f, 1.0f, 0.75f, 1.0f}, bottom_right = {0.25f, 1.125f, 0.875f, 1.0f};
+    Pixel bottom_left = {0.75f, 0.25f, 0.75f, 1.0f};
+#ifndef LEONIDA_M15_GUEST
+    if (dual) {  // + SV_Target1 (0.5 everywhere) times the clear colour, the destination
+        for (Pixel* p : {&top_left, &bottom_right, &bottom_left})
+            for (int c = 0; c < 4; ++c) (*p)[c] += 0.5f * clear_color[c];
+    }
+#endif
 #ifndef LEONIDA_M15_GUEST
     if (derived_zero) {
         const Pixel background{0.5f,0.125f,0.25f,0.5f};
@@ -513,6 +538,11 @@ int main(int argc, char** argv) {
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
+    }
+    if (dual) {
+        std::printf("dual-source: SV_Target1 blended as the second source (ONE + SRC1_COLOR / SRC1_ALPHA), %u of %u "
+                    "pixels exact\n", target_extent * target_extent - edge, target_extent * target_extent);
+        return 0;
     }
     std::printf("M1.5: translated VS+PS found by FSSM hash drew three draws; %u of %u pixels exact, %u edge "
                 "pixels on the triangle's diagonal (%u its colour, %u the clear colour). User data from a descriptor "

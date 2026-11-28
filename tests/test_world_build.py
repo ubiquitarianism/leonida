@@ -2069,6 +2069,156 @@ world_build.build_world(assets, output)
                 self.assertEqual(f.read(), b"previous chunk")
 
 
+def _write_png_window_assets(assets_dir: str, chunks: int) -> list[str]:
+    """`chunks` single-model chunks along X; model i uses the TTPF textures T_i and T_{i+1} (shared with its
+    neighbours) and S (shared by every chunk). Returns the DDS paths [T_0 .. T_chunks, S]."""
+    models_dir = os.path.join(assets_dir, "arch_w", "models")
+    ttpf_dir = os.path.join(assets_dir, "ttpf", "pool_w")
+    os.makedirs(models_dir, exist_ok=True)
+    os.makedirs(ttpf_dir, exist_ok=True)
+
+    keys = [f"00000000{i + 1:08X}" for i in range(chunks + 2)]   # T_0 .. T_chunks, then S
+    tex_entries, dds_paths = [], []
+    for i, key in enumerate(keys):
+        name = f"{i:06d}_w{i}.dds"
+        path = os.path.join(ttpf_dir, name)
+        with open(path, "wb") as f:
+            f.write(_uniform_bgra_dds((i * 37 % 256, i * 91 % 256, 200, 255)))
+        dds_paths.append(path)
+        tex_entries.append({
+            "Index": i, "Name": f"w{i}", "Id": i + 1, "AssetKey": key, "Width": 4, "Height": 4,
+            "DxgiFormat": 87, "Mips": 1, "SourceMips": 1, "BaseMipLevel": 0, "Limitation": None, "File": name,
+        })
+    with open(os.path.join(ttpf_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"src": "synthetic_pool_w.ttpf", "Version": 1, "Count": len(tex_entries), "Metadata": {},
+                   "Textures": tex_entries}, f)
+
+    items = []
+    for i in range(chunks):
+        center = (i * 300.0 + 10.0, 10.0, 1.0)   # one 256 m spatial cell per model
+        file_name = f"w_{i:03d}.obj"
+        with open(os.path.join(models_dir, file_name), "w", encoding="utf-8", newline="\n") as f:
+            f.write(_cube_obj(*center, half=1.0, groups=3))
+        materials = [
+            {"ShaderIndex": s, "Shader": "11111111", "Preset": "22222222", "RenderBucket": 0,
+             "Textures": [{"Param": "2B5170FD", "TextureIndex": -1, "Name": "55667788", "Id64": key,
+                           "Tag": "00000000"}]}
+            for s, key in enumerate((keys[i], keys[i + 1], keys[-1]))
+        ]
+        items.append({
+            "Offset": 4096 * (i + 1), "File": file_name, "Name": f"w_{i:03d}", "Meshes": 3, "Verts": 24,
+            "Tris": 36, "IsFragment": False, "HasBoneBindings": False,
+            "Min": [center[0] - 1.0, center[1] - 1.0, center[2] - 1.0],
+            "Max": [center[0] + 6.0, center[1] + 1.0, center[2] + 1.0],
+            "MeshShaders": [0, 1, 2], "Embedded": [], "Materials": materials,
+        })
+    with open(os.path.join(models_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"src": "synthetic_arch_w.rpf", "Count": len(items), "Items": items}, f)
+    return dds_paths
+
+
+class StagedPngRetentionTest(unittest.TestCase):
+    """The staged (spatial, grid, baked placement) build drops a decoded PNG once no later chunk uses it."""
+
+    def _build(self, chunks: int, jobs: int, **kwargs):
+        """Build a synthetic `chunks`-chunk world, counting the decoded PNGs alive while each chunk is written.
+
+        Each decoded PNG is a bytes subclass whose __del__ counts it out, so the count is whatever the build
+        still references (its cache and the chunks being written), however it holds them."""
+        lock = threading.Lock()
+        state = {"live": 0, "decodes": 0, "live_at_write": []}
+
+        class TrackedPng(bytes):
+            def __del__(self):
+                with lock:
+                    state["live"] -= 1
+
+        real_decode = dds_png.dds_file_to_png_bytes
+        real_write = glb_writer.write_glb
+
+        def decode(path, *args, **kwargs):
+            data = TrackedPng(real_decode(path, *args, **kwargs))
+            with lock:
+                state["live"] += 1
+                state["decodes"] += 1
+            return data
+
+        def write_glb(*args, **kwargs):
+            with lock:
+                state["live_at_write"].append(state["live"])
+            return real_write(*args, **kwargs)
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        assets, out = os.path.join(tmp.name, "assets"), os.path.join(tmp.name, "world")
+        dds_paths = _write_png_window_assets(assets, chunks)
+        with unittest.mock.patch.object(dds_png, "dds_file_to_png_bytes", decode), \
+                unittest.mock.patch.object(glb_writer, "write_glb", write_glb):
+            world_doc = world_build.build_world(assets, out, jobs=jobs, **kwargs)
+        return world_doc, out, dds_paths, state
+
+    @staticmethod
+    def _chunk_images(out_dir, world_doc):
+        images = {}
+        for c in world_doc["chunks"]:
+            with open(_chunk_disk_path(out_dir, c["url"]), "rb") as f:
+                gltf, bin_data = parse_and_validate_glb(f.read())
+            found = set()
+            for img in gltf.get("images", []):
+                bv = gltf["bufferViews"][img["bufferView"]]
+                off = bv.get("byteOffset", 0)
+                found.add(bytes(bin_data[off:off + bv["byteLength"]]))
+            images[c["id"]] = found
+        return images
+
+    def test_retained_pngs_do_not_grow_with_the_chunk_count(self):
+        peaks = {}
+        for chunks in (8, 24):
+            with self.subTest(chunks=chunks):
+                world_doc, out, dds_paths, state = self._build(chunks, jobs=1)
+                self.assertEqual(world_doc["stats"]["chunks"], chunks)
+                self.assertEqual(world_doc["stats"]["textures_embedded"], 3 * chunks)
+                # Every texture is still decoded once per build, and none is left once the build returns.
+                self.assertEqual(state["decodes"], chunks + 2)
+                self.assertEqual(state["live"], 0)
+                # Writing chunk i holds T_i, T_{i+1} and S, the last two also cached for the chunks after it.
+                # A cache that keeps every PNG until the build returns holds i + 3 instead.
+                self.assertEqual(len(state["live_at_write"]), chunks)
+                peaks[chunks] = max(state["live_at_write"])
+                self.assertEqual(peaks[chunks], 3, state["live_at_write"])
+
+                pngs = [dds_png.dds_file_to_png_bytes(p, max_size=512) for p in dds_paths]
+                images = self._chunk_images(out, world_doc)
+                for c in world_doc["chunks"]:
+                    i = round((c["bounds"][0] - 9.0) / 300.0)
+                    self.assertEqual(images[c["id"]], {pngs[i], pngs[i + 1], pngs[-1]}, c["id"])
+        self.assertEqual(peaks[8], peaks[24])
+
+    def test_threaded_build_is_bounded_and_identical_to_serial(self):
+        chunks, jobs = 24, 4
+        serial_doc, serial_out, _, _ = self._build(chunks, jobs=1)
+        world_doc, out, _, state = self._build(chunks, jobs=jobs)
+        self.assertEqual(world_doc, serial_doc)
+        self.assertEqual(WorldBuildTest._output_snapshot(out), WorldBuildTest._output_snapshot(serial_out))
+        self.assertEqual(state["decodes"], chunks + 2)
+        self.assertEqual(state["live"], 0)
+        # At most `jobs` chunks are built at once, each holding its 3 textures.
+        self.assertLessEqual(max(state["live_at_write"]), 3 * jobs, state["live_at_write"])
+
+    def test_grid_layout_releases_every_png_no_later_chunk_uses(self):
+        # The grid packs the models in an order of its own; a small chunk size gives one chunk per model.
+        world_doc, out, dds_paths, state = self._build(24, jobs=1, grid_layout=True, chunk_size=4.0)
+        self.assertEqual((world_doc["layout"], world_doc["stats"]["chunks"]), ("grid", 24))
+        self.assertEqual(state["decodes"], 24 + 2)
+        self.assertEqual(state["live"], 0)
+        # No chunk comes after the last one, so only its own 3 textures are left (all 26 with an unbounded cache).
+        self.assertEqual(state["live_at_write"][-1], 3, state["live_at_write"])
+        pngs = {dds_png.dds_file_to_png_bytes(p, max_size=512) for p in dds_paths}
+        images = self._chunk_images(out, world_doc)
+        self.assertTrue(all(len(found) == 3 and found <= pngs for found in images.values()), images.keys())
+        self.assertEqual(set().union(*images.values()), pngs)
+
+
 # ---------------------------------------------------------------------------
 # 4. viewer/serve.py tests
 # ---------------------------------------------------------------------------

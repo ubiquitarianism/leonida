@@ -1,0 +1,41 @@
+GPU:        NVIDIA Tesla V100-SXM2-16GB (Volta, GV100, PCI device 0x1db1), 16384 MiB reported by nvidia-smi;
+            one of two identical cards in the machine, selected by name
+Driver:     NVIDIA 580.178.04 (driverVersion 580.178.4.0), Vulkan 1.4.312
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32)
+OS:         Linux (x86-64), kernel 6.14
+Commit:     b4b7756e8c64e7ae8b310288d543db0e428c0796 (main, 2026-11-25); the branch for this record is
+            based on current main 5a5df8e0b6bff458814c934e18f4216e69c40d36
+Tools:      llvm-mc 23.1.6 (official LLVM Linux release, AMDGPU target), SPIRV-Tools v2026.4
+            (4a21a48a3840e6e47ded4f1951f7d301b9fc37c3), Python 3.12.3, GCC 13.3.0, CMake 4.4.3
+Selection:  LEONIDA_VK_DEVICE=V100, VK_LOADER_LAYERS_DISABLE='~implicit~'
+Build:      CMake/Ninja Linux harness in an external build directory; no game data, no traces
+
+run_gpu_tests.py, 256 fixtures; 265 shaders translated, 264 pass spirv-val in every run:
+            native:                                       193/256 passed, 62 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1:                        224/256 passed, 31 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1 LEONIDA_MESH_COMPUTE=1
+            LEONIDA_BARY_FALLBACK=1 LEONIDA_TEXOFF_FALLBACK=1: 237/256 passed, 18 skipped, 1 failed
+
+The mesh subset was also run separately with emulation and mesh-compute: 6/6 PASS
+(ms_clip, ms_f16_pack, ms_tri, ms_v5_workgroup, ms_w64x_ballot, ms_wave_info_s3).
+With --wave64-emulate, ms_w64x_ballot passes here; without emulation it is skipped on a 32-wide device.
+
+Failed in all three full runs, reproduced once with --filter cs_imgstore_cube:
+  cs_imgstore_cube: exit 1: r32 sint (sint view): 63 bad, texel(5,3) = 0
+It is not listed under docs/testing.md "Known problems" and is tracked in
+https://github.com/ubiquitarianism/leonida/issues/1492 (opened before this record was merged).
+
+Skips are the documented ones (docs/testing.md): no 64-wide compute subgroup in the native run, no
+VK_EXT_mesh_shader without --mesh-compute, no VK_KHR_fragment_shader_barycentric without --bary-fallback, no
+VK_KHR_maintenance8 without --texoff-fallback, a fragment subgroup that cannot require 64 lanes, computed
+I/J pairs needing PerVertexKHR inputs, wave64 VS/PS/GS tier C on 32-wide subgroups, and fixtures run by
+d3d12_*_test programs or w64_graphics.py. No skip was counted as a pass.
+
+Notes:
+- This is the first Volta/Tesla record in gpu-test-results/. Volta has no mesh shaders, no fragment
+  barycentrics and 32-wide subgroups, so the fallback switches are the whole point of the run.
+- run_gpu_tests.py used its own assembler path for all 265 fixtures. A separate build.py run with the same
+  llvm-mc stops at cs_dpp_cmp (the DPP variants of v_cmp are not accepted by llvm-mc 23.1.6), so build.py
+  and check.py counts are not included here.
+- AI-assisted (OpenCode agent). Only GPU model, driver, subgroup, commit, tool versions, counts and error
+  classes are recorded; no game data, no paths, no machine or account identifiers.

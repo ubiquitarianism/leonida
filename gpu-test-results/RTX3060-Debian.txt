@@ -1,0 +1,27 @@
+GPU:        NVIDIA GeForce RTX 3060 Lite Hash Rate (Ampere / GA106, PCI 10de:2504), subgroup 32..32
+Driver:     NVIDIA 620.70.10 (proprietary), Vulkan device API 1.4.309
+OS:         Debian GNU/Linux 13 (trixie), x86_64
+Commit:     b0f3d3998 (main, 2026-11-25)
+Tools:      llvm-mc 22.1.8 (Debian, AMDGPU target), SPIRV-Tools v2025.1, CMake 3.31.6 + Ninja 1.12.1,
+            GCC 14.2.0, Python 3.13.5, Vulkan headers and loader from Debian (libvulkan-dev)
+Build:      cmake -S runtime -B runtime/build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release, then
+            cmake --build runtime/build/linux --parallel
+            ("gta6rt requires Windows; only Vulkan tools are available on Linux")
+run_gpu_tests.py: 274 shaders: 274 translated, 274 pass spirv-val
+            native:                 208/264 passed, 55 skipped, 1 failed
+Failed:     cs_imgatomic_ext (native): 6 of 64 sint words differ; first word 32:
+            got 0x0badf00d, expected 0x00000101
+Skipped:    native 55 =
+            33 compute shaders that need a 64-wide subgroup (no 64-wide subgroup on this device)
+            + 4 run by d3d12_m3_frame_test + 4 run by d3d12_m2_textured_test
+            + 3 run by d3d12_translated_draw_test + 2 run by d3d12_quad_index_test
+            + 2 run by d3d12_m4_compute_test + 2 run by d3d12_buffer_uav_test
+            + ps_w64x_readlane (no 64-wide fragment subgroup: subgroup 32..32)
+            + 1 run by w64_graphics.py + 1 run by d3d12_m2_formats_test
+            + 1 that needs the Windows D3D12 runtime
+Notes:
+- The Ampere RTX 3060 exposes only 32-wide subgroups, so every wave64 compute fixture that pins
+  subgroup size 64 is skipped. All wave32 pixel and vertex fixtures pass.
+- cs_imgatomic_ext fails: image atomic return values are not written back as expected on this
+  driver/device combination (6 of 64 sint words differ). This is the single failure across the run.
+- No game files were used or needed. The suite uses hand-written fixtures in runtime/test/shaders.

@@ -1,7 +1,8 @@
 // Scratch buffers that live until the submission that used them has completed: device-local chunks handed out
 // while a list is prepared, retired with the submission's timeline value, and reused (or freed) once the GPU is past
 // it. The replay stages copies Vulkan cannot do in one command through them (vulkan_replay.h, depth <-> colour
-// copies). Single-threaded: the caller holds the context's lock. The same life cycle as the depth24 converter's own
+// copies), and the ExecuteIndirect argument clamp keeps its record scratch in one too (vulkan_indirect_clamp.h).
+// Single-threaded: the caller holds the context's lock. The same life cycle as the depth24 converter's own
 // scratch (vulkan_depth24.h), which also needs descriptor pools and exists only on GPUs without D24.
 // The chunks are transfer sources and destinations; `extra_usage` adds what another user needs (the expanded indices
 // of quad lists, quad_index_expand.h: an index buffer written through its device address).
@@ -27,12 +28,31 @@ class ScratchBuffers {
 public:
     // A device-local allocation for a chunk; null on failure.
     using Allocate = std::function<VkDeviceMemory(const VkMemoryRequirements&)>;
+    // What the copy staging needs: transfer both ways.
+    static constexpr VkBufferUsageFlags transfer_usage =
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
+    // Legacy copy-scratch constructor. `extra_usage` is added to the transfer usage, and
+    // `families` keeps retired chunks shareable across queue families.
     ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate, VkBufferUsageFlags extra_usage = 0,
                    std::vector<std::uint32_t> families = {}, DeviceFaultDiagnostics* diagnostics = nullptr)
-        : device_(device), diagnostics_(diagnostics), allocate_(std::move(allocate)), extra_usage_(extra_usage),
-          families_(std::move(families)) {
-        loaded_ = vk_.load(get, device);
+        : device_(device), diagnostics_(diagnostics), allocate_(std::move(allocate)),
+          usage_(transfer_usage | extra_usage), families_(std::move(families)) {
+        loaded_ = vk_.load(get, device, false);
+        addressable_ = (usage_ & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) && vk_.vkGetBufferDeviceAddress;
+    }
+
+    // `usage` is what the chunks are created with. A chunk that declares VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+    // gets its device address from get() as well, and its memory must have been allocated with
+    // VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT (the allocate callback's job). `families` keeps retired chunks shareable
+    // across queue families (graphics + async compute).
+    ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate,
+                   DeviceFaultDiagnostics* diagnostics, VkBufferUsageFlags usage,
+                   std::vector<std::uint32_t> families = {})
+        : device_(device), diagnostics_(diagnostics), allocate_(std::move(allocate)), usage_(usage),
+          families_(std::move(families)),
+          addressable_((usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
+        loaded_ = vk_.load(get, device, addressable_);
     }
 
     ~ScratchBuffers() {
@@ -48,36 +68,14 @@ public:
 
     bool loaded() const { return loaded_; }
 
-    // `bytes` of transfer scratch for the next submission, at a 256-byte aligned offset (more than any copy needs).
+    // `bytes` of scratch for the next submission, at a 256-byte aligned offset (more than any copy needs).
     bool get(std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
-        constexpr VkDeviceSize alignment = 256, minimum = 4u << 20;
-        if (!loaded_ || !bytes) return false;
-        for (auto& chunk : current_.chunks) {
-            const VkDeviceSize rem = chunk.used % alignment;
-            const VkDeviceSize pad = rem ? alignment - rem : 0;
-            if (pad <= chunk.size - chunk.used) {
-                const VkDeviceSize start = chunk.used + pad;
-                if (bytes <= chunk.size - start) {
-                    chunk.used = start + bytes;
-                    buffer = chunk.buffer;
-                    offset = start;
-                    return true;
-                }
-            }
-        }
-        Chunk chunk;
-        for (std::size_t i = 0; i < spare_.size(); ++i)
-            if (spare_[i].size >= bytes) {
-                chunk = spare_[i];
-                spare_.erase(spare_.begin() + std::ptrdiff_t(i));
-                break;
-            }
-        if (!chunk.buffer && !make_chunk(std::max<std::uint64_t>(bytes, minimum), chunk)) return false;
-        chunk.used = bytes;
-        buffer = chunk.buffer;
-        offset = 0;
-        current_.chunks.push_back(chunk);
-        return true;
+        return claim(bytes, buffer, offset, nullptr);
+    }
+
+    // The same for chunks created with a device address: `address` is the device address of the returned offset.
+    bool get(std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset, VkDeviceAddress& address) {
+        return claim(bytes, buffer, offset, &address);
     }
 
     // The chunks handed out since the last call belong to a submission that `timeline` reaches `ticket` for
@@ -145,8 +143,9 @@ private:
 #define LEONIDA_SCRATCH_MEMBER(name) PFN_##name name = nullptr;
         LEONIDA_SCRATCH_FUNCTIONS(LEONIDA_SCRATCH_MEMBER)
 #undef LEONIDA_SCRATCH_MEMBER
+        PFN_vkGetBufferDeviceAddress vkGetBufferDeviceAddress = nullptr;  // optional: addressable pools only
 
-        bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
+        bool load(PFN_vkGetDeviceProcAddr get, VkDevice device, bool addressable) {
             bool all = true;
 #define LEONIDA_SCRATCH_LOAD(name)                              \
     name = reinterpret_cast<PFN_##name>(get(device, #name));    \
@@ -154,14 +153,58 @@ private:
             LEONIDA_SCRATCH_FUNCTIONS(LEONIDA_SCRATCH_LOAD)
 #undef LEONIDA_SCRATCH_LOAD
 #undef LEONIDA_SCRATCH_FUNCTIONS
-            return all;
+            // Only an addressable pool (the indirect clamp's) needs the addresses: a Vulkan 1.0/1.1 device without
+            // bufferDeviceAddress keeps the transfer scratch.
+            this->vkGetBufferDeviceAddress =
+                reinterpret_cast<PFN_vkGetBufferDeviceAddress>(get(device, "vkGetBufferDeviceAddress"));
+            return all && (!addressable || this->vkGetBufferDeviceAddress != nullptr);
         }
     };
+
+    // Hands out `bytes` from this submission's chunks, making a new chunk where none fits.
+    bool claim(std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset, VkDeviceAddress* address) {
+        constexpr VkDeviceSize alignment = 256, minimum = 4u << 20;
+        if (!loaded_ || !bytes) return false;
+        if (address && !addressable_) return false;
+        for (auto& chunk : current_.chunks) {
+            const VkDeviceSize rem = chunk.used % alignment;
+            const VkDeviceSize pad = rem ? alignment - rem : 0;
+            if (pad > chunk.size - chunk.used) continue;
+            const VkDeviceSize start = chunk.used + pad;
+            if (bytes <= chunk.size - start) {
+                chunk.used = start + bytes;
+                buffer = chunk.buffer;
+                offset = start;
+                if (address) *address = device_address(chunk.buffer) + start;
+                return true;
+            }
+        }
+        Chunk chunk;
+        for (std::size_t i = 0; i < spare_.size(); ++i)
+            if (spare_[i].size >= bytes) {
+                chunk = spare_[i];
+                spare_.erase(spare_.begin() + std::ptrdiff_t(i));
+                break;
+            }
+        if (!chunk.buffer && !make_chunk(std::max<std::uint64_t>(bytes, minimum), chunk)) return false;
+        chunk.used = bytes;
+        buffer = chunk.buffer;
+        offset = 0;
+        current_.chunks.push_back(chunk);
+        if (address) *address = device_address(buffer);
+        return true;
+    }
+
+    VkDeviceAddress device_address(VkBuffer buffer) const {
+        VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        info.buffer = buffer;
+        return vk_.vkGetBufferDeviceAddress(device_, &info);
+    }
 
     bool make_chunk(std::uint64_t size, Chunk& out) {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
-        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra_usage_;
+        info.usage = usage_;
         // A retired chunk can be reused by a submission on a different queue family.
         share_across_queue_families(info, families_);
         if (vk_.vkCreateBuffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
@@ -188,8 +231,9 @@ private:
     VkDevice device_;
     DeviceFaultDiagnostics* diagnostics_;
     Allocate allocate_;
-    VkBufferUsageFlags extra_usage_ = 0;
+    VkBufferUsageFlags usage_ = transfer_usage;
     std::vector<std::uint32_t> families_;
+    bool addressable_ = false;
     Functions vk_;
     bool loaded_ = false;
     Batch current_;               // handed out, not yet submitted

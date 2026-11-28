@@ -14,6 +14,7 @@
 // No game data.
 #include "test_temp_dir.h"
 #include "vk_test_device.h"
+#include "shader_fixture_path.h"
 #include "d3d12_test_shaders.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
@@ -822,15 +823,119 @@ bool root_layout_case(Rig& rig, UINT table_count, UINT constants, bool expect_gr
     return true;
 }
 
+// One immutable bundle, executed twice with different parent VB/root state. A normal
+// direct draw supplies the pixel oracle for each legal fixed-count indirect operation.
+bool check_bundle_indirect(ID3D12Device* device, const std::vector<std::uint8_t>& vs,
+                           const std::vector<std::uint8_t>& ps, bool inspect_layer_ir, bool opt_out = false) {
+    for (const bool indexed : {false, true}) {
+        Rig r;
+        CHECK(r.init(device, vs, ps));
+        D3D12_INDIRECT_ARGUMENT_DESC action{};
+        action.Type = indexed ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+        D3D12_COMMAND_SIGNATURE_DESC desc{};
+        desc.NumArgumentDescs = 1; desc.pArgumentDescs = &action;
+        desc.ByteStride = indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) : sizeof(D3D12_DRAW_ARGUMENTS);
+        Ref<ID3D12CommandSignature> sig;
+        CHECK(SUCCEEDED(device->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&sig.p))));
+        constexpr UINT64 offset = 1024;
+        const D3D12_DRAW_ARGUMENTS draw{3, 1, 0, 0};
+        const D3D12_DRAW_INDEXED_ARGUMENTS draw_indexed{6, 1, 0, 0, 0};
+        std::uint8_t* upload = nullptr;
+        CHECK(SUCCEEDED(r.upload->Map(0, nullptr, reinterpret_cast<void**>(&upload))));
+        if (indexed) std::memcpy(upload + offset, &draw_indexed, sizeof(draw_indexed));
+        else std::memcpy(upload + offset, &draw, sizeof(draw));
+        r.upload->Unmap(0, nullptr);
+        auto* bundle = r.bundle(r.pso_a.p, [&](ID3D12GraphicsCommandList* l) {
+            l->IASetPrimitiveTopology(tlist);
+            l->SetMarker(1, "before", 7);
+            l->ExecuteIndirect(sig.p, 1, r.upload.p, offset, nullptr, 0);
+            l->SetMarker(1, "after", 6);
+        });
+        CHECK(bundle);
+        bool ordered = !inspect_layer_ir;
+        const auto record = [&](ID3D12GraphicsCommandList* l, bool indirect) {
+            r.targets(l);
+            l->SetGraphicsRootSignature(r.root1.p);
+            l->SetPipelineState(r.pso_a.p);
+            l->IASetPrimitiveTopology(tlist);
+            r.indices(l, ib_quad);
+            r.offset(l, 0, 0);
+            for (UINT i = 0; i != 2; ++i) {
+                r.vertices(l, i ? vb_other : vb_quad);
+                r.tint(l, i ? tint_green : tint_red);
+                if (indirect) {
+                    if (opt_out) l->ExecuteIndirect(sig.p, 1, r.upload.p, offset, nullptr, 0);  // direct list too
+                    l->ExecuteBundle(bundle);
+                } else if (indexed) l->DrawIndexedInstanced(6, 1, 0, 0, 0);
+                else l->DrawInstanced(3, 1, 0, 0);
+            }
+            if (indirect && inspect_layer_ir) {
+                std::vector<leonida::Command> commands;
+                if (!rt::d3d12::recorded_commands(l, commands)) return;
+                std::string order;
+                unsigned seen = 0;
+                for (const auto& cmd : commands) {
+                    if (const auto* m = std::get_if<leonida::DebugMarker>(&cmd)) order += m->label + ",";
+                    if (const auto d = leonida::draw_command(cmd); d.state) {
+                        if (!d.arguments || d.state->indexed != indexed || d.arguments->max_count != 1 ||
+                            d.arguments->count_buffer || d.arguments->argument_offset != offset ||
+                            d.arguments->argument_buffer != rt::d3d12::resource_id(r.upload.p) || !d.state->views ||
+                            d.state->views->vertex_buffers[0].va != r.upload_va + (seen ? vb_other : vb_quad)) return;
+                        order += "draw,";
+                        ++seen;
+                    }
+                }
+                ordered = opt_out ? seen == 0 && order == "before,after,before,after,"
+                                  : seen == 2 && order == "before,draw,after,before,draw,after,";
+            }
+        };
+        std::string direct, indirect;
+        HRESULT close = E_FAIL;
+        CHECK(r.render([&](Rig&, auto* l) { record(l, false); }, direct, close) && close == S_OK);
+        CHECK(direct.find('R') != std::string::npos && direct.find('G') != std::string::npos);
+        CHECK(r.render([&](Rig&, auto* l) { record(l, true); }, indirect, close) && close == S_OK);
+        if (!(ordered && indirect == (opt_out ? BLANK4 " " BLANK4 : direct))) {
+            std::fprintf(stderr, "bundle indirect mismatch: indexed=%d opt_out=%d ordered=%d direct=[%s] indirect=[%s]\n",
+                         indexed, opt_out, ordered, direct.c_str(), indirect.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    const bool warp_indirect = argc == 2 && !std::strcmp(argv[1], "--indirect-bundle-warp");
+    const bool opt_out = argc == 2 && !std::strcmp(argv[1], "--indirect-bundle-off");
+    const bool layer_indirect = opt_out || (argc == 2 && !std::strcmp(argv[1], "--indirect-bundle-layer"));
+    const bool root_layout = argc == 2 && (!std::strcmp(argv[1], "--compact") || !std::strcmp(argv[1], "--legacy"));
+    if (opt_out) REQUIRE(SetEnvironmentVariableA("LEONIDA_INDIRECT_DRAWS", "off"));
+    if (argc != 1 && !warp_indirect && !layer_indirect && !root_layout) return 2;
+    if (warp_indirect) {
+        if (hostwine::host_is_wine()) return 77;
+        Ref<IDXGIFactory4> factory; Ref<IDXGIAdapter> warp; Ref<ID3D12Device> device;
+        std::vector<std::uint8_t> vs, ps;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
+            FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
+            FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device.p)))) return 77;
+        REQUIRE(compile_hlsl(hlsl, "vs", "vs_5_0", vs) && compile_hlsl(hlsl, "ps", "ps_5_0", ps));
+        REQUIRE(check_bundle_indirect(device.p, vs, ps, false));
+        std::puts("WARP: both indirect bundle draws matched direct across two inherited parent states");
+        return 0;
+    }
     vktest::Device vk;
+    vk.request_draw_indirect_first_instance = layer_indirect;
+    vk.request_robust_index_view = layer_indirect;
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) {
         std::fprintf(stderr, "SKIP: no usable Vulkan 1.3 device\n");
         return 77;
     }
     REQUIRE(device_status == vktest::DeviceStatus::ready);
+    if (layer_indirect && (!vk.enabled.drawIndirectFirstInstance || !vk.robust_index_view)) {
+        std::fprintf(stderr, "SKIP: bundle draw pair requires drawIndirectFirstInstance and a bounded robust index view\n");
+        return 77;
+    }
     const auto list = scenarios();
 
     // Layer shaders: FSSM-shaped containers found by hash in a translator-style index.
@@ -839,8 +944,8 @@ int main(int argc, char** argv) {
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
     const testfiles::ScratchDir scratch("leonida_bundle_test");  // removed on every way out of main
     const auto& library = scratch.path();
-    REQUIRE(testfiles::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv"));
-    REQUIRE(testfiles::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv"));
+    REQUIRE(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_SPV), library / "vs_draw.spv"));
+    REQUIRE(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_SPV), library / "ps_draw.spv"));
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"vs_draw\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
@@ -864,12 +969,14 @@ int main(int argc, char** argv) {
         info.queue = vk.queue;
         info.queue_family = vk.family;
         info.buffer_device_address = true;
+        info.draw_indirect_first_instance = vk.enabled.drawIndirectFirstInstance == VK_TRUE;
+        info.robust_index_view = vk.robust_index_view;
+        info.max_draw_indirect_count = vk.max_draw_indirect_count;
         info.shader_dir = library.string();
         Ref<ID3D12Device> ours;
         REQUIRE(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p))));
-        if (argc == 2) {
+        if (root_layout) {
             const bool stage = std::strcmp(argv[1], "--compact") == 0;
-            REQUIRE(stage || std::strcmp(argv[1], "--legacy") == 0);
             Rig rig;
             rig.device = ours.p;
             rig.vs_code = vs_container;
@@ -882,6 +989,12 @@ int main(int argc, char** argv) {
             REQUIRE(fallback && ordinary && wide && last_register && spill);
             REQUIRE(vk.validation_errors() == errors_before);
             return 0;
+        }
+        if (layer_indirect) {
+            REQUIRE(check_bundle_indirect(ours.p, vs_container, ps_container, true, opt_out));
+            REQUIRE(vk.validation_errors() == errors_before);
+            std::puts(opt_out ? "layer: both indirect draws omitted on direct lists and in bundles; direct pixels and marker order checked"
+                              : "layer: both indirect bundle draws matched direct; snapshots and marker order checked");
         }
         REQUIRE(run_all(ours.p, false, nullptr, vs_container, ps_container, list, layer_grids, layer_closes));
         REQUIRE(layer_checks(ours.p, vs_container, ps_container, library));

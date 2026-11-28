@@ -540,8 +540,9 @@ int main() {
         }
         EXPECT(grab(frame));
         EXPECT(region_is(frame, 0, 0, width, height, {0, 0, 0}, 0));
-        // (The blank frame is a frame in flight like any other: with latency 1 the next wait needs it shown first.)
-        EXPECT(xbox.pacer().frames_in_flight() == 2);  // the first frame and the blank one
+        // (The blank frame is a frame in flight like any other, but at most `latency` frames are: with latency 1 it
+        // replaces the first frame, which still waits for its vblank, and the next wait needs it shown first.)
+        EXPECT(xbox.pacer().frames_in_flight() == 1);
         clock.advance_us(period);
         std::printf("0 planes (blank): ok\n");
 

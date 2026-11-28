@@ -1,0 +1,23 @@
+GPU:        AMD Radeon RX 7800 XT (RDNA3 / GFX1101, Navi 32, PCI 1002:747e), subgroup 32..64
+Driver:     AMD proprietary 26.11.2 (LLPC, driverVersion 2.0.416),
+            Vulkan 1.4.359 (loader 1.4.357)
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; default 64, subgroupSizeControl,
+            compute_in_required_stages, mesh_in_required_stages, per_vertex_inputs,
+            maxPushConstantsSize 256)
+OS:         Windows 11, 10.0.26200
+Commit:     6293c1c4f (main of ubiquitarianism/leonida, 2026-11-24)
+Tools:      MSVC 14.44.35207 (VS 2022 Build Tools, Windows SDK 10.0.26100.0, RelWithDebInfo),
+            llvm-mc 20.1.2 (WSL Ubuntu 24.04), SPIRV-Tools (Vulkan SDK), CMake, Python 3.12+
+run_gpu_tests.py: 261 fixtures: 261 translated, 261 pass spirv-val
+            native:                 236/252 passed, 16 skipped, 0 failed
+Skipped:    16 skips, all delegated to dedicated test runners (0 hardware/driver skips):
+            15 run by d3d12_*_test (m2_textured 4, m3_frame 4, buffer_uav 2, m4_compute 2,
+               translated_draw 2, m2_formats 1),
+            1  run by w64_graphics.py (ps_live_width).
+Notes:
+- Executed on AMD Ryzen 7 7800X3D + AMD Radeon RX 7800 XT (discrete GPU; system also has
+  AMD Radeon Graphics iGPU 1002:164e).
+- All 236 runnable GPU fixtures passed with 0 failures and 0 hardware/driver feature skips;
+  mesh shaders, fragment shader barycentrics, PerVertexKHR inputs, and native wave64
+  subgroups are all supported on this GPU and driver.
+- AI-assisted (Antigravity). Synthetic tests only; no game files.

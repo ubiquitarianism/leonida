@@ -2157,6 +2157,125 @@ class TestExportFileAndCli(unittest.TestCase):
         with self.assertRaises(json.JSONDecodeError):
             ct.export_file(pool, 0, self.root / "u.dds", None, False, bad_json)
 
+    def test_export_file_posix_link_permission_error_fails_safely_and_cleans(self):
+        pool = ttpf.Pool(str(self.pool_path))
+        self.addCleanup(pool.close)
+        out = self.root / "link_perm.dds"
+        orig_move = ct._move_no_clobber
+
+        # 1. When os.link fails with PermissionError, re-raises safely without clobbering or falling back to replace
+        with _fake_native_context(), \
+                mock.patch.object(ct, "_move_no_clobber", lambda s, d: orig_move(s, d, is_nt=False)), \
+                mock.patch("os.link", side_effect=PermissionError(1, "Operation not permitted")):
+            with self.assertRaises(PermissionError):
+                ct.export_file(pool, 0, out, None, False, self.profile)
+        self.assertFalse(out.exists())
+        # Tempfile must be unlinked; no leaked temporary files in directory
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["pool.ttpf", "profile.json"])
+
+        # 2. When os.link fails with PermissionError and destination already exists, preserves destination intact
+        out.write_bytes(b"EXISTING_DATA")
+        with _fake_native_context(), \
+                mock.patch.object(ct, "_move_no_clobber", lambda s, d: orig_move(s, d, is_nt=False)), \
+                mock.patch("os.link", side_effect=PermissionError(1, "Operation not permitted")):
+            with self.assertRaises(PermissionError):
+                ct.export_file(pool, 0, out, None, False, self.profile)
+        self.assertEqual(out.read_bytes(), b"EXISTING_DATA")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["link_perm.dds", "pool.ttpf", "profile.json"])
+
+    def test_export_file_concurrent_destination_creation_rejects_and_cleans(self):
+        pool = ttpf.Pool(str(self.pool_path))
+        self.addCleanup(pool.close)
+        out = self.root / "race.dds"
+        self.assertFalse(out.exists())
+
+        orig_dds = ct.LocalDecoder.dds
+
+        def race_dds(self_dec, index, mips):
+            # Concurrent actor creates the file while decoding is finishing
+            out.write_bytes(b"CONCURRENT_WINNER")
+            return orig_dds(self_dec, index, mips)
+
+        with _fake_native_context(), mock.patch.object(ct.LocalDecoder, "dds", race_dds):
+            with self.assertRaises(FileExistsError):
+                ct.export_file(pool, 0, out, None, False, self.profile)
+
+        # Destination was not overwritten and temporary file was removed
+        self.assertEqual(out.read_bytes(), b"CONCURRENT_WINNER")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["pool.ttpf", "profile.json", "race.dds"])
+
+    def test_export_file_concurrent_destination_creation_rejects_and_cleans_posix(self):
+        pool = ttpf.Pool(str(self.pool_path))
+        self.addCleanup(pool.close)
+        out = self.root / "race_posix.dds"
+        self.assertFalse(out.exists())
+        orig_move = ct._move_no_clobber
+        orig_dds = ct.LocalDecoder.dds
+
+        def race_dds(self_dec, index, mips):
+            # Concurrent actor creates the file while decoding is finishing
+            out.write_bytes(b"CONCURRENT_POSIX_WINNER")
+            return orig_dds(self_dec, index, mips)
+
+        with _fake_native_context(), \
+                mock.patch.object(ct, "_move_no_clobber", lambda s, d: orig_move(s, d, is_nt=False)), \
+                mock.patch.object(ct.LocalDecoder, "dds", race_dds):
+            with self.assertRaises(FileExistsError):
+                ct.export_file(pool, 0, out, None, False, self.profile)
+
+        # Destination was not overwritten and temporary file was removed
+        self.assertEqual(out.read_bytes(), b"CONCURRENT_POSIX_WINNER")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["pool.ttpf", "profile.json", "race_posix.dds"])
+
+    def test_export_file_replacement_failure_cleans_temporary_file(self):
+        pool = ttpf.Pool(str(self.pool_path))
+        self.addCleanup(pool.close)
+        out = self.root / "replace_fail.dds"
+
+        with _fake_native_context(), \
+                mock.patch.object(ct.replace_retry, "replace", side_effect=OSError("simulated I/O write failure")):
+            with self.assertRaisesRegex(OSError, "simulated I/O write failure"):
+                ct.export_file(pool, 0, out, None, True, self.profile)
+
+        # Ensure no temporary files survived the exception
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["pool.ttpf", "profile.json"])
+
+    def test_rename_no_clobber_transient_retry_and_non_transient_error(self):
+        src = self.root / "test_src.tmp"
+        dst = self.root / "test_dst.dds"
+        src.write_bytes(b"NEW")
+
+        # 1. Transient sharing violation (WinError 32) retries and succeeds once released
+        calls = []
+        real_rename = os.rename
+
+        def flaky_rename(s, d):
+            calls.append((s, d))
+            if len(calls) <= 2:
+                err = PermissionError(13, "sharing violation")
+                err.winerror = 32
+                raise err
+            return real_rename(s, d)
+
+        with mock.patch("os.rename", side_effect=flaky_rename), mock.patch("time.sleep"):
+            ct._rename_no_clobber(src, dst)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(dst.read_bytes(), b"NEW")
+
+        # 2. Non-transient PermissionError (WinError 1314 - privilege not held) fails immediately without retry
+        src2 = self.root / "test_src2.tmp"
+        dst2 = self.root / "test_dst2.dds"
+        src2.write_bytes(b"DATA")
+        non_transient = PermissionError(13, "privilege not held")
+        non_transient.winerror = 1314
+
+        with mock.patch("os.rename", side_effect=non_transient) as rename_mock, mock.patch("time.sleep") as sleep_mock:
+            with self.assertRaises(PermissionError) as ctx:
+                ct._rename_no_clobber(src2, dst2)
+            self.assertEqual(ctx.exception.winerror, 1314)
+            self.assertEqual(rename_mock.call_count, 1)
+            sleep_mock.assert_not_called()
+
     def test_ttpf_mips_cli_calibration_paths(self):
         out = self.root / "cli.dds"
 

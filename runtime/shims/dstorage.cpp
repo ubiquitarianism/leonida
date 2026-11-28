@@ -10,12 +10,15 @@
 //     it has. Completion is therefore in queue order, as the API guarantees.
 //   - Compressed requests stage RFC 1950 inflate, BCPack BC block reconstruction and DirectStorage
 //     macro-unshuffle before publishing the destination. Physical page numbers resolve in xmem at execution.
+//   - A queue half full submits itself, but a read into physical pages and everything enqueued behind it wait for
+//     the title's own Submit: the title may fill the page list only then (hold_pages below).
 // Nothing here goes online or touches the GPU.
 #include <windows.h>
 #include <d3d12.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <map>
 #include <condition_variable>
@@ -34,9 +37,11 @@
 #include "../src/shader_library.h"  // leonida::zlib_inflate
 #include "../src/title_page_watch.h"  // title_gpu_views, title_texel_writes, kernel_writes
 #include "../src/bcpack.h"
+#include "../src/guarded_copy.h"
 #include "../src/shader_directory.h"
 #include "../src/dstorage_swizzle.h"
 #include "../src/dstorage_trace.h"
+#include "../src/dstorage_hold.h"
 #include "dstorage_xs_abi.h"
 #include "dstorage_staging.h"
 #include "startup_trace.h"
@@ -405,10 +410,11 @@ File* live_file(IDStorageFileX* p) {
 // ---- Reads --------------------------------------------------------------------------------------------------------
 
 // memmove that turns an access violation into an error instead of ending the process. No C++ objects here: a
-// function with __try cannot have any that need unwinding.
+// function with __try cannot have any that need unwinding. The bytes move in leonida::guarded::move, not the CRT's
+// memmove: under Wine a fault inside ucrtbase never reaches this __except (src/guarded_copy.h).
 bool guarded_move(void* destination, const void* source, size_t size) {
     __try {
-        std::memmove(destination, source, size);
+        leonida::guarded::move(destination, source, size);
         return true;
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
                                                                   : EXCEPTION_CONTINUE_SEARCH) {
@@ -427,6 +433,14 @@ void touch_pages(void* buffer, size_t size) {
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
     }
+}
+
+// A copy into a request's destination, title memory: through kernel_writes like the file reads into it, so a page the
+// D3D12 layer keeps read-only (a slot-133 shadow's guard, a geometry tile's) is opened and pinned first, and the GPU
+// copies of it take the bytes at the next submission. A copy that faults anyway is retried once after the range is
+// reopened (title_page_watch.h); false only when it still faults.
+bool title_write(void* destination, const void* source, size_t size) {
+    return leonida::kernel_writes::write(destination, source, size);
 }
 
 HRESULT read_error(DWORD error) {
@@ -532,6 +546,47 @@ HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint3
     return S_OK;
 }
 
+// ---- Reads into physical pages wait for the title's Submit -------------------------------------------------------
+//
+// A request into physical pages names them through a pointer into the title's own page-number table, and a title may
+// fill that table for a batch only in its submit path, right before Submit. A queue that submits itself at half its
+// capacity then starts such a read early: it finds page 0 and fails, or finds the number the slot held before and
+// writes the data into a page that now belongs to something else, with no error at all. So a self-submit stops at
+// the first read into physical pages: that read and every entry behind it (the queue completes in order) wait for
+// the title's Submit. A full queue still submits everything, since the title cannot call Submit while it waits in an
+// enqueue, and Close does as before. The idea is from VIctory (Marvisak/VIctory eddde73, carried in
+// fxceless/victory-fork 79cfdd9); the code here is written anew for this queue.
+//
+// LEONIDA_DSTORAGE_HOLD_PAGES=0 restores the old self-submit of everything. A hold has a time limit, so that a
+// title path that never calls Submit and counted on the self-submit cannot stall for good: held entries that have
+// waited LEONIDA_DSTORAGE_HOLD_MS milliseconds (2000 unless set) are submitted, page lists as they are, and counted
+// as a timed release. 0 is no limit: they wait for Submit, however long. Both are read when a queue is created.
+constexpr uint32_t kDefaultHoldMs = 2000;
+
+uint32_t environment_number(const wchar_t* name, uint32_t fallback) {
+    wchar_t value[16]{};
+    const DWORD n = GetEnvironmentVariableW(name, value, 16);
+    if (n == 0 || n >= 16) return fallback;
+    wchar_t* end = nullptr;
+    const unsigned long parsed = std::wcstoul(value, &end, 10);
+    return end && *end == 0 ? static_cast<uint32_t>(parsed) : fallback;
+}
+
+// One line with every counter, at each power of two of the counter that moved: countable in a truncated log
+// without a line per event.
+void log_hold(const char* event, uint64_t n, unsigned capacity, size_t held_now) {
+    if (n & (n - 1)) return;
+    const auto& h = leonida::dstorage::hold_stats();
+    std::lock_guard lock(log_mutex());
+    std::fprintf(stderr, "[rt] ds-hold event=%s self_submits=%llu held_reads=%llu full_releases=%llu "
+                         "timed_releases=%llu page0_entries=%llu capacity=%u held_now=%zu\n", event,
+                 static_cast<unsigned long long>(h.self_submits.load()),
+                 static_cast<unsigned long long>(h.held_reads.load()),
+                 static_cast<unsigned long long>(h.full_releases.load()),
+                 static_cast<unsigned long long>(h.timed_releases.load()),
+                 static_cast<unsigned long long>(h.page0_entries.load()), capacity, held_now);
+}
+
 // ---- Queues -------------------------------------------------------------------------------------------------------
 
 // Only sampled when request tracing is enabled. Times include work done by the file/decode worker.
@@ -566,7 +621,10 @@ struct Entry {
 
 class Queue final : public IDStorageQueueX2 {
 public:
-    explicit Queue(const DSTORAGE_QUEUE_DESC1& desc) : desc_(desc) {
+    explicit Queue(const DSTORAGE_QUEUE_DESC1& desc)
+        : desc_(desc),
+          hold_pages_(environment_number(L"LEONIDA_DSTORAGE_HOLD_PAGES", 1) != 0),
+          hold_release_ms_(environment_number(L"LEONIDA_DSTORAGE_HOLD_MS", kDefaultHoldMs)) {
         error_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         clear_record_locked();
         std::lock_guard lock(stats().mutex);
@@ -771,15 +829,64 @@ private:
     bool auto_submit() const { return !desc_.Options.AutoSubmitDisabled; }
     size_t used_locked() const { return entries_.size() + in_flight_; }
 
+    // A read into physical pages: its page list may not be filled before the title's Submit (hold_pages above).
+    static bool into_pages(const Entry& e) {
+        return e.type == Entry::Type::Request && (e.request.Options.AsUINT64 & options::kDestinationPages) != 0;
+    }
+
+    // The queue has reached half its capacity and holds nothing yet. Submits up to the first read into physical
+    // pages, which waits with everything behind it for the title's Submit.
+    void self_submit_locked() {
+        auto& h = leonida::dstorage::hold_stats();
+        if (!hold_pages_) {
+            log_hold("self-submit", ++h.self_submits, desc_.Capacity, 0);
+            submit_locked();
+            return;
+        }
+        size_t end = submitted_;
+        while (end < entries_.size() && !into_pages(entries_[end])) ++end;
+        if (end < entries_.size()) {
+            uint64_t reads = 0;
+            for (size_t i = end; i < entries_.size(); ++i) reads += into_pages(entries_[i]);
+            h.held_reads += reads;
+            holding_ = true;
+            hold_warned_ = false;
+            held_since_ = std::chrono::steady_clock::now();
+        }
+        const size_t held_now = entries_.size() - end;
+        const bool hold = holding_;  // submit_locked ends a hold when it submits everything
+        submit_locked(end);
+        holding_ = hold;
+        if (holding_) work_.notify_one();  // the worker starts timing the hold
+        log_hold("self-submit", ++h.self_submits, desc_.Capacity, held_now);
+    }
+
     void enqueue(Entry&& e) {
         {
             std::unique_lock lock(mutex_);
-            // A full queue waits for the worker to free a slot. With auto-submit on, half the queue is always
-            // submitted by then; with it off, only a Submit from another thread frees one (as the reference warns).
-            space_.wait(lock, [&] { return closing_ || used_locked() < usable(); });
+            // A full queue waits for the worker to free a slot. With auto-submit on, half the queue was submitted
+            // by then, except what is held for the title's Submit: the title cannot make that call while it waits
+            // here, so a full queue submits the held entries too, page lists as they are. With auto-submit off,
+            // only a Submit from another thread frees a slot (as the reference warns).
+            space_.wait(lock, [&] {
+                if (closing_ || used_locked() < usable()) return true;
+                if (holding_) {
+                    const size_t held_now = entries_.size() - submitted_;
+                    submit_locked();
+                    log_hold("full-queue", ++leonida::dstorage::hold_stats().full_releases, desc_.Capacity, held_now);
+                    log_once("full-hold", "a full queue submitted reads into physical pages before the title's "
+                                          "Submit (their page lists may not be filled yet)");
+                }
+                return false;
+            });
             if (!closing_) {
                 entries_.push_back(std::move(e));
-                if (auto_submit() && entries_.size() - submitted_ >= half()) submit_locked();
+                if (holding_) {
+                    // Behind a held read: it waits with it, whatever it is. No second self-submit until the hold ends.
+                    if (into_pages(entries_.back())) ++leonida::dstorage::hold_stats().held_reads;
+                } else if (auto_submit() && entries_.size() - submitted_ >= half()) {
+                    self_submit_locked();
+                }
                 return;
             }
         }
@@ -791,10 +898,16 @@ private:
         release_references(e);
     }
 
-    void submit_locked() {
+    // Submits the entries before "end". Without one it submits all of them and ends a hold: the title's Submit, a
+    // full queue, Close, a hold that ran out of time.
+    void submit_locked(size_t end = SIZE_MAX) {
+        if (end >= entries_.size()) {
+            end = entries_.size();
+            holding_ = false;
+        }
         uint32_t requests = 0;
         uint64_t source_bytes = 0, destination_bytes = 0;
-        for (size_t i = submitted_; i < entries_.size(); ++i) {
+        for (size_t i = submitted_; i < end; ++i) {
             Entry& e = entries_[i];
             if (e.file) e.file_counted = e.file->add_pending();
             if (e.counted) {
@@ -810,9 +923,46 @@ private:
             p.TotalRequestSourceByteCount += source_bytes;
             p.TotalRequestDestinationByteCount += destination_bytes;
         }
-        if (entries_.size() > submitted_) {
-            submitted_ = entries_.size();
+        if (end > submitted_) {
+            submitted_ = end;
             work_.notify_one();
+        }
+    }
+
+    // How long the worker sleeps before it looks at a hold again: until the time limit runs out, a quarter of a
+    // second at most (and exactly that without a limit, for the five-second line).
+    std::chrono::milliseconds hold_wait_locked() const {
+        long long ms = 250;
+        if (hold_release_ms_) {
+            const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - held_since_).count();
+            ms = std::clamp<long long>(static_cast<long long>(hold_release_ms_) - waited, 1, 250);
+        }
+        return std::chrono::milliseconds(ms);
+    }
+
+    // On the worker while entries are held: a hold with a time limit ends when it runs out (a timed release), and
+    // one without says once that it has lasted five seconds (a title that never calls Submit would show up as this
+    // line and nothing after it).
+    void hold_tick_locked() {
+        if (!holding_) return;
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - held_since_).count();
+        const size_t held_now = entries_.size() - submitted_;
+        if (hold_release_ms_ && waited >= static_cast<long long>(hold_release_ms_)) {
+            submit_locked();
+            log_hold("timed", ++leonida::dstorage::hold_stats().timed_releases, desc_.Capacity, held_now);
+            log_once("timed-hold", "timed release: reads into physical pages held for the title's Submit were "
+                                   "submitted after LEONIDA_DSTORAGE_HOLD_MS without one (their page lists may "
+                                   "not be filled; the ds-hold line counts these)");
+        } else if (waited >= 5000 && !hold_warned_) {
+            hold_warned_ = true;
+            std::lock_guard lock(log_mutex());
+            std::fprintf(stderr, "[rt] dstorage: %zu entries behind a read into physical pages have waited %lld ms "
+                                 "for the title's Submit (queue %p, capacity %u; LEONIDA_DSTORAGE_HOLD_MS=<n> "
+                                 "submits them after n ms, LEONIDA_DSTORAGE_HOLD_PAGES=0 never holds)\n",
+                         held_now, static_cast<long long>(waited), static_cast<void*>(this),
+                         unsigned(desc_.Capacity));
         }
     }
 
@@ -849,7 +999,11 @@ private:
             bool paired = false;
             {
                 std::unique_lock lock(mutex_);
-                work_.wait(lock, [&] { return submitted_ > 0 || closed_; });
+                while (!(submitted_ > 0 || closed_)) {
+                    if (!holding_) work_.wait(lock);
+                    else if (work_.wait_for(lock, hold_wait_locked()) == std::cv_status::timeout)
+                        hold_tick_locked();
+                }
                 if (submitted_ == 0) return;
                 head = std::move(entries_.front());
                 entries_.pop_front();
@@ -1042,7 +1196,7 @@ private:
         void* const destination = cpu_destination(r);
         if (memory) {
             const auto begin = Timing::start();
-            const auto hr = written(r, guarded_move(destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
+            const auto hr = written(r, title_write(destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
             e.timing.copy = Timing::elapsed(begin);
             if (FAILED(hr)) e.reason = "copy";
             return hr;
@@ -1078,6 +1232,10 @@ private:
         std::vector<uint64_t> numbers(1 + (buffer.size() - 1 + offset) / 65536);
         if (!guarded_move(numbers.data(), pages, numbers.size() * sizeof(numbers[0])))
             return E_DSTORAGE_ACCESS_VIOLATION;
+        // Page 0 is never a title page: a destination list that names it was not filled when its request ran, and
+        // the request fails below. Counted, since each one is data the title asked for and did not get.
+        if (write && std::find(numbers.begin(), numbers.end(), uint64_t{0}) != numbers.end())
+            log_hold("page0", ++leonida::dstorage::hold_stats().page0_entries, 0, 0);
         if (rt::xmem::transfer_physical(numbers, offset, buffer, write)) return S_OK;
         return HRESULT_FROM_WIN32(GetLastError());
     }
@@ -1122,13 +1280,42 @@ private:
                 char value[2]{};
                 return GetEnvironmentVariableA("LEONIDA_DSTORAGE_FAST_BCPACK", value, sizeof value) != 1 || value[0] != '0';
             }();
+            // LEONIDA_DSTORAGE_LOST_DIVISOR=N: a fitted BC6H/BC7 request may rebuild up to 1 in N of its blocks from
+            // a predictor the profile lacks (default 32; 1024 is the reference decoder's limit). Past it the request
+            // fails, as before. A few approximate blocks cost a few wrong 4x4 texels; a failed request leaves the
+            // whole destination untouched.
+            static const std::size_t lost_divisor = [] {
+                char value[16]{};
+                const DWORD n = GetEnvironmentVariableA("LEONIDA_DSTORAGE_LOST_DIVISOR", value, sizeof value);
+                if (n == 0 || n >= sizeof value) return std::size_t(32);
+                char* end = nullptr;
+                const unsigned long v = std::strtoul(value, &end, 10);
+                if (end == value || *end || v < 1) {
+                    log_once("lost-divisor", std::string("LEONIDA_DSTORAGE_LOST_DIVISOR=") + value +
+                                                 " is not a positive number: using 32");
+                    return std::size_t(32);
+                }
+                return std::size_t(v);
+            }();
             const char* failure = nullptr;
-            const auto quality = leonida::bcpack::decode(bc, data, scratch, allow_fitted, bc >= 6 ? bcpack_history() : nullptr, &failure, fast_entropy);
+            leonida::bcpack::Report report;
+            const auto quality = leonida::bcpack::decode(bc, data, scratch, allow_fitted, bc >= 6 ? bcpack_history() : nullptr,
+                                                         &failure, fast_entropy, lost_divisor, &report);
             e.timing.bcpack = Timing::elapsed(begin);
             if (quality == leonida::bcpack::Quality::failed) { e.reason = failure; return E_DSTORAGE_DECOMPRESSION_ERROR; }
             if (quality == leonida::bcpack::Quality::fitted) {
                 static const bool reported = (log_once("fitted", "using fitted BCPack predictors"), true);
                 (void)reported;
+                if (report.lost) {
+                    static std::atomic<std::uint64_t> requests{0}, blocks{0};
+                    const auto n = requests.fetch_add(1) + 1;
+                    const auto total = blocks.fetch_add(report.lost) + report.lost;
+                    if (n <= 8 || (n & (n - 1)) == 0)   // the first eight, then at powers of two
+                        std::fprintf(stderr, "[rt] dstorage: BC%u request approximated %zu of %zu blocks from predictors the "
+                                     "profile lacks (%llu requests, %llu blocks so far; LEONIDA_DSTORAGE_LOST_DIVISOR=%zu)\n",
+                                     bc, report.lost, report.blocks, static_cast<unsigned long long>(n),
+                                     static_cast<unsigned long long>(total), lost_divisor);
+                }
                 if (leonida::dstorage::trace_enabled())
                     std::fprintf(stderr, "[rt] ds-fitted bc=%u bytes=%u\n", bc, r.DestinationSize);
             }
@@ -1187,7 +1374,7 @@ private:
                 e.reason = "destination-commit";
                 return E_DSTORAGE_ACCESS_VIOLATION;
             }
-            hr = written(r, guarded_move(dest, data.data(), data.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
+            hr = written(r, title_write(dest, data.data(), data.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
         }
         e.timing.copy = Timing::elapsed(copy_begin);
         if (FAILED(hr)) e.reason = "publish";
@@ -1295,6 +1482,11 @@ private:
     std::condition_variable work_, space_, idle_;
     std::deque<Entry> entries_;
     size_t submitted_ = 0;  // the first submitted_ entries are submitted
+    const bool hold_pages_;           // LEONIDA_DSTORAGE_HOLD_PAGES
+    const uint32_t hold_release_ms_;  // LEONIDA_DSTORAGE_HOLD_MS (kDefaultHoldMs unless set); 0: no time limit
+    bool holding_ = false;            // under mutex_: a self-submit left entries for the title's Submit
+    bool hold_warned_ = false;        // under mutex_: this hold's five-second line was written
+    std::chrono::steady_clock::time_point held_since_{};  // under mutex_
     size_t in_flight_ = 0;
     bool closing_ = false;
     bool closed_ = false;

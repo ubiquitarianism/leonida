@@ -165,19 +165,27 @@ class GamedataBlobsTest(unittest.TestCase):
             (7, 5, len(blob) - 1, 3, 1, 2),
         )
 
-        # Negative spatial-grid checks: cell offset out of bounds, lowest cell offset skipping Region 3 start,
-        # and Region 3 pointer targeting Region 3 itself.
+        # Negative spatial-grid checks: cell offset out of bounds, lowest cell offset skipping Region 3 start
+        # where Region 2 cannot end there, and Region 3 pointer targeting Region 3 itself.
         bad_cell = bytearray(blob)
         struct.pack_into("<I", bad_cell, 4, 0)
         with self.assertRaisesRegex(ValueError, "Region 3 bounds"):
             gamedata_blobs.parse_spatial_grid_blob(bytes(bad_cell))
 
+        # The first Region 3 word is the only pointer to the first Region 2 record, and no cell points at it.
+        # Starting Region 3 one word later would move Region 2's start up into that record, so there is no
+        # consistent split and the blob is still rejected.
         skip_start = bytearray(blob)
         r3_second_off = grid["region3_offset"] + 4
         for cell_idx in range(1, 8):
             word = struct.unpack_from("<I", skip_start, cell_idx * 4)[0]
             if (word & gamedata_blobs.CELL_OFFSET_MASK) == grid["region3_offset"]:
                 struct.pack_into("<I", skip_start, cell_idx * 4, (word & ~gamedata_blobs.CELL_OFFSET_MASK) | r3_second_off)
+        rec0 = grid["region2_offset"]
+        rec2 = struct.unpack_from("<I", skip_start, len(skip_start) - 4)[0]
+        for pos in range(grid["region3_offset"] + 4, len(skip_start), 4):
+            if struct.unpack_from("<I", skip_start, pos)[0] == rec0:
+                struct.pack_into("<I", skip_start, pos, rec2)
         with self.assertRaisesRegex(ValueError, "lowest cell offset"):
             gamedata_blobs.parse_spatial_grid_blob(bytes(skip_start))
 
@@ -185,6 +193,53 @@ class GamedataBlobsTest(unittest.TestCase):
         struct.pack_into("<I", bad_r3, len(bad_r3) - 4, grid["region3_offset"])
         with self.assertRaisesRegex(ValueError, "Region 2 bounds"):
             gamedata_blobs.parse_spatial_grid_blob(bytes(bad_r3))
+
+    def test_spatial_grid_region2_tail_that_looks_like_an_offset(self):
+        """Region 1's lowest cell offset, not the tail scan, decides where Region 3 starts."""
+        sentinel = gamedata_blobs.CELL_SENTINEL
+
+        def finding_blob(last_region2_word):
+            # cynbun's repro: Region 1 at 0x00, Region 2 (two 2-word records) at 0x10, Region 3 at 0x20.
+            region1 = [0x20, sentinel, 0x24, sentinel]
+            region2 = [0xDEADBEEF, 0x12345671, 0xCAFEBABD, last_region2_word]
+            region3 = [0x10, 0x18]
+            return struct.pack(f"<{len(region1) + len(region2) + len(region3)}I", *region1, *region2, *region3)
+
+        expected = {
+            "grid_cells": 4, "empty_cells": 2, "populated_cells": 2, "distinct_cell_offsets": 2,
+            "region2_offset": 0x10, "region2_bytes": 16, "region2_records": 2,
+            "region2_record_words_hist": {"2": 2},
+            "region3_offset": 0x20, "region3_bytes": 8, "region3_words": 2,
+            "region3_spans": 2, "region3_span_words_min": 1, "region3_span_words_max": 1,
+        }
+        # 0x13579BDF is the control (not 4-byte aligned); the others are aligned and below the blob size: a Region 1
+        # offset (0x8), a Region 2 record start (0x10) and the Region 3 start itself (0x20).
+        for word in (0x13579BDF, 0x8, 0x10, 0x20):
+            with self.subTest(last_region2_word=hex(word)):
+                grid = gamedata_blobs.parse_spatial_grid_blob(finding_blob(word))
+                self.assertEqual({key: grid[key] for key in expected}, expected)
+
+        # Several Region 2 tail words in a row that look like offsets: the last record of the fixture builder.
+        blob = bytearray(spatial_grid_blob(cells=8))
+        normal = gamedata_blobs.parse_spatial_grid_blob(bytes(blob))
+        r3 = normal["region3_offset"]
+        for pos, word in zip(range(r3 - 12, r3, 4), (normal["region2_offset"], 0x4, r3)):
+            struct.pack_into("<I", blob, pos, word)
+        grid = gamedata_blobs.parse_spatial_grid_blob(bytes(blob))
+        self.assertEqual(grid, normal)
+
+    def test_spatial_grid_truncated_blob_is_rejected(self):
+        blob = spatial_grid_blob(cells=8)
+        grid = gamedata_blobs.parse_spatial_grid_blob(blob)
+        r3 = grid["region3_offset"]
+        # Cut inside Region 3: a cell offset now points at or past the end.
+        with self.assertRaisesRegex(ValueError, "Region 3 bounds"):
+            gamedata_blobs.parse_spatial_grid_blob(blob[:r3 + 8])
+        # Cut at the end of Region 2: no Region 3 left at all.
+        with self.assertRaisesRegex(ValueError, "missing trailing Region 3"):
+            gamedata_blobs.parse_spatial_grid_blob(blob[:r3])
+        with self.assertRaisesRegex(ValueError, "4-byte aligned"):
+            gamedata_blobs.parse_spatial_grid_blob(blob[:-1])
 
     def test_reads_carve_cross_references_sgd5_and_protects_paths(self):
         # Pad text/XML cleanly so printable() > 0.95 distinguishes text from binary in small fixtures
@@ -249,7 +304,8 @@ class BadCarveIndexTest(unittest.TestCase):
     """A folder that is not an rpf9_carve.py carve is one error line naming the index and the bad row."""
 
     def run_tool(self, target):
-        return subprocess.run([sys.executable, "-I", TOOL, target],
+        # UTF-8 mode: a piped stderr is the ANSI code page on Windows, and the errors below name a path.
+        return subprocess.run([sys.executable, "-I", "-X", "utf8", TOOL, target],
                               cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
     def assert_one_error(self, result, *needles, code=1, prefix="error:"):
@@ -270,7 +326,8 @@ class BadCarveIndexTest(unittest.TestCase):
         return folder
 
     def test_no_index_json_names_the_folder(self):
-        folder = self.make_folder()
+        folder = os.path.join(self.make_folder(), "carve-\u00f8")
+        os.mkdir(folder)
         self.assert_one_error(self.run_tool(folder), folder, "no index.json")
 
     def test_malformed_json_names_the_index(self):

@@ -52,8 +52,8 @@ archetype; entity lights belong to one entity.
 `lightFadeDistance` `+0x28d`, `shadowFadeDistance` `+0x28e`, `lightType` `+0x291` (1 point, 2 spot, 4 capsule, 32 seen but not named),
 `groupId` `+0x292`. Its member table has 100 entries.
 
-Pointers are pool references (1-based block number in bits 0..11, byte offset from bit 20) or `0x5xxxxxxx`
-system pointers. A pool reference whose offset is `0x500`..`0x5ff` also has
+Pointers are pool references (1-based block number in bits 0..19, byte offset from bit 20, as in
+[world.md](world.md#instanced-props-and-grass)) or `0x5xxxxxxx` system pointers. A pool reference whose offset is `0x500`..`0x5ff` also has
 the shape of a `0x5xxxxxxx` pointer, so the reader tries the pool form first and only then a system pointer.
 
 | Measure | Count |

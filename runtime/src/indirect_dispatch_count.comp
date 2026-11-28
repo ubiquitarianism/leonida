@@ -16,16 +16,29 @@ layout(push_constant) uniform Params {
     uint stride_words;
     uint first_record;
     uint records;
+    uint budget;
+    uint has_count;
 } p;
 void main() {
     const uint local_record = gl_GlobalInvocationID.x;
     if (local_record >= p.records) return;
     const uint target = local_record * 3u;
-    if (p.first_record + local_record < p.count.data[0]) {
+    if (p.has_count == 0u || p.first_record + local_record < p.count.data[0]) {
         const uint source = local_record * p.stride_words;
-        p.output_words.data[target] = p.arguments.data[source];
-        p.output_words.data[target + 1u] = p.arguments.data[source + 1u];
-        p.output_words.data[target + 2u] = p.arguments.data[source + 2u];
+        uvec3 groups = uvec3(p.arguments.data[source], p.arguments.data[source + 1u],
+                             p.arguments.data[source + 2u]);
+        if (p.budget != 0u) {
+            if (any(equal(groups, uvec3(0u)))) groups = uvec3(0u);
+            else {
+                groups.x = min(groups.x, p.budget);
+                uint remaining = p.budget / groups.x;
+                groups.y = min(groups.y, remaining);
+                groups.z = min(groups.z, remaining / groups.y);
+            }
+        }
+        p.output_words.data[target] = groups.x;
+        p.output_words.data[target + 1u] = groups.y;
+        p.output_words.data[target + 2u] = groups.z;
     } else {
         p.output_words.data[target] = 0u;
         p.output_words.data[target + 1u] = 0u;

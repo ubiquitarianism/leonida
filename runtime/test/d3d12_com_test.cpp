@@ -4,6 +4,7 @@
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_indirect_draw_policy.h"
 #include "../shims/d3d12_trace.h"
 #include "../src/gfx10_descriptors.h"
 
@@ -37,6 +38,16 @@ static_assert(sizeof(leonida::DrawViews::vertex_buffers) == sizeof(leonida::Vert
 static_assert(sizeof(leonida::Draw) < sizeof(leonida::DrawViews));
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--indirect-policy") == 0) {
+        // Each CTest is a fresh process. This branch creates no graphics device.
+        const bool unset = !std::strcmp(argv[2], "unset"), off = !std::strcmp(argv[2], "off");
+        if (unset) SetEnvironmentVariableA("LEONIDA_INDIRECT_DRAWS", nullptr);
+        else EXPECT(SetEnvironmentVariableA("LEONIDA_INDIRECT_DRAWS", !std::strcmp(argv[2], "uppercase") ? "OFF" : argv[2]));
+        EXPECT(rt::d3d12::indirect_draws_disabled() == off);
+        EXPECT(SetEnvironmentVariableA("LEONIDA_INDIRECT_DRAWS", off ? "on" : "off"));
+        EXPECT(rt::d3d12::indirect_draws_disabled() == off);  // process-cached, not re-read per draw
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--trace-d3d12") == 0) rt::d3d12_trace::set_enabled(true);
     else if (argc != 1) return 2;
     using namespace leonida;

@@ -19,7 +19,21 @@ namespace leonida {
 inline constexpr std::uint32_t kFnvOffsetBasis = 2166136261u;
 inline constexpr std::uint32_t kFnvPrime = 16777619u;
 inline constexpr std::uint32_t kDescriptorProbes = 8;
-inline constexpr std::uint32_t kSlotOccupiedMarker = 0xA11CA7EDu;
+// An entry's last dword is 0 while the slot is empty. This bit marks it occupied, and the low bits (kKindMask) say
+// what the index is good for: one bit per array the image is bound in, sampled and storage.
+inline constexpr std::uint32_t kSlotOccupiedMarker = 0x80000000u;
+inline constexpr std::uint32_t kKindMask = 0x1FFFu;   // bits 0..6 sampled, 8..12 storage
+
+// What an index is bound in, for the library whose modules read it (`descriptor_table` tagged in their index.json
+// meta; tools/rdna2spirv.py reads the same bits with OpBitFieldUExtract). Bit `dimension` is that dimension's
+// sampled array (dimensions 0..6, ImageDimension in vulkan_bindless.h); bit 8 + dimension its storage arrays
+// (dimensions 0..4 have them). A table for a plain library leaves every kind bit zero.
+inline constexpr std::uint32_t kind_sampled_bit(std::uint32_t dimension) {
+    return dimension < 7 ? (1u << dimension) : 0u;
+}
+inline constexpr std::uint32_t kind_storage_bit(std::uint32_t dimension) {
+    return dimension < 5 ? (1u << (8 + dimension)) : 0u;
+}
 
 // Key types:
 // T# key is 8 dwords.
@@ -93,13 +107,19 @@ inline DescriptorKey make_ssharp_key(const std::uint32_t ssharp[4]) {
     return k;
 }
 
-// Memory layout of each entry in the table: 10 uint32s = 40 bytes.
+// Memory layout of each entry in the table: 10 uint32s = 40 bytes. The last word is the kind a translated shader
+// reads next to the index, and its occupied bit; a module that does not read it never looks at it.
 struct DescriptorEntry {
     std::uint32_t key[8] = {};
     std::uint32_t index = 0;
-    std::uint32_t pad = 0; // 0 when empty, kSlotOccupiedMarker when occupied
+    std::uint32_t kind = 0; // 0 when empty, kSlotOccupiedMarker | (kKindMask bits) when occupied
 };
 static_assert(sizeof(DescriptorEntry) == 40);
+
+inline constexpr bool slot_occupied(const DescriptorEntry& entry) {
+    return (entry.kind & kSlotOccupiedMarker) != 0;
+}
+inline constexpr std::uint32_t slot_kind(const DescriptorEntry& entry) { return entry.kind & kKindMask; }
 
 class DescriptorTable {
 public:
@@ -122,22 +142,23 @@ public:
     // The kind this table places and finds keys with (immutable after construction).
     DescriptorHashKind hash_kind() const { return hash_kind_; }
 
-    // Inserts or updates a key -> index mapping.
-    // If the key already exists in one of the 8 probe slots, its index is updated.
-    // Try one bounded relocation before growing. Load never exceeds 50%.
-    bool insert(const std::uint32_t key[8], std::uint32_t index) {
-        insert_or_update(key, index);
+    // Inserts or updates a key -> (index, kind) mapping. If the key already exists in one of the 8 probe slots,
+    // its entry is updated. Try one bounded relocation before growing. Load never exceeds 50%. `kind` is what a
+    // shader that reads it (a `descriptor_table` tagged module) uses to tell which array the index is bound in; a
+    // sampler's entry has none.
+    bool insert(const std::uint32_t key[8], std::uint32_t index, std::uint32_t kind = 0) {
+        insert_or_update(key, index, kind);
         return true;
     }
 
     // Report the change under the same lock so the GPU caller can synchronize writes to live slots.
-    InsertResult insert_or_update(const std::uint32_t key[8], std::uint32_t index) {
+    InsertResult insert_or_update(const std::uint32_t key[8], std::uint32_t index, std::uint32_t kind = 0) {
         std::lock_guard lock(mutex_);
-        return insert_locked(key, index);
+        return insert_locked(key, index, kind);
     }
 
-    bool insert(const DescriptorKey& key, std::uint32_t index) {
-        return insert(key.data(), index);
+    bool insert(const DescriptorKey& key, std::uint32_t index, std::uint32_t kind = 0) {
+        return insert(key.data(), index, kind);
     }
 
     // Queries the index associated with key. Returns 0 if not found.
@@ -147,7 +168,7 @@ public:
         for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
             const std::uint32_t slot = (h + k) & mask_;
             const auto& entry = entries_[slot];
-            if (entry.pad == kSlotOccupiedMarker && std::memcmp(entry.key, key, sizeof(entry.key)) == 0) {
+            if (slot_occupied(entry) && std::memcmp(entry.key, key, sizeof(entry.key)) == 0) {
                 return entry.index;
             }
         }
@@ -164,7 +185,7 @@ public:
         for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
             const std::uint32_t slot = (h + k) & mask_;
             const auto& entry = entries_[slot];
-            if (entry.pad == kSlotOccupiedMarker && std::memcmp(entry.key, key, sizeof(entry.key)) == 0) {
+            if (slot_occupied(entry) && std::memcmp(entry.key, key, sizeof(entry.key)) == 0) {
                 return true;
             }
         }
@@ -222,8 +243,8 @@ public:
     }
 
     // Exports the table buffer format consumed by SPIR-V set 0, binding 2.
-    // Word 0 is mask; followed by entries[mask + 1] of 10 dwords: key[8], index, pad.
-    std::vector<std::uint32_t> build_gpu_buffer(bool clear_pad = false) const {
+    // Word 0 is mask; followed by entries[mask + 1] of 10 dwords: key[8], index, kind.
+    std::vector<std::uint32_t> build_gpu_buffer(bool clear_occupied = false) const {
         std::lock_guard lock(mutex_);
         std::vector<std::uint32_t> out(1 + entries_.size() * 10, 0);
         out[0] = mask_;
@@ -231,7 +252,7 @@ public:
             const std::size_t base = 1 + s * 10;
             std::memcpy(&out[base], entries_[s].key, sizeof(entries_[s].key));
             out[base + 8] = entries_[s].index;
-            out[base + 9] = clear_pad ? 0 : entries_[s].pad;
+            out[base + 9] = clear_occupied ? slot_kind(entries_[s]) : entries_[s].kind;
         }
         return out;
     }
@@ -252,7 +273,7 @@ public:
         return changes;
     }
 
-    // One slot's 10 dwords (key[8], index, pad) to `dest`; false when the slot is out of range.
+    // One slot's 10 dwords (key[8], index, kind) to `dest`; false when the slot is out of range.
     bool read_slot(std::uint32_t slot, std::uint32_t* dest) const { return read_slots(slot, 1, dest); }
 
     // `count` consecutive slots' 10 dwords each to `dest`, under one lock; false when any is out of range.
@@ -264,13 +285,13 @@ public:
             const DescriptorEntry& entry = entries_[first + i];
             std::memcpy(dest + i * 10, entry.key, sizeof(entry.key));
             dest[i * 10 + 8] = entry.index;
-            dest[i * 10 + 9] = entry.pad;
+            dest[i * 10 + 9] = entry.kind;
         }
         return true;
     }
 
     // Serializes directly into `dest` (must hold at least size_bytes()) without allocating a temporary vector.
-    void write_to_buffer(void* dest, bool clear_pad = false) const {
+    void write_to_buffer(void* dest, bool clear_occupied = false) const {
         if (!dest) return;
         std::lock_guard lock(mutex_);
         auto* out = static_cast<std::uint8_t*>(dest);
@@ -280,7 +301,7 @@ public:
             std::uint32_t slot[10];
             std::memcpy(slot, entry.key, sizeof(entry.key));
             slot[8] = entry.index;
-            slot[9] = clear_pad ? 0 : entry.pad;
+            slot[9] = clear_occupied ? slot_kind(entry) : entry.kind;
             std::memcpy(out, slot, sizeof(slot));
             out += sizeof(slot);
         }
@@ -298,7 +319,7 @@ private:
         const auto mask = static_cast<std::uint32_t>(entries.size() - 1);
         for (auto offset = kDescriptorProbes; offset < 2 * kDescriptorProbes - 1; ++offset) {
             const auto hole = (hash + offset) & mask;
-            if (entries[hole].pad == kSlotOccupiedMarker) continue;
+            if (slot_occupied(entries[hole])) continue;
             for (auto k = kDescriptorProbes; k > 0; --k) {
                 const auto slot = (hash + k - 1) & mask;
                 const auto home = hash_descriptor_key(entries[slot].key, kind);
@@ -313,7 +334,7 @@ private:
         return -1;
     }
 
-    InsertResult insert_locked(const std::uint32_t key[8], std::uint32_t index) {
+    InsertResult insert_locked(const std::uint32_t key[8], std::uint32_t index, std::uint32_t kind) {
         while (true) {
             const std::uint32_t h = hash_descriptor_key(key, hash_kind_);
             int empty_slot = -1;
@@ -321,10 +342,12 @@ private:
             for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
                 const std::uint32_t slot = (h + k) & mask_;
                 auto& entry = entries_[slot];
-                if (entry.pad == kSlotOccupiedMarker) {
+                if (slot_occupied(entry)) {
                     if (std::memcmp(entry.key, key, sizeof(entry.key)) == 0) {
-                        if (entry.index == index) return InsertResult::unchanged;
+                        if (entry.index == index && slot_kind(entry) == kind) return InsertResult::unchanged;
+                        // A new index or a new kind: either way the slot's copy of the entry must reach the GPU.
                         entry.index = index;
+                        entry.kind = kSlotOccupiedMarker | (kind & kKindMask);
                         mark(slot);
                         return InsertResult::replaced;
                     }
@@ -356,7 +379,7 @@ private:
                 auto& entry = entries_[empty_slot];
                 std::memcpy(entry.key, key, sizeof(entry.key));
                 entry.index = index;
-                entry.pad = kSlotOccupiedMarker;
+                entry.kind = kSlotOccupiedMarker | (kind & kKindMask);
                 ++occupied_count_;
                 if (relocate) mark(moved_to);
                 mark(std::uint32_t(empty_slot));
@@ -374,7 +397,7 @@ private:
         for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
             const std::uint32_t slot = (h + k) & mask_;
             const auto& entry = entries_[slot];
-            if (entry.pad == kSlotOccupiedMarker && std::memcmp(entry.key, key, sizeof(entry.key)) == 0) {
+            if (slot_occupied(entry) && std::memcmp(entry.key, key, sizeof(entry.key)) == 0) {
                 found_slot = slot;
                 found = true;
                 break;
@@ -398,12 +421,12 @@ private:
             bool rehash_ok = true;
 
             for (const auto& old : entries_) {
-                if (old.pad != kSlotOccupiedMarker) continue;
+                if (!slot_occupied(old)) continue;
                 const std::uint32_t h = hash_descriptor_key(old.key, hash_kind_);
                 int slot = -1;
                 for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
                     const std::uint32_t s = (h + k) & new_mask;
-                    if (new_entries[s].pad != kSlotOccupiedMarker) {
+                    if (!slot_occupied(new_entries[s])) {
                         slot = static_cast<int>(s);
                         break;
                     }

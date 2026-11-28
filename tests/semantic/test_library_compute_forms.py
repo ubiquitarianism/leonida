@@ -43,7 +43,7 @@ class LibraryComputeForms(unittest.TestCase):
 
     def test_recovered_vcc_tuple(self):
         code = raw_words(fixture("vcc_tuple_word"))
-        self.assertEqual(rdna2spirv.restore_skipped_instructions([], code, 0, len(code))[0]["args"][0]["r"],
+        self.assertEqual(rdna2spirv.restore_vcc_tuples([], code, 0, len(code))[0]["args"][0]["r"],
                          [104, 105, "vcc_lo", "vcc_hi"])
 
     def run_wave32(self, name, memory):
@@ -94,10 +94,21 @@ class LibraryComputeForms(unittest.TestCase):
                 self.assertEqual((row["op"], row["args"][0]["t"], row["args"][1]["r"], row["args"][2]["r"]),
                                  ("v_cmp_gt_f32_dpp", "vcc_lo" if wave32 else "vcc", 7, 12))
                 self.assertIn(control, row["mods"])
-            junk = {"pc": 4, "enc": blob[4:].hex()}
-            recovered, = rdna2spirv.restore_skipped_instructions([junk], blob, 0, len(blob))
+            # a listing entry as llvm-mc prints the second word: restore_vcc_tuples reads its op, as it does a real one
+            junk = {"pc": 4, "enc": blob[4:].hex(), "op": "s_nop", "args": [{"k": "imm", "v": 0}], "mods": []}
+            recovered, = rdna2spirv.restore_vcc_tuples([junk], blob, 0, len(blob), wave32=wave32)
             self.assertEqual((recovered["pc"], recovered["enc"]), (0, blob.hex()))
             self.assertFalse(rdna2_decode.decode_bytes(blob[:4])["insns"])
+
+    def test_vopcx_dpp_recovery(self):
+        # SHADER-VOPCX-DPP: the same pass recovers v_cmpx in DPP form (opcode 0x14, v_cmpx_gt_f32), which prints no
+        # destination: the game's form, quad_perm:[2,3,0,1] bound_ctrl:1 fi:1 with src1 negated (fa 02 28 7c 01 4e 4c ff).
+        blob = bytes.fromhex("fa02287c014e4cff")
+        row, = rdna2_decode.decode_bytes(blob, wave32=True)["insns"]
+        self.assertEqual((row["op"], len(row["args"]), row["args"][0]["r"]), ("v_cmpx_gt_f32_dpp", 2, 1))
+        junk = {"pc": 4, "enc": blob[4:].hex(), "op": "s_nop", "args": [{"k": "imm", "v": 0}], "mods": []}
+        recovered, = rdna2spirv.restore_vcc_tuples([junk], blob, 0, len(blob), wave32=True)
+        self.assertEqual((recovered["pc"], recovered["enc"], recovered["op"]), (0, blob.hex(), "v_cmpx_gt_f32_dpp"))
 
     def test_vopc_dpp_reads_the_selected_lane(self):
         spv, _ = translate_fspx(fixture("vopc_dpp_compare")[:-1], wave32=False)

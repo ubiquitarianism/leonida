@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BOOT_TRACE = "tools/boot_trace.py"
 GUEST_SCENE = "scripts/run_guest_scene.py"
+SMOKE = "scripts/smoke.py"
 TOOLS = (
     (
         "boot-trace",
@@ -27,6 +28,14 @@ TOOLS = (
             "gta6rt and tiny_guest_draw built with LEONIDA_GUEST_SCENE (static SDL3)",
             "Vulkan and the synthetic M1.5 shader fixture with a spirv/ directory",
             "Wine when running the Windows loader outside Windows",
+        ),
+    ),
+    (
+        "smoke",
+        SMOKE,
+        (
+            "Python 3.10+",
+            "Synthetic source-only smoke suite (compilation, clean-room, CLI help, fast tests)",
         ),
     ),
 )
@@ -81,19 +90,21 @@ def guest_scene(args: list[str]) -> int:
     parser.add_argument("-h", "--help", action="store_true")
     parser.add_argument("--out", metavar="PATH")
     options, _ = parser.parse_known_args(args)
-    if not options.help and not options.out:
+    if not options.help and not (options.out and options.out.strip()):
         parser.error("--out PATH is required to keep the scene results")
 
     return run_producer(GUEST_SCENE, args)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     # The producer owns its arguments and help. Forward before argparse handles them.
-    argv = sys.argv[1:]
+    argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["boot-trace"]:
         return run_producer(BOOT_TRACE, argv[1:])
     if argv[:1] == ["guest-scene"]:
         return guest_scene(argv[1:])
+    if argv[:1] == ["smoke"]:
+        return run_producer(SMOKE, argv[1:])
 
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -101,13 +112,17 @@ def main() -> int:
     inventory.add_argument("--json", action="store_true", help="write a JSON inventory to stdout")
     commands.add_parser("boot-trace", help="summarize startup and D3D12 boot traces")
     commands.add_parser("guest-scene", help="run the synthetic guest scene with a required --out")
+    commands.add_parser("smoke", help="run the synthetic source-only smoke suite (DX-07)")
     args = parser.parse_args(argv)
 
     result = discover()
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        sys.stdout.reconfigure(encoding="utf-8")
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
         print("Paths and help commands are relative to the Leonida checkout root.")
         for tool in result["tools"]:
             status = "present" if tool["present"] else "missing"

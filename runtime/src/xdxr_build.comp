@@ -76,7 +76,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint
 const uint MODE_INIT = 0u, MODE_TRIANGLES = 1u, MODE_INSTANCES = 2u, MODE_MORTON = 3u, MODE_KARRAS = 4u,
            MODE_NODES = 5u, MODE_HEADER = 6u, MODE_RADIX_COUNT = 7u, MODE_RADIX_SCAN = 8u, MODE_RADIX_SCATTER = 9u,
            MODE_SMALL_SORT = 10u, MODE_COPY_AS = 12u, MODE_POSTBUILD = 13u, MODE_KEPT = 14u,
-           MODE_KEPT_SCAN = 15u, MODE_KEPT_INDEX = 16u, MODE_PROPAGATE = 17u, MODE_CLEAR = 18u;
+           MODE_KEPT_SCAN = 15u, MODE_KEPT_INDEX = 16u, MODE_PROPAGATE = 17u, MODE_CLEAR = 18u, MODE_CHECK = 19u;
 const uint SMALL_SORT_MAX = 1024u;          // xdxr_build.h XdxrLayout::small_sort_max
 const uint RADIX_BITS = 4u, RADIX_BINS = 16u, RADIX_PASSES = 8u;
 const uint RADIX_TILE = 256u;              // elements per workgroup in count and scatter: 4 chunks of 64
@@ -84,7 +84,10 @@ const uint INVALID = 0xffffffffu;
 const uint TRI0 = 0u, TRI1 = 1u, BOX16 = 4u, BOX32 = 5u, INSTANCE = 6u;
 const uint LEAF = 0x80000000u;              // a binary child that is a sorted element, not an inner node
 const uint REMAP_IDENTITY = 0x09u;
-const uint FLAG_TLAS = 1u, FLAG_BOX16 = 2u, FLAG_PAIR = 4u;  // pc.flags; xdxr_build.h XdxrBuilder flag_*
+const uint FLAG_TLAS = 1u, FLAG_BOX16 = 2u, FLAG_PAIR = 4u, FLAG_TRANSLATE = 8u;  // pc.flags; xdxr_build.h flag_*
+// An update records both tails: FLAG_IF_REFIT steps run only when MODE_CHECK found the source a structure of this
+// layout (scratch word SCRATCH_REFIT = 1), FLAG_IF_BUILD steps (a full build) only when it did not.
+const uint FLAG_IF_REFIT = 16u, FLAG_IF_BUILD = 32u;
 const uint FLAG_BOTTOM_LEVEL = 0x80000000u, VERSION_2403 = 6u, INST_IDENTITY_ROTATION = 0x80000000u,
            INST_FLAGS_MASK = 0xc0000000u;
 
@@ -92,14 +95,14 @@ layout(push_constant) uniform Push {
     uvec2 dst;            // the acceleration structure (header at byte 0)
     uvec2 scratch;        // xdxr_build.h XdxrLayout scratch words
     uvec2 src0;           // triangles: vertices; instances: the instance descs
-    uvec2 src1;           // triangles: indices (0 = none)
-    uvec2 src2;           // triangles: 3x4 transform (0 = none)
+    uvec2 src1;           // triangles: indices (0 = none); instances with FLAG_TRANSLATE: the BLAS address table
+    uvec2 src2;           // triangles: 3x4 transform (0 = none); instances with FLAG_TRANSLATE: the arena bound
     uvec2 bias;           // added to addresses read from memory
     uint mode;
     uint count;           // threads of this dispatch
     uint first;           // triangles: first element; radix: the pass (0..7)
     uint arg0;            // triangles: vertex stride; otherwise the most nodes the layout has room for
-    uint arg1;            // triangles: 0 = R32G32B32_FLOAT, 1 = R32G32_FLOAT
+    uint arg1;            // triangles: 0 = R32G32B32_FLOAT, 1 = R32G32_FLOAT; instances: table entries
     uint arg2;            // triangles: index type (0 none, 1 u16, 2 u32); header: 1 = an update (bounds only)
     uint geometry;        // triangles: geometry index << 8 | D3D12_RAYTRACING_GEOMETRY_FLAGS
     uint elements;        // element count N
@@ -109,7 +112,9 @@ layout(push_constant) uniform Push {
     uint parents_off;
     uint total_size;
     uint flags;           // FLAG_TLAS: elements are 128-byte instances; FLAG_BOX16: inner nodes are 64-byte BOX16;
-                          //   FLAG_PAIR: pair sibling triangles that share an edge into TRI0/TRI1 leaves
+                          //   FLAG_PAIR: pair sibling triangles that share an edge into TRI0/TRI1 leaves;
+                          //   FLAG_TRANSLATE (instances): BLAS addresses go through blas_address
+    uint vertex_count;    // triangles: the desc's VertexCount; a vertex index at or past it reads nothing
 } pc;
 
 // ---- 64-bit addresses as uvec2 ----
@@ -128,12 +133,19 @@ uint load(uvec2 base, uint byte_offset) { return at(base, byte_offset).w[0]; }
 void store(uvec2 base, uint byte_offset, uint v) { at(base, byte_offset).w[0] = v; }
 void storef(uvec2 base, uint byte_offset, float v) { store(base, byte_offset, floatBitsToUint(v)); }
 bool is_null(uvec2 a) { return a.x == 0u && a.y == 0u; }
+bool less64(uvec2 a, uvec2 b) { return a.y < b.y || (a.y == b.y && a.x < b.x); }
+uvec2 sub64(uvec2 a, uvec2 b) {
+    uint borrow;
+    uint lo = usubBorrow(a.x, b.x, borrow);
+    return uvec2(lo, a.y - b.y - borrow);
+}
 
 // ---- scratch: centroid bounds (6 ordered words at 0) and the node count (word 6), keys and element indices twice
 // (the radix sort's two sides; the sorted result is back in the first after an even number of passes), digit
 // counts, their exclusive prefix sums, element boxes, a box accumulator per node, the binary tree ----
 const uint SCRATCH_KEYS = 64u;
 const uint SCRATCH_NODE_COUNT = 24u;
+const uint SCRATCH_REFIT = 28u;            // MODE_CHECK's verdict for an update
 uint radix_tiles() { return (pc.sort_size + RADIX_TILE - 1u) / RADIX_TILE; }
 uint keys_off() { return SCRATCH_KEYS; }
 uint vals_off() { return SCRATCH_KEYS + 4u * pc.sort_size; }
@@ -194,6 +206,21 @@ uint element_ptr(uint e) { return ((pc.elements_off + e * element_size()) >> 6) 
 uint node_ptr(uint n) { return ((pc.nodes_off + n * node_size()) >> 6) << 3 | (is_box16() ? BOX16 : BOX32); }
 uint ptr_unit(uint p) { return p >> 3; }
 bool ptr_is_node(uint p) { return (p & 7u) == BOX16 || (p & 7u) == BOX32; }
+// A pointer read from the structure (an update's source is the title's, possibly garbage) that names one of this
+// layout's nodes: the layout's node type, on a node boundary, below the node count. Nothing else is followed.
+bool layout_node(uint p) {
+    if ((p & 7u) != (is_box16() ? BOX16 : BOX32)) return false;
+    uint o = ptr_unit(p) * 64u;
+    if (ptr_unit(p) >= (1u << 26) || o < pc.nodes_off) return false;
+    uint rel = o - pc.nodes_off;
+    return rel % node_size() == 0u && rel / node_size() < pc.arg0;
+}
+// The parent-table slot of a record pointer, or INVALID when its unit is outside the body the table covers.
+uint parent_slot(uint p) {
+    uint first = pc.elements_off / 64u, unit = ptr_unit(p);
+    if (unit < first || unit >= pc.total_size / 64u) return INVALID;
+    return pc.parents_off + 4u * (unit - first);
+}
 
 // ---- BOX16 bounds: six IEEE halves in three words (min.x | min.y << 16, min.z | max.x << 16, max.y | max.z << 16;
 // docs/bvh.md 3.1, XdxrDecompressBox16) ----
@@ -225,7 +252,10 @@ void store_box16(uint o, vec3 lo, vec3 hi) {
 }
 
 // ---- MODE_TRIANGLES ----
+// An index at or past VertexCount (garbage in the index buffer, or VertexCount 0) would read past the vertex buffer,
+// possibly gigabytes past it: the vertex is NaN instead, which makes its triangle inactive (build_triangle).
 vec3 vertex(uint v) {
+    if (v >= pc.vertex_count) return vec3(uintBitsToFloat(0x7fc00000u));
     uvec2 a = add(pc.src0, v * pc.arg0);
     float x = uintBitsToFloat(load(a, 0u)), y = uintBitsToFloat(load(a, 4u));
     float z = pc.arg1 == 1u ? 0.0 : uintBitsToFloat(load(a, 8u));
@@ -273,6 +303,38 @@ void build_triangle(uint t) {
 }
 
 // ---- MODE_INSTANCES ----
+// The VA shaders reach the BLAS at the application's VA `va` by (xdxr_build.h XdxrBlasTable). Without
+// FLAG_TRANSLATE, `va` itself. With it: inside a range of the table at src1 (arg1 entries of 6 words {title VA, end,
+// shader VA}, in title-VA order), that range's shader VA, when its 64-byte header lies in the range; outside every
+// range, `va` when the header lies below the arena bound src2 (0: no bound). Anything else, and a VA the INSTANCE
+// record cannot hold (40 bits in 256-byte units), is not reachable (false): nothing is read through it.
+bool blas_address(uvec2 va, out uvec2 shader_va) {
+    shader_va = va;
+    if ((pc.flags & FLAG_TRANSLATE) == 0u) return true;
+    uint lo = 0u, hi = pc.arg1;                    // the first entry that starts past va
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1u;
+        uvec2 start = uvec2(load(pc.src1, 24u * mid), load(pc.src1, 24u * mid + 4u));
+        if (less64(va, start)) hi = mid; else lo = mid + 1u;
+    }
+    uvec2 last = add(va, 64u);
+    if (less64(last, va)) return false;            // wraps
+    bool found = false;
+    if (lo > 0u) {
+        uint e = 24u * (lo - 1u);
+        uvec2 end = uvec2(load(pc.src1, e + 8u), load(pc.src1, e + 12u));
+        if (less64(va, end)) {
+            if (less64(end, last)) return false;   // the header runs past the copy
+            uvec2 start = uvec2(load(pc.src1, e), load(pc.src1, e + 4u));
+            uvec2 to = uvec2(load(pc.src1, e + 16u), load(pc.src1, e + 20u));
+            shader_va = add64(to, sub64(va, start));
+            found = true;
+        }
+    }
+    if (!found && !is_null(pc.src2) && less64(pc.src2, last)) return false;
+    return (shader_va.x & 255u) == 0u && shader_va.y < 256u;
+}
+
 void build_instance(uint i) {
     uint d = 64u * i;
     float m[12];
@@ -285,8 +347,10 @@ void build_instance(uint i) {
     store(pc.dst, o + 52u, contrib);
     vec3 lo = vec3(uintBitsToFloat(0x7f800000u)), hi = -lo;
     uint root = INVALID;
-    if (!is_null(blas_va)) {
-        uvec2 blas = add64(blas_va, pc.bias);
+    uvec2 blas_sva = blas_va;
+    bool reached = !is_null(blas_va) && blas_address(blas_va, blas_sva);
+    if (reached) {
+        uvec2 blas = add64(blas_sva, pc.bias);
         root = load(blas, 48u);
         vec3 blo = vec3(uintBitsToFloat(load(blas, 16u)), uintBitsToFloat(load(blas, 20u)), uintBitsToFloat(load(blas, 24u)));
         vec3 bhi = vec3(uintBitsToFloat(load(blas, 28u)), uintBitsToFloat(load(blas, 32u)), uintBitsToFloat(load(blas, 36u)));
@@ -303,8 +367,10 @@ void build_instance(uint i) {
     bool identity = m[0] == 1.0 && m[1] == 0.0 && m[2] == 0.0 && m[4] == 0.0 && m[5] == 1.0 && m[6] == 0.0 &&
                     m[8] == 0.0 && m[9] == 0.0 && m[10] == 1.0;
     store(pc.dst, o + 56u, (root & ~INST_FLAGS_MASK) | (identity ? INST_IDENTITY_ROTATION : 0u));
-    // The record holds the BLAS address in 256-byte units: the application's address, as the game wrote it.
-    store(pc.dst, o + 60u, (blas_va.x >> 8) | (blas_va.y << 24));
+    // The record holds the BLAS address in 256-byte units: the application's address, as the game wrote it, or with
+    // FLAG_TRANSLATE the one shaders reach it by (0 when there is none: a null BLAS).
+    if (!reached) blas_sva = uvec2(0u);
+    store(pc.dst, o + 60u, (blas_sva.x >> 8) | (blas_sva.y << 24));
     // world-to-object: the inverse of the affine transform
     mat3 a = mat3(m[0], m[4], m[8], m[1], m[5], m[9], m[2], m[6], m[10]);   // columns
     float det = determinant(a);
@@ -689,7 +755,13 @@ void build_node(uint i) {
 }
 
 // ---- MODE_PROPAGATE ----
-uint parent_of(uint p) { return load(pc.dst, pc.parents_off + 4u * (ptr_unit(p) - pc.elements_off / 64u)); }
+// INVALID (the walk ends) for anything but one of the layout's nodes: an update reads the source's parent table.
+uint parent_of(uint p) {
+    uint slot = parent_slot(p);
+    if (slot == INVALID) return INVALID;
+    uint parent = load(pc.dst, slot);
+    return layout_node(parent) ? parent : INVALID;
+}
 bool ptr_box16(uint p) { return (p & 7u) == BOX16; }
 uint node_index(uint p) { return (ptr_unit(p) * 64u - pc.nodes_off) / (ptr_box16(p) ? 64u : 128u); }
 void accum_box(uint node, out vec3 lo, out vec3 hi) {
@@ -759,8 +831,26 @@ void build_header() {
     store(pc.dst, 60u, 0u);                              // compressionParams: uncompressed
 }
 
+// ---- MODE_CHECK: is the structure an update refits (already copied to dst) one this layout's build wrote? The
+// header words build_header writes that the layout fixes, and a size within the layout. A title may pass a source it
+// never built (D3D12 leaves that undefined); then the update is a full build instead and reads nothing of it. ----
+bool refit_source_ok() {
+    uint size = (load(pc.dst, 4u) + 1u) * 64u;
+    return load(pc.dst, 0u) == ((is_tlas() ? 0u : FLAG_BOTTOM_LEVEL) | VERSION_2403) &&
+           load(pc.dst, 12u) == pc.elements && load(pc.dst, 40u) == pc.nodes_off && load(pc.dst, 48u) == node_ptr(0u) &&
+           load(pc.dst, 52u) == pc.elements_off && load(pc.dst, 56u) == pc.parents_off && load(pc.dst, 4u) < (1u << 26) &&
+           size > pc.nodes_off && size <= pc.total_size;
+}
+
 void main() {
     uint i = gl_GlobalInvocationID.x;
+    // uniform across the dispatch, so a workgroup that uses barriers leaves as a whole
+    if ((pc.flags & (FLAG_IF_REFIT | FLAG_IF_BUILD)) != 0u &&
+        (load(pc.scratch, SCRATCH_REFIT) == 1u) != ((pc.flags & FLAG_IF_REFIT) != 0u)) return;
+    if (pc.mode == MODE_CHECK) {
+        if (i == 0u) store(pc.scratch, SCRATCH_REFIT, refit_source_ok() ? 1u : 0u);
+        return;
+    }
     // the radix and kept modes use shared memory and barriers: every invocation of a workgroup takes part
     if (pc.mode == MODE_RADIX_COUNT) { radix_count(gl_WorkGroupID.x, gl_LocalInvocationID.x); return; }
     if (pc.mode == MODE_RADIX_SCAN) {

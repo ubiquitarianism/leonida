@@ -15,7 +15,9 @@ op_sel. The plain instruction has op_sel 0 and op_sel_hi 7. 89 words in 8 of tho
 op_sel 2 and op_sel_hi 5, which llvm-mc does not decode (docs/fspx.md). Run on the same hardware as two raw words
 (0xCC165008 0x0C0E0501: v8 = v1 . v2 + v3 with those fields), that form gave the words of MEASURED_OP_SEL: the dot
 product with the two 16-bit halves of the second source exchanged, as op_sel selects halves for the packed 16-bit
-ops. `ref_op_sel` reproduces them. The translator recovers this form from its binary when LLVM omits it.
+ops. `ref_op_sel` reproduces them. A listing carries the form since tools/shader_disasm.py prints it
+(tests/semantic/test_fspx_dot4_op_sel_disasm.py), and the translator also recovers it from the binary when a
+listing lacks it (rdna2spirv.skipped_form).
 
 neg_lo and neg_hi. llvm-mc accepts them on v_dot4_i32_i8 for gfx1036 (not on v_dot4c_i32_i8), and the hardware does
 not ignore them: on the same GPU, 5 operand sets with 8 forms each gave the words of `ref_neg`, 9 of which are in

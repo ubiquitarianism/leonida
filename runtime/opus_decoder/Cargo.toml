@@ -1,0 +1,16 @@
+[package]
+name = "leonida-opus-decoder"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "leonida_opus_decoder"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+opus-pure = "0.2.4"
+
+[profile.release]
+panic = "unwind"

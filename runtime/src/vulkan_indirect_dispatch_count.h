@@ -8,13 +8,32 @@
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <charconv>
+#include <string_view>
 #include <limits>
 #include <memory>
 #include <vector>
 #include "indirect_dispatch_count_spv.h"
+#include "vulkan_aftermath.h"
 #include "vulkan_memory.h"
 
 namespace leonida {
+
+// Vulkan guarantees at least 65535 groups along each axis. A total budget
+// at or below it bounds both the workload and every dimension.
+inline std::uint32_t indirect_group_budget() {
+    static const auto budget = []() -> std::uint32_t {
+        const char* value = std::getenv("LEONIDA_INDIRECT_GROUP_BUDGET");
+        if (!value) return 0;
+        const std::string_view text(value);
+        std::uint32_t groups{};
+        const auto end = value + text.size();
+        const auto parsed = std::from_chars(value, end, groups);
+        return parsed.ec == std::errc{} && parsed.ptr == end ? std::min(groups, 65535u) : 0;
+    }();
+    return budget;
+}
 
 struct CountedDispatch {
     VkBuffer indirect = VK_NULL_HANDLE;
@@ -61,7 +80,7 @@ public:
                      CountedDispatch& out) {
             out = {};
             constexpr VkDeviceSize record_bytes = 3 * sizeof(std::uint32_t);
-            if (!arguments || !count || stride < record_bytes || stride % 4 ||
+            if (!arguments || (!count && !indirect_group_budget()) || stride < record_bytes || stride % 4 ||
                 (argument_offset % 4) != 0 || (count_offset % 4) != 0 || !max_count ||
                 !owner.limits_.maxComputeWorkGroupCount[0] || !owner.make_pipeline()) return false;
             if (VkDeviceSize(max_count) > std::numeric_limits<VkDeviceSize>::max() / record_bytes)
@@ -100,10 +119,10 @@ public:
             addr.buffer = arguments;
             const VkDeviceAddress args_va = address(owner.device_, &addr);
             addr.buffer = count;
-            const VkDeviceAddress count_va = address(owner.device_, &addr);
+            const VkDeviceAddress count_va = count ? address(owner.device_, &addr) : 0;
             addr.buffer = a.buffer;
             const VkDeviceAddress output_va = address(owner.device_, &addr);
-            if (!args_va || !count_va || !output_va ||
+            if (!args_va || (count && !count_va) || !output_va ||
                 argument_offset > UINT64_MAX - args_va || count_offset > UINT64_MAX - count_va)
                 return false;
             out = {a.buffer, 0, args_va + argument_offset, count_va + count_offset,
@@ -124,9 +143,9 @@ public:
         fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         struct Push {
             VkDeviceAddress arguments, count, output;
-            std::uint32_t stride_words, first_record, records;
+            std::uint32_t stride_words, first_record, records, budget, has_count;
         };
-        static_assert(sizeof(Push) == 40);
+        static_assert(sizeof(Push) == 48);
         const VkDeviceSize dispatch_limit = VkDeviceSize(limits_.maxComputeWorkGroupCount[0]) * 64;
         // Bound per-dispatch indexing to 32 bits, even when the D3D12 stride is very large.
         // The shader loads and stores three consecutive dwords per record, so leave room for the final +2.
@@ -136,7 +155,7 @@ public:
         for (VkDeviceSize first = 0; first < job.max_count;) {
             const std::uint32_t count = std::uint32_t(std::min<VkDeviceSize>(chunk_limit, job.max_count - first));
             const Push push{job.arguments + first * job.stride, job.count, job.output + first * 12,
-                            job.stride / 4, std::uint32_t(first), count};
+                            job.stride / 4, std::uint32_t(first), count, indirect_group_budget(), job.count != 0};
             fn<PFN_vkCmdPushConstants>("vkCmdPushConstants")(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT,
                                                              0, sizeof(push), &push);
             fn<PFN_vkCmdDispatch>("vkCmdDispatch")(cb, (count - 1u) / 64u + 1u, 1, 1);
@@ -166,8 +185,9 @@ private:
         VkShaderModuleCreateInfo shader{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         shader.codeSize = sizeof(indirect_dispatch_count_spirv);
         shader.pCode = indirect_dispatch_count_spirv;
+        const aftermath::ShaderName aftermath_name("(runtime) indirect_dispatch_count");
         bool ok = fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(device_, &shader, nullptr, &module) == VK_SUCCESS;
-        const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 40};
+        const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 48};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &range;
