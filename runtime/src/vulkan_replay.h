@@ -5570,6 +5570,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
                 colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             }
+            LayoutPieces sampled_depth_stencil_restore;
             VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             VkRenderingAttachmentInfo stencil{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             if (d.depth.id) {
@@ -5596,6 +5597,15 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                                      "[rt] replay: mixed read-only depth/stencil with writable sibling cannot safely "
                                      "sample in GENERAL without VK_KHR_maintenance7 "
                                      "separateDepthStencilAttachmentAccess; keeping optimal read-only layout\n");
+                }
+                if (tracker && !allow_general_ro && d.depth.binding.sampled &&
+                    d.depth.binding.sampled_in_general && !d.depth.binding.simultaneous_access) {
+                    auto range = d.depth.range;
+                    range.aspectMask = ro_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT;
+                    range = detail::planes_for_layout(d.depth.binding, range, separate);
+                    for (const auto& piece : detail::current(tracker, d.depth.id, range, VK_IMAGE_LAYOUT_UNDEFINED)) {
+                        if (piece.layout == VK_IMAGE_LAYOUT_GENERAL) sampled_depth_stencil_restore.push_back(piece);
+                    }
                 }
                 const auto dsv_layout = [&](VkImageLayout wanted) {
                     if (d.depth.binding.simultaneous_access && wanted != VK_IMAGE_LAYOUT_UNDEFINED &&
@@ -5800,6 +5810,15 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
             }
             vk.end_rendering(command_buffer);
+            for (const auto& piece : sampled_depth_stencil_restore) {
+                const VkImageLayout attachment_layout = (d.depth.dsv_flags & dsv_read_only_depth)
+                    ? depth.imageLayout
+                    : stencil.imageLayout;
+                detail::image_barrier(vk, command_buffer, d.depth.binding, piece.range, attachment_layout,
+                                      piece.layout, depth_access, depth_stages, VK_ACCESS_SHADER_READ_BIT,
+                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                tracker->set(d.depth.id, piece.range, piece.layout);
+            }
         }
     }
     // Predication does not carry over to the next command list.

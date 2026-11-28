@@ -328,6 +328,29 @@ int main() {
             EXPECT(g.depth.storeOp == VK_ATTACHMENT_STORE_OP_NONE);
             EXPECT(g.stencil.storeOp == VK_ATTACHMENT_STORE_OP_STORE);
         }
+        for (const bool separate_layouts : {false, true}) {
+            auto vk = make_vk(separate_layouts, &pso_writes_s);
+            vk.separate_depth_stencil_attachment_access = false;
+            LayoutTracker tracker(separate_layouts);
+            b.sampled = true;
+            const VkImageAspectFlags sampled_aspects = separate_layouts
+                ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT)
+                : b.aspects;
+            tracker.track(1, b, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            tracker.set(1, {sampled_aspects, 0, 1, 0, 1}, VK_IMAGE_LAYOUT_GENERAL);
+            g.reset();
+            EXPECT(replay(list, VK_NULL_HANDLE, [&](auto) { return &b; }, vk, &tracker) == ReplayResult::success);
+            EXPECT(g.depth.imageLayout != VK_IMAGE_LAYOUT_GENERAL);
+            EXPECT(tracker.layout(1, 0) == VK_IMAGE_LAYOUT_GENERAL);
+            EXPECT(tracker.layout(1, 1) == (separate_layouts ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                                            : VK_IMAGE_LAYOUT_GENERAL));
+            EXPECT(g.image_barriers.size() >= 2);
+            const auto& restore = g.image_barriers.back();
+            EXPECT(restore.oldLayout == g.depth.imageLayout && restore.newLayout == VK_IMAGE_LAYOUT_GENERAL);
+            EXPECT(restore.subresourceRange.aspectMask == sampled_aspects);
+            EXPECT((restore.dstAccessMask & VK_ACCESS_SHADER_READ_BIT) != 0);
+            b.sampled = false;
+        }
         // With maintenance7, stencil writes -> depth stays in GENERAL for concurrent SRV sampling.
         {
             auto vk = make_vk(true, &pso_writes_s);
