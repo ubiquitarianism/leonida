@@ -1494,10 +1494,10 @@ def _decode_dds(data: bytes, *, mip: int = 0, layer: int = 0, face: str | None =
 
 
 def decode_dds(data: bytes, *, mip: int = 0, layer: int = 0, face: str | None = None,
-               z: int = 0) -> tuple[int, int, bytes]:
-    """Decode one DDS image plane into top-down row-major RGBA8 with straight alpha."""
-    width, height, rgba, _ = _decode_dds(data, mip=mip, layer=layer, face=face, z=z)
-    return width, height, rgba
+               z: int = 0, max_size: int = 0) -> tuple[int, int, bytes]:
+    """Decode a straight-alpha RGBA8 plane, optionally filtering in its declared color space."""
+    width, height, rgba, srgb = _decode_dds(data, mip=mip, layer=layer, face=face, z=z)
+    return downscale_rgba(width, height, rgba, max_size, srgb=srgb)
 
 
 def _box_spans(source: int, target: int) -> list:

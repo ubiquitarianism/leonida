@@ -76,10 +76,14 @@ def vertices(b):
     return out
 
 
+def _carve_inputs(carve):
+    return glob.iglob(os.path.join(glob.escape(carve), "*.bin"))
+
+
 def vehicle_documents(carve):
     """(cell-size Counter, set of ModelName values) of the CVehiclePoints documents in a carve of common.rpf."""
     cells, names = Counter(), set()
-    for p in sorted(glob.glob(os.path.join(carve, "*.bin"))):
+    for p in sorted(_carve_inputs(carve)):
         with open(p, "rb") as f:
             t = f.read()
         m = re.search(rb"<(CVehiclePoints\w*)[\s>]", t)
@@ -195,6 +199,8 @@ def main():
         return 2
     hashes, docs = None, None
     if a.common:
+        if a.out and os.path.exists(a.out) and any(same_report_path(a.out, p) for p in _carve_inputs(a.common)):
+            ap.error("--out would overwrite a --common carve input")
         cells, names = vehicle_documents(a.common)
         hashes = name_hashes(names)
         docs = {"documents": sum(cells.values()), "models": len(names),

@@ -692,6 +692,29 @@ class ExportBankTest(unittest.TestCase):
         self.assertEqual(audio[-1]["flags"] & 0x04, 0x04)
         self.assertEqual(sum(1 for p in audio for value in p["lacing"] if value < 255), 26)
 
+    def test_staged_writer_receives_ogg_pages_as_they_are_encoded(self):
+        produced = 0
+        consumed = 0
+        encode = awc.ogg_page
+
+        def page(*args):
+            nonlocal produced
+            produced += 1
+            return encode(*args)
+
+        def sink(path, parts):
+            nonlocal consumed
+            for part in parts:
+                consumed += 1
+                self.assertEqual(produced, consumed)
+                self.assertEqual(part[:4], b"OggS")
+
+        packets = [bytes([0x08]) + bytes(159)] * 100
+        with mock.patch.object(awc, "ogg_page", page), mock.patch.object(awc, "_write_file_parts", sink):
+            end = awc.write_ogg_opus("synthetic.ogg", packets, 1, 21)
+        self.assertEqual(end, 96000)
+        self.assertGreater(consumed, 3)
+
     def test_pre_skip_larger_than_the_stream_is_clamped(self):
         # Six 960-frame packets are 5760 samples; a pre-skip of 65535 would put the
         # EOS granule below the pre-skip and make the stream undecodable.

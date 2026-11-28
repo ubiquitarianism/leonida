@@ -216,15 +216,25 @@ public:
     // SetFrameIntervalX(output, interval, latency, flags). `period_us` is the interval as a period; `latency` is
     // the number of frames allowed in flight (0 counts as 1). The vblank grid is re-based: its epoch is now. A
     // scheduled origin event stays armed (with its offset, kept below the new period) and its next origin is one
-    // new period from now; waiters blocked on the old grid pick the new one up.
+    // new period from now. When the period changes, pending frames receive consecutive vblanks on that grid in
+    // their original order. Reapplying the same period preserves their display deadlines.
     std::int32_t set_frame_interval(std::uint32_t period_us, std::uint32_t latency, std::uint32_t flags) {
         (void)flags;
         if (period_us == 0) return pacer_hr::invalid_arg;
         std::lock_guard guard(mutex_);
         if (suspended_) return pacer_hr::invalid_state;
+        const auto now = clock_.now_us();
+        if (period_us_ != period_us) {
+            retire_locked(now);
+            auto next_flip = now;
+            for (Pending& frame : pending_) {
+                next_flip += period_us;
+                frame.flip_us = next_flip;
+            }
+        }
         period_us_ = period_us;
         latency_ = std::max(latency, 1u);
-        epoch_us_ = clock_.now_us();
+        epoch_us_ = now;
         interval_set_ = true;
         for (std::uint32_t k = 0; k < frame_event_count; ++k) {
             event_offset_us_[k] = std::min(event_offset_us_[k], period_us - 1);
@@ -554,7 +564,8 @@ private:
         auto& tick = last_event_tick_[frame_event_origin];
         tick = std::max(tick, newest);
         const auto origin = first + static_cast<std::uint64_t>(tick) * period_us_;
-        *token = issue_token_locked(origin, origin - offset + period_us_);
+        // The current token can be polled before the first configured origin.
+        *token = issue_token_locked(std::min(origin, now), origin - offset + period_us_);
         return pacer_hr::ok;
     }
 

@@ -39,6 +39,27 @@ class CellFit(unittest.TestCase):
         self.assertEqual(s["cells"]["0.0325"]["meshes"], 0)
         self.assertEqual(s["fit_none"], 0)
 
+    def test_output_cannot_overwrite_a_common_carve_input(self):
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "nav.rpf"
+            archive.write_bytes(b"9FPR" + (8).to_bytes(4, "little") + bytes(8))
+            doc = Path(root) / "vehicle.bin"
+            original = b"<CVehiclePoints><ModelName>Test</ModelName></CVehiclePoints>"
+            doc.write_bytes(original)
+            alias = Path(root) / "report.json"
+            os.link(doc, alias)
+            for output in (doc, alias):
+                with self.subTest(output=output):
+                    proc = subprocess.run([sys.executable, "-I", cf.__file__, str(archive), "--common", root,
+                                           "--out", str(output)], capture_output=True, text=True)
+                    self.assertEqual(proc.returncode, 2)
+                    self.assertIn("--common", proc.stderr)
+                    self.assertEqual(doc.read_bytes(), original)
+
     def test_name_hashes_cover_case_and_suffix(self):
         h = cf.name_hashes({"Wagon01"})
         self.assertIn(cf.nd.joaat_cs("wagon01"), h)
