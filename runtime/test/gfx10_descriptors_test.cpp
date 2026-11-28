@@ -338,6 +338,14 @@ int main() {
     CHECK((one_field({.mag_filter = Filter::bilinear}) == SamplerWords{0, 0, 1u << 20, 0}));
     CHECK((one_field({.min_filter = Filter::aniso_bilinear}) == SamplerWords{0, 0, 3u << 22, 0}));
     CHECK((one_field({.mip_filter = MipFilter::linear}) == SamplerWords{0, 0, 2u << 26, 0}));
+    CHECK((one_field({.volume_filter = VolumeFilter::point}) == SamplerWords{0, 0, 1u << 24, 0}));
+    CHECK((one_field({.volume_filter = VolumeFilter::linear}) == SamplerWords{0, 0, 2u << 24, 0}));
+    for (unsigned z = 0; z <= 2; ++z) {
+        for (unsigned mip = 0; mip <= 2; ++mip) {
+            const SamplerWords words{0, 0, (1u << 20) | (z << 24) | (mip << 26), 0};
+            CHECK(encode(decode(words)) == words);
+        }
+    }
     CHECK((one_field({.border_color = BorderColor::opaque_white}) == SamplerWords{0, 0, 0, 2u << 30}));
     CHECK((one_field({.border_color = BorderColor::table, .border_color_index = 0xABC}) ==
            SamplerWords{0, 0, 0, (3u << 30) | 0xABC}));

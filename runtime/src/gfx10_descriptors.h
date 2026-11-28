@@ -11,7 +11,7 @@
 //   SQ_IMG_SAMP_WORD0..3 and SQ_BUF_RSRC_WORD0..3 types with their gfx103 variants (RDNA2). The comments below
 //   name those fields.
 // - Enum values in the fields: Mesa's gfx6.json (SQ_RSRC_IMG_TYPE, SQ_SEL_XYZW01, SQ_TEX_CLAMP, SQ_TEX_XY_FILTER,
-//   SQ_TEX_MIP_FILTER, SQ_TEX_DEPTH_COMPARE, SQ_TEX_BORDER_COLOR, SQ_IMG_FILTER_TYPE).
+//   SQ_TEX_Z_FILTER, SQ_TEX_MIP_FILTER, SQ_TEX_DEPTH_COMPARE, SQ_TEX_BORDER_COLOR, SQ_IMG_FILTER_TYPE).
 // - Which value goes into which field: Mesa's src/amd/common/ac_descriptors.c (ac_build_gfx10_texture_descriptor,
 //   ac_build_sampler_descriptor, ac_build_buffer_descriptor) and radv's radv_image_view.c and radv_sampler.c.
 // - Formats: the GFX10_FORMAT enum, which tools/gfx10_formats.json holds too. A format names its channel sizes
@@ -488,6 +488,12 @@ enum class MipFilter : std::uint32_t {  // SQ_TEX_MIP_FILTER
     linear = 2,
 };
 
+enum class VolumeFilter : std::uint32_t {  // SQ_TEX_Z_FILTER
+    none = 0,
+    point = 1,
+    linear = 2,
+};
+
 enum class CompareFunction : std::uint32_t {  // SQ_TEX_DEPTH_COMPARE; the same values as VkCompareOp
     never = 0,
     less = 1,
@@ -534,6 +540,7 @@ struct Sampler {
     // layer keeps it in the S# words, which are the sampler's key: see kIntegerBorderPtr.
     bool integer_border = false;
     bool compare_never = false;  // D3D12 comparison filter with DEPTH_COMPARE_FUNC = NEVER
+    VolumeFilter volume_filter = VolumeFilter::none;
     bool operator==(const Sampler&) const = default;
 };
 
@@ -552,7 +559,7 @@ inline constexpr std::uint32_t kCompareNever = 1u << 12;
 //          DEPTH_COMPARE_FUNC [14:12], FORCE_UNNORMALIZED [15], FILTER_MODE [30:29]
 //   WORD1  MIN_LOD [11:0], MAX_LOD [23:12]                       (4.8 fixed, clamped to 0..15)
 //   WORD2  LOD_BIAS [13:0] (signed 5.8 fixed, clamped to -32..31), XY_MAG_FILTER [21:20], XY_MIN_FILTER [23:22],
-//          MIP_FILTER [27:26]
+//          Z_FILTER [25:24], MIP_FILTER [27:26]
 //   WORD3  BORDER_COLOR_PTR [11:0], BORDER_COLOR_TYPE [31:30]
 // Mesa also sets tuning fields from the anisotropy (ANISO_THRESHOLD, ANISO_BIAS, PERF_MIP, ANISO_OVERRIDE) and
 // TRUNC_COORD for point filters. They are not written here, and decode() ignores them.
@@ -569,7 +576,7 @@ inline SamplerWords encode(const Sampler& sampler) {
                field(detail::unsigned_fixed(sampler.max_lod, 0, 15), 12, 12);
     words[2] = field(detail::signed_fixed(sampler.lod_bias, -32, 31), 0, 14) |
                field(std::uint32_t(sampler.mag_filter), 20, 2) | field(std::uint32_t(sampler.min_filter), 22, 2) |
-               field(std::uint32_t(sampler.mip_filter), 26, 2);
+               field(std::uint32_t(sampler.volume_filter), 24, 2) | field(std::uint32_t(sampler.mip_filter), 26, 2);
     const bool marked = sampler.integer_border && sampler.border_color != BorderColor::table;
     words[3] = field(marked ? kIntegerBorderPtr : sampler.border_color_index, 0, 12) |
                field(std::uint32_t(sampler.border_color), 30, 2);
@@ -598,6 +605,7 @@ inline Sampler decode(const SamplerWords& words) {
     sampler.lod_bias = float(std::int32_t(bias ^ 0x2000u) - 0x2000) / 256.0f;  // sign-extend 14 bits
     sampler.mag_filter = Filter(get(words[2], 20, 2));
     sampler.min_filter = Filter(get(words[2], 22, 2));
+    sampler.volume_filter = VolumeFilter(get(words[2], 24, 2));
     sampler.mip_filter = MipFilter(get(words[2], 26, 2));
     sampler.border_color_index = get(words[3], 0, 12);
     sampler.border_color = BorderColor(get(words[3], 30, 2));
@@ -634,6 +642,7 @@ inline constexpr VkSamplerReductionMode vulkan_reduction_mode(FilterMode mode) {
 //   the S# only indexes (VK_EXT_custom_border_color);
 // - filter_mode != blend: chain a VkSamplerReductionModeCreateInfo with vulkan_reduction_mode();
 // - mirror-once modes need samplerMirrorClampToEdge, anisotropy needs samplerAnisotropy.
+// Vulkan applies minFilter and magFilter to all three spatial axes; the S# can specify a separate Z filter.
 // MIP_FILTER_NONE samples the base level only, which Vulkan expresses as nearest mip filtering with the LOD held
 // in [0, 0.25] (the Vulkan specification's note on samplers without mipmapping). An unnormalised sampler gets
 // what Vulkan requires of one: no mips, no anisotropy, no comparison.
