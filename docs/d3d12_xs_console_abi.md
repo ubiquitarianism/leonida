@@ -161,6 +161,7 @@ end; on a full buffer they call the vtable method the record stands for (Package
 | 41, 43, 45 | `Set*RootDescriptor*` / table | Package + sibling layer |
 | 48 | `IASetVertexBuffers` | Sibling layer |
 | 51 | `ClearDepthStencilView` | Sibling layer |
+| 71-74 | memory writes and waits (newer layout; 69-72 older) | **Measured here**, §5.5 |
 | 80 | `ExecuteIndirect` | Sibling layer (note: the package measured slot 80 as a console-only call, a `Dispatch`-with-extra-word shape; slot assignments past 61 differ between the two sources — unconfirmed) |
 | 83 | `CopyTextureRegionX` (older layout) | Sibling layer; the package measured a `CopyTextureRegion`-shaped call at slot 85 — consistent with the newer layout (+2) |
 | 108 | `ResolveSubresourceRegion` | Sibling layer |
@@ -188,6 +189,88 @@ console-shaped either way.
 | 11 | `CopyBufferRegion` | Sibling layer |
 | 12 | `CopyTextureRegion` | Sibling layer |
 | 13 | `CopyResource` | Sibling layer |
+
+### 5.5 Memory writes and waits
+
+The list has bottom-of-pipe writes of a 32- or 64-bit value into title memory and waits that stop the queue until
+a 32- or 64-bit value in memory compares true against a reference. Neither has a D3D12 or Vulkan command; the
+runtime models both (`runtime/shims/d3d12_xs_list_values.h`, the list cut and `execute_with_values` in
+`d3d12_xs_device.cpp`).
+
+| Older slot | Newer slot | Method | Evidence |
+|---:|---:|---|---|
+| 68 | 70 | depth bounds `(min, max)` as floats | Sibling layer; the retail title calls 70 (unmodelled, a no-op) |
+| 69 | 71 | `write32(address, value, flush, flags)` | Sibling layer; **measured here** on retail 1.0.2.1 |
+| 70 | 72 | `write64(address, value, flush, flags)`: flags 1 stores the GPU timestamp, 2 the system one (QPC) | Sibling layer; **measured here** (flags 1 and 0 seen) |
+| 71 | 73 | `wait32(address, comparison, reference, word)` | Sibling layer; not called by the retail title in the boots measured |
+| 72 | 74 | `wait64(address, comparison, reference, word)` | Sibling layer; **measured here** |
+| 73 | 75 | pixel-shader depth order (state) | Sibling layer; the retail title calls 75 (a no-op) |
+
+Measured here (retail 1.0.2.1, boots to the story load; temporary per-call logging, not committed):
+
+- The lists record before the queue proxy has detected the layout (§1.1): the first value calls arrive with the
+  layout still unknown. The runtime takes an undetected layout as the newer one, the title's, as it already does for
+  `ExecuteIndirect` at 61.
+- Up to the story load (~150 s): about 12 000 `write32` (small counters and a constant tag in a ring of 72-byte
+  records), 16 000 `write64` (all with flags 1, GPU timestamps, in begin/end pairs) and 4 100 `wait64`, one per
+  frame, `>=` a reference that rises by one each frame, at the start of a direct list, always met when the list is
+  submitted (the CPU writes that value).
+- From the story load on: job chains across the queues. Compute lists (the title uses five compute queues) and
+  direct lists `wait64(address, >=, tag)`, mostly as their first calls and sometimes after two to five calls of
+  work, for addresses that other lists `write64(address, tag)` with flags 0: direct lists write tags as their first
+  calls and wait for compute results; compute lists wait for those tags and write theirs near their end. Before
+  this runtime modelled the writes, every such wait was unmet at submission and ran on.
+- Comparison code 7 is the only one seen; the codes are taken as `D3D12_COMPARISON_FUNC` (memory OP reference, as
+  the sibling layer does). The wait's fourth word had 1 in its low 32 bits each time; it is not used.
+
+The runtime's model:
+
+- A write lands after the list part it was recorded in has run: the queue proxy signals a fence of its own behind
+  the part and a pump thread stores the value with the CPU once the fence is reached
+  (`leonida::kernel_writes::store`: one locked access for an aligned value, so a title thread polling it never
+  reads half of it, and pinned like any host write, so the slot-133 shadows see it). Later than the console, never
+  earlier. Writes land in submission order across queues: the pump reads the fences newest write first, so a write
+  whose work waited for an older one is never seen done before it.
+- Two targets that store cannot reach (`runtime/src/value_write_sink.h`). An address in the GPU address arena's
+  range is an arena offset, a default-heap buffer, not a host address: it is asked before any host store and lands
+  in the arena's own mapping (one in the arena's reserved start or a sparse buffer is dropped). A page of xmem's that
+  the title's view keeps `PAGE_NOACCESS` (a GPU-only window), where the store faults, lands through xmem's own
+  mapping of the physical page. Counted as `writes_arena` and `writes_title_pages`. In the boots to the story load no
+  write failed the host store (0 of 63 219), so both are a safety net.
+- `write64` flags 1 and 2 take the GPU's timestamp at the write's place in the list: an `EndQuery(TIMESTAMP)` on
+  the real list (the Vulkan layer writes it at the bottom of the pipe) and a `ResolveQueryData` of that one slot into
+  a readback ring of the device's, read when the write lands. Flag 1 lands those ticks, which count at the queue's
+  `GetTimestampFrequency` (what the queue proxy answers the title's frequency query with, newer layout slot 18);
+  flag 2 lands the `QueryPerformanceCounter` value at which the GPU took them, through the queue's clock
+  calibration (renewed every second), never later than the landing. A write that lands before its part has run
+  (recorded before a wait whose gate holds the part) takes the CPU's clock at landing instead, as before. The
+  title's GPU timing reads these values back, in begin/end pairs.
+- A wait recorded before any work of the part stands at the part's start; writes recorded before that first wait
+  land before the queue stands at it (behind the work submitted before the part), as the title's frame lists and
+  job-tag writers need. A wait recorded after work, or after a write that follows a wait, cuts the list:
+  the real list so far is closed as a part, recording goes on in a spare real list on the same allocator, and the
+  state set so far (heaps, root signatures and arguments, pipeline, viewports, scissors, targets, vertex and index
+  buffers, blend factor, stencil reference, predication; what an executed bundle set, and nothing from before a
+  `ClearState`) is set on it again. A cut that would split an open query waits for the query's `EndQuery`.
+  Bundles record neither method (`ExecuteBundle` names one real list, so a bundle cannot be cut).
+- At submission each part's waits are checked: met ones cost nothing; one that a write still in flight will meet
+  becomes a queue `Wait` on that write's fence (the GPU orders the two queues); any other makes the queue `Wait` on
+  a gate fence that is signalled once memory compares true. The Vulkan layer holds the queue's later work behind
+  that wait without blocking the submitting thread (`src/queue_holds.h`). The pump only decides; a second thread,
+  the releaser, signals the gates, because that Signal runs the work the layer held behind them (the held
+  submission, the shadow refresh, a deferred Present), and the pump keeps landing writes and timing gates out
+  meanwhile.
+- A gate opens after `LEONIDA_VALUE_WAIT_TIMEOUT_MS` (default 200) whatever memory holds, counted from when the
+  gates before it on its queue opened, and logged once per address. An address that timed out three times in a row
+  (the last 256 addresses are counted) gets 4 ms. Once four gates in a row timed out, so does every wait for an
+  address no wait was ever met for, until a gate cut short is met within its 4 ms; a wait cut short that memory
+  meets within the rest of the full timeout gives its address the full timeout from then on.
+  `LEONIDA_LIST_VALUES=0` drops both methods, as before. After `stop_list_values` (the process is ending) nothing
+  new is landed or opened.
+- Queue slot 31 (`CopyPageMappingsBatchX`, section 4) waits at most 16 ms for the queue's earlier work. Work held
+  behind a gate takes longer: the remap is then deferred to the releaser, which runs it once the queue's write
+  fence passes the call's point and only then opens a gate the queue's later work waits on, so the GPU sees the
+  order of the call and the title's thread does not wait (the console's CPU does not either).
 
 ## 6. Root arguments
 

@@ -47,12 +47,24 @@ def uniform_descriptor_predicate(value, definitions):
 class SampledDynamicIndex(unittest.TestCase):
     def check_accesses(self, asm, sampled_bindings, storage_bindings=()):
         bindings = {var: int(binding) for var, binding in re.findall(r"OpDecorate (%\w+) Binding (\d+)", asm)}
-        lookups = set(re.findall(r"(%\w+) = OpFunctionCall %uint %desc_lookup_fn ", asm))
+        lookups = set(re.findall(r"(%\w+) = OpFunctionCall %\w+ %desc_lookup_fn ", asm))
         broadcasts = re.findall(r"(%\w+) = OpGroupNonUniformBroadcastFirst %uint %\w+ (%\w+)", asm)
         # a wave32 pixel shader in a 64-lane subgroup takes its own half's first lane with a shuffle (design.md,
         # "Execution model": shuffle sources keep the current half)
         broadcasts += re.findall(r"(%\w+) = OpGroupNonUniformShuffle %uint %\w+ (%\w+) %\w+", asm)
         lookup_indices = lookups | {result for result, source in broadcasts if source in lookups}
+        # The index a chain uses is that value, or the array's fallback chosen by the T# dimension check
+        # (an OpSelect against 0): follow the extracts and selects the probe's result feeds.
+        for _ in range(4):
+            more = {res for res, source in re.findall(
+                r"(%\w+) = Op(?:CompositeExtract %uint|GroupNonUniformBroadcastFirst %uint %\w+|"
+                r"GroupNonUniformShuffle %uint %\w+) (%\w+)", asm) if source in lookup_indices}
+            more |= {res for res, true_value, false_value in re.findall(
+                r"(%\w+) = OpSelect %uint %\w+ (%\w+) (%\w+)", asm)
+                if true_value in lookup_indices and false_value == "%c0"}
+            if more <= lookup_indices:
+                break
+            lookup_indices |= more
         definitions = dict(re.findall(r"^\s*(%\w+) = (Op[^\n]+)$", asm, re.M))
         zero = {var for var, op in definitions.items() if op == "OpConstant %uint 0"}
         # An unsupported tagged storage view selects the null descriptor. Only a uniform

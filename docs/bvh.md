@@ -123,8 +123,42 @@ So the "`u16` table at header `0x130`" of section 4 is not a table: it is these 
 (a root pointer, the element offset and the parent offset, the last usually negative; hence "often monotonic"). With `offsetToPrimRemap` 0 everywhere there is no
 primitive remap table either, and the element region allocates 64 bytes per element, `numElements` of them, padded
 to 128 bytes (a stride, not a record layout: section 4a describes the packed arrays inside it).
-**Open:** where the parent array starts and how big it is. Neither `offsetToParents + 4 * unit` against the header end
-or `offsetToElements`, nor a size of `4 *` the node or element count, holds on every stream.
+**The parent table (BUILD-1390).** The traversal shader finds the entry for the 64-byte unit `u` at
+`offsetToParents + 4 * (u - offsetToElements / 64)` (`XboxBvh4Node_GetParentTableOffset` and
+`XboxBvh4Node_LoadParentPointer`, L3254-L3275 of the `.hlsli` above, 32-bit arithmetic). It only looks up the
+parent of a box node: the node it climbs from is the last non-triangle node (L6212), asserted to be above `TRI3`
+(L6265). The table is laid out for the box nodes only:
+
+* *Start:* `offsetToParents = 0x40 - (((offsetToNodes - offsetToElements) / 16) & ~127)`. The element units'
+  entries take `(offsetToNodes - offsetToElements) / 16` bytes; their whole 128-byte blocks sit below the header
+  end, which is why the word is negative from 32 element units up. The first box node's entry is then at
+  `offsetToParents + (offsetToNodes - offsetToElements) / 16`, in `[0x40, 0xc0)`.
+* *Extent:* one entry per box unit (a BOX16 node takes one, a BOX32 node two) from the first box entry, and
+  `offsetToElements` is the end of the last one rounded up to 128 bytes. The bytes between the header end and the
+  first box entry, and after the last one, are the only slack.
+* *Not shipped:* the bytes from `0x40` to `offsetToElements` are all zero; rehydration writes the entries
+  (`tools/bvh_rehydrate.py`, which matches the library byte for byte on 8 samples, §4a).
+* *The units the header counts:* `totalSizeIn64BNodes + 1` is the end of the last box group in 64-byte units plus
+  `ceil((4 + 8 * levels) / 64)` units for the level table (§4a). The level table's units have no entry, so the end
+  `offsetToParents + 4 * (totalSizeIn64BNodes + 1 - offsetToElements / 64)` taken from the header alone, rounded up
+  to 128, lands on `offsetToElements` on only 259,456 of the 272,858 box-rooted streams.
+
+Measured over every stream of both packs, with a scratch probe over the `tools/bvh_index.py` scan and then with
+`tools/bvh_packing_check.py`, which now checks all three (§4a): 272,874 streams (271,627 complete and 10 joined in
+`core_bvh4.rpf`, 1,237 in `shared_minigame000_bvh4.rpf`). Counts only.
+
+| rule | holds on |
+|---|---|
+| `[0x40, offsetToElements)` is zero | 272,874 / 272,874 |
+| `offsetToParents` from the start rule | 272,874 / 272,874 |
+| `offsetToElements` from the extent rule (box root) | 272,858 / 272,858 |
+| `totalSizeIn64BNodes + 1` = box groups' end plus the level table's units (box root) | 272,858 / 272,858 |
+| leaf root (`numElements` 1): `offsetToElements` `0x80`, `offsetToNodes` `0x100`, `offsetToParents` `0x40`, `totalSizeIn64BNodes` 3 | 16 / 16 |
+| no slack after the last box entry | 8,973 (1 to 31 entries on the rest) |
+
+**Hypothesis:** the console builder sizes the table from the box nodes it wrote and aligns it the same way for
+updatable or top-level structures. Every measured stream has `flags` `0x81020006`, a BLAS without the updatable
+bit `0x00040000`, so where an updatable structure keeps its leaves' entries is not measured.
 
 The `flags` word has version `6` in its low 16 bits. It also sets `0x80000000` (bottom level), `0x00020000`
 (offline) and `0x01000000` (dehydrated). It does not set `0x00010000` (compressed). The sample is therefore a
@@ -506,6 +540,7 @@ bytes form exactly one tree:
 * a box pointer names a node of its own width on a lower level;
 * a TRI0 pointer names a leaf slot `offsetToElements + 64 * k` with `k < numElements`;
 * nothing points to the root, and every other node and every leaf has exactly one parent;
+* the parent table is not shipped and its start and extent follow the element and box regions (§3.1);
 * every vertex-order byte is a permutation;
 * every stored override lies inside `sceneBounds` in the leaf frame.
 
@@ -1090,7 +1125,10 @@ elements, so with N elements there are at most (3N - 2) / 4 nodes. `XdxrLayout` 
 sizes for that many when the build is recorded, and the same numbers answer
 `GetRaytracingAccelerationStructurePrebuildInfo`. The header's `totalSizeIn64BNodes` counts only the nodes the build
 wrote.
-A triangle with a NaN vertex gets an empty box (D3D12 treats it as inactive). So do an instance with mask 0, one with
+A triangle with a NaN vertex gets an empty box (D3D12 treats it as inactive). So does a triangle with a vertex
+index at or past the geometry's `VertexCount` (every triangle when it is 0): the builder reads no vertex for it, as
+the index would address past the vertex buffer, possibly by gigabytes (`vk_xdxr_build_test` case
+`blas_vertex_count`). So do an instance with mask 0, one with
 no BLAS and one with a singular transform. An instance record holds its BLAS address in 256-byte units in 32 bits,
 so BLAS addresses must be below 2^40, as console GPU addresses are. Where device addresses are wider (llvmpipe's are
 host pointers), the builder takes a bias that is added to the addresses read from instance descs.

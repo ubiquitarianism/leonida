@@ -9,7 +9,8 @@
 //
 // 1. Aliases (title_page_aliases). xmem maps one physical page at as many VAs as the title asks
 //    (XMemMapPhysicalPages): a write through one VA changes what the others read without touching them. xmem
-//    reports each 64 KiB page mapped at more than one address; a shadow copies those at every submission.
+//    reports each 64 KiB page mapped at more than one address; a shadow guards those at every address with the
+//    geometry watch's cells (title_geometry_watch.h), or copies them at every submission while it can't.
 //
 // 2. Kernel writes (kernel_writes). A read-only page makes ReadFile fail with ERROR_NOACCESS instead of faulting
 //    into a user-mode handler. The file shims (read_file and the rest, below) pin the destination before the kernel
@@ -21,8 +22,21 @@
 //
 //    Any other host code that has the kernel write title memory (a DirectStorage queue that ReadFiles straight into
 //    a request's destination, for one) does the same: kernel_writes::read_file instead of ::ReadFile, or
-//    begin_write(destination, bytes, overlapped) before the call and end_write(id, pending) after it. A user-mode
-//    copy into title memory needs nothing: it faults like the title's own writes.
+//    begin_write(destination, bytes, overlapped) before the call and end_write(id, pending) after it. A host thread's
+//    own copy into title memory (a DirectStorage request decompressed into its destination) goes through
+//    kernel_writes::write: pinned the same way, so it takes no write fault per guarded block and is retried once after
+//    reopen() if it faults anyway.
+//
+//    A pin made with an OVERLAPPED lasts until the call returns, whatever the OVERLAPPED says meanwhile: until
+//    ReadFile stores STATUS_PENDING in it, it reads as a completed request (zero, or the status of the title's last
+//    request through it), and a refresh that dropped the pin then could guard the destination again before the kernel
+//    wrote it (natively, DirectStorage reads failing with E_DSTORAGE_ACCESS_VIOLATION on a read-only destination).
+//
+//    A page left read-only with no guard to answer for it (each guard reopens only what it protected) would fail every
+//    kernel write and fault every write for good. In xmem's physical-page views, where the protection a page should
+//    have is known (its window's), kernel_writes' unguarder (rt::xmem::reopen_unowned) makes such a page writable
+//    again: reopen() calls it before a retry, and the D3D12 layer's write-fault handler when no guard reopened the
+//    faulting page.
 //
 // Successful title memory map changes also invalidate the shadows' cached protection state. The shadows' own
 // protection changes stay local to their trackers.
@@ -34,11 +48,14 @@
 // Header-only, so the D3D12 layer, xmem and the file shims share one state in a process without linking each other.
 #include <windows.h>
 
+#include "guarded_copy.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -93,12 +110,68 @@ using map = std::map<K, V, std::less<K>, Allocator<std::pair<const K, V>>>;
 
 }  // namespace leonida::host_heap
 
+// Changes to what the title's address space shows (a view mapped or unmapped, pages committed, decommitted, allocated,
+// freed or given another protection by the title), each numbered by the generation it moved to, with its address
+// range. A reader that remembers the generation it last looked at asks which ranges changed since (changes_since):
+// only what overlaps its own pages needs looking at again, where a bare generation said "everything". The last
+// kJournal changes are kept; a reader further behind is told so and looks at everything, as before. changed() with no
+// range is a change anywhere.
 namespace leonida::title_memory_map {
 
 inline std::atomic<std::uint64_t> map_generation{0};
 
+struct Change {
+    std::uintptr_t from, to;
+};
+constexpr std::size_t kJournal = 1 << 16;  // 1 MiB
+struct Journal {
+    SRWLOCK lock = SRWLOCK_INIT;
+    Change at[kJournal] = {};
+};
+inline Journal& journal() {
+    static Journal j;
+    return j;
+}
+
 inline std::uint64_t generation() { return map_generation.load(std::memory_order_acquire); }
-inline void changed() { map_generation.fetch_add(1, std::memory_order_release); }
+
+// [from, to) changed. No allocation and no title memory touched: the write-fault handler calls it.
+inline void changed(std::uintptr_t from, std::uintptr_t to) {
+    if (from >= to) return;
+    from &= ~std::uintptr_t(0xfff);  // whole host pages, as the kernel changes them
+    to = to > UINTPTR_MAX - 0xfff ? UINTPTR_MAX : (to + 0xfff) & ~std::uintptr_t(0xfff);
+    Journal& j = journal();
+    AcquireSRWLockExclusive(&j.lock);
+    const std::uint64_t next = map_generation.load(std::memory_order_relaxed) + 1;
+    j.at[next % kJournal] = {from, to};
+    map_generation.store(next, std::memory_order_release);
+    ReleaseSRWLockExclusive(&j.lock);
+}
+inline void changed(const void* at, std::size_t bytes) {
+    const auto from = reinterpret_cast<std::uintptr_t>(at);
+    changed(from, bytes > UINTPTR_MAX - from ? UINTPTR_MAX : from + bytes);
+}
+inline void changed() { changed(std::uintptr_t(0), std::uintptr_t(UINTPTR_MAX)); }
+
+// The changes after generation `since` that overlap [from, to): f(begin, end) for each, clipped to [from, to), with
+// `now` set to the generation they go up to. False, with nothing called, when the journal no longer holds them all
+// (the caller takes everything as changed).
+template <class F>
+bool changes_since(std::uint64_t since, std::uint64_t& now, std::uintptr_t from, std::uintptr_t to, F&& f) {
+    Journal& j = journal();
+    AcquireSRWLockShared(&j.lock);
+    now = map_generation.load(std::memory_order_relaxed);
+    if (now < since || now - since > kJournal) {
+        ReleaseSRWLockShared(&j.lock);
+        return false;
+    }
+    for (std::uint64_t g = since + 1; g <= now; ++g) {
+        const Change c = j.at[g % kJournal];
+        if (c.from < to && from < c.to) f((std::max)(c.from, from), (std::min)(c.to, to));
+    }
+    ReleaseSRWLockShared(&j.lock);
+    return true;
+}
 
 }  // namespace leonida::title_memory_map
 
@@ -132,6 +205,18 @@ inline void set(std::uintptr_t va, bool aliased) {
 // Bumped by every change of set().
 inline std::uint64_t generation() { return state().generation.load(std::memory_order_acquire); }
 
+// Up to `n` aliased pages, and how many there are (a probe's sample; no order).
+inline std::size_t sample(std::vector<std::uintptr_t>& out, std::size_t n) {
+    State& s = state();
+    out.clear();
+    std::shared_lock lock(s.mutex);
+    for (const std::uintptr_t va : s.aliased) {
+        if (out.size() >= n) break;
+        out.push_back(va);
+    }
+    return s.aliased.size();
+}
+
 // Calls `f(va)` for each aliased 64 KiB page overlapping [begin, end).
 template<class F>
 void for_each_in(std::uintptr_t begin, std::uintptr_t end, F&& f) {
@@ -155,6 +240,7 @@ namespace leonida::title_gpu_views {
 
 struct View {
     std::uintptr_t gpu, cpu, size;
+    bool independent_pages;  // queue slot 31 maps physical pages at the GPU address itself
 };
 
 struct State {
@@ -170,7 +256,7 @@ inline State& state() {
 }
 
 // xmem: a reservation the title made, GPU-only or not. Returns true when it paired a GPU-only one.
-inline bool note_reservation(std::uintptr_t base, std::uintptr_t size, bool gpu_only) {
+inline bool note_reservation(std::uintptr_t base, std::uintptr_t size, bool gpu_only, bool independent_pages = false) {
     State& s = state();
     std::unique_lock lock(s.mutex);
     if (!gpu_only) {
@@ -179,20 +265,82 @@ inline bool note_reservation(std::uintptr_t base, std::uintptr_t size, bool gpu_
         return false;
     }
     if (!s.last_cpu || s.last_cpu_size != size) return false;
-    s.views.push_back({base, s.last_cpu, size});
+    s.views.push_back({base, s.last_cpu, size, independent_pages});
     s.count.store(s.views.size(), std::memory_order_release);
     s.last_cpu = s.last_cpu_size = 0;
     return true;
 }
 
-// Where the CPU reads the memory a GPU address names: the paired CPU range for a GPU-only view, else the address.
+// Both addresses of every pair, as [start, end) ranges (LEONIDA_CONSOLE_HEAP_GPU's ask table); `count()` changes
+// with them.
+inline void spans(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) {
+    State& s = state();
+    out.clear();
+    if (!s.count.load(std::memory_order_acquire)) return;
+    std::shared_lock lock(s.mutex);
+    for (const View& v : s.views) {
+        out.emplace_back(v.gpu, v.gpu + v.size);
+        out.emplace_back(v.cpu, v.cpu + v.size);
+    }
+}
+inline std::size_t count() { return state().count.load(std::memory_order_acquire); }
+// Marks the pair whose GPU-only range starts at `gpu` as one whose GPU-only range has pages of its own (queue slot 31
+// or XMemMapPhysicalPages map them at that address, not through the CPU view): the host reads it there (to_cpu) and
+// a slot-133 buffer over it is a shadow, not an import (independently_mapped). False when no pair starts at `gpu`.
+// Nothing in the runtime marks a pair yet: which of the title's pairs are independent is not decided (a pair xmem
+// makes is the legacy kind, read at its CPU view), so only tests that model an independent window call it.
+inline bool set_independent_pages(std::uintptr_t gpu, bool independent = true) {
+    State& s = state();
+    std::unique_lock lock(s.mutex);
+    for (View& v : s.views) {
+        if (v.gpu != gpu) continue;
+        v.independent_pages = independent;
+        return true;
+    }
+    return false;
+}
+
+// Where the host reads a GPU address. Slot 31 maps its window directly; legacy pairs use the CPU view.
 inline std::uintptr_t to_cpu(std::uintptr_t va, std::uintptr_t bytes = 1) {
     State& s = state();
     if (!s.count.load(std::memory_order_acquire)) return va;
     std::shared_lock lock(s.mutex);
     for (const View& v : s.views)
-        if (va >= v.gpu && va - v.gpu < v.size && bytes <= v.size - (va - v.gpu)) return va - v.gpu + v.cpu;
+        if (va >= v.gpu && va - v.gpu < v.size && bytes <= v.size - (va - v.gpu))
+            return v.independent_pages ? va : va - v.gpu + v.cpu;
     return va;
+}
+
+// A host-pointer import would pin the old physical pages across a queue remap. Use the
+// ordinary dirty-page shadow for buffers in these GPU windows.
+inline bool independently_mapped(std::uintptr_t va, std::uint64_t bytes) {
+    State& s = state();
+    if (!bytes || !s.count.load(std::memory_order_acquire)) return false;
+    std::shared_lock lock(s.mutex);
+    for (const View& v : s.views)
+        if (v.independent_pages && (va >= v.gpu ? va - v.gpu < v.size : v.gpu - va < bytes)) return true;
+    return false;
+}
+
+// A paired range: [gpu, gpu + size) and [cpu, cpu + size) are the title's two names for the same pages.
+struct Range {
+    std::uintptr_t gpu, cpu, size;
+    bool independent_pages;
+};
+
+// The paired reservation that holds [va, va + bytes), from either of its addresses. False outside every pair.
+inline bool view_at(std::uintptr_t va, std::uintptr_t bytes, Range& out) {
+    State& s = state();
+    if (!s.count.load(std::memory_order_acquire)) return false;
+    std::shared_lock lock(s.mutex);
+    for (const View& v : s.views) {
+        if ((va >= v.gpu && va - v.gpu < v.size && bytes <= v.size - (va - v.gpu)) ||
+            (va >= v.cpu && va - v.cpu < v.size && bytes <= v.size - (va - v.cpu))) {
+            out = {v.gpu, v.cpu, v.size, v.independent_pages};
+            return true;
+        }
+    }
+    return false;
 }
 
 // The other address of memory in a paired range: the CPU view's address for a GPU-only one and the GPU-only
@@ -206,6 +354,25 @@ inline std::uintptr_t other_view(std::uintptr_t va) {
         if (va >= v.cpu && va - v.cpu < v.size) return va - v.cpu + v.gpu;
     }
     return 0;
+}
+
+// The address of the pages at `va` through the CPU view of their pair (the stream-pool rule B described in
+// docs/d3d12_vulkan.md):
+// the host reads the frames there, so a buffer made over them is host-importable and shared with every other view
+// naming that range, and a copy made from them reads what the title wrote. `va` itself when it is in no pair, or when
+// the CPU view has no committed page and the GPU-only one has (queue slot 31 maps the frames at the alias).
+inline std::uintptr_t to_host_view(std::uintptr_t va, std::uintptr_t bytes = 1) {
+    Range range{};
+    if (!view_at(va, bytes, range)) return va;
+    const auto offset = va >= range.gpu && va - range.gpu < range.size ? va - range.gpu : va - range.cpu;
+    const auto cpu = range.cpu + offset, gpu = range.gpu + offset;
+    const auto readable = [](std::uintptr_t address) {
+        MEMORY_BASIC_INFORMATION region{};
+        return VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) &&
+               region.State == MEM_COMMIT && region.Protect && !(region.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+    };
+    if (cpu != va && readable(cpu)) return cpu;
+    return readable(gpu) ? gpu : va;
 }
 
 }  // namespace leonida::title_gpu_views
@@ -562,15 +729,22 @@ using Opener = void (*)(std::uintptr_t begin, std::uintptr_t end);
 // touch (rt::xmem::commit_physical_range; pages xmem does not map are left as they are). gta6rt sets it at start.
 using Committer = bool (*)(const void* address, std::size_t bytes);
 
+// xmem's side: makes the pages of its physical-page views in [begin, end) that are read-only although their window is
+// writable, with no guard left to reopen them, writable again (rt::xmem::reopen_unowned). True when such a page there
+// is writable now. Called from the write-fault handler: it must not wait for the process heap or g_phys_mutex.
+using Unguarder = bool (*)(std::uintptr_t begin, std::uintptr_t end);
+
 struct Pin {
     std::uintptr_t begin, end;
     const OVERLAPPED* overlapped;  // null: ends when the call returns
     std::uint64_t id;
+    bool returned;  // the call returned with the request pending: from now on the OVERLAPPED says when it ends
 };
 
 struct State {
     std::atomic<Opener> opener{nullptr};
     std::atomic<Committer> committer{nullptr};
+    std::atomic<Unguarder> unguarder{nullptr};
     std::mutex mutex;
     host_heap::vector<Pin> pins;  // host_heap: see there
     std::uint64_t next_id = 1;
@@ -584,25 +758,28 @@ inline State& state() {
 
 inline void set_opener(Opener opener) { state().opener.store(opener, std::memory_order_release); }
 inline void set_committer(Committer committer) { state().committer.store(committer, std::memory_order_release); }
+inline void set_unguarder(Unguarder unguarder) { state().unguarder.store(unguarder, std::memory_order_release); }
 
 // Whether an overlapped request is still in flight. Its OVERLAPPED is the title's and may be gone by now: a read that
 // faults counts as completed (the title doesn't free an OVERLAPPED it is still waiting on).
 inline bool overlapped_pending(const OVERLAPPED* overlapped) {
-    __try {
-        return overlapped->Internal == static_cast<ULONG_PTR>(STATUS_PENDING);
+    __try {  // the read is a call (src/guarded_copy.h): clang-cl does not cover an inline load without /EHa
+        return guarded::read_word(&overlapped->Internal) == static_cast<ULONG_PTR>(STATUS_PENDING);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 }
 
-// The pinned ranges overlapping [begin, end), for the layer's refresh. Overlapped pins whose request completed are
-// dropped first.
+// The pinned ranges overlapping [begin, end), for the layer's refresh. Overlapped pins whose call returned and whose
+// request completed since are dropped first; one whose call is still running stays (see the top of this file).
 template<class F>
 void for_each_pin(std::uintptr_t begin, std::uintptr_t end, F&& f) {
     State& s = state();
     if (!s.count.load(std::memory_order_acquire)) return;
     std::lock_guard lock(s.mutex);
-    std::erase_if(s.pins, [](const Pin& pin) { return pin.overlapped && !overlapped_pending(pin.overlapped); });
+    std::erase_if(s.pins, [](const Pin& pin) {
+        return pin.overlapped && pin.returned && !overlapped_pending(pin.overlapped);
+    });
     s.count.store(s.pins.size(), std::memory_order_release);
     for (const Pin& pin : s.pins)
         if (pin.begin < end && begin < pin.end) f((std::max)(pin.begin, begin), (std::min)(pin.end, end));
@@ -619,7 +796,7 @@ inline std::uint64_t begin_write(const void* buffer, std::size_t bytes, const OV
     {
         std::lock_guard lock(s.mutex);
         id = s.next_id++;
-        s.pins.push_back({begin, begin + bytes, overlapped, id});
+        s.pins.push_back({begin, begin + bytes, overlapped, id, false});
         s.count.store(s.pins.size(), std::memory_order_release);
     }
     // After the pin: a refresh that runs from here on leaves the range writable.
@@ -632,7 +809,14 @@ inline void end_write(std::uint64_t id, bool pending) {
     if (!id) return;
     State& s = state();
     std::lock_guard lock(s.mutex);
-    std::erase_if(s.pins, [id, pending](const Pin& pin) { return pin.id == id && !(pending && pin.overlapped); });
+    for (auto it = s.pins.begin(); it != s.pins.end(); ++it) {
+        if (it->id != id) continue;
+        if (pending && it->overlapped)
+            it->returned = true;
+        else
+            s.pins.erase(it);
+        break;
+    }
     s.count.store(s.pins.size(), std::memory_order_release);
 }
 
@@ -662,18 +846,76 @@ inline std::uint64_t hold(const void* buffer, std::size_t bytes) {
 inline void release(std::uint64_t id) { end_write(id, false); }
 
 // Readies [buffer, buffer + bytes) for a retry after ERROR_NOACCESS: commits xmem's pages that wait for their first
-// touch (the kernel's write does not fault them in) and opens watched pages again. false: neither side is set.
+// touch (the kernel's write does not fault them in), opens watched pages again, and then makes xmem's pages that are
+// still read-only with no guard to answer for it writable. false: no side is set.
 inline bool reopen(const void* buffer, std::size_t bytes) {
     if (!buffer || !bytes) return false;
     const State& s = state();
     const Committer committer = s.committer.load(std::memory_order_acquire);
     const Opener opener = s.opener.load(std::memory_order_acquire);
+    const Unguarder unguarder = s.unguarder.load(std::memory_order_acquire);
+    const auto begin = reinterpret_cast<std::uintptr_t>(buffer);
     if (committer) committer(buffer, bytes);
-    if (opener) {
-        const auto begin = reinterpret_cast<std::uintptr_t>(buffer);
-        opener(begin, begin + bytes);
+    if (opener) opener(begin, begin + bytes);
+    if (unguarder) unguarder(begin, begin + bytes);
+    return committer || opener || unguarder;
+}
+
+namespace detail {
+// memmove that reports an access violation instead of raising it (after the vectored handlers declined it). No C++
+// objects here: a function with __try cannot have any that need unwinding. leonida::guarded::move, not the CRT's
+// memmove: under Wine a fault inside ucrtbase never reaches this __except (src/guarded_copy.h).
+inline bool move_guarded(void* destination, const void* source, std::size_t bytes) {
+    __try {
+        guarded::move(destination, source, bytes);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                  : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
     }
-    return committer || opener;
+}
+
+// An aligned 4- or 8-byte store (guarded::store32/store64) that reports an access violation the same way.
+inline bool store_guarded(void* destination, std::uint64_t value, std::size_t bytes) {
+    __try {
+        if (bytes == 8)
+            guarded::store64(destination, value);
+        else
+            guarded::store32(destination, static_cast<std::uint32_t>(value));
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                  : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+}  // namespace detail
+
+// A host thread's copy of `bytes` from `source` into the title's memory at `destination`: pinned and opened as a
+// kernel write is, so the guards over it are lifted first, the copies take the bytes at the next submission and no
+// refresh guards it again mid-copy; retried once after reopen() if it faults anyway (not when the two ranges overlap:
+// the part copied before the fault changed the source). False when it still faults (the destination, or the source,
+// is not memory it can copy).
+inline bool write(void* destination, const void* source, std::size_t bytes) {
+    if (!bytes) return true;
+    const auto to = reinterpret_cast<std::uintptr_t>(destination), from = reinterpret_cast<std::uintptr_t>(source);
+    const bool overlap = to < from + bytes && from < to + bytes;
+    const std::uint64_t pin = begin_write(destination, bytes, nullptr);
+    bool ok = detail::move_guarded(destination, source, bytes);
+    if (!ok && !overlap && reopen(destination, bytes)) ok = detail::move_guarded(destination, source, bytes);
+    end_write(pin, false);
+    return ok;
+}
+
+// write() of a 4- or 8-byte value (the low `bytes` of `value`). Aligned, it is stored in one locked access, so a
+// title thread polling it never reads a mix of the old and the new value; pinned and retried the same way.
+inline bool store(void* destination, std::uint64_t value, std::size_t bytes) {
+    const auto to = reinterpret_cast<std::uintptr_t>(destination);
+    if ((bytes != 4 && bytes != 8) || to % bytes) return write(destination, &value, bytes);
+    const std::uint64_t pin = begin_write(destination, bytes, nullptr);
+    bool ok = detail::store_guarded(destination, value, bytes);
+    if (!ok && reopen(destination, bytes)) ok = detail::store_guarded(destination, value, bytes);
+    end_write(pin, false);
+    return ok;
 }
 
 // The file shims' reads into title memory (file_system.cpp): ReadFile, ReadFileEx and ReadFileScatter with their

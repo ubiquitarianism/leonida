@@ -126,6 +126,42 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
                 err = self.assert_preflight_fails(["runtime", "pipelines"], "VULKAN_SDK")
                 self.assertIn("vk_pipeline_check", err)
 
+    def run_runtime_preflight(self, system, vulkan_sdk, runtime_build=None):
+        with mock.patch("os.name", system), \
+                mock.patch.dict(os.environ), \
+                mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
+                mock.patch.object(make_game, "log") as log:
+            if vulkan_sdk is None:
+                os.environ.pop("VULKAN_SDK", None)
+            else:
+                os.environ["VULKAN_SDK"] = vulkan_sdk
+            make_game.preflight(["runtime"], self.work, runtime_build=runtime_build)
+        return [call.args[0] for call in log.call_args_list]
+
+    def test_runtime_without_vulkan_sdk_warns_that_the_vulkan_device_may_be_missing(self):
+        for sdk in (None, ""):
+            with self.subTest(sdk=sdk):
+                lines = self.run_runtime_preflight("nt", sdk)
+                self.assertEqual(len([line for line in lines if "VULKAN_SDK is not set" in line]), 1)
+                self.assertIn("LEONIDA_D3D12=vulkan", "".join(lines))
+
+    def test_runtime_with_vulkan_sdk_does_not_warn(self):
+        lines = self.run_runtime_preflight("nt", r"C:\Vulkan")
+        self.assertFalse([line for line in lines if "VULKAN_SDK" in line])
+
+    def test_runtime_warning_is_skipped_for_a_prebuilt_runtime_and_other_systems(self):
+        build = os.path.join(self.root, "build")
+        os.makedirs(build)
+        for name in make_game.RUNTIME_FILES:
+            with open(os.path.join(build, name), "wb"):
+                pass
+        self.assertFalse([line for line in self.run_runtime_preflight("nt", None, runtime_build=build)
+                          if "VULKAN_SDK" in line])
+        with mock.patch.object(make_game, "cross_build_missing", return_value=[]), \
+                mock.patch.object(make_game, "cross_configure"):
+            self.assertFalse([line for line in self.run_runtime_preflight("posix", None)
+                              if "VULKAN_SDK" in line])
+
     def test_missing_checker_is_listed_with_other_missing_prerequisites(self):
         with mock.patch("os.name", "nt"), \
                 mock.patch("shutil.which", side_effect=lambda t: None if t == "llvm-mc" else "/bin/tool"), \

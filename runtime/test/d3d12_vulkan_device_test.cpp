@@ -2423,8 +2423,8 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         fail("unknown feature unexpectedly answered");
 
     // Local invariants for what this layer actually implements.
-    if (o2.DepthBoundsTestSupported ||
-        o2.ProgrammableSamplePositionsTier != D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED)
+    // DepthBoundsTestSupported follows the device's depthBounds feature.
+    if (o2.ProgrammableSamplePositionsTier != D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED)
         fail("OPTIONS2 unexpected support");
     if (o3.CastingFullyTypedFormatSupported ||
         o3.WriteBufferImmediateSupportFlags != D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE ||
@@ -6766,8 +6766,11 @@ int main() {
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&timestamps.p))));
             query_desc = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, 0, 0};
             EXPECT(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&refused.p)) == E_INVALIDARG && !refused.p);
-            // The layer has no stream output, so stream-output statistics heaps are made without a Vulkan pool and
-            // every query reads zero (D3D-302).
+            // D3D-302: an SO_STATISTICS heap is a real transform-feedback pool on a device with
+            // VK_EXT_transform_feedback whose transformFeedbackQueries property is set (indexed on the stream); without
+            // them the heap is made without a Vulkan pool and every query reads zero. A stream past
+            // maxTransformFeedbackStreams reads zero too. StreamOutput PSOs are still refused, so no stream output runs
+            // and the resolved counts are 0 in either case.
             query_desc = {D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 3, 0};
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&so.p))));
             query_desc = {D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 2, 0};

@@ -7,7 +7,8 @@
 //   0x1220  reads address 0 (an access violation the test catches)
 // The loader maps it with the trace open, the test calls the three functions, closes the trace and checks the lines:
 // map, unimplemented_call with the caller as module+RVA, debug_string with the text, exception with the faulting
-// RVA and access kind. No game data and no GPU are involved.
+// RVA and access kind. A second image with delay imports checks delay_import_unimplemented (make_delay_image).
+// No game data and no GPU are involved.
 // LEONIDA_TEST_DIR names the folder for the image and the trace, as for loader_test; the default is the temp folder.
 #include <windows.h>
 
@@ -279,6 +280,102 @@ void test_trace(const fs::path& dir) {
     check(find_line(lines, "exit") == &lines.back(), "exit comes last");
 }
 
+// A DLL image with no code: one ordinary import that binds to nothing, and two delay-import descriptors, one naming a
+// function nothing serves and one naming kernel32!GetTickCount (bound to the host). Delay imports are bound when the
+// image is loaded, so the trace names the missing one then; the ordinary missing import and the bound delay import
+// give no such event.
+constexpr const char* kDelayImageName = "delay_image.bin";
+
+std::vector<uint8_t> make_delay_image() {
+    std::vector<uint8_t> b(0x600, 0);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(b.data());
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = 0x80;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(b.data() + dos->e_lfanew);
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt->FileHeader.NumberOfSections = 1;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+    nt->FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_DLL | IMAGE_FILE_LARGE_ADDRESS_AWARE;
+    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt->OptionalHeader.ImageBase = 0x1a0000000;
+    nt->OptionalHeader.SizeOfHeaders = 0x200;
+    nt->OptionalHeader.SizeOfImage = 0x2000;
+    nt->OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    std::memcpy(sec->Name, ".data", 6);
+    sec->VirtualAddress = kTextRva;
+    sec->Misc.VirtualSize = 0x400;
+    sec->PointerToRawData = 0x200;
+    sec->SizeOfRawData = 0x400;
+    sec->Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+
+    uint8_t* data = b.data() + 0x200;
+    auto put_string = [&](uint32_t off, const char* s) { std::strcpy(reinterpret_cast<char*>(data + off), s); };
+    // One name table entry and its terminator at `lookup_off`, the import's hint/name at `hint_off`.
+    auto put_thunk = [&](uint32_t lookup_off, uint32_t hint_off, const char* name) {
+        *reinterpret_cast<uint64_t*>(data + lookup_off) = kTextRva + hint_off;
+        put_string(hint_off + 2, name);
+    };
+    put_string(0x100, "leonida_trace_probe.dll");
+    put_string(0x120, "kernel32.dll");
+
+    auto* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(data);
+    d->Name = kTextRva + 0x100;
+    d->OriginalFirstThunk = kTextRva + 0x140;
+    d->FirstThunk = kTextRva + 0x160;
+    put_thunk(0x140, 0x180, "NormalProbeMissing");
+
+    const struct {
+        uint32_t dll_off, int_off, iat_off, hint_off;
+        const char* name;
+    } delayed[2] = {{0x100, 0x1A0, 0x1C0, 0x1E0, "DelayProbeMissing"}, {0x120, 0x200, 0x220, 0x240, "GetTickCount"}};
+    for (int i = 0; i < 2; ++i) {
+        auto* dd = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(data + 0x40) + i;
+        dd->Attributes.AllAttributes = 1;  // dlattrRva
+        dd->DllNameRVA = kTextRva + delayed[i].dll_off;
+        dd->ImportNameTableRVA = kTextRva + delayed[i].int_off;
+        dd->ImportAddressTableRVA = kTextRva + delayed[i].iat_off;
+        put_thunk(delayed[i].int_off, delayed[i].hint_off, delayed[i].name);
+    }
+
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    dir.VirtualAddress = kTextRva;
+    dir.Size = 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    auto& ddir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    ddir.VirtualAddress = kTextRva + 0x40;
+    ddir.Size = 3 * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
+    return b;
+}
+
+void test_delay_import_trace(const fs::path& dir) {
+    const fs::path image = write_file(dir / kDelayImageName, make_delay_image());
+    const fs::path trace = dir / "delay_trace.jsonl";
+    check(rt::startup_trace::open(trace.c_str()), "open the delay-import trace file");
+    {
+        rt::Loader loader(dir);
+        rt::Module& m = loader.load(image);
+        int unimplemented = 0, host = 0;
+        for (const auto& r : m.imports) {
+            unimplemented += r.binding == rt::Binding::Unimplemented;
+            host += r.binding == rt::Binding::Host;
+        }
+        check(m.imports.size() == 3 && unimplemented == 2 && host == 1,
+              "the delay image binds 3 imports: 2 unimplemented, 1 host");
+    }
+    rt::startup_trace::close();
+
+    const auto lines = read_lines(trace);
+    int events = 0;
+    for (auto& l : lines) events += l.find("\"kind\":\"delay_import_unimplemented\"") != std::string::npos;
+    const std::string* e = find_line(lines, "delay_import_unimplemented");
+    check(events == 1, "one delay_import_unimplemented event (got " + std::to_string(events) + ")");
+    check(has(e, "\"module\":\"" + std::string(kDelayImageName) + "\"") &&
+              has(e, "\"import\":\"leonida_trace_probe.dll!DelayProbeMissing\""),
+          "delay_import_unimplemented names the module and the delay import");
+}
+
 }  // namespace
 
 int wmain() {
@@ -287,6 +384,7 @@ int wmain() {
         test_disabled_is_silent();
         test_existing_file_is_kept(dir);
         test_trace(dir);
+        test_delay_import_trace(dir);
         std::error_code ec;
         fs::remove_all(dir, ec);
     } catch (const std::exception& e) {

@@ -3,13 +3,20 @@
 // write does not fault such a page in, so the read fails with ERROR_NOACCESS unless the committer runs first. Then
 // kernel_writes::hold, the pin a host import keeps over its pages: recorded with no opener set (no tracker yet), seen
 // by for_each_pin until release(), untouched by a file read's pin ending over the same pages. No game data.
+// the pins and the guards of the geometry watch (src/title_geometry_watch.h): a pin made with an OVERLAPPED that does
+// not say pending yet lasts until its call returns; a host thread's write (kernel_writes::write) into a geometry tile
+// the watch made read-only lands and counts as a write; and a tile armed while another guard changes one of its pages
+// gives every page it protected back. No game data.
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
+#include "../src/title_geometry_watch.h"
 #include "../src/title_page_watch.h"
 
 namespace {
@@ -86,9 +93,119 @@ bool commit_view(const void* address, std::size_t bytes) {
     return VirtualAlloc(const_cast<std::uint8_t*>(begin), bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr;
 }
 
+DWORD protection_of(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(address, &info, sizeof(info)) && info.State == MEM_COMMIT ? info.Protect : 0;
+}
+
+// The D3D12 layer's opener as far as the geometry watch goes (open_shadow_pages): its guards over the range lift.
+int g_opened = 0;
+void open_geometry(std::uintptr_t from, std::uintptr_t to) {
+    ++g_opened;
+    leonida::geometry_writes::notify(from, to, leonida::geometry_writes::Event::open);
+}
+
+// A pin made with an OVERLAPPED whose Internal is not STATUS_PENDING yet (ReadFile stores that when it starts) is kept
+// until the call returns; once it returned pending, it lasts until the OVERLAPPED says it completed.
+void check_overlapped_pin() {
+    namespace kw = leonida::kernel_writes;
+    std::vector<std::uint8_t> bytes(0x1000);
+    const auto begin = reinterpret_cast<std::uintptr_t>(bytes.data());
+    const auto pinned = [&] {
+        int n = 0;
+        kw::for_each_pin(begin, begin + bytes.size(), [&](std::uintptr_t, std::uintptr_t) { ++n; });
+        return n;
+    };
+    kw::set_opener([](std::uintptr_t, std::uintptr_t) {});
+    OVERLAPPED at{};  // Internal 0: reads as completed
+    const std::uint64_t pin = kw::begin_write(bytes.data(), bytes.size(), &at);
+    check(pin != 0 && pinned() == 1, "an overlapped pin is kept while its call has not returned (Internal still 0)");
+    at.Internal = static_cast<ULONG_PTR>(STATUS_PENDING);
+    kw::end_write(pin, true);
+    check(pinned() == 1, "returned pending: kept while the OVERLAPPED says pending");
+    at.Internal = 0;
+    check(pinned() == 0 && kw::state().count.load() == 0, "and dropped once it says completed");
+    const std::uint64_t sync = kw::begin_write(bytes.data(), bytes.size(), &at);
+    kw::end_write(sync, false);
+    check(kw::state().count.load() == 0, "an overlapped pin whose call completed ends with the call");
+    kw::set_opener(nullptr);
+}
+
+// A geometry tile over 64 KiB of the title's memory, armed: read-only. A host thread copies into it through
+// kernel_writes::write (as a DirectStorage queue publishes a request): the opener lifts the watch, the copy lands, and
+// the tile's version moved (the geometry copy is refilled at the next submission). The tile is not armed again while
+// a write into it is pinned.
+void check_geometry_write() {
+    namespace gw = leonida::geometry_writes;
+    constexpr std::size_t tile = gw::tile_size;
+    auto* pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, tile, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    check(pages != nullptr, "a tile of memory");
+    if (!pages) return;
+    const auto va = reinterpret_cast<std::uintptr_t>(pages);
+    gw::Cell* cell = gw::acquire(va);
+    check(gw::arm(va, *cell) && (protection_of(pages + 0x5000) & 0xff) == PAGE_READONLY, "the armed tile is read-only");
+    leonida::kernel_writes::set_opener(&open_geometry);
+    const auto version = cell->version.load();
+    std::vector<std::uint8_t> source(0x3000);
+    for (std::size_t i = 0; i < source.size(); ++i) source[i] = static_cast<std::uint8_t>(i * 13 + 5);
+    bool ok = false;
+    std::thread host([&] { ok = leonida::kernel_writes::write(pages + 0x4800, source.data(), source.size()); });
+    host.join();
+    check(ok && std::memcmp(pages + 0x4800, source.data(), source.size()) == 0,
+          "a host thread's write into the armed tile lands");
+    check(g_opened == 1 && cell->version.load() != version, "the watch was opened first and the tile counts as written");
+    check(gw::arm(va, *cell) && (protection_of(pages) & 0xff) == PAGE_READONLY, "armed again after the write");
+    const std::uint64_t pin = leonida::kernel_writes::begin_write(pages + 0x100, 0x100, nullptr);
+    check(!gw::arm(va, *cell), "not armed while a write into the tile is pinned");
+    leonida::kernel_writes::end_write(pin, false);
+    leonida::kernel_writes::set_opener(nullptr);
+    gw::release(va);
+    check((protection_of(pages) & 0xff) == PAGE_READWRITE && (protection_of(pages + tile - 1) & 0xff) == PAGE_READWRITE,
+          "released: the tile is writable again");
+    VirtualFree(pages, 0, MEM_RELEASE);
+}
+
+// The geometry watch arms a tile while another guard (a slot-133 shadow, under a lock of its own) makes the tile's
+// first page read-only and writable again. VirtualProtect over the tile returns the first page's protection only:
+// taken as every page's, a read-only answer left the others read-only for good once the watch reopened the tile. Every
+// page but the first must be writable after each reopen.
+void check_arm_race() {
+    namespace gw = leonida::geometry_writes;
+    constexpr std::size_t tile = gw::tile_size;
+    auto* pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, tile, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!pages) return;
+    const auto va = reinterpret_cast<std::uintptr_t>(pages);
+    gw::Cell* cell = gw::acquire(va);
+    std::atomic<bool> stop{false};
+    std::thread other([&] {
+        DWORD old = 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            VirtualProtect(pages, 0x1000, PAGE_READONLY, &old);
+            VirtualProtect(pages, 0x1000, PAGE_READWRITE, &old);
+        }
+    });
+    int stuck = 0, armed = 0;
+    const auto until = GetTickCount64() + 1500;
+    while (GetTickCount64() < until && !stuck) {
+        armed += gw::arm(va, *cell) ? 1 : 0;
+        gw::notify(va, va + tile, gw::Event::open);
+        for (std::size_t at = 0x1000; at < tile; at += 0x1000)
+            if ((protection_of(pages + at) & 0xff) != PAGE_READWRITE) ++stuck;
+    }
+    stop = true;
+    other.join();
+    std::printf("   %d arms while another guard toggled the first page, %d pages left read-only\n", armed, stuck);
+    check(armed > 0 && stuck == 0, "reopening an armed tile gives back every page it protected");
+    gw::release(va);
+    VirtualFree(pages, 0, MEM_RELEASE);
+}
+
 }  // namespace
 
 int main() {
+    check_overlapped_pin();
+    check_geometry_write();
+    check_arm_race();
     wchar_t dir[MAX_PATH], path[MAX_PATH];
     GetTempPathW(MAX_PATH, dir);
     GetTempFileNameW(dir, L"kwt", 0, path);

@@ -265,9 +265,10 @@ int main(int argc, char** argv) {
     VkBufferDeviceAddressInfo address_info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     address_info.buffer = heap;
     const VkDeviceAddress heap_base = vkGetBufferDeviceAddress(dev, &address_info);
-    // Descriptor hash table: the T# names image 1, the S# sampler 1. Index 0 of each is a magenta fallback.
+    // Descriptor hash table: the T# names image 1, the S# sampler 1. Index 0 of each is a magenta fallback. The
+    // module is tagged (build.py), so the T# entry names the array its index is bound in: a sampled 2D image.
     leonida::DescriptorTable table(16);
-    table.insert(tsharp.data(), 1);
+    table.insert(tsharp.data(), 1, leonida::kind_sampled_bit(0));
     table.insert(leonida::make_ssharp_key(ssharp.data()).data(), 1);
     const auto table_words = table.build_gpu_buffer(true);
     VkBuffer table_buffer;

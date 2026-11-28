@@ -19,7 +19,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 FENCE = re.compile(r"(`{3,})[^`]*$|(~{3,}).*$")
 LIST_ITEM = re.compile(r"( *)([-+*]|\d{1,9}[.)])(?: +|$)")
-LINK = re.compile(r"!?\[[^\]]*\]\((?:<([^>]+)>|([^)\s]+))(?:\s+\"[^\"]*\")?\)")
+LINK = re.compile(
+    r"""!?\[[^\]]*\]\(
+    (?:<([^>]+)>|([^)\s]+))
+    (?:\s+(?:
+        "(?:\\.|[^"\\])*" | '(?:\\.|[^'\\])*' | \((?:\\.|[^()\\])*\)
+    ))?
+    \)""",
+    re.VERBOSE,
+)
 HTML = re.compile(r'(?:href|src)\s*=\s*"([^"]+)"')
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$", re.M)
 EXTERNAL = ("http://", "https://", "mailto:", "tel:", "data:")
@@ -204,6 +212,21 @@ class StripFencesTest(unittest.TestCase):
 
 
 class RepositoryLinksTest(unittest.TestCase):
+    def test_checks_links_with_commonmark_title_delimiters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = os.path.join(tmp, "page.md")
+            with open(page, "w", encoding="utf-8", newline="\n") as f:
+                f.write("# Existing\n"
+                        "[valid](#existing 'A title')\n"
+                        r"[missing](missing.md 'It\'s missing')" "\n"
+                        r"[bad anchor](#missing (An escaped \) in a title))" "\n"
+                        r'[double quotes](another.md "An escaped \" in a title")' "\n")
+            self.assertEqual(broken_links(tmp, [page]), [
+                ("page.md", "missing.md", "missing file"),
+                ("page.md", "#missing", "same-page anchor not found"),
+                ("page.md", "another.md", "missing file"),
+            ])
+
     @unittest.skipUnless(shutil.which("git"), "requires Git")
     def test_flags_broken_link_in_tracked_unicode_filename(self):
         with tempfile.TemporaryDirectory() as tmp:

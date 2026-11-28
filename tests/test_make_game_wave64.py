@@ -49,6 +49,76 @@ class SmallestMaxSubgroupTest(unittest.TestCase):
         self.assertIsNone(make_game.smallest_max_subgroup("\tminSubgroupSize = 32\n"))
 
 
+def typed_device(name, kind, size):
+    """vulkaninfo's plain-text layout for one device as a real run prints it: deviceType just before deviceName."""
+    return ("VkPhysicalDeviceProperties:\n---------------------------\n"
+            f"\tdeviceType        = PHYSICAL_DEVICE_TYPE_{kind}\n"
+            f"\tdeviceName        = {name}\n"
+            "VkPhysicalDeviceVulkan13Properties:\n-----------------------------------\n"
+            "\tminSubgroupSize                                                               = "
+            f"{min(size, 32) if size >= 32 else size}\n"
+            f"\tmaxSubgroupSize                                                               = {size}\n")
+
+
+class CpuDeviceTest(unittest.TestCase):
+    """A CPU device (llvmpipe: maxSubgroupSize 8) does not decide when a GPU is listed: the runtime ranks it last."""
+
+    def test_llvmpipe_beside_a_wave64_gpu_is_left_out(self):
+        text = (typed_device("AMD Radeon RX 7900 XTX (RADV NAVI31)", "DISCRETE_GPU", 64)
+                + typed_device("AMD Ryzen 9 7950X3D (RADV RAPHAEL_MENDOCINO)", "INTEGRATED_GPU", 64)
+                + typed_device("llvmpipe (LLVM 23.1.5, 256 bits)", "CPU", 8))
+        self.assertEqual(make_game.smallest_max_subgroup(text), 64)
+        size, device, left_out = make_game.max_subgroup_decider(text)
+        self.assertEqual((size, device), (64, "AMD Radeon RX 7900 XTX (RADV NAVI31)"))
+        self.assertEqual(left_out, ["llvmpipe (LLVM 23.1.5, 256 bits)"])
+
+    def test_the_cpu_device_listed_first_is_left_out_too(self):
+        text = typed_device("llvmpipe", "CPU", 8) + typed_device("GPU", "DISCRETE_GPU", 64)
+        self.assertEqual(make_game.max_subgroup_decider(text), (64, "GPU", ["llvmpipe"]))
+
+    def test_a_32_wide_gpu_still_decides(self):
+        text = (typed_device("A", "DISCRETE_GPU", 64) + typed_device("B", "INTEGRATED_GPU", 32)
+                + typed_device("llvmpipe", "CPU", 8))
+        self.assertEqual(make_game.max_subgroup_decider(text), (32, "B", ["llvmpipe"]))
+
+    def test_only_a_cpu_device_decides(self):
+        self.assertEqual(make_game.max_subgroup_decider(typed_device("llvmpipe", "CPU", 8)), (8, "llvmpipe", []))
+
+    def test_a_cpu_device_without_a_size_does_not_make_it_unknown(self):
+        text = (typed_device("GPU", "DISCRETE_GPU", 64)
+                + "VkPhysicalDeviceProperties:\n\tdeviceType        = PHYSICAL_DEVICE_TYPE_CPU\n"
+                  "\tdeviceName        = old lavapipe\n")
+        self.assertEqual(make_game.smallest_max_subgroup(text), 64)
+        # ...but a GPU without one still does.
+        old_gpu = ("VkPhysicalDeviceProperties:\n\tdeviceType        = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU\n"
+                   "\tdeviceName        = old GPU\n")
+        self.assertIsNone(make_game.smallest_max_subgroup(text + old_gpu))
+
+    def test_json_key_order(self):
+        text = ('{"VkPhysicalDeviceProperties": {\n\t\t"deviceName": "llvmpipe",\n'
+                '\t\t"deviceType": "VK_PHYSICAL_DEVICE_TYPE_CPU"},\n'
+                '\t"VkPhysicalDeviceSubgroupSizeControlProperties": {\n\t\t"maxSubgroupSize": 8}}\n'
+                '{"VkPhysicalDeviceProperties": {\n\t\t"deviceName": "GPU",\n'
+                '\t\t"deviceType": "VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU"},\n'
+                '\t"VkPhysicalDeviceSubgroupSizeControlProperties": {\n\t\t"maxSubgroupSize": 64}}')
+        self.assertEqual(make_game.max_subgroup_decider(text), (64, "GPU", ["llvmpipe"]))
+
+    def test_auto_logs_the_deciding_device_and_the_left_out_one(self):
+        text = typed_device("GPU", "DISCRETE_GPU", 64) + typed_device("llvmpipe", "CPU", 8)
+        lines = []
+
+        def fake_run(args, **kw):
+            if os.path.basename(str(args[-1])) == "vk_subgroup_info.py":
+                return subprocess.CompletedProcess(args, 0, stdout='{"native64": true}', stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout=text, stderr="")
+        with mock.patch.object(make_game.shutil, "which", return_value="vulkaninfo"), \
+                mock.patch.object(make_game.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(make_game, "log", lambda *a: lines.append(" ".join(map(str, a)))):
+            self.assertFalse(make_game.wave64_emulate("auto"))
+        self.assertTrue(any("llvmpipe" in line and "left out" in line for line in lines), lines)
+        self.assertTrue(any("is 64 (GPU)" in line and "emulation off" in line for line in lines), lines)
+
+
 class Wave64EmulateTest(unittest.TestCase):
     """wave64_emulate(): on and off are taken as given; auto asks vulkaninfo and falls back to on."""
 

@@ -36,7 +36,7 @@ happens **on your PC, from your own copy of the game**.
 > from your game and stays on your PC. Never share those files.
 
 > [!NOTE]
-> **This is a continuation of [NotRexed's Leonida project](https://github.com/ItsNotRexed/Leonida).** The original
+> **This is a continuation of [NotRexed's Leonida project](https://github.com/ProjectLeonida/Leonida).** The original
 > author has left the project, and development continues here with its full commit history. Credit for the work up to
 > that point belongs to NotRexed and the contributors listed in the history.
 
@@ -44,16 +44,40 @@ Discord: https://discord.gg/ETf4qj5acN
 
 Telegram: https://t.me/mandyport
 
-Original author's Git Mirror: https://git.notrexed.dev/notrexed/Leonida
 <br>
 
 ## Project status
 
-**Early. Nothing is playable yet.** On `main`, the game boots from your own copy on native Windows and on Linux
+**Early, and playable in the world on one of its two runtimes.** The Direct3D 12 runtime in
+[`d3d12/`](d3d12/README.md) loads a save into the open world on Windows, where you control the character with the
+HUD, the map and the pause menu working, at a low frame rate (12 to 13 frames a second on the maintainer's PC; the
+measurements are at the end of this section). The rest of this section up to there is about the other runtime, the
+recompiled one with the D3D12 → Vulkan layer (`runtime/`), which is not playable yet. With that one, on `main`, the
+game boots from your own copy on native Windows and on Linux
 through Proton: it shows the launch movie, the first-run pages and the landing prompt, which respond to a pad or
 the keyboard pad, then runs the story load to its end and enters the world phase. A first world frame has not been
-verified yet on any test machine. [First-run UI on Windows](docs/first_run_ui.md) has the build and launch steps;
+verified yet on any test machine. On native Windows a scripted pad alone (`LEONIDA_INPUT_SCRIPT`, no keyboard or
+controller) gets through every first-run page, including the legal-terms page whose Confirm waits for both boxes, to
+the loading screen of the story load ([the route](docs/first_run_ui.md#through-the-first-run-pages-with-the-scripted-pad)).
+[First-run UI on Windows](docs/first_run_ui.md) has the build and launch steps;
 [the Linux/Proton report](docs/linux_proton.md) has the timings and where it stops.
+
+**The Direct3D 12 runtime, [`d3d12/`](d3d12/README.md) (Windows, NVIDIA and AMD), is playable in the world.**
+It is a separate program (`leonida.exe`) that grew from VIctory; what follows are this project's own measurements,
+taken by the maintainer on 2026-11-27, not figures quoted from another project. They are of the working branch of
+that day (commit `37426fd9f`, which has a fix for waits on the graphics card that is not on `main` yet); `main`
+itself measured about 10 frames a second at the same place earlier that day (median frame about 102 ms):
+
+- PC: Ryzen 5 7600X (6 cores), GeForce RTX 4060 Ti 16 GB (driver 616.64), 32 GB of RAM, Windows 11.
+- Series X profile, 2560x1440 picture, the title's own upscaler at render scale 1, no generated frames.
+- A save loads into the open world and you play from there: the character walks and drives with a pad (Xbox or
+  PlayStation, with matching button prompts) or with keyboard and mouse, with sound, the HUD, the map, the weapon
+  wheel and the pause menu. **12 to 13 frames a second** standing at the save point (median frame 75 to 82 ms in three runs of about
+  three minutes, about 7,100 draws a frame); the game uses about 5.6 of the 6 cores and the card is about 95% busy.
+- Known to be wrong in the picture: a stair-stepped part of the screen near the camera gets no indirect light at
+  that save point; ray-traced light is stood in for (every ray is a miss, the structure builder is off); the
+  transmission-volumetrics programs are left out, which darkens water.
+- Not measured: how far the story plays, and how long a session lasts.
 
 | What | Status |
 |---|---|
@@ -80,7 +104,8 @@ and the `D3D-` items), run `python -I tools/progress_dashboard.py --out <folder 
 
 ## Platforms
 
-Nothing is playable on any platform yet (see *Project status*). What runs where today:
+The Direct3D 12 runtime in `d3d12/` is playable in the world on Windows (see *Project status*); the recompiled runtime with the
+Vulkan layer is not playable on any platform yet. What runs where today, for the latter:
 
 | Platform | Today |
 |---|---|
@@ -89,7 +114,7 @@ Nothing is playable on any platform yet (see *Project status*). What runs where 
 | macOS (Apple Silicon) | The Python tools and the Vulkan test tools run natively, on MoltenVK (Homebrew) or KosmicKrisp. The runtime is Windows code and runs as on Linux, under Wine: CrossOver, arm64 with FEX or x86-64 under Rosetta (#1706, #1707, #1924; #3119 fixes the last loader tests there). Known gaps: no geometry stage and no `VK_EXT_mesh_shader` (those tests are skipped), 32-wide subgroups (wave64 shaders run emulated), and MoltenVK's float handling (`PerVertexKHR`, NaN compares, -0, the cost of `NoContraction`); [docs/testing.md](docs/testing.md) lists each (#2947). |
 | AMD RDNA1 (RX 5000) | A supported target: close to the console's RDNA2, and its 64-wide subgroups run the wave64 shaders natively. RX 5700 XT results pass the GPU test suite (#146); on RADV, pixel shaders without fragment barycentrics have a known difference (*Known problems* in [docs/testing.md](docs/testing.md)) (#330). |
 
-GPU results from every platform are collected in #166; how to run the tests is in [docs/testing.md](docs/testing.md).
+GPU results from every platform are submitted as pull requests adding a file to [gpu-test-results/](gpu-test-results); how to run the tests is in [docs/testing.md](docs/testing.md).
 
 ## How to build
 
@@ -98,7 +123,7 @@ The port isn't downloaded ready-made. It's built on your PC from your own copy.
 **The easy way:**
 
 1. Install the prerequisites below.
-2. Download this project **with its submodule**: `git clone --recursive https://github.com/ubiquitarianism/leonida`. A
+2. Download this project **with its submodule**: `git clone --recursive https://github.com/ProjectLeonida/mandy`. A
    "Download ZIP" from GitHub leaves out `third_party/rpf9-explorer`. The build fetches it if `git` is installed,
    and otherwise tells you what to do.
 3. Double-click **`Build.bat`**. On Linux or macOS, run **`./Build.sh`** from a terminal instead (see
@@ -205,6 +230,12 @@ skips a shader without `shaderSignedZeroInfNanPreserveFloat32`; needs PR #664's 
 on by itself on Intel's Windows Vulkan driver, whose native mesh draws crash, BUILD-2202, unless `--native-mesh`).
 Each is documented in [docs/design.md](docs/design.md).
 
+`--mesh-serial-waves` is forwarded and saved the same way. It is off by default: with wave64 emulation it runs
+the waves of a mesh shader one after the other in 64 invocations instead of side by side (docs/design.md, "Mesh
+shaders with their waves in series"). Only a wave64 mesh shader of more than 64 threads, a multiple of 64, with no
+LDS instruction, store or atomic takes that form; every other shader, and every shader translated natively or with
+`--mesh-compute`, comes out as before, so turning it on retranslates everything but changes only those.
+
 The build records which llvm-mc command and version produced the disassembly. Changing either, or reusing a work
 folder that predates this record, reruns disassembly and translation while keeping the extracted shader inputs.
 
@@ -220,11 +251,13 @@ Stages: `check` always runs first; then `shaders`, `assets` and `runtime` run to
 depend on each other). `pipelines` starts once the translated shaders are ready and, when this run includes runtime,
 that stage has finished rebuilding `vk_pipeline_check`, so it can overlap the rest of assets; it creates every
 translated shader on your GPU driver, reports any it has to skip, and saves a pipeline cache to `pipeline_cache.bin`
-in `--out` (the runtime doesn't load that cache yet, so it doesn't speed up the first boot). The shader translation
-is the longest CPU step: it runs on `--jobs` processes (half the CPU threads by default). When shaders and assets
-share the machine, that budget is split between them and passed to `rpf9dump` as `--jobs`; a solo assets run still
-lets `rpf9dump` use every core. Progress lines include percent and a rough ETA for translation shards, asset steps,
-and overall stage completion.
+in `--out`, which also holds `gta6rt.exe` after the `runtime` stage. The runtime seeds its Vulkan pipeline cache
+from the file beside the executable when its header matches the device and pipeline cache UUID. It falls back to
+an empty cache if the file is missing, incompatible, or rejected by the driver. Shader translation is the longest
+CPU step. It runs on `--jobs` processes (half the CPU threads by default). When shaders and assets share the machine,
+that budget is split between them and passed to `rpf9dump` as `--jobs`. A solo assets run still lets `rpf9dump` use
+every core. Progress lines include percent and a rough ETA for translation shards, asset steps, and overall stage
+completion.
 
 On an interactive terminal, a LEONIDA setup screen lets you set jobs and whether stages overlap, then a key-switchable
 per-stage log view (`1`–`4` / `Tab`) keeps parallel output demuxed; full stage logs go under `work/logs/`. Use
@@ -268,12 +301,23 @@ Either way it copies `gta6rt.exe` and `gta6rt_tls_host.dll` into `--out` and wri
 starts `gta6rt.exe` with `wine`, or with the Wine named by `WINE` (for Proton, its `files/bin/wine`). The same option
 skips the build on Windows.
 
+For `tools/pe_inspect.py`'s import classes on Linux, set `WINEPREFIX` to the prefix the loader runs in (or use
+`~/.wine`); without one, system DLLs are reported as `system (unverified)`
+([docs/design.md](docs/design.md#day-one-when-the-exe-is-here)).
+
 On Linux, run `<out>/gta6rt.sh --dry-run` to inspect the packaged title's imports, then
 `<out>/gta6rt.sh --init` to check TLS callbacks and DLL initialization. Use `<out>/gta6rt.sh --run` for startup.
 These commands use the package in `game_path.txt`, the port's `overlay` for writes, and Vulkan by default.
 
 When the Vulkan backend is selected with `LEONIDA_D3D12=vulkan`, the packaged runtime finds the translated shaders
 in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEONIDA_SHADERS` to use another directory.
+
+### Starting the game: the launcher
+
+Double-click **`Launcher.bat`** (Linux: `python3 tools/leonida_launcher.py`) for the Leonida Launcher: a window with a
+PLAY button, the game and data folders, the runtime's options (DLSS, ray tracing, Smooth Motion, and so on), the mod
+list and a few tools. PLAY runs `scripts\play-d3d12.ps1` for you. It needs only Python and Tkinter, and is described in
+[docs/launcher.md](docs/launcher.md).
 
 ## How it works
 
@@ -304,8 +348,9 @@ The biggest open pieces:
 - **World start**: the story load finishes, but no world frame has been verified yet;
   [Where it stops](docs/linux_proton.md#where-it-stops) lists what stops it.
 - **Shader translator on hardware**: compute, mesh and geometry now translate (see the translator contract in
-  [docs/design.md](docs/design.md)); still open are the vertex-shader input layout (`v0` = `VertexIndex` is
-  unverified if the console runs VS as NGG) and wave64 cross-half code in VS/PS/GS on 32-wide subgroups.
+  [docs/design.md](docs/design.md)); still open is wave64 cross-half code in VS/PS/GS on 32-wide subgroups. The
+  vertex-shader input layout is measured: all 2,236 VS are legacy (non-NGG), with `v0` = `VertexIndex` (the
+  *Inputs and outputs* row of [docs/design.md](docs/design.md)).
 - **Xbox D3D12 → Vulkan**: mesh-shader draws, indirect draw state and stream output are still open; #313 tracks the
   remaining method surface. The Windows integration exercises the first-run UI. [Plan and status](docs/d3d12_vulkan.md)
 - **Model recovery**: investigate the 71 unrecovered fragment candidates in [`levels.rpf`](docs/models.md#full-archive-re-count-at-e293917).
@@ -326,6 +371,12 @@ pull requests.
 - [LLVM](https://llvm.org/): AMDGPU disassembler.
 - Logo: ["Grand Theft Auto VI" icon by SlyDevil](https://www.steamgriddb.com/icon/122618) on SteamGridDB.
 - [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools): assembly and validation.
+- Aki-Developer: `aki-gta6/aki-runtime` (GPL-3.0), a sister port shared with the project. Taken from it into the Rust
+  D3D12 runtime: the count of dropped draws by reason in the frame line, descriptor slots given back as soon as the
+  card has run a submission, pixel colours held to the console's HDR range, the composer's clamp that keeps a NaN from
+  coming out black, two planes composed into 10 bits under frame generation, the paired form of wave64 programs tried
+  before the approximate ones (`LEONIDA_PAIRED_LANES=exact`), a pipeline's kept skip answer, and four small fixes it
+  carried from fxceless/victory-fork. Each commit names the `aki-runtime` commit it is from.
 
 Grand Theft Auto and all related names are trademarks of their owners. This project is not affiliated with or
 endorsed by them.

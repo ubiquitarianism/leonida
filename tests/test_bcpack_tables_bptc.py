@@ -15,6 +15,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS_DIR = os.path.join(ROOT, "tools")
@@ -636,6 +637,127 @@ class TestLoadBc7(unittest.TestCase):
             with self.subTest(bad_sec=bad_sec):
                 with self.assertRaises((ValueError, TypeError)):
                     bptc.load_bc7({"bc7": bad_sec})
+
+
+class TestSecurityAndEdgeValidation(unittest.TestCase):
+    """Regression tests for section validation, recursion bounds, bit-shift bounds, and cache identity."""
+
+    def test_non_dict_codec_section_raises_value_error(self) -> None:
+        for bad in ([], 123, "bad"):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "JSON object"):
+                    bptc.load_bc6h({"bc6h": bad})
+                with self.assertRaisesRegex(ValueError, "JSON object"):
+                    bptc.load_bc7({"bc7": bad})
+
+    def test_recursion_error_in_json_raises_value_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "deep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("{}")
+            bptc._FILE_CACHE.pop(os.path.realpath(path), None)
+            bptc._FILE_CACHE.pop(os.path.abspath(path), None)
+            with mock.patch.object(bptc.json, "load", side_effect=RecursionError("too deep")):
+                for fn in (
+                    lambda: bptc.load_bc6h(path),
+                    lambda: bptc.load_bc7(path),
+                    lambda: bptc.load_bc_history(1, path),
+                ):
+                    with self.assertRaisesRegex(ValueError, "too deep"):
+                        fn()
+
+    def test_bc7_low2_fit_confirmed_bits_above_8_raises_value_error_not_negative_shift(self) -> None:
+        sec = {
+            "historyEndpoints": {"0": [0x80] * 24},
+            "historyEndpointBits": {"0": [4] * 24},
+            "historyEndpointConfirmedBits": {"0": [9] + [0] * 23},
+            "historyEndpointLow2Fits": [[0, 0, 1]],
+        }
+        with self.assertRaisesRegex(ValueError, "out of bounds"):
+            bptc.load_bc7({"bc7": sec})
+        for bad_fits in (123, [[0, 0]], [[True, 0, 1]], [[0, 0, "1"]]):
+            with self.subTest(bad_fits=bad_fits):
+                bad_sec = {
+                    "historyEndpoints": {"0": [0x80] * 24},
+                    "historyEndpointBits": {"0": [4] * 24},
+                    "historyEndpointLow2Fits": bad_fits,
+                }
+                with self.assertRaises(ValueError):
+                    bptc.load_bc7({"bc7": bad_sec})
+
+    def test_bc7_last_resort_scalar_or_out_of_bounds_raises_value_error(self) -> None:
+        for bad_lr in (123, [123], [[256, 0]], [[-1, 0]], [[0, 24]], [[0, 3, 0, 0]], [[0, 0, 2, 0]], [[0, 0, 0, 4]]):
+            with self.subTest(bad_lr=bad_lr):
+                with self.assertRaises(ValueError):
+                    bptc.load_bc7({"bc7": {"historyEndpointLastResort": bad_lr}})
+
+    def test_bc6h_scalar_row_raises_value_error(self) -> None:
+        for bad_sec in (
+            {"endpointHistory": {"0": 123}},
+            {"endpointHistory": {"0": [123, [0] * 4, [0] * 4]}},
+            {"indexHistory": {"0": 123}},
+            {"endpointConfirmedBits": {"0": 123}},
+            {"indexConfirmedBits": {"0": 123}},
+        ):
+            with self.subTest(bad_sec=bad_sec):
+                with self.assertRaises(ValueError):
+                    bptc.load_bc6h({"bc6h": bad_sec})
+
+    def test_file_cache_invalidates_on_same_size_mtime_inode_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hist = os.path.join(tmp, "hist.json")
+            staged = os.path.join(tmp, "staged.json")
+            payload_a = json.dumps({"bc6h": {"endpointClass": {"0": 1}}})
+            payload_b = json.dumps({"bc6h": {"endpointClass": {"0": 2}}})
+            self.assertEqual(len(payload_a), len(payload_b))
+            with open(hist, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(payload_a)
+            st = os.stat(hist)
+            self.assertEqual(bptc.load_bc6h(hist)[2][0], 1)
+
+            with open(staged, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(payload_b)
+            os.utime(staged, ns=(st.st_atime_ns, st.st_mtime_ns))
+            os.replace(staged, hist)
+            os.utime(hist, ns=(st.st_atime_ns, st.st_mtime_ns))
+            self.assertEqual(bptc.load_bc6h(hist)[2][0], 2)
+
+    def test_strict_int_rejects_bool_float_and_duplicate_or_malformed_dict_keys(self) -> None:
+        for bad_key in (True, 1.5, " 0 ", "+0", "\u0660", "bad"):
+            with self.subTest(bad_key=bad_key):
+                with self.assertRaises(ValueError):
+                    list(bptc._iter_entries({bad_key: 0}))
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            list(bptc._iter_entries({"01": 1, "1": 2}))
+        with self.assertRaises(ValueError):
+            bptc.load_bc6h({"bc6h": {"endpointClass": {"0": True}}})
+        with self.assertRaises(ValueError):
+            bptc.load_bc6h({"bc6h": {"indexHistory": {"0": [1.5] + [0] * 15}}})
+        with self.assertRaises(ValueError):
+            bptc.load_bc7({"bc7": {"historyEndpointBits": {"0": [True] + [0] * 23}}})
+        with self.assertRaises(ValueError):
+            bptc.load_bc7({"bc7": {"historyEndpointLastResort": [[0, True]]}})
+        with self.assertRaises(ValueError):
+            bptc.load_bc_history(1, {"bc1": {"confirmed": {"0": [True, 0, 0, 0, 0, 0]}}})
+
+    def test_bc6h_class_and_bc7_bit_depth_bounds(self) -> None:
+        for key in ("endpointClass", "indexClass"):
+            for bad_cls in (-1, 4):
+                with self.subTest(key=key, bad_cls=bad_cls):
+                    with self.assertRaisesRegex(ValueError, "outside 0..3"):
+                        bptc.load_bc6h({"bc6h": {key: {"0": bad_cls}}})
+
+        for key, bad_vals in (
+            ("historyEndpointBits", (-1,)),
+            ("historyEndpointConfirmedBits", (-1, 9)),
+            ("historyIndexBits", (-1, 5)),
+            ("historyIndexConfirmedBits", (-1, 5)),
+        ):
+            width = 24 if "Endpoint" in key else 32
+            for bad in bad_vals:
+                with self.subTest(key=key, bad=bad):
+                    with self.assertRaisesRegex(ValueError, "out of bounds"):
+                        bptc.load_bc7({"bc7": {key: {"0": [bad] + [0] * (width - 1)}}})
 
 
 if __name__ == "__main__":

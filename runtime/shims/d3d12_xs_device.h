@@ -58,6 +58,14 @@
 //             CreateCommandList(0, type, allocator, initialState). The type is the first word of the Xbox desc; there
 //             is no node-mask argument in the console call (public HLE; the PC six-argument form differs). An riid the
 //             proxy does not answer (the console's own list IID) is answered with the proxy.
+//   slots 71/72  Write32BitValueBottomOfPipeX and Write64BitValueBottomOfPipeX: the console's value writes, with
+//             slots 73/74 (Wait32BitValueX, Wait64BitValueX) the waits that go with them. A list the list values
+//             track (d3d12_xs_list_values.h, LEONIDA_LIST_VALUES, on by default) records all four, lands each write
+//             once its part has run and holds its queue at a wait. Only for a list they do not track
+//             (LEONIDA_LIST_VALUES=0, bundles) does LEONIDA_GPU_LABELS=1 record slots 71/72 as GPU completion labels
+//             (runtime/src/vulkan_gpu_labels.h): one writer per list. Either writer lands a value at an arena offset
+//             in the arena, and one on a page of xmem's that the title's view keeps PAGE_NOACCESS through xmem's own
+//             mapping (runtime/src/value_write_sink.h).
 //   slots 78/79/80/81  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX, GetFrameStatisticsX. A presentation
 //             attached with set_presentation_handler (below) answers them; without one a per-device token state
 //             machine does, before the PC vtable is indexed: WaitFrameEventX returns at once with a fresh non-zero
@@ -131,6 +139,8 @@ class FrameTokenSource;
 }
 
 namespace leonida::native_pso { struct GraphicsDesc; }
+
+namespace rt::xmem { struct PageBatch; }
 
 namespace rt::d3d12_xs {
 
@@ -281,6 +291,11 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler);
 // called. With none registered nothing is done.
 using PlacedAtVaPagesHook = bool (*)(const void* va, std::size_t bytes);
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook);
+// Test/backend seam for queue slot 31. The proxy serializes the mapping after earlier queue work and before later
+// submissions. A null hook leaves the console-only call as a successful no-op when xmem is not linked.
+using CopyPageMappingsHook = bool (*)(std::uint32_t, const rt::xmem::PageBatch*, std::uintptr_t,
+                                      std::uint32_t, std::uint32_t);
+void set_copy_page_mappings_hook(CopyPageMappingsHook hook);
 using PinnedTexturePages = std::shared_ptr<std::uint8_t> (*)(const void*, std::size_t);
 void set_texture_page_provider(PinnedTexturePages hook);
 std::shared_ptr<std::uint8_t> pin_texture_pages(const void* address, std::size_t size);
@@ -425,6 +440,64 @@ inline constexpr unsigned console_to_pc_list_slot(unsigned slot) {
     return kListNotForwarded;
 }
 
+// Console list memory writes and waits (docs/d3d12_xs_console_abi.md §5.5; the runtime side is
+// d3d12_xs_list_values.h). `write32(address, value, flush, flags)` and `write64(address, value, flush, flags)` store a
+// value once the work before them has run (write64 flag 1 stores the GPU timestamp, 2 the system one);
+// `wait32/wait64(address, comparison, reference, ?)` hold the queue until memory compares true. The newer layout
+// (this package's title: the list tail sits two slots later) has them at 71-74, the older at 69-72; a layout not
+// detected yet is taken as the newer one, as for ExecuteIndirect at 61.
+enum class ConsoleValueOp : unsigned char { none, write32, write64, wait32, wait64 };
+inline constexpr ConsoleValueOp console_value_op(unsigned slot, unsigned char console_layout) {
+    const unsigned first = console_layout == kConsoleLayoutOlder ? 69 : 71;
+    if (slot < first || slot > first + 3) return ConsoleValueOp::none;
+    return static_cast<ConsoleValueOp>(slot - first + 1);
+}
+// A wait's comparison codes are the D3D12_COMPARISON_FUNC values, memory OP reference: 2 less, 3 equal, 4 less or
+// equal, 5 greater, 6 not equal, 7 greater or equal (the title's, with a rising reference). 8 (always), 1 (never)
+// and any other code count as met: a wait nothing can meet would only hold the queue to its timeout. A 32-bit wait
+// compares the low 32 bits of both.
+inline constexpr bool console_value_met(std::uint32_t comparison, std::uint64_t value, std::uint64_t reference,
+                                        bool wide) {
+    if (!wide) {
+        value &= 0xffffffffu;
+        reference &= 0xffffffffu;
+    }
+    switch (comparison) {
+    case 2: return value < reference;
+    case 3: return value == reference;
+    case 4: return value <= reference;
+    case 5: return value > reference;
+    case 6: return value != reference;
+    case 7: return value >= reference;
+    default: return true;
+    }
+}
+struct ListValueStats {
+    std::uint64_t writes_recorded, writes_landed, writes_failed;
+    std::uint64_t waits_recorded, waits_met_at_submit, waits_relayed;  // relayed: a GPU wait on a write in flight
+    std::uint64_t gates_held, gates_met, gates_timed_out;               // gate: opened from the CPU
+    std::uint64_t cuts, cuts_deferred, cut_failures;                    // a list split at a wait after work
+    std::uint64_t gates_short, demotions, late_met;  // short timeouts, every wait demoted, short waits met later
+    std::uint64_t bundle_ops;                         // writes and waits on bundles, not modelled
+    std::uint64_t releases, release_us, release_us_max, pass_us_max;  // the releaser's signals, the pump's passes
+    std::uint64_t release_stalls;                     // gate Signals still running after a second
+    std::uint64_t remaps_now, remaps_deferred, remaps_failed, remap_wait_us_max;  // queue slot 31
+    std::uint64_t stamps_gpu, stamps_cpu;  // write64 flags 1/2 landed with the GPU's timestamp, the CPU's clock
+    std::uint64_t labels_handed;           // slot 71/72 writes given to LEONIDA_GPU_LABELS (lists not tracked here)
+    std::uint64_t writes_arena, writes_title_pages;  // landed in the arena, through xmem's mapping (in writes_landed)
+};
+ListValueStats list_value_stats();
+void reset_list_value_stats();
+// How long a queue stands at an unmet wait before it runs on (LEONIDA_VALUE_WAIT_TIMEOUT_MS, default 200 ms).
+void set_list_value_wait_timeout_ms(unsigned ms);
+// Test helper: LEONIDA_LIST_VALUES as if set to 0 (false) or unset (true), for lists made afterwards.
+void set_list_values_enabled(bool on);
+// Before the process exits: the threads that land list writes and open gates finish and end (up to `ms`).
+void stop_list_values(unsigned ms);
+// Test helper: true once every write landed and every gate opened, waiting up to `ms`.
+bool list_values_idle(unsigned ms);
+// Test helper: the real lists a list proxy's recording is in (1 + its cuts), 0 for anything else.
+unsigned list_proxy_part_count(const void* list);
 
 // Number of live references on a device proxy. Test helper for the heap's GetDevice/lifetime checks. References the
 // layer under the proxy holds for background work of its own are waited out first (set_reference_settler), so the

@@ -1,0 +1,110 @@
+#version 460
+// Null descriptors of every kind through the bindless set 0 (src/vulkan_bindless.h), for vk_null_descriptor_test.
+// The shader finds its images the way translated shaders do (tools/rdna2spirv.py desc_probe; docs/design.md,
+// "Images"): FNV-1a over the eight key dwords, eight probes of the table at binding 2, a miss is index 0, and it uses
+// that index in the binding of the instruction's own dimension. The keys come from the test (set 1 binding 1):
+//   key 0: all zeros (a null T#), key 1: a 3D T# no image answers, key 2: a cube T# (read through the 2D-array
+//   binding, as the translator reads cubes), key 3: a 1D T#, key 4: the T# of a real 2D image, key 5: a zero S#.
+// pc.mode 0 stores and adds through the storage fallbacks (a null UAV); mode 1 reads everything back. Result words
+// (set 1 binding 0), each vec4 as four uints:
+//   0..5 the index each key finds; 8, 9: what the 2D and 3D r32ui atomics of mode 0 returned;
+//   16.. sampled fetches: 2D, 2D array, 3D, 1D, then the real 2D image; 36.. sampled with the found sampler:
+//   2D, cube (layer 3, clamped), 3D, 1D; 64.. storage loads (2D, 2D array, 3D, 1D) x (float, uint, sint);
+//   112, 113: the 2D and 3D atomics of mode 1.
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 1) in;
+
+layout(push_constant) uniform Mode { uint mode; } pc;
+
+layout(set = 0, binding = 0) uniform texture2D images[];
+layout(set = 0, binding = 1) uniform sampler samplers[];
+layout(set = 0, binding = 2, std430) readonly buffer DescriptorMap { uint map[]; };
+layout(set = 0, binding = 3) uniform texture2DArray layers[];
+layout(set = 0, binding = 5) uniform texture1D lines[];
+layout(set = 0, binding = 6) uniform texture3D volumes[];
+layout(set = 0, binding = 4, r32ui) uniform uimage2D atomics_2d[];
+layout(set = 0, binding = 7, r32ui) uniform uimage3D atomics_3d[];
+layout(set = 0, binding = 8, rgba8) uniform image2D store_2d_f[];
+layout(set = 0, binding = 9, r32ui) uniform uimage2D store_2d_u[];
+layout(set = 0, binding = 10, r32i) uniform iimage2D store_2d_i[];
+layout(set = 0, binding = 11, rgba8) uniform image2DArray store_arr_f[];
+layout(set = 0, binding = 12, r32ui) uniform uimage2DArray store_arr_u[];
+layout(set = 0, binding = 13, r32i) uniform iimage2DArray store_arr_i[];
+layout(set = 0, binding = 14, rgba8) uniform image3D store_3d_f[];
+layout(set = 0, binding = 15, r32ui) uniform uimage3D store_3d_u[];
+layout(set = 0, binding = 16, r32i) uniform iimage3D store_3d_i[];
+layout(set = 0, binding = 17, rgba8) uniform image1D store_1d_f[];
+layout(set = 0, binding = 18, r32ui) uniform uimage1D store_1d_u[];
+layout(set = 0, binding = 19, r32i) uniform iimage1D store_1d_i[];
+
+layout(set = 1, binding = 0, std430) buffer Result { uint result[]; };
+layout(set = 1, binding = 1, std430) readonly buffer Keys { uint keys[]; };  // 6 keys of 8 words
+
+uint lookup(uint which) {
+    uint h = 2166136261u;
+    for (uint i = 0; i < 8; ++i) h = (h ^ keys[which * 8 + i]) * 16777619u;
+    const uint mask = map[0];
+    for (uint k = 0; k < 8; ++k) {
+        const uint slot = 1 + ((h + k) & mask) * 10;
+        bool same = true;
+        for (uint i = 0; i < 8; ++i) same = same && map[slot + i] == keys[which * 8 + i];
+        if (same) return map[slot + 8];
+    }
+    return 0;
+}
+
+void put(uint at, vec4 v) {
+    for (int c = 0; c < 4; ++c) result[at + c] = floatBitsToUint(v[c]);
+}
+void put(uint at, uvec4 v) {
+    for (int c = 0; c < 4; ++c) result[at + c] = v[c];
+}
+
+void main() {
+    const uint zero = lookup(0), volume = lookup(1), cube = lookup(2), line = lookup(3), real = lookup(4);
+    const uint smp = lookup(5);
+    if (pc.mode == 0) {
+        for (uint k = 0; k < 6; ++k) result[k] = lookup(k);
+        // A null UAV of each dimension and class: on the console these stores are dropped.
+        imageStore(store_2d_f[zero], ivec2(0), vec4(1.0, 0.5, 0.25, 1.0));
+        imageStore(store_2d_u[zero], ivec2(0), uvec4(0xA1u));
+        imageStore(store_2d_i[zero], ivec2(0), ivec4(-0xA2));
+        imageStore(store_arr_f[cube], ivec3(0), vec4(1.0));
+        imageStore(store_arr_u[cube], ivec3(0), uvec4(0xB1u));
+        imageStore(store_arr_i[cube], ivec3(0), ivec4(-0xB2));
+        imageStore(store_3d_f[volume], ivec3(0), vec4(1.0));
+        imageStore(store_3d_u[volume], ivec3(0), uvec4(0xC1u));
+        imageStore(store_3d_i[volume], ivec3(0), ivec4(-0xC2));
+        imageStore(store_1d_f[line], 0, vec4(1.0));
+        imageStore(store_1d_u[line], 0, uvec4(0xD1u));
+        imageStore(store_1d_i[line], 0, ivec4(-0xD2));
+        result[8] = imageAtomicAdd(atomics_2d[zero], ivec2(0), 5u);
+        result[9] = imageAtomicAdd(atomics_3d[volume], ivec3(0), 7u);
+        return;
+    }
+    put(16, texelFetch(images[zero], ivec2(0), 0));
+    put(20, texelFetch(layers[cube], ivec3(0), 0));
+    put(24, texelFetch(volumes[volume], ivec3(0), 0));
+    put(28, texelFetch(lines[line], 0, 0));
+    put(32, texelFetch(images[real], ivec2(0), 0));
+    put(36, textureLod(sampler2D(images[zero], samplers[smp]), vec2(0.75, 0.25), 0.0));
+    put(40, textureLod(sampler2DArray(layers[cube], samplers[smp]), vec3(0.5, 0.5, 3.0), 0.0));
+    put(44, textureLod(sampler3D(volumes[volume], samplers[smp]), vec3(0.5), 0.0));
+    put(48, textureLod(sampler1D(lines[line], samplers[smp]), 0.5, 0.0));
+    put(64, imageLoad(store_2d_f[zero], ivec2(0)));
+    put(68, imageLoad(store_2d_u[zero], ivec2(0)));
+    put(72, uvec4(imageLoad(store_2d_i[zero], ivec2(0))));
+    put(76, imageLoad(store_arr_f[cube], ivec3(0)));
+    put(80, imageLoad(store_arr_u[cube], ivec3(0)));
+    put(84, uvec4(imageLoad(store_arr_i[cube], ivec3(0))));
+    put(88, imageLoad(store_3d_f[volume], ivec3(0)));
+    put(92, imageLoad(store_3d_u[volume], ivec3(0)));
+    put(96, uvec4(imageLoad(store_3d_i[volume], ivec3(0))));
+    put(100, imageLoad(store_1d_f[line], 0));
+    put(104, imageLoad(store_1d_u[line], 0));
+    put(108, uvec4(imageLoad(store_1d_i[line], 0)));
+    result[112] = imageAtomicAdd(atomics_2d[zero], ivec2(0), 5u);
+    result[113] = imageAtomicAdd(atomics_3d[volume], ivec3(0), 7u);
+}

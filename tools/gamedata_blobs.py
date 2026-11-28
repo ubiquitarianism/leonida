@@ -148,6 +148,33 @@ def parse_fixed_table_1296(blob: bytes) -> dict:
     }
 
 
+def _region3_start_word(words: tuple[int, ...], run_start: int) -> int:
+    """Pick the Region 3 start inside the trailing run of offset-like words.
+
+    The run can also take in the last words of Region 2 when they happen to be 4-byte-aligned values below the
+    blob size. Region 1 decides where Region 3 begins: at the lowest cell offset (docs/gamedata.md, the `0x23c000`
+    row: Region 3 is "the trailing run of 4-byte-aligned offsets matching `min(cell_offs)`"). Region 1 ends where
+    Region 2 begins, at the lowest Region 3 word, so a start is taken only where both agree. The lowest such start
+    is the real one: an earlier start leaves Region 1 the same or shorter, whose lowest cell offset is then never
+    below the real start. With no agreeing start the run start is kept and the checks after report the fault.
+    """
+    total_words = len(words)
+    no_offset = 1 << 32
+    # Region 2 start for each candidate Region 3 start: the lowest word from there to the end.
+    region2_start = [no_offset] * (total_words - run_start + 1)
+    for i in range(total_words - 1, run_start - 1, -1):
+        region2_start[i - run_start] = min(words[i], region2_start[i - run_start + 1])
+    # Lowest populated cell offset among the first n words, for each candidate Region 1 length n.
+    lowest_cell = [no_offset]
+    for w in words:
+        lowest_cell.append(lowest_cell[-1] if w == CELL_SENTINEL else min(lowest_cell[-1], w & CELL_OFFSET_MASK))
+    for start in range(run_start, total_words):
+        r2 = region2_start[start - run_start]
+        if 0 < r2 < start * 4 and lowest_cell[r2 // 4] == start * 4:
+            return start
+    return run_start
+
+
 def parse_spatial_grid_blob(blob: bytes) -> dict:
     """Decode the 3-region spatial grid / record / pointer-list blob (0x23c000)."""
     if len(blob) < 16 or len(blob) % 4 != 0:
@@ -161,6 +188,7 @@ def parse_spatial_grid_blob(blob: bytes) -> dict:
         k -= 1
     if k == total_words or k == 0:
         raise ValueError("missing trailing Region 3 offset table")
+    k = _region3_start_word(words, k)
     region3_start = k * 4
     region3 = words[k:]
 

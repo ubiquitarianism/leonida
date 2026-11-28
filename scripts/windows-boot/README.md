@@ -15,7 +15,7 @@ powershell -NoProfile -File scripts\windows-boot\boot.ps1 -DryRun -GameDir D:\GT
 powershell -NoProfile -File scripts\windows-boot\boot.ps1 -Name first -Seconds 200 -GameDir D:\GTA6pkg -Shaders E:\leonida-work\shaders\spirv
 
 # Extra or changed switches: trailing KEY=VALUE arguments (KEY= removes one), as run-boot.sh takes them.
-powershell -NoProfile -File scripts\windows-boot\boot.ps1 -Name split -Seconds 120 LEONIDA_PRESENT_PLANE1=0 "LEONIDA_PEEK=0x7446510,0x98f828c,0x78b2818"
+powershell -NoProfile -File scripts\windows-boot\boot.ps1 -Name split -Seconds 120 LEONIDA_PRESENT_PLANE1=0 "LEONIDA_PEEK=<rva>,<rva>,<rva>"
 
 # Every parameter.
 Get-Help -Full .\scripts\windows-boot\boot.ps1
@@ -38,7 +38,8 @@ Only when your shell has not set them already (`-DryRun` prints the final list):
 | `LEONIDA_PIPELINE_CACHE_BYTES` | `4294967296` | pipeline cache size limit |
 | `LEONIDA_STARTUP_CACHE_CHECKPOINTS` | `1` | save the pipeline cache during startup |
 | `LEONIDA_PIPELINE_CACHE_DIR` | `<out>\pipeline-cache` | one warmed cache shared by every build you boot |
-| `LEONIDA_PEEK` / `_SECONDS` | `0x7446510,0x98f828c` / `5` | game state and session state (low dword), the two numbers every RESULT reports |
+| `LEONIDA_PIPELINE_JOURNAL_SEED_DIR` | `pipeline_cache.d` beside `gta6rt.exe`, when it exists | the journal `gta6rt --precompile-pipelines` fills there when it runs without `LEONIDA_PIPELINE_CACHE_DIR`, read-only, so its pipelines are not compiled again. Not set when the boot's own journal (`<cache folder>\pipeline_cache.d`, or beside `gta6rt.exe` when the cache folder is empty) is that folder or one holds the other, compared through Windows' final paths (so a junction, symbolic link, substituted or mapped drive, 8.3 name or `\\?\` / `\\.\` prefix counts as the same folder), or when the cache folder is a relative path. `LEONIDA_PIPELINE_JOURNAL_SEED_DIR=` (empty) turns the seed off. If the runtime still logs `[rt] d3d12: invalid or overlapping compute journal directories; journal disabled`, set it so. On NVIDIA, run the pre-compile with the same `LEONIDA_DEVICE_FAULT` as the boot (this script sets `1`): the diagnostics config is part of the journal's file names |
+| `LEONIDA_PEEK` / `_SECONDS` | the game-state and session-state RVAs from `LEONIDA_GAME_STATE_RVA` and `LEONIDA_SESSION_STATE_RVA` (measured locally, not kept here; unset: no peek) / `5` | game state and session state (low dword), the two numbers every RESULT reports |
 | `LEONIDA_DEVICE_FAULT` | `1` | on device loss: `VK_EXT_device_fault` info, checkpoints, last replay steps |
 | `LEONIDA_KEYBOARD_PAD` | `always` (with an input script) | keyboard as a pad even unfocused, so the script's presses arrive |
 | `LEONIDA_CAPTURE_EVERY` / `_LIMIT` | `60` / `40` | a swapchain read-back every 60 presents, at most 40 |
@@ -68,12 +69,21 @@ faults:   none
 frames:   14 captured, 0 non-black; last mean rgb 0.00 0.00 0.00; brightest 0.00 0.00 0.00
 ```
 
-`-DigestOnly -Name <name>` writes the summary and digest again for an earlier run. The digest holds counts and
-states only, which is what goes into a RESULT on the board; the logs, traces, captures and dumps can quote the game
-and stay on your machine ([AGENTS.md](../../AGENTS.md), "No game data").
+`-DigestOnly -Name <name>` writes the summary and digest again for an earlier run. The `faults` row reports whether
+the log recorded device loss and counts Vulkan address records by type (for example, `WRITE_INVALID=2`).
+Several records can describe one loss. A driver can also report loss without any address records.
+Share counts and states on the board. Keep paths, logs, traces, captures and dumps on your machine
+([AGENTS.md](../../AGENTS.md), "No game data").
 
-How to read the states: game state `0x7446510` goes 1, 2 (init), 3 (running); session state goes 0, 1, 3 (landing
-screen waiting for A), `d` after A. `docs/linux_proton.md` (the same stages apply natively)
+How to read the states: game state goes 1, 2 (init), 3 (running); session state goes 0, 1, 3 (landing
+screen waiting for A), `d` after A.
+
+**Changed: the states need two variables now.** The script used to set `LEONIDA_PEEK` to the game-state and
+session-state RVAs by default. Those addresses of the retail executable are no longer kept in the repository, so set
+`LEONIDA_GAME_STATE_RVA` and `LEONIDA_SESSION_STATE_RVA` (hex, measured locally) in the shell before the boot.
+Without them the script warns, sets no `LEONIDA_PEEK`, and the `states:` line and the RESULT show `game=?
+session=?`. A `LEONIDA_PEEK` of your own still works for the log, but the digest reads only the two RVAs those
+variables name. `docs/linux_proton.md` (the same stages apply natively)
 section 2 has the healthy sequence with times and section 3 "which blank do you have".
 
 ## One game at a time
@@ -91,3 +101,33 @@ game processes on one GPU make both runs meaningless and can take the driver dow
 | `minidump.py PID OUT.dmp` | a minidump through dbghelp's `MiniDumpWriteDump`. Do not use `rundll32 comsvcs.dll MiniDump`: Defender flags it. A dump holds game memory: local only |
 
 Each prints its usage with `-h` (Python) or `Get-Help` (PowerShell).
+
+## Recover a stack from a manually mapped image
+
+When the exception stack stops inside the mapped executable, run `mapped_stack.py` on the existing
+private dump. Supply the exact PE from the crashing build and an x64 CDB from Debugging Tools for
+Windows. If CDB is on your PATH, omit `--cdb`. The optional `--symbols` takes one local directory
+containing the matching runtime images and PDBs.
+
+```powershell
+py -3 -I scripts\windows-boot\mapped_stack.py D:\runs\fault\crash.dmp D:\package\title.exe --symbols D:\build\RelWithDebInfo --cdb "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"
+```
+
+The command derives the mapping base, including a relocated base, by locating a unique captured
+instruction window in an executable section of the supplied PE. It checks for a file-backed x64
+unwind entry at the exception RIP and compares captured bytes from the first header page and that
+function's unwind metadata when available.
+A small dump can establish a local code match only. Use the original image even if another build
+has the same function. Exit-only snapshots, faults outside the supplied image, leaf functions
+without unwind entries, and missing, patched or ambiguous instruction windows cannot establish
+this stack.
+
+CDB reads the exception context and uses the disk image's unwind data to recover callers. The
+script makes a temporary copy of the PE beside the dump under the debugger alias `leonida_mapped`.
+It disables network symbols and writes private frame rows to a new `mapped-stack.txt` beside the
+dump. Use `--output` for a different new file. A successful walk recovers at least one caller and
+can stop when later stack memory or module information is missing. Keep dumps and reports outside
+the checkout and share only the outcome and frame count.
+
+Run the synthetic regression tests with `py -3 -I tests\test_mapped_stack.py`. To include the
+native CDB walk, put x64 CDB on PATH or set `LEONIDA_TEST_CDB` to its full path.

@@ -8,6 +8,7 @@
 
 #include "vulkan_backend.h"
 #include "present_compose_spv.h"
+#include "vulkan_aftermath.h"
 
 #include <array>
 #include <cstdint>
@@ -98,6 +99,7 @@ public:
         module_info.codeSize = sizeof(present_compose_spirv);
         module_info.pCode = present_compose_spirv;
         VkShaderModule module = VK_NULL_HANDLE;
+        const aftermath::ShaderName aftermath_name("(runtime) present_compose");
         if (vk.vkCreateShaderModule(device, &module_info, nullptr, &module) != VK_SUCCESS) return false;
         VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,

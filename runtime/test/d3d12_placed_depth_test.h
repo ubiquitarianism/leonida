@@ -34,6 +34,19 @@ inline bool check_alias_lifetime(ID3D12Device* device, ID3D12Device* xbox, bool 
                            const D3D12_CLEAR_VALUE* clear = nullptr) {
         return create(xbox, va, &shape, UINT_MAX, clear, IID_PPV_ARGS(&result.p));
     };
+    if (opaque) {
+        auto packed = xbox_desc;
+        packed.Format = static_cast<DXGI_FORMAT>(118);
+        packed.Width = 1280;
+        packed.Height = 720;
+        Ptr<ID3D12Resource> target;
+        // The image is privately backed; reserve a full placement for its title VA.
+        Pages packed_pages{VirtualAlloc(nullptr, 8u << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)};
+        const auto packed_va = reinterpret_cast<UINT64>(packed_pages.ptr);
+        if (!packed_va || FAILED(place(packed_va, packed, target)) ||
+            target->GetGPUVirtualAddress() != packed_va) return false;
+        target.reset();
+    }
     Ptr<ID3D12Resource> first, alias, next, invalid;
     if (FAILED(place(address, xbox_desc, first)) || FAILED(place(address, xbox_desc, alias)) ||
         FAILED(place(address + allocation.SizeInBytes, xbox_desc, next))) return false;

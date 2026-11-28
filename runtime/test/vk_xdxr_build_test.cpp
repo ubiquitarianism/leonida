@@ -105,6 +105,7 @@ struct Geometry {
     bool transform = false;
     float m[12] = {};
     std::uint32_t triangle_count = 0;
+    std::uint32_t vertex_count = 0xffffffffu;  // XdxrTriangles::vertex_count; the default bounds nothing
 };
 
 // The world-space triangles a geometry describes, as the reference must see them.
@@ -114,8 +115,9 @@ void expand(const Geometry& g, std::uint32_t geometry, std::vector<Tri>& out) {
         Tri tri{};
         for (int k = 0; k < 3; ++k) {
             const std::uint32_t v = g.indices.empty() ? 3 * t + k : g.indices[3 * t + k];
-            float p[3] = {g.vertex_data[v * floats], g.vertex_data[v * floats + 1],
-                          g.xy ? 0.0f : g.vertex_data[v * floats + 2]};
+            float p[3] = {std::nanf(""), std::nanf(""), std::nanf("")};   // past VertexCount: inactive, nothing read
+            if (v < g.vertex_count)
+                for (int c = 0; c < 3; ++c) p[c] = c == 2 && g.xy ? 0.0f : g.vertex_data[v * floats + c];
             for (int c = 0; c < 3; ++c)
                 tri.v[k][c] = g.transform ? g.m[4 * c] * p[0] + g.m[4 * c + 1] * p[1] + g.m[4 * c + 2] * p[2] + g.m[4 * c + 3]
                                           : p[c];
@@ -139,7 +141,7 @@ struct Built {
 int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir, const std::string& name,
                const std::vector<Geometry>& geometries, Built& built, unsigned rays = 0,
                const std::vector<Geometry>* moved = nullptr, bool into_other = false, bool box16 = false,
-               bool pair = false, bool expect_no_pairs = false) {
+               bool pair = false, bool expect_no_pairs = false, int poison = 0) {
     std::vector<Buffer> keep, vertex_buffers;
     std::vector<XdxrTriangles> descs;
     std::uint32_t total = 0;
@@ -153,6 +155,7 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         d.vertex_stride = geo.stride;
         d.xy_only = geo.xy;
         d.triangle_count = geo.triangle_count;
+        d.vertex_count = geo.vertex_count;
         d.flags = 1;
         keep.push_back(v);
         vertex_buffers.push_back(v);
@@ -223,12 +226,29 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
     Buffer other = into_other ? make(gpu, layout.size + 256) : Buffer{};
     const std::uint64_t target = into_other ? (other.address + 255) & ~std::uint64_t(255) : base;
     EXPECT(!into_other || other.buffer);
+    // `poison`: the update's source is not a structure this layout built (a title passing one it never built). 1: all
+    // zero, 2: random bytes, 3: the built structure with another element count in its header, 4: its header kept and
+    // the rest random. The builder must read nothing past the layout; 1-3 then become a full build of the moved
+    // geometry (check-build validates it), 4 refits garbage pointers, whose result is not checked, only that it ends.
+    if (poison) {
+        auto* s = reinterpret_cast<std::uint32_t*>(static_cast<char*>(dst.map) + (base - dst.address));
+        std::mt19937 prng(11);
+        const std::size_t words = layout.size / 4;
+        if (poison == 1) std::fill(s, s + words, 0u);
+        if (poison == 2) for (std::size_t w = 0; w < words; ++w) s[w] = std::uint32_t(prng());
+        if (poison == 3) s[3] += 1;
+        if (poison == 4) for (std::size_t w = 16; w < words; ++w) s[w] = std::uint32_t(prng());
+    }
     EXPECT(gpu.run([&](VkCommandBuffer cb) {
         recorded = builder.record_blas(cb, layout, descs, target, scratch.address, base);
         barrier_to_host(gpu, cb);
         return recorded;
     }));
-    if (into_other) EXPECT(dump(name + "_source", dst, base, built.tris));     // a refit must not touch its source
+    if (poison == 4) {
+        std::printf("%s: %u triangles refitted from a garbage tree, %u bytes\n", name.c_str(), total, layout.size);
+        return 0;
+    }
+    if (into_other && !poison) EXPECT(dump(name + "_source", dst, base, built.tris));   // a refit must not touch its source
     EXPECT(dump(name, into_other ? other : dst, target, moved_tris));
     built.tris = moved_tris;
     built.address = target;
@@ -349,6 +369,18 @@ int main(int argc, char** argv) {
     b.vertex_data[3 * 3 * 7] = std::nanf("");                    // triangle 7 of geometry 1: inactive
     if (build_blas(gpu, builder, dir, "blas_two_geometries", {a, b}, multi)) return 1;
     if (build_blas(gpu, builder, dir, "blas_empty", {}, empty)) return 1;
+    // VertexCount bounds the vertex reads: an unindexed geometry whose last triangle lies past it (the buffer holds
+    // finite vertices there, so a read would show), an index far past the buffer, and VertexCount 0: those
+    // triangles are inactive.
+    {
+        Built bounded;
+        Geometry past = soup(8), wild = grid(4, 3, false), no_vertices = soup(2);
+        past.vertex_count = 21;
+        wild.vertex_count = 25;
+        wild.indices[3 * 5 + 1] = 0xfffffff0u;
+        no_vertices.vertex_count = 0;
+        if (build_blas(gpu, builder, dir, "blas_vertex_count", {past, wild, no_vertices}, bounded)) return 1;
+    }
     // many radix-sort tiles (RADIX_TILE elements each), the last one partial (fewer rays: the brute force is slow)
     Built tiles;
     if (build_blas(gpu, builder, dir, "blas_three_sort_tiles", {soup(5000)}, tiles, 200)) return 1;
@@ -374,6 +406,19 @@ int main(int argc, char** argv) {
         const Geometry g = grid(12, 4, false);              // R32 indices, stride 16; the small-sort path
         const std::vector<Geometry> after_grid = {move(g, 0.3f)};
         if (build_blas(gpu, builder, dir, "blas_refit_into_other", {g}, copied, 0, &after_grid, true)) return 1;
+        // updates whose source is no structure of this layout: a full build instead, or (garbage tree) a bounded walk
+        const char* poisoned[] = {"blas_refit_zero_source", "blas_refit_garbage_source", "blas_refit_other_layout",
+                                  "blas_refit_garbage_tree"};
+        for (int poison = 1; poison <= 4; ++poison) {
+            Built b;
+            if (build_blas(gpu, builder, dir, poisoned[poison - 1], {big}, b, 100, &after, poison == 2, false, false,
+                           false, poison))
+                return 1;
+            Built small;
+            if (build_blas(gpu, builder, dir, std::string(poisoned[poison - 1]) + "_small", {g}, small, 0, &after_grid,
+                           poison != 2, false, false, false, poison))
+                return 1;
+        }
     }
 
     // BOX16 inner nodes: the same tree with half boxes rounded outward (64-byte nodes instead of 128).

@@ -8,6 +8,7 @@
 #include <memory>
 #include <initializer_list>
 #include "predicate_reduce_spv.h"
+#include "vulkan_aftermath.h"
 
 namespace leonida {
 struct PredicateCapture {
@@ -156,6 +157,7 @@ private:
         ok = ok && fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(device_, &layout_info, nullptr, &layout) == VK_SUCCESS;
         VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         module.codeSize = sizeof(predicate_reduce_spirv); module.pCode = predicate_reduce_spirv;
+        const aftermath::ShaderName aftermath_name("(runtime) predicate_reduce");
         ok = ok && fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(device_, &module, nullptr, &shader) == VK_SUCCESS;
         VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};

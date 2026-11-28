@@ -1,0 +1,30 @@
+GPU:        NVIDIA GeForce RTX 4080 SUPER (Ada / AD103, PCI 10de:2702), subgroup 32..32
+Driver:     NVIDIA 617.14 (proprietary), Vulkan 1.4.351 (loader 1.4.363)
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32)
+OS:         Windows 11 Home, build 26300
+Commit:     360c728bded95512f71050205c7c9f57a0cfea7b (main, 2026-11-25)
+Tools:      llvm-mc 21.1.8 (native, built by scripts\build_llvm_mc.ps1), SPIRV-Tools v2026.4 (Vulkan SDK
+            1.4.363.0), CMake 4.4.1 + Ninja 1.13.2 (both from Visual Studio 2026), MSVC 19.51.36252 (VS 2026
+            Community, toolset 14.51.36231, Windows SDK 10.0.28000.0), Python 3.12.10
+run_gpu_tests.py: 274 shaders: 274 translated, 274 pass spirv-val
+            native:                 209/264 passed, 54 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1:  243/264 passed, 20 skipped, 1 failed
+Failed:     cs_imgatomic_ext in both runs: "6 of 64 sint words differ; first word 32: got 0x0badf00d,
+            expected 0x00000101". This is the failure already seen on main in CI (llvmpipe), on Apple M3 and
+            on the RTX 4090, and #1518 (GPU-IMG-ATOMIC-EXT-VOLUME-TAG) fixes it: with #1518's change to
+            runtime/test/shaders/cs_imgatomic_ext.asm applied (head 1bbf8a9b), `--filter cs_imgatomic_ext`
+            passes in both modes here ("all 64 words of the uint image, the sint image and the volume exact").
+            Nothing else failed.
+Skipped:    native: 33 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this device"
+            and 1 "this device cannot require a 64-wide fragment subgroup" (the wave64 fixtures, which the
+            emulated run covers), plus the 19 "run by d3d12_*_test / w64_graphics.py" cases.
+            Emulated: the same 19, plus the 64-wide fragment one.
+Notes:
+- First record of this card.
+- Built with scripts\build_runtime.ps1 (CMake + Ninja, RelWithDebInfo), with the Vulkan SDK's Bin folder and
+  llvm-mc on PATH and LLVM_MC set, so the llvm-mc / spirv-as / glslangValidator tests register.
+- Device picked with LEONIDA_VK_DEVICE=4080 (the machine also has an AMD Radeon integrated GPU, PCI 1002:13c0).
+- ctest, the D3D12 tests and w64_graphics.py were not run in this pass; this file covers run_gpu_tests.py
+  only, one run of each mode.
+- AI-assisted (Claude Code): built main and ran run_gpu_tests.py native and emulated. No game files, nothing
+  online.

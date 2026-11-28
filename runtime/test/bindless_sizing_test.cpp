@@ -133,23 +133,61 @@ int main() {
         const Device d = uniform(1048576, 1048576);
         BindlessFeatures f = with_ms(update_after_bind);
         EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12));
-        EXPECT(count(f, D::dim_2d) == bindless::max_2d_images);
+        EXPECT(count(f, D::dim_2d) == bindless::max_images);
         EXPECT(f.counts[bindless::sampler_binding] == 4000 - bindless::reserved_samplers);
         EXPECT(f.counts[bindless::sampler_binding] > 2048);  // a full sampler heap and the fallback
         EXPECT(storage(f, D::dim_2d) == bindless::max_storage_indices);
-        // The other dimensions grow too (a title's cube maps, texture arrays and 1D lookups outnumber the defaults);
-        // their storage arrays hold as many indices as the 2D one. The storage-only 1D array keeps its 256.
-        EXPECT(count(f, D::dim_2d_array) == bindless::max_2d_array_images &&
-               count(f, D::dim_3d) == bindless::max_3d_images && count(f, D::dim_1d) == bindless::max_1d_images);
+        // The other dimensions grow as far as 2D (a title's textures are of whichever dimension it chose); their
+        // storage arrays hold as many indices as the 2D one. The storage-only 1D array keeps its 256.
+        EXPECT(count(f, D::dim_2d_array) == bindless::max_images && count(f, D::dim_3d) == bindless::max_images &&
+               count(f, D::dim_1d) == bindless::max_images);
         EXPECT(storage(f, D::dim_2d_array) == bindless::max_storage_indices &&
                storage(f, D::dim_3d) == bindless::max_storage_indices &&
                storage(f, D::dim_1d) == bindless::max_storage_indices);
-        EXPECT(storage(f, D::dim_1d_array) == 256 && totals(f).all == 153697);
+        EXPECT(storage(f, D::dim_1d_array) == 256 && totals(f).all == 325729);
         EXPECT(f.ms_samples[0] == VK_SAMPLE_COUNT_4_BIT && f.ms_samples[2] == VK_SAMPLE_COUNT_4_BIT);
         EXPECT(storage_consistent(f));
         if (update_after_bind)
             std::printf("RTX 5070-like: %u 2D images, %u samplers, %u storage indices in 2D, %u descriptors\n",
                         count(f, D::dim_2d), f.counts[bindless::sampler_binding], storage(f, D::dim_2d), totals(f).all);
+    }
+
+    // RADV (Mesa 26.3, a Raphael iGPU and an RX 7900 XTX alike) and llvmpipe: their update-after-bind limits hold
+    // every sampled dimension at the full size. A world run kept 4090 live 1D textures, filling the 4096 1D indices
+    // the set used to stop at whatever the device held; now 1D, 3D and 2D-array images get as many as 2D.
+    {
+        Device radv = uniform(8388606, 8388606);
+        radv.limits.maxPerStageResources = radv.v12.maxPerStageUpdateAfterBindResources = 8388606;
+        radv.v12.maxUpdateAfterBindDescriptorsInAllPools = 67108863;
+        radv.v11.maxPerSetDescriptors = 22369621;
+        radv.limits.maxSamplerAllocationCount = 4294967295u;
+        Device lvp = uniform(1015808, 1015808);
+        lvp.limits.maxPerStageResources = lvp.v12.maxPerStageUpdateAfterBindResources = 1015808;
+        lvp.v11.maxPerSetDescriptors = 1015808;
+        lvp.limits.maxSamplerAllocationCount = 32768;
+        for (const Device* d : {&radv, &lvp}) {
+            BindlessFeatures f = with_ms(true);
+            EXPECT(bindless::size_bindings(f, d->limits, d->v11, d->v12));
+            for (const D dimension : {D::dim_2d, D::dim_2d_array, D::dim_3d, D::dim_1d}) {
+                EXPECT(count(f, dimension) == bindless::max_images);
+                EXPECT(count(f, dimension) > 4096 + 1);  // more than 4096 live images and the fallback
+            }
+            EXPECT(storage_consistent(f));
+        }
+    }
+
+    // A device whose limits stop growth short of max_images: the 2D-array, 3D and 1D arrays share what is left alike,
+    // whichever is grown first.
+    {
+        Device d = uniform(1048576, 1048576);
+        d.v12.maxPerStageDescriptorUpdateAfterBindSampledImages = 65536 + 3 * 20000 + 6 * 256 + bindless::growth_headroom;
+        BindlessFeatures f = with_ms(true);
+        EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12));
+        EXPECT(count(f, D::dim_2d) == bindless::max_images);
+        EXPECT(count(f, D::dim_2d_array) == count(f, D::dim_3d) && count(f, D::dim_3d) == count(f, D::dim_1d));
+        EXPECT(count(f, D::dim_1d) > 4096 && count(f, D::dim_1d) <= 20000);
+        EXPECT(totals(f).sampled + bindless::growth_headroom <= d.v12.maxPerStageDescriptorUpdateAfterBindSampledImages);
+        EXPECT(storage_consistent(f));
     }
 
     // At today's sizes exactly (5632 sampled images, 1024 samplers, 4352 storage images): no MS pairs.
@@ -191,7 +229,7 @@ int main() {
         BindlessFeatures uab = with_ms(true), plain = with_ms(false);
         EXPECT(bindless::size_bindings(uab, d.limits, d.v11, d.v12));
         EXPECT(bindless::size_bindings(plain, d.limits, d.v11, d.v12));
-        EXPECT(count(uab, D::dim_2d) == bindless::max_2d_images);
+        EXPECT(count(uab, D::dim_2d) == bindless::max_images);
         const Totals t = totals(plain);
         EXPECT(count(plain, D::dim_2d) > 4096 && count(plain, D::dim_2d) < 16384);
         EXPECT(t.sampled + bindless::growth_headroom <= 16384 && t.storage + bindless::growth_headroom <= 16384);
@@ -232,7 +270,7 @@ int main() {
         BindlessFeatures f = with_ms(true);
         EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12, all_supported));
         EXPECT(asked > 0 && asked_within == 0 && missing_storage == 0);
-        EXPECT(count(f, D::dim_2d) == bindless::max_2d_images &&
+        EXPECT(count(f, D::dim_2d) == bindless::max_images &&
                f.counts[bindless::sampler_binding] == 4000 - bindless::reserved_samplers);
         EXPECT(storage(f, D::dim_2d) == bindless::max_storage_indices && storage_consistent(f));
 

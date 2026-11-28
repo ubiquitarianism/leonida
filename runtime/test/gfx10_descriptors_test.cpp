@@ -114,6 +114,25 @@ int main() {
         CHECK(is_image(words) && decode(words, out) && out == in);
     }
 
+    ImageWords volume_words = encode(Image{.type = ImageType::image_3d, .depth = 16,
+                                          .first_mip = 1, .mip_count = 2, .resource_mips = 4});
+    volume_words[4] |= 37u << 16;
+    CHECK(decode(volume_words, image) && image.first_layer == 37 && image.depth == 16);
+    CHECK(!has_hardware_volume_uav_slice_offset(volume_words, image));
+    const auto volume_range = vulkan_subresource_range(image, VK_IMAGE_ASPECT_COLOR_BIT);
+    CHECK(volume_range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT);
+    CHECK(volume_range.baseMipLevel == 1 && volume_range.levelCount == 2);
+    CHECK(volume_range.baseArrayLayer == 0 && volume_range.layerCount == 1);
+    volume_words = encode(Image{.type = ImageType::image_3d, .depth = 7, .first_mip = 1, .resource_mips = 4});
+    volume_words[4] |= 2u << 16;
+    volume_words[5] |= 1u;
+    CHECK(decode(volume_words, image) && has_hardware_volume_uav_slice_offset(volume_words, image));
+    volume_words[4] &= 0xffffu;
+    CHECK(decode(volume_words, image) && !has_hardware_volume_uav_slice_offset(volume_words, image));
+
+    const auto array_range = vulkan_subresource_range(images[2], VK_IMAGE_ASPECT_COLOR_BIT);
+    CHECK(array_range.baseArrayLayer == 3 && array_range.layerCount == 7);
+
     // Bits this header does not encode are ignored: SW_MODE and BC_SWIZZLE (word 3), PITCH_MSB (word 4), PERF_MOD
     // and the rest of word 5, the compression and metadata fields of words 6 and 7, RESOURCE_LEVEL (word 2 bit 31).
     ImageWords busy = encode(images[3]);

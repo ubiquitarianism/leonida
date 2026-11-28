@@ -25,6 +25,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
@@ -281,11 +282,24 @@ def write_json_report(path, data):
             os.makedirs(parent, exist_ok=True)
         except OSError as e:
             return f"cannot create directory for --json {path}: {e.strerror or e}"
+    tmp_path = None
     try:
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", newline="\n",
+            dir=parent or ".", prefix=".f16_widen_probe-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp_path = f.name
             json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+        tmp_path = None
     except OSError as e:
         return f"cannot write --json {path}: {e.strerror or e}"
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     return None
 
 
@@ -333,20 +347,24 @@ def main(argv=None):
     except runner.Unavailable as exc:
         print(f"SKIP: {exc}", file=sys.stderr)
         return 77
-    if asm.family(oracle.arch) != "gfx10":
-        print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
-        return 77
-    out = {"arch": oracle.arch, "waves": {}}
-    for wave in waves:
-        report = sweep(oracle, asm, wave)
-        out["waves"][str(wave)] = report
-        print_table(report, wave)
-    if args.json_out is not None:
-        err = write_json_report(args.json_out, out)
-        if err:
-            print(f"error: {err}", file=sys.stderr)
-            return 1
-    return 0
+    try:
+        if asm.family(oracle.arch) != "gfx10":
+            print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
+            return 77
+        out = {"arch": oracle.arch, "waves": {}}
+        for wave in waves:
+            report = sweep(oracle, asm, wave)
+            out["waves"][str(wave)] = report
+            print_table(report, wave)
+        if args.json_out is not None:
+            err = write_json_report(args.json_out, out)
+            if err:
+                print(f"error: {err}", file=sys.stderr)
+                return 1
+        return 0
+    finally:
+        if hasattr(oracle, "close"):
+            oracle.close()
 
 
 if __name__ == "__main__":

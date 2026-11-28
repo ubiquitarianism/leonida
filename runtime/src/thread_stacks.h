@@ -35,4 +35,8 @@ bool parse_stack_times(std::string_view text, std::vector<unsigned>& seconds);
 // sampler before unmapping the title image.
 std::jthread start_thread_stacks();
 
+// The call chain of thread `tid` now, or of every other thread when `tid` is 0, printed as LEONIDA_STACKS does under
+// the tag `why`. One call at a time; the device-loss diagnostics call it (vulkan_device_fault.h thread_stack_hook).
+void print_thread_stacks_now(std::uint32_t tid, const char* why) noexcept;
+
 }  // namespace rt
