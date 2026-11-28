@@ -201,7 +201,65 @@ python -I tools/first_light.py --game "<package>" --work ~/leonida-work \
 LEONIDA_FIRST_LIGHT_DIR=~/leonida-work/first_light/camera python -I tests/test_first_light.py -v
 ```
 
-## 8. Limits and next
+## 8. With a texture, through the D3D12 layer
+
+`runtime/test/d3d12_first_light_textured_test.cpp` (ctest `d3d12_first_light_textured`, TEST-524) draws the same
+mesh through the D3D12 layer (as section 5 does for section 3) with a game pixel shader that samples a texture. The PS is chosen by census:
+
+- Of the corpus's 12,101 PS, 780 do one `image_sample` and no other memory access.
+- 148 of those link with this VS (`shader_link_check.py`).
+- The pick is `$PS_PassthroughCopy`. It interpolates the TEXCOORD, `s_load`s an 8-dword T# through the 32-bit
+  table pointer in user SGPR `s8`, samples with a **literal S#** (`0x92, 0xC00000, 0x14500000, 0`: CLAMP_LAST_TEXEL,
+  bilinear, mip point) and exports the colour with `v_cvt_pkrtz_f16_f32`.
+
+How the draw is fed:
+
+- The root signature is [0] eight 32-bit constants (`s0..s7`, zero) and [1] a one-SRV descriptor table. The layer's
+  packing ([d3d12_vulkan.md](d3d12_vulkan.md) 3.5) puts the table at `s8:s9`.
+- The texture goes through `CopyTextureRegion` into a DEFAULT texture, and `CreateShaderResourceView` writes its T#
+  into a shader-visible heap.
+- The literal S# is in no heap. `CreateGraphicsPipelineState` registers it from the index (`literal_samplers`; see
+  `docs/design.md`, Literal samplers).
+
+The texture is a 64×64 R16G16B16A16_FLOAT **coordinate ramp**: texel (x, y) holds its own centre,
+((x+½)/64, (y+½)/64, 0, 1). Bilinear sampling with clamp therefore gives back the UV, clamped to the outer texel
+centres, so the image has an exact oracle. `first_light.py --texture ramp` writes `texture.bin` and
+`expected.raw`, which samples the ramp on the CPU at every covered pixel's interpolated UV.
+
+On an RTX 3060 (Windows 11, driver 616.64), the draw covers the same **12,804 pixels** as section 5, with no
+coverage mismatch. The worst channel error is **0.00028** and the mean 0.000045, against a tolerance of 0.002.
+Point sampling would be off by up to half a texel (1/128 = 0.0078). That is what this draw gave before literal S#s
+were registered (#2887), because the shader's lookup found the fallback sampler: worst error 0.0078, with 19,041
+channels over the tolerance. The same count was measured on an RTX 3070, a Ryzen RDNA2 iGPU and an RTX 5090.
+
+The test takes the PS's layout from the PS itself. The pointer SGPR comes from the index (`user_sgpr_reads`,
+`layer_ptr_sgpr`), and the root signature pads up to it. The T#'s byte offset in the table comes from the PS's
+`s_load_dwordx8` (`layer_tsharp_offset`), and the SRV goes in that slot. So any 2D copy PS can be checked, not only
+`$PS_PassthroughCopy`. Of the 148 single-sample PS that link with this VS (section 6's census), 24 sample once and
+export the result with no arithmetic. On an RTX 3060:
+
+| group | PS | result |
+|---|---:|---|
+| plain copies (`PS_Copy*`, `PS_TexCopy`, `PS_mipMap`, `$PS_PassthroughCopy`, `#PS_DownsampleCopy`, `PS_CopyWetMap`, `'PS_FreezeFrameCapture`, `!PS_AIFComposite`, `-PS_SecondPassRefractionBlit`) | 11 | pass, worst 0.00028 |
+| copies that remap channels: `&PS_HDRPassThroughRGB` exports (r, g, b, b) and `PS_BlitNormal` (r, g, 1, 1), checked per channel | 2 | pass, worst 0.00028 |
+| the UV transformed before the sample (overlays, zoom, live renderer, lens distortion) | 7 | not a copy, so not comparable to the ramp |
+| 2D-array or cube textures | 4 | not run |
+
+All 13 comparable game PS give the same worst error as `$PS_PassthroughCopy`. `!PS_AIFComposite` reads its T# at
+offset `0xA0` (slot 5), which a single-slot table had missed. Pass `--ps=<name>` when the name starts with `-`.
+
+The ramp folder is for this test only: its PS samples a T# that only the D3D12 layer binds, so
+`tests/test_first_light.py`'s `vk_harness` tests skip it.
+
+```sh
+python -I tools/first_light.py ... --no-fit --out ~/leonida-work/first_light/out_tex --vs VS_main_170e32e6_Wrapped --ps '$PS_PassthroughCopy_1a08fc46_Wrapped' --texture ramp
+LEONIDA_FIRST_LIGHT_TEX_DIR=~/leonida-work/first_light/out_tex ctest --test-dir <build> -R d3d12_first_light_textured -V
+```
+
+Without `LEONIDA_FIRST_LIGHT_TEX_DIR` the test prints SKIP and exits 77. The drawn image is written next to the
+inputs as `d3d12_textured.raw`; it stays in the user's folder.
+
+## 9. Limits and next
 
 * The camera draw (section 7) runs in `vk_harness` only. Through the D3D12 layer, s9 and the table it points at
   have to come from root arguments, which `d3d12_first_light_test` does not set up yet.
