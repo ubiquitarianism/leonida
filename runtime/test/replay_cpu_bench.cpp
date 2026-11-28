@@ -276,10 +276,43 @@ bool uav_clear(CommandList& list, std::uint32_t index) {
 
 // A draw into the colour and depth targets, as a scene's mesh draws are: two vertex streams, and for `indexed`
 // a 16-bit index buffer; each draw reads its own part of the geometry arena.
+// d3d12_com.cpp::draw_views() rebuilds this block only when the render targets or the vertex buffers change, so a
+// steady-state draw shares one block and pays only the shared_ptr copy. A draw that changes that state pays the
+// make_shared instead. The two are different costs and the table measures them apart: only the second allocates.
+const std::shared_ptr<const DrawViews>& steady_views() {
+    static const std::shared_ptr<const DrawViews> views = [] {
+        auto v = std::make_shared<DrawViews>();
+        v->render_targets = {color_view};
+        v->vertex_buffers[0] = {Scene::geometry_va, 24576, 12};
+        v->vertex_buffers[1] = {Scene::geometry_va + 24576, 16384, 8};
+        return std::shared_ptr<const DrawViews>(std::move(v));
+    }();
+    return views;
+}
+
+// A draw as the layer records it in the steady state: the views block is the one already in hand.
 bool draw(CommandList& list, std::uint32_t index, bool indexed) {
     Draw d{};
     d.pipeline = Scene::pipeline_id;
-    auto views = std::make_shared<DrawViews>();  // out of line since D3D-391
+    const std::shared_ptr<const DrawViews>& views = steady_views();
+    d.depth = depth_view;
+    d.views = views;
+    if (indexed) d.index = {Scene::geometry_va + 40960, 6144, 57};
+    d.topology = 4;  // D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+    d.viewport = {0, 0, 1920, 1080, 0, 1};
+    d.scissor = {0, 0, 1920, 1080};
+    d.blend_factor = {1, 1, 1, 1};
+    d.indexed = indexed;
+    d.count = indexed ? 3072 : 2048;
+    d.instances = 1;
+    return list.draw(d);
+}
+
+// A draw that rebuilt its views first, which is what a state change costs: one allocation and the block written out.
+bool draw_rebuilt(CommandList& list, std::uint32_t index, bool indexed) {
+    Draw d{};
+    d.pipeline = Scene::pipeline_id;
+    auto views = std::make_shared<DrawViews>();
     views->render_targets = {color_view};
     d.depth = depth_view;
     const std::uint64_t base = Scene::geometry_va + (index % 256) * 65536ull;
@@ -355,6 +388,8 @@ const Kind kinds[] = {
      1},
     {"draw", [](CommandList& l, std::uint32_t i) { return draw(l, i, false); }, 1},
     {"draw indexed", [](CommandList& l, std::uint32_t i) { return draw(l, i, true); }, 1},
+    {"draw, views rebuilt", [](CommandList& l, std::uint32_t i) { return draw_rebuilt(l, i, false); }, 1},
+    {"draw indexed, views rebuilt", [](CommandList& l, std::uint32_t i) { return draw_rebuilt(l, i, true); }, 1},
     {"predication on+off",
      [](CommandList& l, std::uint32_t) {
          return l.set_predication({Scene::predicate, 0, d3d12_predication::equal_zero}) &&
