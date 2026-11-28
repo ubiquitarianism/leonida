@@ -61,6 +61,8 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    /// A mesh program lowered as compute: where its outputs went.
+    pub mesh_out: Option<super::shader::MeshOut>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -94,6 +96,10 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// Mesh: lower the program as compute, its outputs going to
+    /// [`super::SLOT_MESH_OUT`] ([`super::shader::MeshOut`]): for a host
+    /// without mesh shaders.
+    pub mesh_compute: bool,
 }
 
 enum Stop {
@@ -427,6 +433,9 @@ struct Lower<'a> {
     console_lanes: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// Mesh as compute: the byte offset of this group's
+    /// [`super::SLOT_MESH_OUT`] slot (made in the entry block).
+    mesh_base: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
@@ -1585,9 +1594,74 @@ fn own_bits_on() -> bool {
 
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+/// what it writes for the console's own hardware, whether mesh programs
+/// run as compute and whether pixel shaders go without barycentrics.
+pub fn host_settings() -> [u32; 6] {
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        u32::from(host_mesh_compute()),
+        u32::from(!host_barycentrics()),
+    ]
+}
+
+static HOST_NO_BARYCENTRICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator whether the host has D3D12 barycentrics
+/// (`SV_Barycentrics`, `attributeAtVertex`; Turing and newer). Without them
+/// a pixel shader reads the weights and the other vertices' values from
+/// ordinary inputs a geometry shader of ours writes ([`super::bary_gs`]).
+pub fn set_host_barycentrics(on: bool) {
+    HOST_NO_BARYCENTRICS.store(!on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`host_barycentrics`], for its thread only.
+    pub(super) static TEST_BARYCENTRICS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether pixel shaders may use D3D12 barycentrics ([`set_host_barycentrics`]).
+pub fn host_barycentrics() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_BARYCENTRICS.get() {
+        return on;
+    }
+    !HOST_NO_BARYCENTRICS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static HOST_MESH_COMPUTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator whether the host runs mesh shaders. Without them a
+/// mesh program is lowered as compute, its outputs going to
+/// [`super::SLOT_MESH_OUT`] for the pass-through vertex shader
+/// ([`super::mesh_vs`]) to draw.
+pub fn set_host_mesh_shaders(on: bool) {
+    HOST_MESH_COMPUTE.store(!on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`host_mesh_compute`], for its thread only.
+    pub(super) static TEST_MESH_COMPUTE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether mesh programs are translated as compute (the host has no mesh
+/// shaders, or `LEONIDA_MESH_COMPUTE=1` asked for it): the pipeline side
+/// draws them through `mesh_vs`.
+pub fn mesh_as_compute() -> bool {
+    host_mesh_compute()
+}
+
+/// Whether mesh programs are lowered as compute ([`set_host_mesh_shaders`]).
+pub(super) fn host_mesh_compute() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_MESH_COMPUTE.get() {
+        return on;
+    }
+    HOST_MESH_COMPUTE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2372,6 +2446,14 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            if x.mesh_compute {
+                s.mesh_compute = Some(super::shader::MeshOut::new(
+                    ms.max_vertices,
+                    ms.max_primitives,
+                    &s.outputs,
+                    &s.prims,
+                ));
+            }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -2497,6 +2579,7 @@ impl<'a> Lower<'a> {
             wave_base: None,
             wave_rank: None,
             flat: None,
+            mesh_base: None,
             no_barrier,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -3287,6 +3370,9 @@ impl<'a> Lower<'a> {
             }
             self.fill_phis()?;
         }
+        if self.s.pixel && !host_barycentrics() {
+            place_fallback_inputs(&mut self.s.inputs).map_err(|why| unsupported(0, why))?;
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -3295,7 +3381,16 @@ impl<'a> Lower<'a> {
         let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        // Mesh as compute: the container is a compute shader's, with no
+        // output signatures (what they held is in the layout).
+        let mesh_out = self.s.mesh_compute.take();
+        if mesh_out.is_some() {
+            self.s.mesh = None;
+            self.s.outputs.clear();
+            self.s.prims.clear();
+        }
         Ok(Lowered {
+            mesh_out,
             wave_size,
             cmp_samplers,
             root_cbvs,
@@ -3751,6 +3846,9 @@ impl<'a> Lower<'a> {
         if index > 1 {
             return Val::Missing("pull-model barycentrics");
         }
+        if !host_barycentrics() {
+            return self.fallback_barycentric(mode, index);
+        }
         // One element per interpolation mode (the console's own, if its
         // signature declares one): DXIL allows two.
         let bary = |e: &SigElement| e.kind == 28;
@@ -3790,6 +3888,60 @@ impl<'a> Lower<'a> {
         e.row = None;
         e.interp = mode;
         self.s.flags |= flags::BARYCENTRICS;
+        self.load_any_input(id, index + 1)
+    }
+
+    /// [`Self::barycentric`] on a host without barycentrics: channel
+    /// `index + 1` of an ordinary three-float input [`super::BARY_INPUT`]
+    /// interpolated with `mode`, which [`super::bary_gs`] writes as (1, 0,
+    /// 0), (0, 1, 0) and (0, 0, 1) at the triangle's vertices 0, 1 and 2:
+    /// interpolated, the weights `SV_Barycentrics` would hold. Its register
+    /// is placed after the title's inputs when the shader is finished.
+    fn fallback_barycentric(&mut self, mode: u8, index: u8) -> Val {
+        // A barycentrics element the console's signature declared is not
+        // read any more: the weights come from ours.
+        let ours = |e: &SigElement| e.kind == 0 && e.name == super::BARY_INPUT;
+        let console = self
+            .s
+            .inputs
+            .iter()
+            .position(|e| e.kind == 28 && (e.interp == mode || e.usage == 0));
+        let id = match self.s.inputs.iter().position(|e| ours(e) && e.interp == mode) {
+            Some(id) => id,
+            None => {
+                let index = self.s.inputs.iter().filter(|e| ours(e)).count() as u32;
+                if index >= 2 {
+                    return Val::Missing("barycentrics of a third interpolation mode");
+                }
+                if let Some(id) = console
+                    && (self.s.inputs[id].col != 0 || self.s.inputs[id].cols < 3)
+                {
+                    return Val::Missing("a console barycentrics element without i and j");
+                }
+                let e = SigElement {
+                    name: super::BARY_INPUT.into(),
+                    index,
+                    kind: 0,
+                    comp: 9,
+                    interp: mode,
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                };
+                match console {
+                    Some(id) => {
+                        self.s.inputs[id] = e;
+                        id
+                    }
+                    None => {
+                        self.s.inputs.push(e);
+                        self.s.inputs.len() - 1
+                    }
+                }
+            }
+        };
         self.load_any_input(id, index + 1)
     }
 
@@ -5878,7 +6030,10 @@ impl<'a> Lower<'a> {
         let fits = |m: super::shader::Mesh| {
             mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
         };
-        if !fits(mesh) {
+        let compute = self.s.mesh_compute.is_some();
+        // As compute there is no output limit: the maxima stay the
+        // program's, as the layout has them.
+        if !compute && !fits(mesh) {
             mesh.max_vertices = mesh.max_vertices.min(threads);
             mesh.max_primitives = mesh.max_primitives.min(threads);
             // shortcut: outputs past the cap even at the lane count are
@@ -5896,9 +6051,29 @@ impl<'a> Lower<'a> {
             self.s.m.i32(mesh.max_vertices),
             self.s.m.i32(mesh.max_primitives),
         );
-        self.s
-            .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        if !compute {
+            self.s
+                .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        }
         let flat = self.mesh_thread();
+        if compute {
+            // Made here, in the entry block, before any guarded block ends
+            // it: every store below uses them.
+            self.mesh_base();
+            let out = self.s.root_uav_handle(super::SLOT_MESH_OUT);
+            // Lane 0 raises the header's instance count to the group's id + 1:
+            // after the dispatch it holds the groups to draw.
+            let i32t = self.s.t.i32;
+            let zero = self.s.m.i32(0);
+            let group = self.s.op(e, "groupId.i32", Attr::ReadNone, i32t, 94, &[zero]);
+            let one = self.s.m.i32(1);
+            let count = self.s.m.bin(e, Bin::Add, group, one);
+            let first = self.s.m.cmp(e, pred::EQ, flat, zero);
+            let at = self.begin_guarded(Some(first));
+            let (code, byte, iu) = (self.s.m.i32(7), self.s.m.i32(4), self.s.m.undef(i32t));
+            self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[out, code, byte, iu, iu, count]);
+            self.end_guarded(at, &[]);
+        }
         let z = self.s.m.i32(0);
         // Every primitive of the declared count starts culled, also those
         // past the lanes (a count of 256 with 128 lanes): lane n culls
@@ -5916,14 +6091,18 @@ impl<'a> Lower<'a> {
             let guard = ((pass + 1) * threads > mesh.max_primitives)
                 .then(|| self.s.m.cmp(self.cur, pred::IULT, index, p));
             let at = self.begin_guarded(guard);
-            self.s.op(
-                self.cur,
-                "emitIndices",
-                Attr::NoUnwind,
-                void,
-                169,
-                &[index, z, z, z],
-            );
+            if compute {
+                self.mesh_out_indices(index, [z, z, z]);
+            } else {
+                self.s.op(
+                    self.cur,
+                    "emitIndices",
+                    Attr::NoUnwind,
+                    void,
+                    169,
+                    &[index, z, z, z],
+                );
+            }
             self.end_guarded(at, &[]);
         }
         Ok(())
@@ -5946,6 +6125,71 @@ impl<'a> Lower<'a> {
         );
         self.flat = Some(f);
         f
+    }
+
+    /// Mesh as compute: the byte offset of this group's slot in
+    /// [`super::SLOT_MESH_OUT`] (the host group's x id times the slot size).
+    fn mesh_base(&mut self) -> V {
+        if let Some(b) = self.mesh_base {
+            return b;
+        }
+        let m = self.s.mesh_compute.as_ref().expect("mesh as compute");
+        let (bytes, cap) = (m.group_bytes(), m.groups_cap());
+        let e = self.s.entry;
+        let zero = self.s.m.i32(0);
+        let i32t = self.s.t.i32;
+        let group = self.s.op(e, "groupId.i32", Attr::ReadNone, i32t, 94, &[zero]);
+        // A group past the cap writes to the slot after the last one.
+        let cap = self.s.m.i32(cap);
+        let slot = self.s.op(e, "binary.i32", Attr::ReadNone, i32t, 40, &[group, cap]);
+        self.s.m.tag(slot, super::bitcode::Tag::Clamp);
+        let k = self.s.m.i32(bytes);
+        let b = self.s.m.bin(e, Bin::Mul, slot, k);
+        let header = self.s.m.i32(super::shader::MESH_OUT_HEADER);
+        let b = self.s.m.bin(e, Bin::Add, b, header);
+        self.mesh_base = Some(b);
+        b
+    }
+
+    /// Mesh as compute: one dword, `value`, at byte `at` of this group's
+    /// slot in the current block.
+    fn mesh_out_store(&mut self, at: V, value: V) {
+        let base = self.mesh_base();
+        let out = self.s.root_uav_handle(super::SLOT_MESH_OUT);
+        let c = self.cur;
+        let place = self.s.m.bin(c, Bin::Add, base, at);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        let void = self.s.t.void;
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[out, place, iu, value, iu, iu, iu, mask, align],
+        );
+    }
+
+    /// Mesh as compute: the byte offset of primitive `index` in the slot.
+    fn mesh_primitive_at(&mut self, index: V) -> V {
+        let m = self.s.mesh_compute.as_ref().expect("mesh as compute");
+        let (first, stride) = (m.primitives_at(), m.primitive_stride);
+        let c = self.cur;
+        let (first, stride) = (self.s.m.i32(first), self.s.m.i32(stride));
+        let at = self.s.m.bin(c, Bin::Mul, index, stride);
+        self.s.m.bin(c, Bin::Add, at, first)
+    }
+
+    /// Mesh as compute: the three indices of primitive `index`.
+    fn mesh_out_indices(&mut self, index: V, corners: [V; 3]) {
+        let at = self.mesh_primitive_at(index);
+        for (k, v) in corners.into_iter().enumerate() {
+            let c = self.cur;
+            let off = self.s.m.i32(4 * k as u32);
+            let place = self.s.m.bin(c, Bin::Add, at, off);
+            self.mesh_out_store(place, v);
+        }
     }
 
     /// The console wave size.
@@ -12127,6 +12371,9 @@ impl<'a> Lower<'a> {
     /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
     /// of a constant input element's channel, as a float.
     fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+        if !host_barycentrics() {
+            return self.fallback_vertex_input(id, col, k);
+        }
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let int = e.comp != 9;
@@ -12151,6 +12398,69 @@ impl<'a> Lower<'a> {
             137,
             &args,
         );
+        if int {
+            self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.f32)
+        } else {
+            v
+        }
+    }
+
+    /// [`Self::vertex_input`] on a host without barycentrics. Vertex 0 is
+    /// the element itself: it is constant, and a constant input is the
+    /// first vertex's, which [`super::bary_gs`] emits first. Vertices 1 and
+    /// 2 are one-channel constant inputs [`super::VERTEX_INPUT`] of their
+    /// own whose semantic index names the source ([`super::vertex_index`]):
+    /// the geometry shader copies that vertex's value of the vertex
+    /// shader's output in the element's register and column into them.
+    fn fallback_vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+        let e = &self.s.inputs[id];
+        // The other vertices' values as 32-bit floats or as raw bits.
+        let int = e.comp != 9;
+        let comp = if int { 5 } else { 9 };
+        let source = e.row.map(|row| (row, e.col + col));
+        let id = match (k, source) {
+            (0, _) | (_, None) => id,
+            (k, Some((row, col))) => {
+                let index = super::vertex_index(k, row, col);
+                let ours = |e: &SigElement| e.name == super::VERTEX_INPUT && e.index == index;
+                match self.s.inputs.iter().position(ours) {
+                    Some(id) => id,
+                    None => {
+                        self.s.inputs.push(SigElement {
+                            name: super::VERTEX_INPUT.into(),
+                            index,
+                            kind: 0,
+                            comp,
+                            interp: 1,
+                            row: None,
+                            col: 0,
+                            cols: 1,
+                            usage: 0,
+                            half: false,
+                        });
+                        self.s.inputs.len() - 1
+                    }
+                }
+            }
+        };
+        // A source without a register (a system value) has no vertex
+        // shader output to copy: its vertex 0 value stands for all three.
+        let col = if k == 0 || source.is_none() { col } else { 0 };
+        let e = &mut self.s.inputs[id];
+        e.usage |= 1 << col;
+        let (ty, suffix) = if int {
+            (self.s.t.i32, ".i32")
+        } else {
+            (self.s.t.f32, ".f32")
+        };
+        let entry = self.s.entry;
+        let args = [
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            self.s.m.undef(self.s.t.i32),
+        ];
+        let v = self.s.op(entry, &format!("loadInput{suffix}"), Attr::ReadNone, ty, 4, &args);
         if int {
             self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.f32)
         } else {
@@ -13965,6 +14275,30 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            let placed = self.s.mesh_compute.as_ref().filter(|_| mesh).map(|layout| {
+                let element = if primitive { layout.primitive_at[id] } else { layout.vertex_at[id] };
+                (element + 4 * u32::from(col), layout.vertex_stride)
+            });
+            if let Some((column, vertex_stride)) = placed {
+                // As compute: the value's bits at the element's column of
+                // this lane's vertex or primitive (`x` is the float the
+                // output takes for `.f32`).
+                let bits = if suffix == ".f32" { self.as_int(x) } else { x };
+                let flat = self.mesh_thread();
+                let c = self.cur;
+                let at = if primitive {
+                    let at = self.mesh_primitive_at(flat);
+                    let off = self.s.m.i32(column);
+                    self.s.m.bin(c, Bin::Add, at, off)
+                } else {
+                    let stride = self.s.m.i32(vertex_stride);
+                    let at = self.s.m.bin(c, Bin::Mul, flat, stride);
+                    let off = self.s.m.i32(column);
+                    self.s.m.bin(c, Bin::Add, at, off)
+                };
+                self.mesh_out_store(at, bits);
+                continue;
+            }
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),
@@ -14035,13 +14369,16 @@ impl<'a> Lower<'a> {
             }
             *slot = i;
         }
-        let mut args = vec![flat];
-        for i in indices {
-            args.push(self.s.m.select(c, culled, z, i));
+        let corners = indices.map(|i| self.s.m.select(c, culled, z, i));
+        if self.s.mesh_compute.is_some() {
+            self.mesh_out_indices(flat, corners);
+        } else {
+            let mut args = vec![flat];
+            args.extend(corners);
+            let void = self.s.t.void;
+            self.s
+                .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
         }
-        let void = self.s.t.void;
-        self.s
-            .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
         self.end_guarded(at, &[]);
         Ok(())
     }
@@ -14396,6 +14733,66 @@ impl<'a> Lower<'a> {
 
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
 /// pull model).
+/// The pixel inputs a host without barycentrics reads in their place
+/// ([`super::BARY_INPUT`], [`super::VERTEX_INPUT`]) get registers after the
+/// title's: each weights element a row of its own (its interpolation mode
+/// is the row's), the one-channel vertex values packed four to a row, the
+/// floats and the integers apart. A console barycentrics element no
+/// barycentric read took over is not declared on the host: it turns into
+/// an unread weights element. More rows than a pixel shader has (32) are
+/// refused.
+fn place_fallback_inputs(inputs: &mut [SigElement]) -> Result<(), Why> {
+    const ROWS: u32 = 32;
+    let ours = |e: &SigElement| e.name == super::BARY_INPUT || e.name == super::VERTEX_INPUT;
+    // (indices after the two a barycentric read may take)
+    for (n, e) in inputs.iter_mut().filter(|e| e.kind == 28).enumerate() {
+        *e = SigElement {
+            name: super::BARY_INPUT.into(),
+            index: 2 + n as u32,
+            kind: 0,
+            comp: 9,
+            interp: if e.interp == 0 { 2 } else { e.interp },
+            row: None,
+            col: 0,
+            cols: 3,
+            usage: 0,
+            half: false,
+        };
+    }
+    let mut next = inputs
+        .iter()
+        .filter(|e| !ours(e))
+        .filter_map(|e| e.row)
+        .max()
+        .map_or(0, |r| r + 1);
+    for e in inputs.iter_mut().filter(|e| e.name == super::BARY_INPUT) {
+        e.row = Some(next);
+        next += 1;
+    }
+    for comp in [9, 5] {
+        let mut col = 0;
+        for e in inputs
+            .iter_mut()
+            .filter(|e| e.name == super::VERTEX_INPUT && e.row.is_none() && e.comp == comp)
+        {
+            e.row = Some(next);
+            e.col = col;
+            col += 1;
+            if col == 4 {
+                col = 0;
+                next += 1;
+            }
+        }
+        if col != 0 {
+            next += 1;
+        }
+    }
+    if next > ROWS {
+        return Err("more pixel inputs than 32 registers with the barycentrics stand-ins");
+    }
+    Ok(())
+}
+
 fn interp_mode(kind: Barycentric) -> Option<u8> {
     Some(match kind {
         Barycentric::PerspectiveCenter => 2,
@@ -14606,6 +15003,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            mesh_compute: false,
         })
         .map(|_| ())
     }
@@ -14656,6 +15054,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            mesh_compute: false,
         })
     }
 
@@ -14826,6 +15225,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            mesh_compute: false,
         }).unwrap();
 
         let container =

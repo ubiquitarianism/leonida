@@ -129,6 +129,7 @@ fn lowered_counted(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_compute: false,
     }, counted);
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
@@ -143,6 +144,7 @@ fn lowered_counted(
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
+        mesh_out: None,
     })
 }
 
@@ -268,6 +270,7 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_compute: false,
     });
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered.expect("lower");
@@ -283,6 +286,7 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: Vec::new(),
+        mesh_out: None,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -1010,6 +1014,7 @@ fn flag_wave(native: &NativeProgram) -> Option<u32> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_compute: false,
     });
     lower::TEST_HOST_WAVE.set(was);
     lowered.expect("lower").wave_size
@@ -1353,6 +1358,7 @@ fn partial_dispatch_with_a_cross_half_wave_op_runs_in_32_lane_waves() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            mesh_compute: false,
     });
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered.unwrap_or_else(|e| panic!("lower: {e}"));
@@ -1374,6 +1380,7 @@ fn partial_dispatch_with_a_cross_half_wave_op_runs_in_32_lane_waves() {
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: lowered.half_views,
+        mesh_out: None,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).unwrap_or_else(|e| panic!("DXIL validation: {e}"));

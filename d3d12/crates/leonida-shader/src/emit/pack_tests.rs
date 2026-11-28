@@ -152,6 +152,7 @@ fn translate(native: &NativeProgram, k: u32) -> Result<HostShader, ShaderError> 
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_compute: false,
     });
     lower::TEST_GROUP_PACK.set(packing);
     lower::TEST_HOST_WAVE.set(was);
@@ -167,6 +168,7 @@ fn translate(native: &NativeProgram, k: u32) -> Result<HostShader, ShaderError> 
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: lowered.half_views,
+        mesh_out: None,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

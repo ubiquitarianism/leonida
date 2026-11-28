@@ -218,7 +218,7 @@ fn paired_override(container: &[u8], mut shader: HostShader) -> HostShader {
     let Some(dir) = DIR.get_or_init(|| std::env::var_os("LEONIDA_PAIRED_SHADER_DIR").map(PathBuf::from)) else {
         return shader;
     };
-    if shader.stage != HwStage::Cs || leonida_shader::emit::host_settings() != [32, 999_999, 0, 0] {
+    if shader.stage != HwStage::Cs || leonida_shader::emit::host_settings() != [32, 999_999, 0, 0, 0, 0] {
         return shader;
     }
     let digest = blake3::hash(container).to_hex();
@@ -397,6 +397,26 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, u32::from(slot));
         word(&mut out, dword);
     }
+    // A mesh program lowered as compute: its output layout (0: none).
+    match &s.mesh_out {
+        None => word(&mut out, 0),
+        Some(m) => {
+            word(&mut out, 1);
+            for value in [m.max_vertices, m.max_primitives, m.vertex_stride, m.primitive_stride] {
+                word(&mut out, value);
+            }
+            for at in [&m.vertex_at, &m.primitive_at] {
+                word(&mut out, at.len() as u32);
+                for &offset in at {
+                    word(&mut out, offset);
+                }
+            }
+            for part in [&m.osg1, &m.psg1] {
+                word(&mut out, part.len() as u32);
+                out.extend_from_slice(part);
+            }
+        }
+    }
     out
 }
 
@@ -470,6 +490,30 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     for _ in 0..n {
         half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
     }
+    let mesh_out = match r.word()? {
+        0 => None,
+        1 => {
+            let [max_vertices, max_primitives, vertex_stride, primitive_stride] =
+                [r.word()?, r.word()?, r.word()?, r.word()?];
+            let mut offsets = || -> Option<Vec<u32>> {
+                let n = r.word()? as usize;
+                (0..n.min(1024)).map(|_| r.word()).collect()
+            };
+            let (vertex_at, primitive_at) = (offsets()?, offsets()?);
+            let (osg1, psg1) = (r.list()?, r.list()?);
+            Some(leonida_shader::emit::MeshOut {
+                max_vertices,
+                max_primitives,
+                vertex_stride,
+                primitive_stride,
+                vertex_at,
+                primitive_at,
+                osg1,
+                psg1,
+            })
+        }
+        _ => return None,
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -481,6 +525,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_uavs,
         root_indexed_views,
         half_views,
+        mesh_out,
     })
 }
 
@@ -543,6 +588,17 @@ mod tests {
                 shift: 5,
             }],
             half_views: vec![(0, 8), (4, 0)],
+            // A mesh program's output layout survives the round trip.
+            mesh_out: Some(leonida_shader::emit::MeshOut {
+                max_vertices: 64,
+                max_primitives: 126,
+                vertex_stride: 32,
+                primitive_stride: 16,
+                vertex_at: vec![0, 16],
+                primitive_at: vec![12],
+                osg1: b"OSG1 part".to_vec(),
+                psg1: Vec::new(),
+            }),
         }
     }
 

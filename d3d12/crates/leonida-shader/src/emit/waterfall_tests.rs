@@ -69,6 +69,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_compute: false,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.
@@ -85,6 +86,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
         half_views: lowered.half_views,
+        mesh_out: None,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -369,6 +371,7 @@ fn immediate_sampler_chosen_by_control_flow() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            mesh_compute: false,
         })
         .unwrap_or_else(|e| panic!("{case_name}: lower failed: {e}"));
 
@@ -388,6 +391,7 @@ fn immediate_sampler_chosen_by_control_flow() {
             root_uavs: lowered.root_uavs,
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            mesh_out: None,
         };
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())

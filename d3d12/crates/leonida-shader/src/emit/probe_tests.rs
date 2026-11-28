@@ -35,6 +35,7 @@ fn probe() {
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            mesh_out: None,
         };
         let (root, pso) = match host.compute_pipeline(&shader) {
             Ok(made) => made,

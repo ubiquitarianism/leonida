@@ -37,6 +37,22 @@ fn is_depth_srv(desc: &[u32; 10]) -> bool {
         && !matches!(format, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT | DXGI_FORMAT_X24_TYPELESS_G8_UINT)
 }
 
+/// The device-local buffer mesh programs run as compute write to
+/// ([`leonida_shader::emit::MESH_OUT_BYTES`], made once; it starts and ends
+/// each use in the common state).
+fn mesh_buffer() -> Option<ID3D12Resource> {
+    static BUFFER: std::sync::Mutex<Option<ID3D12Resource>> = std::sync::Mutex::new(None);
+    let mut held = BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(b) = held.as_ref() {
+        return Some(b.clone());
+    }
+    let size = u64::from(leonida_shader::emit::MESH_OUT_BYTES);
+    let b = crate::host::host()?.uav_buffer(size)?;
+    tracing::info!(mib = size >> 20, "mesh buffer (mesh programs run as compute)");
+    *held = Some(b.clone());
+    Some(b)
+}
+
 /// Shader interface metadata shared by every pipeline variant and draw.
 pub(crate) struct TablePlan {
     groups: Vec<TableGroup>,
@@ -818,6 +834,10 @@ pub(crate) struct State {
     heaps: [usize; 2],
     graphics: Vec<Root>,
     compute: Vec<Root>,
+    /// While a mesh program runs as compute (`D3D12-MESH-COMPUTE-FALLBACK`):
+    /// its root arguments are the title's graphics ones, bound on the
+    /// compute side.
+    title_side_graphics: bool,
     vertex: [VertexView; 32],
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
@@ -2523,6 +2543,10 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for (at, &(slot, param)) in views.iter().enumerate() {
+                    if srv && slot == leonida_shader::emit::SLOT_MESH_IN {
+                        // Ours: the mesh buffer, bound by `mesh_as_compute`.
+                        continue;
+                    }
                     if srv && slot == leonida_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
                         if let Some(m) = &memory {
@@ -2592,6 +2616,10 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == leonida_shader::emit::SLOT_MESH_OUT {
+                    // Ours: the mesh buffer, bound by `mesh_as_compute`.
+                    continue;
+                }
                 if slot == leonida_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -4418,6 +4446,148 @@ impl State {
         )
     }
 
+    /// `D3D12-MESH-COMPUTE-FALLBACK`: `x` groups of a mesh pipeline on a host
+    /// without mesh shaders. The mesh program runs as compute with the
+    /// title's graphics root arguments, writing each group's outputs to the
+    /// mesh buffer; the pipeline then draws them as a triangle list of
+    /// `x * max_primitives * 3` vertices through its pass-through vertex
+    /// shader. The buffer starts and ends each use in the common state, so
+    /// every list finds it there.
+    fn mesh_as_compute(&mut self, list: &HostList, x: u32, p: &crate::pipeline::host::HostPipeline) -> bool {
+        let Some(mc) = p.mesh_compute.as_deref() else {
+            return false;
+        };
+        // Groups past the buffer's slots (`MeshOut::groups_cap`) draw nothing.
+        if x > mc.layout.groups_cap() {
+            once!(x, cap = mc.layout.groups_cap(), "a mesh dispatch of more groups than the mesh buffer holds: the rest draw nothing");
+        }
+        let n = x.min(65_535);
+        if n == 0 {
+            return true;
+        }
+        let Some(buffer) = mesh_buffer() else {
+            once!("no mesh buffer: the mesh draw is dropped");
+            return false;
+        };
+        let l = &list.list;
+        self.title_side_graphics = true;
+        let bound = self.bind(list, &mc.cs, true);
+        self.title_side_graphics = false;
+        if !bound {
+            return false;
+        }
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        };
+        // SAFETY: an open list, a live buffer and the compute pipeline bound.
+        unsafe {
+            l.ResourceBarrier(&[crate::host::transition(
+                &buffer,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            l.SetComputeRootUnorderedAccessView(mc.out_param, buffer.GetGPUVirtualAddress());
+            l.Dispatch(n, 1, 1);
+            l.ResourceBarrier(&[crate::host::transition(
+                &buffer,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            )]);
+        }
+        // The compute pipeline took the list's pipeline slot.
+        self.host_pipeline = 0;
+        let drawn = self.prepare_for(list, false, true);
+        // SAFETY: as above, the graphics pipeline bound when `drawn`.
+        unsafe {
+            if drawn {
+                self.mesh_scissor(list, true);
+                l.SetGraphicsRootShaderResourceView(mc.in_param, buffer.GetGPUVirtualAddress());
+                l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                l.DrawInstanced(mc.layout.max_primitives * 3, n, 0, 0);
+                self.mesh_scissor(list, false);
+            }
+            l.ResourceBarrier(&[crate::host::transition(
+                &buffer,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        list.keep(&buffer);
+        drawn
+    }
+
+    /// [`Self::mesh_as_compute`] for one indirect record: the record's
+    /// `(x, y, z)` is a dispatch's arguments as it stands (`stride` apart),
+    /// so the compute pipeline runs it as recorded; its groups raise the
+    /// buffer header's instance count, and the draw reads the header's
+    /// arguments (`3 * max_primitives` vertices, one instance a group).
+    fn mesh_indirect_as_compute(
+        &mut self,
+        list: &HostList,
+        p: &crate::pipeline::host::HostPipeline,
+        (arguments, at, stride): (&ID3D12Resource, u64, u32),
+        count: Option<(&ID3D12Resource, u64)>,
+    ) -> bool {
+        let Some(mc) = p.mesh_compute.as_deref() else {
+            return false;
+        };
+        let (Some(dispatch), Some(draw)) = (host_signature(2, stride), host_signature(0, 16)) else {
+            return false;
+        };
+        let Some(buffer) = mesh_buffer() else {
+            once!("no mesh buffer: the mesh draw is dropped");
+            return false;
+        };
+        let Ok(l2) = list.list.cast::<ID3D12GraphicsCommandList2>() else {
+            return false;
+        };
+        self.title_side_graphics = true;
+        let bound = self.bind(list, &mc.cs, true);
+        self.title_side_graphics = false;
+        if !bound {
+            return false;
+        }
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_WRITEBUFFERIMMEDIATE_PARAMETER,
+        };
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        let l = &list.list;
+        // SAFETY: an open list, live buffers and the compute pipeline bound.
+        unsafe {
+            let va = buffer.GetGPUVirtualAddress();
+            l.ResourceBarrier(&[crate::host::transition(&buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            let header = [mc.layout.max_primitives * 3, 0, 0, 0].map(|v| v);
+            let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = header
+                .iter()
+                .enumerate()
+                .map(|(k, &value)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: va + 4 * k as u64, Value: value })
+                .collect();
+            l2.WriteBufferImmediate(params.len() as u32, params.as_ptr(), None);
+            l.ResourceBarrier(&[crate::host::transition(&buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            l.SetComputeRootUnorderedAccessView(mc.out_param, va);
+            l.ExecuteIndirect(&dispatch, 1, arguments, at, count.map(|c| c.0), count.map_or(0, |c| c.1));
+            l.ResourceBarrier(&[crate::host::transition(&buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read)]);
+        }
+        self.host_pipeline = 0;
+        let drawn = self.prepare_for(list, false, true);
+        // SAFETY: as above, the graphics pipeline bound when `drawn`.
+        unsafe {
+            if drawn {
+                self.mesh_scissor(list, true);
+                l.SetGraphicsRootShaderResourceView(mc.in_param, buffer.GetGPUVirtualAddress());
+                l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                l.ExecuteIndirect(&draw, 1, &buffer, 0, None, 0);
+                self.mesh_scissor(list, false);
+            }
+            l.ResourceBarrier(&[crate::host::transition(&buffer, read, D3D12_RESOURCE_STATE_COMMON)]);
+        }
+        list.keep(&buffer);
+        drawn
+    }
+
     /// A mesh draw under `LEONIDA_MESH_TEST=scissor` rasterises one pixel:
     /// the scissors before it (`on`), the title's after it.
     fn mesh_scissor(&self, list: &HostList, on: bool) {
@@ -4443,6 +4613,20 @@ impl State {
         if held {
             crate::drops::begin();
             crate::drops::note(Why::SkipList);
+        }
+        // Without mesh shaders: the program as compute, its output drawn.
+        let fallback = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+            .filter(|p| p.mesh_compute.is_some());
+        if let Some(p) = fallback {
+            let ran = !held && self.mesh_as_compute(list, x, p);
+            if ran {
+                self.drew(Some(p));
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                crate::drops::count_noted(Kind::Draw, Why::Other);
+            }
+            return;
         }
         let ran = !held
             && self.prepare_for(list, false, true)
@@ -4546,7 +4730,7 @@ impl State {
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
-        if compute {
+        if compute && !self.title_side_graphics {
             &self.compute
         } else {
             &self.graphics
@@ -5368,6 +5552,19 @@ impl State {
             ));
             return false;
         }
+        // `D3D12-MESH-COMPUTE-FALLBACK`: the pipeline is a compute and a
+        // graphics one, not a mesh pipeline, so the title's indirect mesh
+        // dispatch cannot run as recorded (the host loses the device when it
+        // is: 2026-11-28, GTX 1050 Ti).
+        // So it runs as compute and a draw (`mesh_indirect_as_compute`), one
+        // record at a time.
+        // shortcut: several records a call (each would fill the same slots)
+        // are left out.
+        if kind == MESH && p.mesh_compute.is_some() && max != 1 {
+            once!(max, "an indirect mesh dispatch of several records without mesh shaders is left out");
+            why("an indirect mesh dispatch of several records without mesh shaders");
+            return false;
+        }
         // A program run several console groups to a host group takes the console's grid from
         // root constants the records carry (`crate::indirect::bound_packed`).
         if kind == DISPATCH && pack_broken(p) {
@@ -5507,6 +5704,18 @@ impl State {
                 (bounded, 0)
             }
         };
+        if kind == MESH && p.mesh_compute.is_some() {
+            let counted = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            let ran = self.mesh_indirect_as_compute(list, p, (&bounded, at, stride), counted);
+            if ran {
+                self.drew(Some(p));
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            } else {
+                crate::drops::note(Why::BindFailed);
+                why("the mesh program as compute did not run");
+            }
+            return ran;
+        }
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),

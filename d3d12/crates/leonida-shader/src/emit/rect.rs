@@ -416,6 +416,7 @@ mod tests {
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            mesh_out: None,
         };
         (
             host(crate::native::HwStage::Vs, vs),
@@ -465,6 +466,7 @@ mod tests {
                     stride: 32,
                     size: (8, 8),
                     mesh_groups: 0,
+                    vertex_count: 0,
                 };
                 host.draw(&root, &pso, &d).unwrap()
             };

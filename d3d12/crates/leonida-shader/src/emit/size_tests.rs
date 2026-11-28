@@ -62,6 +62,7 @@ fn build(words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_compute: false,
     })?;
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -74,6 +75,7 @@ fn build(words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
         half_views: Vec::new(),
+        mesh_out: None,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

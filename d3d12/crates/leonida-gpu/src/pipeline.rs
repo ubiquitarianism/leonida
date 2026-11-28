@@ -170,6 +170,67 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// `D3D12-MESH-COMPUTE-FALLBACK`, on a host without mesh shaders: this
+    /// mesh program seen as a compute stage (its translation there is the
+    /// compute variant, which writes its outputs to
+    /// [`leonida_shader::emit::SLOT_MESH_OUT`]), and the pass-through vertex
+    /// shader that draws what it wrote in front of the pixel shader `ps`,
+    /// with the layout both use. None when the program did not translate
+    /// as compute or the vertex shader cannot be made (logged).
+    pub(crate) fn mesh_fallback(
+        &self,
+        ps: Option<&Shader>,
+    ) -> Option<(Arc<Shader>, Arc<Shader>, leonida_shader::emit::MeshOut)> {
+        let layout = self.translated()?.host.mesh_out.clone()?;
+        let cs = Arc::new(Shader {
+            stage: "compute",
+            hash: self.hash.clone(),
+            container: self.container.clone(),
+            ambient: None,
+            translated: OnceLock::new(),
+        });
+        let ps_dxil = ps.and_then(Shader::translated).map(|t| t.host.dxil.as_slice());
+        let dxil = match leonida_shader::emit::mesh_vs(&layout, ps_dxil) {
+            Ok(dxil) => dxil,
+            Err(e) => {
+                tracing::warn!(error = %e, shader = %self.hash, "no pass-through vertex shader for a mesh program");
+                return None;
+            }
+        };
+        let host = leonida_shader::emit::HostShader {
+            stage: leonida_shader::HwStage::Vs,
+            dxil,
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: vec![leonida_shader::emit::SLOT_MESH_IN],
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
+            mesh_out: None,
+        };
+        let vs = Arc::new(Shader {
+            stage: "vertex",
+            hash: format!("{}.vs", self.hash),
+            container: Vec::new(),
+            ambient: None,
+            translated: OnceLock::from(Some(Translated {
+                host,
+                threads: None,
+                used: Vec::new(),
+                tables: crate::draw::TablePlan::new(&[], &[]),
+                stores: false,
+                stores_by_address: false,
+                writes: false,
+                pack: None,
+                pack_logged: Default::default(),
+                picks: Default::default(),
+            })),
+        });
+        Some((cs, vs, layout))
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {

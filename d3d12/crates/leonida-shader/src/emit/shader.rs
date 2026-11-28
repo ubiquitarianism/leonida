@@ -80,6 +80,22 @@ pub fn constant_marks() -> bool {
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// A mesh program translated as compute (the host has no mesh shaders): the
+/// root UAV `u<SLOT_MESH_OUT>` takes what the mesh outputs would, one
+/// [`MeshOut`] slot per group, for the pass-through vertex shader
+/// (`mesh_vs.rs`) to read back as the root SRV `t<SLOT_MESH_IN>`.
+pub const SLOT_MESH_OUT: u8 = 251;
+/// See [`SLOT_MESH_OUT`].
+pub const SLOT_MESH_IN: u8 = 250;
+/// Bytes of the [`SLOT_MESH_OUT`] buffer: the header, then the groups'
+/// slots ([`MeshOut::groups_cap`] of them and one more, where groups past
+/// the cap write).
+pub const MESH_OUT_BYTES: u32 = 64 << 20;
+/// Bytes before the first group's slot: the draw arguments of the groups
+/// written (`D3D12_DRAW_ARGUMENTS`: the host writes `3 * max_primitives`
+/// to dword 0 and zero to dword 1 before a dispatch; each group raises
+/// dword 1 to its id + 1, so it holds the group count for an indirect draw).
+pub const MESH_OUT_HEADER: u32 = 256;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// In a directory entry's first dword: shaders do not store there by address
@@ -214,6 +230,74 @@ pub(crate) struct Mesh {
     pub topology: u8,
 }
 
+/// Where a mesh program lowered as compute ([`SLOT_MESH_OUT`]) puts what
+/// its outputs would hold, in bytes from the start of its group's slot:
+/// `max_vertices` vertices of `vertex_stride` bytes, then `max_primitives`
+/// primitives of `primitive_stride` bytes (three indices, then the
+/// per-primitive outputs). Each output element takes one dword per
+/// column, in signature order (`vertex_at`, `primitive_at`). The
+/// pass-through vertex shader (`mesh_vs.rs`) reads the same layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshOut {
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    pub vertex_stride: u32,
+    pub primitive_stride: u32,
+    /// Byte offset of each vertex output element (OSG1 order).
+    pub vertex_at: Vec<u32>,
+    /// Byte offset of each per-primitive output element (PSG1 order),
+    /// past the three indices.
+    pub primitive_at: Vec<u32>,
+    /// The mesh program's vertex outputs as an `OSG1` part, and its
+    /// per-primitive outputs as a `PSG1` part: what the pass-through vertex
+    /// shader outputs.
+    pub osg1: Vec<u8>,
+    pub psg1: Vec<u8>,
+}
+
+impl MeshOut {
+    /// The layout for these maxima and signatures.
+    pub fn new(max_vertices: u32, max_primitives: u32, outputs: &[SigElement], prims: &[SigElement]) -> Self {
+        let place = |first: u32, elements: &[SigElement]| {
+            let mut at = Vec::with_capacity(elements.len());
+            let mut next = first;
+            for e in elements {
+                at.push(next);
+                next += 4 * u32::from(e.cols);
+            }
+            (at, next)
+        };
+        let (vertex_at, vertex_stride) = place(0, outputs);
+        let (primitive_at, primitive_stride) = place(12, prims);
+        MeshOut {
+            max_vertices,
+            max_primitives,
+            vertex_stride,
+            primitive_stride,
+            vertex_at,
+            primitive_at,
+            osg1: super::container::signature(outputs, false),
+            psg1: super::container::signature(prims, false),
+        }
+    }
+
+    /// Bytes of one group's slot.
+    pub fn group_bytes(&self) -> u32 {
+        self.max_vertices * self.vertex_stride + self.max_primitives * self.primitive_stride
+    }
+
+    /// Groups with a slot of their own in [`MESH_OUT_BYTES`]; one more slot
+    /// takes the writes of every group past them (which draw nothing).
+    pub fn groups_cap(&self) -> u32 {
+        ((MESH_OUT_BYTES - MESH_OUT_HEADER) / self.group_bytes().max(4)).saturating_sub(1).max(1)
+    }
+
+    /// Byte offset of primitive 0 in a group's slot.
+    pub fn primitives_at(&self) -> u32 {
+        self.max_vertices * self.vertex_stride
+    }
+}
+
 /// What a geometry shader declares: triangles in, triangle strips out on
 /// stream 0, one instance.
 #[derive(Debug, Clone, Copy)]
@@ -304,6 +388,10 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// The mesh program is lowered as compute: the outputs go to
+    /// [`SLOT_MESH_OUT`] in this layout (`mesh` stays set while lowering and
+    /// is cleared before [`Shader::finish`]).
+    pub mesh_compute: Option<MeshOut>,
     /// A geometry shader (the rectangle stage, `rect.rs`); `pixel` is false.
     pub geometry: Option<Geometry>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
@@ -368,6 +456,7 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            mesh_compute: None,
             geometry: None,
             user_data: 0,
             samplers: 0,
