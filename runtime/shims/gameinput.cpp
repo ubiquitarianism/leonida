@@ -2441,6 +2441,13 @@ private:
 
 Device* as_device(IGameInputDevice* d) { return static_cast<Device*>(d); }
 
+// A reading matches a kind filter only when the reading itself carries one of the requested kinds. A device can
+// advertise Motion or RawDeviceReport in supportedInput before its first sample or report, when its current reading
+// does not carry that kind yet.
+bool reading_matches(Reading* r, uint32_t kind) {
+    return kind == GameInputKindUnknown || (kind & r->GetInputKind()) != 0;
+}
+
 // GetNextReading (forward) and GetPreviousReading: the reading right after or right before the reference in the order
 // readings were taken, from the filter device's history or, with no filter, every connected pad's. Readings compare by
 // Reading::order, not timestamp, since pads polled together share one. The horizon is the newest reading dropped from
@@ -2484,7 +2491,10 @@ HRESULT find_reading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* de
     for (Device* d : scope)
         for (Reading* c : d->history) {
             const bool beyond = forward ? c->order() > r->order() : c->order() < r->order() && c->order() > horizon;
-            if (beyond && (!best || (c->order() < best->order()) == forward)) best = c;  // the nearest one
+            // A device may advertise Motion/RawDeviceReport before its readings carry that kind (see #5053).
+            // A history walk must skip those readings, or a Motion/Raw query can return one without the data.
+            if (beyond && reading_matches(c, kind) &&
+                (!best || (c->order() < best->order()) == forward)) best = c;  // the nearest one
         }
     if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
     best->AddRef();
@@ -2596,17 +2606,23 @@ public:
                 const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & d->info.supportedInput) : d->info.supportedInput;
                 for (Device* cd : g().connected) {
                     if (!(effective_kind & cd->info.supportedInput)) continue;
-                    if (Reading* r = cd->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
+                    if (Reading* r = cd->latest();
+                        r && reading_matches(r, effective_kind) &&
+                        (!best || r->GetTimestamp() >= best->GetTimestamp()))
+                        best = r;
                 }
             } else {
                 if (d->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
                 if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
                     return GAMEINPUT_E_READING_NOT_FOUND;  // the device does not do this kind (motion on a plain pad)
                 best = d->latest();
+                if (best && !reading_matches(best, kind)) best = nullptr;  // advertised, but no sample/report yet
             }
         } else {
-            for (Device* d : g().connected)  // the most recent reading from any gamepad
-                if (Reading* r = d->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
+            for (Device* d : g().connected)  // the most recent reading that carries the requested kind
+                if (Reading* r = d->latest(); r && reading_matches(r, kind) &&
+                                             (!best || r->GetTimestamp() >= best->GetTimestamp()))
+                    best = r;
         }
         if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
         best->AddRef();

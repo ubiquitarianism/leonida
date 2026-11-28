@@ -281,9 +281,10 @@ intensity 0; waveform indices other than 0 are `E_INVALIDARG`.
 Pads whose SDL gamepad reports both a gyroscope and an accelerometer (a DualSense, a Switch Pro, Steam Input pads) get
 `GameInputKindMotion` in `supportedInput` and a `motionInfo` (`GameInputMotionInfo`, Microsoft's v0 layout); `IGameInputReading::GetMotionState`
 returns a `GameInputMotionState` on their readings, and `GetCurrentReading`/`GetNextReading` answer a
-`GameInputKindMotion` query for such a pad and return `GAMEINPUT_E_READING_NOT_FOUND` for a pad without sensors. A
-reading callback registered for `GameInputKindMotion` hears only such pads: like a device callback, it is limited to
-devices that support at least one of the kinds it names (Microsoft's `RegisterReadingCallback` reference). The
+`GameInputKindMotion` query for such a pad once it has a sample; they return `GAMEINPUT_E_READING_NOT_FOUND` for a pad
+without sensors or before its first sample. A reading callback registered for `GameInputKindMotion` hears only such
+pads: like a device callback, it is limited to devices that support at least one of the kinds it names (Microsoft's
+`RegisterReadingCallback` reference). The
 sensors are enabled when the pad is opened, at SDL's requested rate, and every poll reads the latest sample.
 
 - The state carries **signed fractions of the maxima `motionInfo` reports** (1.0 = full magnitude), which is the
@@ -402,7 +403,8 @@ A pad opened this way gets the following:
 - `inputReportInfo`, `outputReportInfo` and `featureReportInfo` tables with their counts. Every report has `itemCount`
   0: the descriptor's items (usages, logical ranges, units) are not decoded.
 - Readings that carry the newest raw input report. Each poll drains the reports that arrived, the last declared one
-  wins, and a report with new bytes makes a reading of its own. Before the first report, a reading carries none.
+  wins, and a report with new bytes makes a reading of its own. Before the first report, a reading carries none, so a
+  `GameInputKindRawDeviceReport` query is `GAMEINPUT_E_READING_NOT_FOUND` until one arrives.
 - These device calls, each on any `IGameInputRawDeviceReport` of the right kind whose id the pad declares:
   - `CreateRawDeviceReport(id, kind)` makes a zeroed report.
   - `GetRawDeviceFeature(id)` reads a feature report.
