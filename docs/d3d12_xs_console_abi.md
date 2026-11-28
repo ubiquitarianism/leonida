@@ -260,6 +260,16 @@ The runtime's model:
   the releaser, signals the gates, because that Signal runs the work the layer held behind them (the held
   submission, the shadow refresh, a deferred Present), and the pump keeps landing writes and timing gates out
   meanwhile.
+- `LEONIDA_LATE_RELAY=1` (off by default): a gate held because the write that meets it was submitted after the
+  wait (the waiter's `ExecuteCommandLists` came first) opens on the GPU instead. When a queue signals its write fence
+  behind a group of writes, the first gate still shut on each other queue whose waits are all met in memory or by
+  that queue's writes in flight is signalled by the writer's queue right behind its write fence (a queue `Signal` of
+  the waiter's gate fence). The waiter's held work is then released as soon as that Signal is submitted, and the GPU
+  runs it after the writer's part, as a relayed wait does; the write still lands through the pump as before. Such a
+  gate never times out and is never signalled by the releaser; it keeps its queue's later gates shut until the gate
+  fence reaches its value, so a CPU Signal of a later value cannot open it before the writer has run. Not a gate on
+  the writer's own queue (it stands behind the gate), not an action gate, and none while the releaser has gates to
+  signal.
 - A gate opens after `LEONIDA_VALUE_WAIT_TIMEOUT_MS` (default 200) whatever memory holds, counted from when the
   gates before it on its queue opened, and logged once per address. An address that timed out three times in a row
   (the last 256 addresses are counted) gets 4 ms. Once four gates in a row timed out, so does every wait for an

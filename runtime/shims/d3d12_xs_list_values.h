@@ -181,7 +181,32 @@ struct Counters {
     // stored to as a host address), and through xmem's own mapping of a page the title's view keeps PAGE_NOACCESS.
     // Both are also counted in writes_landed.
     std::atomic<std::uint64_t> writes_arena{0}, writes_title_pages{0};
+    // Gates held whose every wait a write submitted after them meets (a write the pump knows of, in flight), and of
+    // those, the ones that were their queue's first gate still shut then: what a relay made at the writer's
+    // submission, rather than at the waiter's, could have taken off the CPU.
+    std::atomic<std::uint64_t> gates_late_relayable{0}, gates_late_relayable_first{0};
+    // LEONIDA_LATE_RELAY: gates the writer's queue signalled on the GPU (Pump::take_late_relays), and those seen open.
+    std::atomic<std::uint64_t> gates_late_relayed{0}, gates_late_relayed_open{0};
 };
+
+// LEONIDA_LATE_RELAY=1: a gate held for a write submitted after it is signalled by the writer's queue on the GPU, right
+// behind the writer's `written` Signal (Pump::take_late_relays), instead of by the releaser once the write has run,
+// landed and been read back. Off by default.
+inline std::atomic<int>& late_relay_state() {  // -1: not read yet
+    static std::atomic<int> state{-1};
+    return state;
+}
+inline bool late_relay_enabled() {
+    int state = late_relay_state().load(std::memory_order_relaxed);
+    if (state < 0) {
+        const char* v = std::getenv("LEONIDA_LATE_RELAY");
+        int read = v && v[0] == '1' ? 1 : 0;
+        late_relay_state().compare_exchange_strong(state, read, std::memory_order_relaxed);
+        state = late_relay_state().load(std::memory_order_relaxed);
+    }
+    return state == 1;
+}
+inline void set_late_relay(bool on) { late_relay_state().store(on ? 1 : 0, std::memory_order_relaxed); }
 
 inline Counters& counters() {
     static Counters* c = new Counters;  // immortal: the threads may still count during teardown
@@ -368,6 +393,7 @@ public:
             std::lock_guard lock(mutex_);
             const std::uint64_t after_gate = max_pending_gate_locked(queue.get());
             writes_.push_back({std::move(queue), value, std::move(writes), after_gate});
+            count_late_relayable_locked();
         }
         start_or_settle();
     }
@@ -427,6 +453,68 @@ public:
     }
 
     HANDLE wake() const { return wake_; }
+
+    // LEONIDA_LATE_RELAY, after `writer` signalled its `written` fence behind a group of writes (add_writes): the
+    // first gate still shut on each other queue whose every wait is met in memory or by a write of `writer`'s in
+    // flight. Each is marked signalled on the GPU and returned: the caller has `writer` Signal the gate fence to its
+    // value next, so the waiting queue's work runs behind the write on the GPU, with no landing, poll or releaser
+    // between. Such a gate is never signalled by the releaser and does not time out; it keeps the gates after it on
+    // its queue shut until the gate fence reaches its value (take_open), so no CPU Signal of a later value can open
+    // it early. Not a gate on `writer` itself (it stands behind the gate on its own queue), not an action gate, and
+    // nothing while the releaser has gates to signal (one of them could be an action this gate must not overtake).
+    std::vector<std::pair<std::shared_ptr<QueueValues>, std::uint64_t>> take_late_relays(const QueueValues* writer) {
+        std::vector<std::pair<std::shared_ptr<QueueValues>, std::uint64_t>> out;
+        if (!late_relay_enabled() || exiting_.load(std::memory_order_relaxed)) return out;
+        if (pending_releases_.load(std::memory_order_acquire) != 0) return out;
+        std::lock_guard lock(mutex_);
+        std::vector<const QueueValues*> seen;
+        for (Gate& gate : gates_) {
+            const QueueValues* queue = gate.queue.get();
+            if (std::find(seen.begin(), seen.end(), queue) != seen.end()) continue;
+            seen.push_back(queue);
+            if (queue == writer || gate.action || gate.gpu_signalled || gate.waits.empty()) continue;
+            const bool all = std::all_of(gate.waits.begin(), gate.waits.end(), [&](const Wait& wait) {
+                const std::uint8_t need = wait.wide ? 8 : 4;
+                for (const WriteGroup& group : writes_)
+                    if (group.queue.get() == writer)
+                        for (const Write& write : group.writes)
+                            if (write.kind == WriteKind::value && write.address == wait.address &&
+                                write.bytes >= need &&
+                                console_value_met(wait.comparison, write.value, wait.reference, wait.wide))
+                                return true;
+                return met_now(wait);
+            });
+            if (!all) continue;
+            gate.gpu_signalled = true;
+            out.emplace_back(gate.queue, gate.value);
+        }
+        if (!out.empty()) bump(counters().gates_late_relayed, out.size());
+        return out;
+    }
+
+    // Counts the gates that the writes in flight now meet in full (gates_late_relayable), once each. mutex_ held.
+    void count_late_relayable_locked() {
+        for (std::size_t i = 0; i < gates_.size(); ++i) {
+            Gate& gate = gates_[i];
+            if (gate.action || gate.late_counted || gate.waits.empty()) continue;
+            const bool all = std::all_of(gate.waits.begin(), gate.waits.end(), [&](const Wait& wait) {
+                const std::uint8_t need = wait.wide ? 8 : 4;
+                for (const WriteGroup& group : writes_)
+                    for (const Write& write : group.writes)
+                        if (write.kind == WriteKind::value && write.address == wait.address && write.bytes >= need &&
+                            console_value_met(wait.comparison, write.value, wait.reference, wait.wide))
+                            return true;
+                return false;
+            });
+            if (!all) continue;
+            gate.late_counted = true;
+            Counters& c = counters();
+            c.gates_late_relayable.fetch_add(1, std::memory_order_relaxed);
+            bool first = true;
+            for (std::size_t k = 0; k < i && first; ++k) first = gates_[k].queue != gate.queue;
+            if (first) c.gates_late_relayable_first.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 
     // stop() ran: nothing new is landed or opened (the process is ending).
     bool stopped() const { return exiting_.load(std::memory_order_relaxed); }
@@ -518,6 +606,8 @@ private:
         Clock::time_point since{};
         bool started = false;          // the gates before it on its queue have opened: its time runs
         bool cut_short = false;        // given the short timeout
+        bool late_counted = false;     // counted in gates_late_relayable
+        bool gpu_signalled = false;    // LEONIDA_LATE_RELAY: another queue signals it on the GPU (take_late_relays)
         std::uint64_t after = 0;       // action gates: the queue's `written` value the action runs behind
         std::function<void()> action;  // null: a memory wait
     };
@@ -799,10 +889,22 @@ private:
 
         std::vector<const QueueValues*> blocked;
         std::vector<bool> opened(gates_.size(), false);
+        bool gpu_done = false;  // a gate another queue signalled on the GPU was seen done: taken out below
         for (std::size_t idx = 0; idx < gates_.size(); ++idx) {
             Gate& gate = gates_[idx];
             const QueueValues* queue = gate.queue.get();
             if (std::find(blocked.begin(), blocked.end(), queue) != blocked.end()) continue;
+            if (gate.gpu_signalled) {
+                // Signalled by another queue on the GPU: gone once the gate fence shows it, never by the releaser.
+                if (queue->gate->GetCompletedValue() >= gate.value) {
+                    opened[idx] = true;
+                    gpu_done = true;
+                    bump(counters().gates_late_relayed_open);
+                } else {
+                    blocked.push_back(queue);
+                }
+                continue;
+            }
             bool open = force;
             if (gate.action) {
                 open = open || queue->written->GetCompletedValue() >= gate.after;
@@ -839,7 +941,7 @@ private:
                 blocked.push_back(queue);
             }
         }
-        if (!opening.empty()) {
+        if (!opening.empty() || gpu_done) {
             std::deque<Gate> rest;
             for (std::size_t idx = 0; idx < gates_.size(); ++idx)
                 if (!opened[idx]) rest.push_back(std::move(gates_[idx]));
@@ -901,7 +1003,8 @@ private:
                      "(%llu short, %llu demotions, %llu met late); %llu cuts (%llu deferred to a query's end, %llu "
                      "failed), %llu on bundles; releaser %llu signals, %.1f ms, longest %.2f ms, %llu stalls; longest pump pass "
                      "%.2f ms; %llu page remaps at the call (longest wait %.2f ms), %llu deferred (%llu failed); "
-                     "timestamps %llu from the GPU, %llu from the CPU clock\n",
+                     "timestamps %llu from the GPU, %llu from the CPU clock; gates a later write meets %llu (%llu "
+                     "first on their queue), signalled on the GPU by the writer's queue %llu (%llu seen open)\n",
                      get(c.writes_recorded), get(c.writes_landed), get(c.writes_failed), get(c.waits_recorded),
                      get(c.waits_met_at_submit), get(c.waits_relayed), get(c.gates_held), get(c.gates_met),
                      get(c.gates_timed_out), get(c.gates_short), get(c.demotions), get(c.late_met), get(c.cuts),
@@ -909,7 +1012,8 @@ private:
                      get(c.release_us) / 1000.0, get(c.release_us_max) / 1000.0, get(c.release_stalls),
                      get(c.pass_us_max) / 1000.0,
                      get(c.remaps_now), get(c.remap_wait_us_max) / 1000.0, get(c.remaps_deferred),
-                     get(c.remaps_failed), get(c.stamps_gpu), get(c.stamps_cpu));
+                     get(c.remaps_failed), get(c.stamps_gpu), get(c.stamps_cpu), get(c.gates_late_relayable),
+                     get(c.gates_late_relayable_first), get(c.gates_late_relayed), get(c.gates_late_relayed_open));
     }
 
     // A timestamp write's value: the GPU's timestamp for the write's place in its list when the GPU wrote one, else

@@ -4263,6 +4263,60 @@ int check_list_values() {
     InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells[7]), 3);
     EXPECT(xs::list_values_idle(2000) && fence_completed(a_gate) == 3);
 
+    // 9. LEONIDA_LATE_RELAY: a gate held for a write submitted after it (case 2) is signalled by the writer's queue on
+    // the GPU, right behind the writer's `written` Signal: it opens when the writer's work has run, before the write
+    // has landed or been read back, and the releaser never signals it.
+    xs::set_list_value_late_relay(true);
+    g_cells[6] = 0;
+    const std::uint64_t gate_next = fence_completed(b_gate) + 1;
+    const xs::ListValueStats before_late = xs::list_value_stats();
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 74, word(&g_cells[6]), 7, 0x99, 1);  // wait64(address, >=, 0x99), before any work: the part's gate
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    g_queue_call_count = 0;
+    EXPECT(submit(qb, lv) == 0);
+    EXPECT(g_queue_call_count == 2 && queue_call_is(0, qb_mock, 15, word(b_gate), gate_next));
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 14, 1, 1, 1);
+    raw(lw, 72, word(&g_cells[6]), 0x99, 0, 0);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    g_queue_call_count = 0;
+    EXPECT(submit(qa, lw) == 0);
+    EXPECT(g_queue_call_count == 3 && queue_call_is(0, qa_mock, 10, 1, word(lw_real)) &&
+           queue_call_is(1, qa_mock, 14, word(a_written), 6) && queue_call_is(2, qa_mock, 14, word(b_gate), gate_next));
+    xs::ListValueStats late = xs::list_value_stats();
+    EXPECT(late.gates_late_relayed == before_late.gates_late_relayed + 1);
+    // The writer has not run: the gate stays shut and blocks nothing it should not.
+    EXPECT(!xs::list_values_idle(30) && fence_completed(b_gate) == gate_next - 1 && cell(6) == 0);
+    // The GPU runs the writer's work, then its Signal of the gate: the gate goes without a release, the write lands.
+    fence_signal(a_written, 6);
+    fence_signal(b_gate, gate_next);
+    EXPECT(xs::list_values_idle(2000) && cell(6) == 0x99 && fence_completed(b_gate) == gate_next);
+    late = xs::list_value_stats();
+    EXPECT(late.gates_late_relayed_open == before_late.gates_late_relayed_open + 1 &&
+           late.releases == before_late.releases);
+    // A writer on the waiter's own queue stands behind the gate: no late relay there.
+    g_cells[6] = 0;
+    EXPECT(hr_of(raw(lv, 139, word(allocator), 0)) == S_OK);
+    raw(lv, 74, word(&g_cells[6]), 7, 0x99, 1);
+    raw(lv, 14, 1, 1, 1);
+    EXPECT(hr_of(raw(lv, 9)) == S_OK);
+    EXPECT(submit(qb, lv) == 0);
+    EXPECT(hr_of(raw(lw, 139, word(allocator), 0)) == S_OK);
+    raw(lw, 14, 1, 1, 1);
+    raw(lw, 72, word(&g_cells[6]), 0x99, 0, 0);
+    EXPECT(hr_of(raw(lw, 9)) == S_OK);
+    g_queue_call_count = 0;
+    EXPECT(submit(qb, lw) == 0);
+    bool gate_signalled = false;
+    for (unsigned i = 0; i < g_queue_call_count; ++i)
+        gate_signalled = gate_signalled || (g_queue_calls[i].slot == 14 && g_queue_calls[i].a1 == word(b_gate));
+    EXPECT(!gate_signalled && xs::list_value_stats().gates_late_relayed == late.gates_late_relayed);
+    fence_signal(b_written, fence_completed(b_written) + 1);
+    xs::set_list_value_late_relay(false);
+    EXPECT(xs::list_values_idle(3000));
+
     // Every real list, spare and fence goes with its proxy.
     EXPECT(xs::list_values_idle(2000));
     EXPECT(release(lw) == 0 && lw_real->refs == 0 && spare->refs == 0);

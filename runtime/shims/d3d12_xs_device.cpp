@@ -4038,6 +4038,13 @@ public:
             if (SUCCEEDED(signal(values->written, value))) {
                 values->written->SetEventOnCompletion(value, list_values::Pump::get().wake());
                 list_values::Pump::get().add_writes(queue_->values, value, std::move(writes_));
+                // LEONIDA_LATE_RELAY: other queues' gates these writes meet open on the GPU, behind them.
+                for (const auto& [waiter, gate_value] : list_values::Pump::get().take_late_relays(values)) {
+                    if (FAILED(signal(waiter->gate, gate_value)))
+                        std::fprintf(stderr, "[rt] d3d12_xs: late relay: the gate Signal failed\n");
+                    else
+                        waiter->gate->SetEventOnCompletion(gate_value, list_values::Pump::get().wake());
+                }
             } else {
                 // Nothing would ever say when they may land: dropped, as without fences.
                 list_values::bump(list_values::counters().writes_failed, writes_.size());
@@ -7093,7 +7100,8 @@ const char* list_tail_slot_name(unsigned slot, unsigned char console_layout) {
     X(waits_relayed) X(gates_held) X(gates_met) X(gates_timed_out) X(cuts) X(cuts_deferred) X(cut_failures)  \
     X(gates_short) X(demotions) X(late_met) X(bundle_ops) X(releases) X(release_us) X(release_us_max)        \
     X(pass_us_max) X(release_stalls) X(remaps_now) X(remaps_deferred) X(remaps_failed) X(remap_wait_us_max)    \
-    X(stamps_gpu) X(stamps_cpu) X(labels_handed) X(writes_arena) X(writes_title_pages)
+    X(stamps_gpu) X(stamps_cpu) X(labels_handed) X(writes_arena) X(writes_title_pages)                         \
+    X(gates_late_relayable) X(gates_late_relayable_first) X(gates_late_relayed) X(gates_late_relayed_open)
 
 ListValueStats list_value_stats() {
     const list_values::Counters& c = list_values::counters();
@@ -7113,6 +7121,8 @@ void reset_list_value_stats() {
 #undef LEONIDA_LIST_VALUE_COUNTERS
 
 void set_list_value_wait_timeout_ms(unsigned ms) { list_values::Pump::get().set_timeout_ms(ms); }
+
+void set_list_value_late_relay(bool on) { list_values::set_late_relay(on); }
 
 void set_list_values_enabled(bool on) { list_values::set_enabled(on); }
 

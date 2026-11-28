@@ -485,11 +485,16 @@ struct ListValueStats {
     std::uint64_t stamps_gpu, stamps_cpu;  // write64 flags 1/2 landed with the GPU's timestamp, the CPU's clock
     std::uint64_t labels_handed;           // slot 71/72 writes given to LEONIDA_GPU_LABELS (lists not tracked here)
     std::uint64_t writes_arena, writes_title_pages;  // landed in the arena, through xmem's mapping (in writes_landed)
+    // Gates a write submitted after them meets (and of those, first shut on their queue); LEONIDA_LATE_RELAY: gates
+    // the writer's queue signalled on the GPU, and those seen open.
+    std::uint64_t gates_late_relayable, gates_late_relayable_first, gates_late_relayed, gates_late_relayed_open;
 };
 ListValueStats list_value_stats();
 void reset_list_value_stats();
 // How long a queue stands at an unmet wait before it runs on (LEONIDA_VALUE_WAIT_TIMEOUT_MS, default 200 ms).
 void set_list_value_wait_timeout_ms(unsigned ms);
+// Tests: LEONIDA_LATE_RELAY on or off from now on.
+void set_list_value_late_relay(bool on);
 // Test helper: LEONIDA_LIST_VALUES as if set to 0 (false) or unset (true), for lists made afterwards.
 void set_list_values_enabled(bool on);
 // Before the process exits: the threads that land list writes and open gates finish and end (up to `ms`).
