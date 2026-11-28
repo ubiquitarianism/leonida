@@ -4,7 +4,7 @@ LLVM_MC may be one executable (a path, spaces and all, with or without its .exe)
 needs the command-line form when llvm-mc runs inside WSL, because the official Windows LLVM build has no AMDGPU
 target:
 
-    set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc
+    set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc
 
 On Windows, arguments follow the MSVC C runtime's quoting rules. Double a trailing backslash in a quoted
 argument before the closing quote.
@@ -116,7 +116,7 @@ def default_command() -> str:
 
 
 def mc_command(raw: str | None = None) -> list:
-    """LLVM_MC is a path, or a command line: 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc'. Unset or empty,
+    """LLVM_MC is a path, or a command line: 'wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc'. Unset or empty,
     default_command()."""
     if raw is None:
         raw = os.environ.get("LLVM_MC", "")
@@ -127,14 +127,14 @@ def install_hint() -> str:
     """Where to get an llvm-mc with the AMDGPU target on this OS, for the messages that report a missing one."""
     if os.name == "nt":
         return ("The official Windows LLVM build has no AMDGPU target: build a native one with "
-                "scripts\\build_llvm_mc.ps1 (it sets LLVM_MC), or install llvm-21 in WSL and set LLVM_MC to the "
-                "whole command, e.g.\n  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
+                "scripts\\build_llvm_mc.ps1 (it sets LLVM_MC), or install llvm-23 in WSL and set LLVM_MC to the "
+                "whole command, e.g.\n  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc")
     if sys.platform == "darwin":
         return ("Homebrew's llvm has the AMDGPU target but is keg-only (not on PATH): brew install llvm, then\n"
                 "  LLVM_MC=\"$(brew --prefix llvm)/bin/llvm-mc\"")
-    return ("Distribution LLVM packages include the AMDGPU target: on Debian or Ubuntu, sudo apt install llvm-21\n"
-            "(found as /usr/lib/llvm-21/bin/llvm-mc without further setup); elsewhere install your distribution's\n"
-            "LLVM 21+ package and put llvm-mc on PATH, or set LLVM_MC=/path/to/llvm-mc")
+    return ("Distribution LLVM packages include the AMDGPU target: on Debian or Ubuntu, sudo apt install llvm-23\n"
+            "(found as /usr/lib/llvm-23/bin/llvm-mc without further setup); elsewhere install your distribution's\n"
+            "LLVM 23+ package and put llvm-mc on PATH, or set LLVM_MC=/path/to/llvm-mc")
 
 
 def not_found(exe: str, error: OSError, flag: str | None = None) -> str:

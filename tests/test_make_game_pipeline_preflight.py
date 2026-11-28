@@ -167,7 +167,7 @@ class PipelinePreflightTest(PreflightEnv, unittest.TestCase):
                 mock.patch("shutil.which", side_effect=lambda t: None if t == "llvm-mc" else "/bin/tool"), \
                 mock.patch.object(make_game, "pipeline_check_exe", return_value=None):
             err = self.assert_preflight_fails(["shaders", "pipelines"], "vk_pipeline_check")
-        self.assertIn("llvm-mc (LLVM 21+ with the AMDGPU target)", err)
+        self.assertIn("llvm-mc (LLVM 23+ with the AMDGPU target)", err)
         self.assertEqual(err.count("vk_pipeline_check"), 1)
 
 

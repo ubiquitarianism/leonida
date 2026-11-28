@@ -85,7 +85,7 @@ def probe(mcpu: str) -> None:
     if p.returncode != 0 or "s_endpgm" not in p.stdout:
         why = (p.stderr.strip().splitlines() or [f"exit code {p.returncode}"])[0]
         fail(f"'{' '.join(MC)}' did not disassemble an s_endpgm: {why}\n"
-             f"The disassembler needs LLVM 21+ with the AMDGPU target (docs/design.md, 'Disassembling shaders').\n"
+             f"The disassembler needs LLVM 23+ with the AMDGPU target (LLVM 21 cannot decode some pipeline-library compute programs; docs/design.md, 'Disassembling shaders').\n"
              f"{install_hint()}")
 
 

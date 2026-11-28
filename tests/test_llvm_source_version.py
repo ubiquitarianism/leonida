@@ -10,6 +10,17 @@ import unittest
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_llvm_mc.ps1"
 
 
+class DefaultVersionTest(unittest.TestCase):
+    """The version the script builds when the caller names none: LLVM 23 for
+    the `shaders` stage (1844 of 2684 compute programs do not disassemble with
+    21's listings), so an accidental revert to 21 fails here instead of
+    silently in a translation run."""
+
+    def test_the_default_source_version_is_23(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('[string]$Version = "23.1.5"', text)
+
+
 @unittest.skipUnless(os.name == "nt" and shutil.which("git"), "Windows and Git required")
 class SourceVersionTest(unittest.TestCase):
     def setUp(self):

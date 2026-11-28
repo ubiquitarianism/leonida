@@ -145,16 +145,19 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 - [Python 3.12+](https://www.python.org/downloads/) (tick "Add python.exe to PATH").
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`.
-- [LLVM 21+](https://github.com/llvm/llvm-project/releases) with the **AMDGPU target** for `llvm-mc`. The official
+- [LLVM 23+](https://github.com/llvm/llvm-project/releases) with the **AMDGPU target** for `llvm-mc`. LLVM 21
+  translates all 26,503 shaders of `shaders.rpf`, but 840 of the 2,684 pipeline-library compute programs come out of
+  its listings with 79,490 undecodable words and the translator refuses them, so the `shaders` stage keeps 1,844 of
+  2,684; LLVM 23.1.5 decodes those 840 cleanly and the stage translates 2,683 of 2,684. The official
   Windows build has no AMDGPU target. On Windows, `scripts\build_llvm_mc.ps1` builds a native `llvm-mc.exe` with it
-  (no WSL; needs git and the Visual Studio C++ tools below) and sets `LLVM_MC`; it takes about 20-40 minutes. A faster
-  way, if you use [conda](https://docs.conda.io/): `conda install -c conda-forge llvm-tools` (its Windows build
-  includes the AMDGPU target; [docs/testing.md](docs/testing.md) used version 23.1.6), then set `LLVM_MC` to the full
-  path of the `llvm-mc.exe` it installs (`where.exe llvm-mc` shows it once the environment is active; in PowerShell a
-  bare `where` is `Where-Object`). Or install `llvm-21`
-  in WSL and set `LLVM_MC` to the whole command, `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see
+  (LLVM 23.1.5 by default; no WSL; needs git and the Visual Studio C++ tools below) and sets `LLVM_MC`; it takes about
+  20-40 minutes. A faster way, if you use [conda](https://docs.conda.io/): `conda install -c conda-forge llvm-tools`
+  (its Windows build includes the AMDGPU target; [docs/testing.md](docs/testing.md) used version 23.1.6), then set
+  `LLVM_MC` to the full path of the `llvm-mc.exe` it installs (`where.exe llvm-mc` shows it once the environment is
+  active; in PowerShell a bare `where` is `Where-Object`). Or install `llvm-23`
+  in WSL and set `LLVM_MC` to the whole command, `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc"` (see
   [docs/design.md](docs/design.md#disassembling-shaders)). On Linux, `llvm-mc` on PATH is enough, and so is a
-  versioned distribution install such as Ubuntu's `llvm-21` (`llvm-mc-21`, `/usr/lib/llvm-21/bin/llvm-mc`).
+  versioned distribution install such as Ubuntu's `llvm-23` (`llvm-mc-23`, `/usr/lib/llvm-23/bin/llvm-mc`).
 - Visual Studio 2022 with **Desktop development with C++** and the **Windows SDK 10.0.26100 or newer**, for the
   runtime stage (the runtime uses version 1.2 root signatures, which older SDKs don't declare).
 - [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).

@@ -931,7 +931,7 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if "shaders" in stages:
         mc = mc_command()[0]
         if not (os.path.isfile(mc) or shutil.which(mc)):
-            missing.append("llvm-mc (LLVM 21+ with the AMDGPU target). " + mc_install_hint().replace("\n", " ")
+            missing.append("llvm-mc (LLVM 23+ with the AMDGPU target). " + mc_install_hint().replace("\n", " ")
                            + " (docs/design.md)." + appdata_hint(mc))
         for t in ("spirv-as", "spirv-val"):
             if not shutil.which(t):

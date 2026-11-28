@@ -552,7 +552,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                 err = self.assert_fails(make_game.preflight, ["shaders", "assets", "runtime"], tmp_work, wav=True,
                                         match="Install these first, then run the build again:")
                 self.assertIn("ffmpeg (needed for --wav)", err)
-                self.assertIn("llvm-mc (LLVM 21+ with the AMDGPU target)", err)
+                self.assertIn("llvm-mc (LLVM 23+ with the AMDGPU target)", err)
                 self.assertIn("spirv-as:", err)
                 self.assertIn("spirv-val:", err)
                 self.assertIn(".NET 8 SDK", err)
@@ -578,7 +578,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
              mock.patch("shutil.which", side_effect=available.get), \
              mock.patch("os.path.isfile", return_value=False):
             err = self.assert_fails(make_game.preflight, ["shaders"], tmp_work,
-                                    match="llvm-mc (LLVM 21+ with the AMDGPU target)")
+                                    match="llvm-mc (LLVM 23+ with the AMDGPU target)")
         self.assertIn("LLVM_MC points into %LOCALAPPDATA%", err)
 
     def test_preflight_rejects_visual_studio_installer_without_cpp_tools(self):

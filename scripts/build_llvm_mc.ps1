@@ -7,11 +7,17 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1 -Dest D:\tools\llvm-mc -NoEnv
 #
+# -Version defaults to 23.1.5, the release the shader corpus was measured with. LLVM 21.1.8's gfx1013 decoder
+# cannot decode 840 of the 2,684 pipeline-library compute programs: their listings carry 79,490 undecodable words and
+# the translator refuses them ("fall-through into undecodable words"), which leaves the shaders stage at 1,844 of
+# 2,684. llvm-mc 23.1.5 disassembles those 840 with no rejected word, and the stage then translates 2,683 of 2,684
+# (the last wants s_sethalt, which the translator does not implement). docs/design.md, "Disassembling shaders".
+#
 # The default -Dest is outside AppData on purpose: `python` from the Python install manager (the app execution alias
 # in WindowsApps) doesn't see folders that other programs create under %LOCALAPPDATA% or %APPDATA%, so an llvm-mc.exe
 # there looks missing to make_game.py and the tools, although LLVM_MC names it.
 param(
-    [string]$Version = "21.1.8",
+    [string]$Version = "23.1.5",
     [string]$Dest = (Join-Path $env:USERPROFILE ".leonida\llvm-mc"),
     [string]$Temp = (Join-Path $env:TEMP "leonida-llvm-mc"),
     [switch]$NoEnv,   # don't set LLVM_MC for the current user

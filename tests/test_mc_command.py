@@ -2,7 +2,7 @@
 
 Windows runs llvm-mc through WSL (the official Windows LLVM build has no AMDGPU target):
 
-    set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc
+    set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc
 
     python -I tests/test_mc_command.py
 """
@@ -198,7 +198,7 @@ class VersionedLlvmMcTest(unittest.TestCase):
     def test_the_message_names_the_distribution_package_off_windows(self):
         with mock.patch.object(mc_command.sys, "platform", "linux"):
             message = mc_command.not_found("llvm-mc", FileNotFoundError(2, "No such file"))
-        self.assertIn("apt install llvm-21", message)
+        self.assertIn("apt install llvm-23", message)
         self.assertNotIn("build_llvm_mc.ps1", message)
 
 
@@ -245,7 +245,7 @@ class MissingLlvmMcTest(unittest.TestCase):
         with mock.patch.object(mc_command.os, "name", "nt"):
             hint = mc_command.install_hint()
         self.assertIn("build_llvm_mc.ps1", hint)
-        self.assertIn("LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc", hint)
+        self.assertIn("LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc", hint)
 
     def test_run_names_the_tools_own_option(self):
         with self.assertRaises(SystemExit) as cm:

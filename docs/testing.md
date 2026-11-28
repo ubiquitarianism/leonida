@@ -87,7 +87,7 @@ main at <commit>: ...`, plus any `FAIL` lines that differ from `main`.
 
 - **Python 3.12+**, which `make_game.py` requires (it stops with "Python 3.12 or newer is needed" on an older one, so
   its tests fail there too). `scripts/run_gpu_tests.py` on its own runs on 3.10 or newer.
-- **`llvm-mc` with the AMDGPU target** (LLVM 21+). The official LLVM Windows release has no AMDGPU target. On
+- **`llvm-mc` with the AMDGPU target** (LLVM 21+ to assemble the test fixtures, 23+ for the `shaders` stage; see below). The official LLVM Windows release has no AMDGPU target. On
   Windows, use one of:
   - `scripts\build_llvm_mc.ps1`, which builds a native `llvm-mc.exe` (needs git and the Visual Studio C++ tools);
   - conda-forge's `llvm-tools` package, whose Windows build includes the AMDGPU target;
@@ -117,6 +117,13 @@ main at <commit>: ...`, plus any `FAIL` lines that differ from `main`.
 
   If it reports `not a valid operand`, point `LLVM_MC` at a build that accepts this instruction. The Windows
   conda-forge `llvm-tools` 23.1.6 package assembled the same f16 programs.
+
+  The `shaders` stage needs LLVM 23+ as well, for reasons that have nothing to do with the tests above: 840 of the
+  2,684 compute programs in the pipeline library come out of LLVM 21.1.8's listings with 79,490 undecodable words, so
+  the translator refuses them (`fall-through into undecodable words`) and 1,844 of 2,684 reach the output. 23.1.5
+  decodes those 840 with no rejected word and the stage translates 2,683 of 2,684 (the last is refused for
+  `s_sethalt`, which the translator does not implement); `scripts\build_llvm_mc.ps1` builds 23.1.5 by default
+  ([design.md](design.md), "Disassembling shaders").
 - **SPIRV-Tools** (`spirv-as`, `spirv-val`): part of the Vulkan SDK, or a distribution package.
 - **A C++20 compiler, CMake and the Vulkan headers** to build the test programs:
   - Windows: the full runtime needs Visual Studio 2022 with "Desktop development with C++" and Windows SDK

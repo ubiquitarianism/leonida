@@ -596,9 +596,20 @@ cross-half code on 32-wide subgroups.
 
 ## Disassembling shaders
 
-The AMDGPU disassembler needs LLVM 21+ built with the AMDGPU target (`llvm-mc`; on Linux the `llvm-21` package
-installs it at `/usr/lib/llvm-21/bin/llvm-mc`). The official Windows LLVM build has no AMDGPU target and ships no
+The AMDGPU disassembler needs LLVM 23+ built with the AMDGPU target (`llvm-mc`; on Linux the `llvm-23` package
+installs it at `/usr/lib/llvm-23/bin/llvm-mc`). The official Windows LLVM build has no AMDGPU target and ships no
 `llvm-mc.exe`. On Windows, either build a native one or run it from WSL.
+
+23+ is the requirement because of the pipeline library: LLVM 21.1.8 decodes all 26,503 shaders of `shaders.rpf`, but
+840 of the 2,684 compute programs there come out of its listings with 79,490 undecodable words and 8,310
+`exp invalid_target_N` words, so the translator refuses them as `fall-through into undecodable words` and the stage
+ends at 1,844 of 2,684.
+Under LLVM 23.1.5 those 840 have no undecodable word, and the stage translates 2,683 of the 2,684 and passes
+`spirv-val`; the 2,684th is refused for `s_sethalt`, which the translator does not implement, under either version.
+1,674 of the 1,844 that already translated print differently under 23.1.5, because LLVM prints some operands
+differently; re-translated from those listings all 1,674 pass, and the other 170 listings are byte-identical
+(`-mcpu=gfx1013`, `--stages cs`, 1.0.2.1). `scripts/build_llvm_mc.ps1` builds 23.1.5 by default for this reason; keep
+`LLVM_MC` on 23+ for the `shaders` stage.
 
 Native: `scripts\build_llvm_mc.ps1` fetches the LLVM sources the tool needs (sparse, shallow), builds `llvm-mc` alone
 with `LLVM_TARGETS_TO_BUILD=AMDGPU`, static CRT and the DIA SDK off (its headers need ATL, which the C++ build tools
@@ -615,10 +626,10 @@ powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1
 python -I make_game.py --game "D:\path\to\your\package" --stages shaders
 ```
 
-WSL: install `llvm-21` and give `LLVM_MC` the whole command:
+WSL: install `llvm-23` and give `LLVM_MC` the whole command:
 
 ```
-set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc
+set LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-23/bin/llvm-mc
 python -I make_game.py --game "D:\path\to\your\package" --stages shaders
 ```
 
@@ -630,7 +641,7 @@ on stdin, so a WSL command never receives a Windows file path.
 with that reason instead of writing empty `.s` files. To disassemble by hand inside WSL:
 
 ```
-LLVM_MC=/usr/lib/llvm-21/bin/llvm-mc python3 -I <repo>/tools/shader_disasm.py <work>/shaders/fssm
+LLVM_MC=/usr/lib/llvm-23/bin/llvm-mc python3 -I <repo>/tools/shader_disasm.py <work>/shaders/fssm
 ```
 
 Code starts at the u32 at FSSM offset 0xC0 (the code-section offset) plus 0x28 bytes into that section, and ends at the
