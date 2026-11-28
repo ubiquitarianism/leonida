@@ -269,7 +269,10 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # the entry thread 8 MB (shims/process_shim.h); this is the same number for the others. Keep it in step with
   # scripts/build_runtime.ps1.
   set(GTA6RT_STACK 8388608)
-  target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE} /STACK:${GTA6RT_STACK})
+  # /MAP writes gta6rt.map next to the exe (link.exe and lld-link): gta6rt_no_tls_callbacks names each TLS callback from
+  # it, to tell the C++ runtime's __dyn_tls_init (tlsdyn.obj) and __dyn_tls_dtor (tlsdtor.obj) from Rust std's own
+  # callback. It does not change the exe.
+  target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE} /STACK:${GTA6RT_STACK} /MAP)
   target_link_libraries(gta6rt PRIVATE gta6rt_bcpack gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue psapi)
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
@@ -785,6 +788,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     target_compile_options(gameinput_no_sdl_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(gameinput_no_sdl_test PRIVATE /OPT:NOREF)
   endif()
+  # When the keyboard pad clips the cursor (shims/gameinput_clip.h): not while the window is dragged. No SDL, no window.
+  add_executable(gameinput_clip_test test/gameinput_clip_test.cpp)
+  target_include_directories(gameinput_clip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  if(MSVC)
+    target_compile_options(gameinput_clip_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  add_test(NAME gameinput_clip COMMAND gameinput_clip_test)
   if(LEONIDA_SDL3 AND TARGET SDL3::SDL3-static)
     target_sources(gta6rt PRIVATE shims/gameinput.cpp)
     target_link_libraries(gta6rt PRIVATE SDL3::SDL3-static)
@@ -965,6 +975,7 @@ if(BUILD_TESTING)
       test/loader_test.cpp
       src/pe_loader.cpp
       shims/registry.cpp
+      shims/library_loader.cpp  # the run-time LEONIDA_COMPAT_DIR cases call its LoadLibrary / GetProcAddress
     )
     target_compile_definitions(loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
     target_compile_options(loader_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
@@ -1041,6 +1052,18 @@ if(BUILD_TESTING)
           "--report=${CMAKE_CURRENT_BINARY_DIR}/module-names-results.json")
         set_tests_properties(run_module_names PROPERTIES TIMEOUT 90)
       endif()
+    endif()
+
+    # TEST-GTA6RT-NO-TLS-CALLBACKS: a thread_local with a destructor gives gta6rt.exe the C++ runtime's TLS callbacks,
+    # and the game then fast-fails (0xC0000409) in its own _register_thread_local_exe_atexit_callback
+    # (RT-XMEM-STARTUP-FASTFAIL). The checker names the callbacks from gta6rt.map (/MAP above), so Rust std's callback,
+    # linked in with the audio decoders when cargo is found, passes.
+    # The checker only reads the PE file with the host's Python, so unlike run_module_names it is registered for a
+    # cross build too (runtime/cmake/clang-cl-xwin.cmake, same MSVC ABI and UCRT).
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_FOUND)
+      add_test(NAME gta6rt_no_tls_callbacks COMMAND "${Python3_EXECUTABLE}" -I
+        "${CMAKE_CURRENT_SOURCE_DIR}/test/check_pe_tls_callbacks.py" "$<TARGET_FILE:gta6rt>")
     endif()
 
     # pe_loader.cpp needs the shim registry for shims::find/make_unimplemented_thunk. The xmem and d3d12_xs tables
@@ -1154,7 +1177,7 @@ if(BUILD_TESTING)
     endif()
     add_executable(tiny_atexit test/fixtures/tiny_atexit.cpp)
     target_compile_definitions(tiny_atexit PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(tiny_atexit PRIVATE /W4 /permissive- /utf-8)
+    target_compile_options(tiny_atexit PRIVATE /W4 /permissive- /utf-8 /EHsc)  # a handler that throws
     set_target_properties(tiny_atexit PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
@@ -1992,6 +2015,12 @@ if(NOT TARGET Vulkan::Headers)
     set(VULKAN_HEADERS_ENABLE_MODULE OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(VulkanHeaders)
   endif()
+endif()
+# The Windows runtime's D3D12 layer needs newer headers than the portable Vulkan tools, so only its builds check.
+if(TARGET Vulkan::Headers AND WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_version.cmake")
+  get_target_property(leonida_vk_include_dirs Vulkan::Headers INTERFACE_INCLUDE_DIRECTORIES)
+  leonida_vulkan_headers_version("${leonida_vk_include_dirs}")
 endif()
 if(TARGET Vulkan::Headers)
   # The standalone Khronos releases use glslang; older SDKs also provide glslangValidator.
@@ -3352,6 +3381,12 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_resource_desc_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_resource_desc COMMAND d3d12_resource_desc_test)
 
+    # Mapped session staging file, compile activity and cache cleanup (shims/d3d12_pipeline_checkpoint.h).
+    add_executable(d3d12_pipeline_checkpoint_test test/d3d12_pipeline_checkpoint_test.cpp)
+    target_compile_definitions(d3d12_pipeline_checkpoint_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_pipeline_checkpoint_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_pipeline_checkpoint COMMAND d3d12_pipeline_checkpoint_test)
+
     # Multi-viewport & multi-scissor rendering (RSSetViewports / RSSetScissorRects 1..16) against host D3D12.
     add_executable(d3d12_multi_viewport_test test/d3d12_multi_viewport_test.cpp)
     target_link_libraries(d3d12_multi_viewport_test PRIVATE gta6rt_d3d12_com d3d12 dxgi dxguid)
@@ -4094,13 +4129,21 @@ if(TARGET Vulkan::Headers)
                            d3d12_stateful_indirect_nonindexed_counted_pixels PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
       add_test(NAME d3d12_title_index_window COMMAND d3d12_draw_test --title-index-window)
       add_test(NAME d3d12_title_vertex_window COMMAND d3d12_draw_test --title-vertex-window)
-      # LEONIDA_STUB_PIPELINES: a pipeline with no translated shader is a no-op stub when the switch is on.
+      # LEONIDA_STUB_PIPELINES: a pipeline with no translated shader is a stub when the switch is on.
       add_executable(d3d12_stub_pipelines_test test/d3d12_stub_pipelines_test.cpp)
       target_link_libraries(d3d12_stub_pipelines_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_stub_pipelines_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
       target_compile_options(d3d12_stub_pipelines_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_stub_pipelines COMMAND d3d12_stub_pipelines_test)
       set_tests_properties(d3d12_stub_pipelines PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+      # MVP-GPU-04: a stub graphics pipeline is real (src/stub_pipeline.h); draws with =1 and =color, read back.
+      add_executable(d3d12_stub_draw_test test/d3d12_stub_draw_test.cpp shims/d3d12_xs_device.cpp
+                     shims/d3d12_xs_pso_stream.cpp)
+      target_link_libraries(d3d12_stub_draw_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_stub_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(d3d12_stub_draw_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_stub_draw COMMAND d3d12_stub_draw_test)
+      set_tests_properties(d3d12_stub_draw PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
       set_tests_properties(d3d12_draw d3d12_title_index_window d3d12_title_vertex_window PROPERTIES SKIP_RETURN_CODE 77)
       # Graphics & compute PSO descriptor validation parity against live Windows D3D12 (WARP and HW).
       add_executable(d3d12_pso_validation_test test/d3d12_pso_validation_test.cpp ${LEONIDA_TEST_VS}
@@ -4472,6 +4515,11 @@ if(TARGET Vulkan::Headers)
     target_link_libraries(d3d12_set_descriptor_heaps_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_set_descriptor_heaps_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_set_descriptor_heaps_test PRIVATE /W4 /permissive- /utf-8)
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      target_sources(d3d12_set_descriptor_heaps_test PRIVATE ${LEONIDA_TEST_CS})
+      target_compile_definitions(d3d12_set_descriptor_heaps_test PRIVATE
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
+    endif()
     add_test(NAME d3d12_set_descriptor_heaps COMMAND d3d12_set_descriptor_heaps_test)
     set_tests_properties(d3d12_set_descriptor_heaps PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
@@ -4865,6 +4913,7 @@ if(TARGET Vulkan::Headers)
       endif()
     endif()
     add_test(NAME vk_xdxr_postbuild_readback COMMAND vk_xdxr_postbuild_readback_test)
+    set_tests_properties(vk_xdxr_postbuild_readback PROPERTIES SKIP_RETURN_CODE 77)
 
     # Title-placed buffer VAs (device slot 133) and the console VA shaders reach them by (src/title_va_alias.h).
     add_executable(title_va_alias_test test/title_va_alias_test.cpp)

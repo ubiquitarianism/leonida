@@ -52,6 +52,7 @@
 #include <vector>
 
 #include "gameinput.h"
+#include "gameinput_clip.h"
 #include "gameinput_abi.h"
 #include "gameinput_script.h"
 #include "keyboard_pad_connection.h"
@@ -864,10 +865,19 @@ State& g() {
     return *s;
 }
 
+bool matches(const Callback& c, const Event& e);
+
+// Under g().mu. Queues an event only when a registered callback wants it: GameInput dispatches callbacks, and with
+// none listening there is no work. Otherwise every reading (a pad's moving stick, a sensor pad's 125 Hz stream) would
+// queue an item nobody hears, and a title holding a dispatcher that runs one item a frame (Dispatch(0)) would fall
+// further behind every frame: a pad plugged in after start would have its connect event stuck behind that backlog and
+// never reach the title (RT-GAMEINPUT-LATE-PAD).
 void queue_event(const Event& e) {
+    State& s = g();
+    if (std::none_of(s.callbacks.begin(), s.callbacks.end(), [&e](const Callback& c) { return matches(c, e); })) return;
     if (e.device) e.device->AddRef();
     if (e.reading) e.reading->AddRef();
-    g().queue.push_back(e);
+    s.queue.push_back(e);
 }
 
 bool matches(const Callback& c, const Event& e) {
@@ -885,7 +895,19 @@ bool matches(const Callback& c, const Event& e) {
     }
 }
 
+// The token of the callback running on this thread, for kCurrentCallbackToken; 0 outside a callback.
+thread_local GameInputCallbackToken t_running_token = kInvalidCallbackToken;
+
+GameInputCallbackToken resolve_token(GameInputCallbackToken token) {
+    return token == kCurrentCallbackToken ? t_running_token : token;
+}
+
 void call(const Callback& c, const Event& e) {
+    struct Running {  // restored on return, so a callback that drives another delivery keeps its own token
+        GameInputCallbackToken saved = t_running_token;
+        explicit Running(GameInputCallbackToken t) { t_running_token = t; }
+        ~Running() { t_running_token = saved; }
+    } running(c.token);
     switch (c.type) {
         case CbType::Device:
             reinterpret_cast<GameInputDeviceCallback>(c.fn)(c.token, c.context, e.device, e.timestamp, e.current, e.previous);
@@ -1688,10 +1710,10 @@ bool async_key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 //
 // The cursor stops at the edge of the screen, so cursor deltas stop too. Raw input reports what the mouse itself
 // moved, with no edge and no pointer acceleration. A message-only window (never shown) on its own thread receives
-// WM_INPUT and adds each movement to a running total; system_cursor_pos then returns that total as an edgeless
+// WM_INPUT and adds each movement to a running total; raw_cursor_pos then returns that total as an edgeless
 // "cursor", and update_keyboard_pad takes the difference between polls exactly as it did with the real cursor.
 std::atomic<long long> g_raw_x{0}, g_raw_y{0};  // total raw movement since the thread started, mouse counts
-std::atomic<bool> g_raw_ready{false};           // registration worked; system_cursor_pos uses the totals
+std::atomic<bool> g_raw_ready{false};           // registration worked; the pad can use the totals
 std::atomic<bool> g_raw_started{false};         // the thread is started once per process
 
 LRESULT CALLBACK raw_mouse_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1748,12 +1770,13 @@ void start_raw_mouse() {
     if (!g_raw_started.exchange(true)) std::thread(raw_mouse_thread).detach();
 }
 
+bool raw_cursor_pos(int* x, int* y) {
+    *x = static_cast<int>(g_raw_x.load());
+    *y = static_cast<int>(g_raw_y.load());
+    return true;
+}
+
 bool system_cursor_pos(int* x, int* y) {
-    if (g_raw_ready) {  // the edgeless total; it wraps only after ±2^31 counts, and the poll uses differences
-        *x = static_cast<int>(g_raw_x.load());
-        *y = static_cast<int>(g_raw_y.load());
-        return true;
-    }
     POINT p;
     if (!GetCursorPos(&p)) return false;
     *x = p.x;
@@ -1774,6 +1797,7 @@ std::atomic<rt::gameinput::CursorPosFn> g_cursor_pos{system_cursor_pos};
 struct KeyboardPad : rt::gameinput::detail::KeyboardPadConnection<SDL_JoystickID, SDL_Joystick*> {
     int right_x = 0, right_y = 0;    // the mouse's right stick, SDL axis units (+Y down)
     int cursor_x = 0, cursor_y = 0;  // the cursor at the last poll
+    rt::gameinput::CursorPosFn cursor_source = nullptr;
     bool have_cursor = false;        // cursor_x/y are valid; false after focus loss, so the first poll moves nothing
 };
 KeyboardPad g_keyboard;
@@ -1783,11 +1807,29 @@ bool is_keyboard_pad(SDL_JoystickID jid) { return jid != 0 && jid == g_keyboard.
 // Keeps the cursor inside the game window while it has focus, so a click cannot land on another window, and releases
 // it on focus loss. Only with raw input (a clipped plain cursor would stop the stick at the window edge) and only for
 // a real foreground window of this process: not KeyboardPadMode::Always over a terminal, nor a test's fake focus.
-// Re-applied every 100 ms, because Windows drops the clip on some focus and resize changes.
+// Re-applied every 100 ms, because Windows drops the clip on some focus and resize changes. Never while the window is
+// dragged or sized, or a press that began on its title bar or border is held (gameinput_clip.h has why).
 bool g_clipped = false;
 uint64_t g_clip_at = 0;
+rt::gameinput::detail::CursorClipGate g_clip_gate;
 
 void clip_cursor(bool want) {
+    const HWND w = want ? GetForegroundWindow() : nullptr;
+    if (w) {
+        GUITHREADINFO gui{};
+        gui.cbSize = sizeof(gui);
+        const bool modal_loop = GetGUIThreadInfo(GetWindowThreadProcessId(w, nullptr), &gui) &&
+                                (gui.flags & (GUI_INMOVESIZE | GUI_INMENUMODE | GUI_SYSTEMMENUMODE));
+        const bool button_down = ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+                                   GetAsyncKeyState(VK_MBUTTON)) & 0x8000) != 0;
+        POINT cursor;
+        RECT client;
+        const bool in_client = GetCursorPos(&cursor) && ScreenToClient(w, &cursor) && GetClientRect(w, &client) &&
+                               PtInRect(&client, cursor);
+        want = g_clip_gate.update(true, modal_loop, button_down, in_client);
+    } else {
+        want = g_clip_gate.update(false, false, false, false);
+    }
     if (!want) {
         if (g_clipped) ClipCursor(nullptr);
         g_clipped = false;
@@ -1795,9 +1837,8 @@ void clip_cursor(bool want) {
     }
     const uint64_t now = now_us();
     if (g_clipped && now - g_clip_at < 100'000) return;
-    const HWND w = GetForegroundWindow();
     RECT r;
-    if (!w || !GetClientRect(w, &r)) return;
+    if (!GetClientRect(w, &r)) return;
     POINT top_left{r.left, r.top}, bottom_right{r.right, r.bottom};
     if (!ClientToScreen(w, &top_left) || !ClientToScreen(w, &bottom_right)) return;
     const RECT screen{top_left.x, top_left.y, bottom_right.x, bottom_right.y};
@@ -1857,6 +1898,7 @@ void update_keyboard_pad() {
     bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
     int lx = 0, ly = 0;
     bool aim = false, fire = false;
+    bool raw_mouse = false;
     // Focus gates physical keyboard and mouse input. Read the cursor afresh on return to avoid a jump.
     // Scripted presses still run while the window is unfocused.
     const bool active = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
@@ -1869,22 +1911,34 @@ void update_keyboard_pad() {
         fire = key_down(VK_LBUTTON);
 
         int x = 0, y = 0;
-        const bool have = g_cursor_pos.load()(&x, &y);
+        auto cursor_source = g_cursor_pos.load();
+        raw_mouse = cursor_source == system_cursor_pos && g_raw_ready;
+        if (raw_mouse) cursor_source = raw_cursor_pos;
+        // The first sample from a new coordinate source establishes its baseline.
+        if (cursor_source != g_keyboard.cursor_source) {
+            g_keyboard.cursor_source = cursor_source;
+            g_keyboard.have_cursor = false;
+        }
+        const bool have = cursor_source(&x, &y);
         const bool moved = have && g_keyboard.have_cursor;
+        // Raw input exposes the low bits of a running total. Keep subtraction modular across a wrap.
+        auto delta = [](int current, int previous) {
+            return static_cast<int>(static_cast<unsigned>(current) - static_cast<unsigned>(previous));
+        };
         auto step = [sens](int v, int pixels) {
             const long long n = static_cast<long long>(v) * kMouseDecayNum / kMouseDecayDen +
-                                std::lround(static_cast<long long>(pixels) * kMouseAxisPerPixel * sens);
+                                std::llround(static_cast<long long>(pixels) * kMouseAxisPerPixel * sens);
             return static_cast<int>(std::clamp<long long>(n, -kStickFull, kStickFull));
         };
-        g_keyboard.right_x = step(g_keyboard.right_x, moved ? x - g_keyboard.cursor_x : 0);
-        g_keyboard.right_y = step(g_keyboard.right_y, moved ? y - g_keyboard.cursor_y : 0);
+        g_keyboard.right_x = step(g_keyboard.right_x, moved ? delta(x, g_keyboard.cursor_x) : 0);
+        g_keyboard.right_y = step(g_keyboard.right_y, moved ? delta(y, g_keyboard.cursor_y) : 0);
         if (have) g_keyboard.cursor_x = x, g_keyboard.cursor_y = y;
         g_keyboard.have_cursor = have;
     } else {
         g_keyboard.right_x = g_keyboard.right_y = 0;
         g_keyboard.have_cursor = false;
     }
-    clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
+    clip_cursor(raw_mouse && foreground_is_ours());
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
     // LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120" (with LEONIDA_KEYBOARD_PAD=always): timed presses on the keyboard
     // pad, in seconds since the pad's first update, each held 300 ms or its own button@seconds:hold, and then until the
@@ -2402,7 +2456,13 @@ public:
         return r;
     }
     // Runs the queued callbacks on the caller's thread within the quota (see deliver_within).
-    bool STDMETHODCALLTYPE Dispatch(uint64_t quotaInMicroseconds) override { return deliver_within(quotaInMicroseconds); }
+    bool STDMETHODCALLTYPE Dispatch(uint64_t quotaInMicroseconds) override {
+        static std::atomic<bool> s_logged{false};
+        if (!s_logged.exchange(true))
+            std::fprintf(stderr, "[rt] gameinput: Dispatch first call (quota %llu us)\n",
+                         static_cast<unsigned long long>(quotaInMicroseconds));
+        return deliver_within(quotaInMicroseconds);
+    }
     HRESULT STDMETHODCALLTYPE OpenWaitHandle(HANDLE* handle) override {
         if (!handle) return E_POINTER;
         *handle = nullptr;
@@ -2626,6 +2686,15 @@ public:
         if (token) *token = kInvalidCallbackToken;
         if (!fn) return E_INVALIDARG;
         if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
+        // How a title learns of its pads decides whether one plugged in later reaches it, so the first few
+        // registrations are logged.
+        static std::atomic<int> s_logged{0};
+        if (s_logged.fetch_add(1) < 8)
+            std::fprintf(stderr, "[rt] gameinput: RegisterDeviceCallback(%s, kind 0x%x, status 0x%x, %s enumeration)\n",
+                         device ? "one device" : "all devices", kind, status_filter,
+                         enumeration == GameInputBlockingEnumeration ? "blocking"
+                         : enumeration == GameInputAsyncEnumeration  ? "async"
+                                                                     : "no");
         State& s = g();
         GameInputCallbackToken t;
         std::vector<Event> now;
@@ -2671,6 +2740,8 @@ public:
     }
 
     void STDMETHODCALLTYPE StopCallback(GameInputCallbackToken token) override {
+        token = resolve_token(token);
+        if (token == kInvalidCallbackToken) return;
         std::lock_guard lock(g().mu);
         for (Callback& c : g().callbacks)
             if (c.token == token) c.active = false;
@@ -2679,6 +2750,8 @@ public:
     // Removes the callback and, unless called from inside a callback, waits for one that is running to return.
     // VERIFY: the timeout is not honoured; the wait is for at most one callback.
     bool STDMETHODCALLTYPE UnregisterCallback(GameInputCallbackToken token, uint64_t) override {
+        token = resolve_token(token);
+        if (token == kInvalidCallbackToken) return false;
         State& s = g();
         bool found = false;
         {
@@ -2695,6 +2768,9 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateDispatcher(IGameInputDispatcher** out) override {
         if (!out) return E_POINTER;
+        static std::atomic<bool> s_logged{false};
+        if (!s_logged.exchange(true))
+            std::fprintf(stderr, "[rt] gameinput: CreateDispatcher first call (callbacks now run in Dispatch)\n");
         *out = new Dispatcher;
         return S_OK;
     }
