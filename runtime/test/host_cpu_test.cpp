@@ -47,6 +47,14 @@ void expect(bool ok, const char* what) {
     }
 }
 
+int g_missing_calls = 0;
+std::vector<const char*> g_missing;
+
+std::vector<const char*> fake_missing() {
+    ++g_missing_calls;
+    return g_missing;
+}
+
 bool has(const std::vector<const char*>& v, const char* name) {
     for (const char* s : v)
         if (std::strcmp(s, name) == 0) return true;
@@ -111,6 +119,30 @@ int main() {
             expect(check_skipped() == c.skipped, c.value ? c.value : "LEONIDA_SKIP_CPU_CHECK unset");
         }
         set_env("LEONIDA_SKIP_CPU_CHECK", nullptr);
+    }
+    // preflight: what gta6rt's main does with the list, on a fake host.
+    {
+        g_missing = {kMissingAvx, kMissingOsxsave};
+        g_missing_calls = 0;
+        std::string error = "untouched";
+        expect(preflight(false, false, &fake_missing, &error) == 0 && error == "untouched" && g_missing_calls == 0,
+               "preflight: --dry-run goes on without looking at the CPU");
+        expect(preflight(true, true, &fake_missing, &error) == 0 && error == "untouched" && g_missing_calls == 0,
+               "preflight: LEONIDA_SKIP_CPU_CHECK=1 goes on without looking at the CPU");
+        expect(preflight(true, false, &fake_missing, &error) == kExitCode && g_missing_calls == 1,
+               "preflight: --init/--run on a host without AVX stops with kExitCode");
+        expect(error == message(g_missing), "preflight: the line to print is message() of what is missing");
+        g_missing = {};
+        error = "untouched";
+        expect(preflight(true, false, &fake_missing, &error) == 0 && error == "untouched",
+               "preflight: --init/--run on an AVX host goes on");
+        g_missing = {kMissingYmmState};
+        expect(preflight(true, false, &fake_missing, nullptr) == kExitCode, "preflight: a null error pointer is fine");
+    }
+    // The real host's preflight: --dry-run always goes on.
+    {
+        std::string error;
+        expect(preflight(false, &error) == 0 && error.empty(), "preflight on this host: --dry-run goes on");
     }
     // The real host: whatever it reports, the call itself must not fault (OSXSAVE gates XGETBV).
     std::printf("host: %zu missing feature(s)\n", missing_host_features().size());

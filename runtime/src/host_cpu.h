@@ -35,4 +35,11 @@ std::string message(const std::vector<const char*>& missing);
 // LEONIDA_SKIP_CPU_CHECK=1 skips the check (for the #UD emulation work).
 bool check_skipped();
 
+// gta6rt's whole decision before it starts the game: 0 to go on, or kExitCode with the one line to print in *error.
+// Only --init and --run are checked (starts_game), and not when skipped; missing is not called in either case.
+int preflight(bool starts_game, bool skipped, std::vector<const char*> (*missing)(), std::string* error);
+
+// The same for the running host: missing_host_features() and check_skipped().
+int preflight(bool starts_game, std::string* error);
+
 }  // namespace rt::host_cpu

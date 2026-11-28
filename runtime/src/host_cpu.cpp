@@ -77,4 +77,19 @@ bool check_skipped() {
 #endif
 }
 
+int preflight(bool starts_game, bool skipped, std::vector<const char*> (*missing)(), std::string* error) {
+    if (!starts_game || skipped) return 0;
+    const auto features = missing();
+    if (features.empty()) return 0;
+    if (error) *error = message(features);
+    return kExitCode;
+}
+
+int preflight(bool starts_game, std::string* error) {
+    // check_skipped() only when the check applies, as before: --dry-run doesn't read the environment.
+    if (!starts_game) return 0;
+    std::vector<const char*> (*host)() = &missing_host_features;
+    return preflight(starts_game, check_skipped(), host, error);
+}
+
 }  // namespace rt::host_cpu
