@@ -1,6 +1,7 @@
 // The positive-only cadence oracle in vk_presenter_sync_test.cpp. Included after its driver counters.
 #pragma once
 
+#include "test_temp_dir.h"
 namespace sparse_test {
 namespace fs = std::filesystem;
 using RGB = std::array<int, 3>;
@@ -10,7 +11,7 @@ constexpr RGB red{255, 0, 0}, blue{0, 0, 255}, black{0, 0, 0};
 struct Folder {
     fs::path path;
     bool create(const char* tag) {
-        auto candidate = fs::temp_directory_path() / (std::string("leonida-sparse-") + tag + "-" +
+        auto candidate = testfiles::temp_dir() / (std::string("leonida-sparse-") + tag + "-" +
             std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()));
         PSECURITY_DESCRIPTOR sd = nullptr;
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)",

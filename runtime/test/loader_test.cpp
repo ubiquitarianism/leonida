@@ -4,6 +4,7 @@
 //
 // What it pins down: a valid image maps exactly as its headers say, and a truncated or corrupt one is rejected with
 // a message instead of being followed out of bounds. The truncation case covers every length of a valid image.
+#include "test_temp_dir.h"
 #include <windows.h>
 #include <intrin.h>
 
@@ -1370,7 +1371,7 @@ std::filesystem::path work_dir() {
     std::filesystem::path base;
     if (_wdupenv_s(&env, &size, L"LEONIDA_TEST_DIR") == 0 && env && *env) base = env;
     std::free(env);
-    if (base.empty()) base = std::filesystem::temp_directory_path();
+    if (base.empty()) base = testfiles::temp_dir();
     return base / "leonida_loader_test" / std::to_string(GetCurrentProcessId());
 }
 

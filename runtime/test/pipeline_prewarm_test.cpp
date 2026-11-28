@@ -5,6 +5,7 @@
 //   - a demanded build overtakes the queued prewarms and starts while one runs;
 //   - a missing, garbled or other-GPU log gives no plan, with a message; `E` lines are skipped as not damage.
 #include "../src/pipeline_prewarm.h"
+#include "test_temp_dir.h"
 #include "../shims/d3d12_pipeline_compile.h"
 
 #include <algorithm>
@@ -124,7 +125,7 @@ void test_the_budget_is_respected() {
 }
 
 void test_a_missing_or_garbled_log_is_ignored_with_a_message() {
-    const auto missing = prewarm::load_plan(std::filesystem::temp_directory_path() / "leonida-no-such-order.log",
+    const auto missing = prewarm::load_plan(testfiles::temp_dir() / "leonida-no-such-order.log",
                                             vendor, device_id);
     EXPECT(!missing && missing.message.find("cannot read") != std::string::npos);
 
@@ -150,7 +151,7 @@ void test_a_missing_or_garbled_log_is_ignored_with_a_message() {
     EXPECT(e_lines.entries == 2 && e_lines.bad_lines == 0);
 
     // A file on disk, read the same way.
-    const auto path = std::filesystem::temp_directory_path() / "leonida-pipeline-prewarm-test.log";
+    const auto path = testfiles::temp_dir() / "leonida-pipeline-prewarm-test.log";
     {
         std::ofstream out(path, std::ios::binary);
         out << order::format_header() << session({record('g', 9, 0, 5)});

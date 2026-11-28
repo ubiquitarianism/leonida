@@ -12,6 +12,7 @@
 //                  --env-child    prints the results for whatever LEONIDA_UNIMPLEMENTED the parent set, which pins
 //                                 the default (unset = log), case-insensitivity and the response to a bad value.
 // LEONIDA_TEST_DIR names the folder for the image, as for loader_test; the default is the temp directory.
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <cstddef>
@@ -117,7 +118,7 @@ std::vector<uint8_t> make_image() {
 
 fs::path test_dir() {
     const char* env = std::getenv("LEONIDA_TEST_DIR");
-    fs::path dir = (env && *env ? fs::path(env) : fs::temp_directory_path()) /
+    fs::path dir = (env && *env ? fs::path(env) : testfiles::temp_dir()) /
                    ("leonida_unimplemented_policy_" + std::to_string(GetCurrentProcessId()));
     fs::create_directories(dir);
     return dir;

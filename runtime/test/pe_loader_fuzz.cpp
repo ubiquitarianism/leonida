@@ -15,6 +15,7 @@
 // (each try in a child process, as an ASan report ends the process). docs/testing.md has the commands.
 #define _CRT_SECURE_NO_WARNINGS
 
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <algorithm>
@@ -939,7 +940,7 @@ int main(int argc, char** argv) {
     if (getenv_s(&env_n, env_dir, "LEONIDA_TEST_DIR") == 0 && env_n > 1)
         g_dir = std::filesystem::path(env_dir) / ("loader_fuzz_" + std::to_string(GetCurrentProcessId()));
     else
-        g_dir = std::filesystem::temp_directory_path() / ("leonida_loader_fuzz_" + std::to_string(GetCurrentProcessId()));
+        g_dir = testfiles::temp_dir() / ("leonida_loader_fuzz_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(g_dir);
     struct Cleanup {
         ~Cleanup() {

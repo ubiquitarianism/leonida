@@ -1,5 +1,6 @@
 // The compile helper's file protocol (shims/d3d12_compile_helper.h): request lines, their order, and the markers that
 // keep two processes from compiling one entry at once. No Vulkan, no helper process.
+#include "test_temp_dir.h"
 #include "../shims/d3d12_compile_helper.h"
 
 #include <chrono>
@@ -159,7 +160,7 @@ static int test_pending_bound(const fs::path& dir) {
 }
 
 int main() {
-    const auto dir = fs::temp_directory_path() /
+    const auto dir = testfiles::temp_dir() /
         ("leonida_compile_helper_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::error_code ec;
     fs::create_directories(dir, ec);

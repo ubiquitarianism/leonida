@@ -1,4 +1,5 @@
 // vk_pipeline_check's memory budget for large modules (large_module_gate.h), without a Vulkan device.
+#include "test_temp_dir.h"
 #include "large_module_gate.h"
 
 #include <atomic>
@@ -270,7 +271,7 @@ static int cgroup_limits_are_read_up_the_tree() {
     // Before: only MemAvailable was read, so under systemd-run -p MemoryMax=... (or in a container) the budget was
     // the whole machine's and the checker could be killed by its own cgroup.
     namespace fs = std::filesystem;
-    const fs::path root = fs::temp_directory_path() / ("lmg_test_" + std::to_string(::getpid()));
+    const fs::path root = testfiles::temp_dir() / ("lmg_test_" + std::to_string(::getpid()));
     fs::remove_all(root);
     write_file(root / "self", "0::/user.slice/app.scope\n");
     write_file(root / "cg/user.slice/memory.max", "10000\n");

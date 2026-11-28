@@ -11,6 +11,7 @@
 //   slot 8/36 CreateCommandQueue/CreateFence (return queue and fence proxies that run GPU work)
 // Slot 9 on the device is CreateCommandAllocator on the PC vtable and must still forward, which proves the handle
 // getters were not wedged into the device slots. Console output also shows the proxy's first-call slot log.
+#include "test_temp_dir.h"
 #include <vector>
 #include <windows.h>
 #include <d3d12.h>
@@ -1296,7 +1297,7 @@ int main(int argc, char** argv) {
         // Synthetic test for ShaderLibrary loading `fspx_gfx/index.json` alongside `fspx/index.json` and `bvh/index.json`
         // while keeping `fspx_size()`, `fspx_gfx_size()`, and `bvh_size()` independent.
         wchar_t temp_root[MAX_PATH]{};
-        if (GetTempPathW(MAX_PATH, temp_root)) {
+        if (wcscpy_s(temp_root, testfiles::temp_dir().c_str()) == 0) {
             const std::filesystem::path tmp_dir =
                 std::filesystem::path(temp_root) / ("leonida_fspx_gfx_test_" + std::to_string(GetCurrentProcessId()));
             std::error_code ec;

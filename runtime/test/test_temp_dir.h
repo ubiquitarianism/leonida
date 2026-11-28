@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -20,6 +21,26 @@
 
 namespace testfiles {
 
+// The system temporary directory, or LEONIDA_TEST_DIR when it is set. GetTempPath falls back to the Windows
+// directory when TMP, TEMP and USERPROFILE are all absent; a test must not try to write scratch files there.
+inline std::filesystem::path temp_dir() {
+    if (const char* dir = std::getenv("LEONIDA_TEST_DIR"); dir && *dir) return std::filesystem::path(dir) / "";
+#ifdef _WIN32
+    const char* tmp = std::getenv("TMP");
+    const char* temp = std::getenv("TEMP");
+    const char* profile = std::getenv("USERPROFILE");
+    if ((!tmp || !*tmp) && (!temp || !*temp) && (!profile || !*profile)) {
+        std::error_code ec;
+        auto cwd = std::filesystem::current_path(ec);
+        if (!ec) return cwd / "";
+        return std::filesystem::path(".") / "";
+    }
+#endif
+    std::error_code ec;
+    auto dir = std::filesystem::temp_directory_path(ec);
+    return ec ? std::filesystem::path(".") / "" : dir;
+}
+
 // <temp>/<name>_<pid>: a folder no other running process uses.
 inline std::filesystem::path process_temp_dir(std::string_view name) {
 #ifdef _WIN32
@@ -27,7 +48,7 @@ inline std::filesystem::path process_temp_dir(std::string_view name) {
 #else
     const long pid = long(getpid());
 #endif
-    return std::filesystem::temp_directory_path() / (std::string(name) + "_" + std::to_string(pid));
+    return temp_dir() / (std::string(name) + "_" + std::to_string(pid));
 }
 
 // process_temp_dir(name), emptied and created on construction (a crashed run may have left the same name behind) and

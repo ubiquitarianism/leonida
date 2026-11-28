@@ -7,6 +7,7 @@
 //   4. memory the kernel doesn't write-watch (a section view) is refused;
 //   5. a reader that joins another's pages (merge_reader) sees what the other had not seen yet;
 //   6. the record: add, contains, for_each_in split by reservation, remove.
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <cstdint>
@@ -80,7 +81,7 @@ int main() {
 
     // 3. A kernel write: a plain buffered ReadFile into the watched pages succeeds and is in the answer.
     wchar_t directory[MAX_PATH]{}, path[MAX_PATH]{};
-    GetTempPathW(MAX_PATH, directory);
+    wcscpy_s(directory, testfiles::temp_dir().c_str());
     GetTempFileNameW(directory, L"lww", 0, path);
     HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);

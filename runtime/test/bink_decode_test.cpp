@@ -8,6 +8,7 @@
 //
 // With either required variable unset the test prints "SKIP (no package/movie)" and exits 77 (CTest skip).
 // Output frames are written under %TEMP%\leonida_bink and are never committed.
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <algorithm>
@@ -245,7 +246,7 @@ int main() {
 
         const uint32_t pitch = header.width * 4;
         std::vector<uint8_t> frame((size_t)pitch * header.height);
-        const std::filesystem::path out_dir = std::filesystem::temp_directory_path() / "leonida_bink";
+        const std::filesystem::path out_dir = testfiles::temp_dir() / "leonida_bink";
         std::filesystem::create_directories(out_dir, ec);
         const std::string stem = movie.stem().string();
 

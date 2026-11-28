@@ -3,6 +3,7 @@
 // is not; the order of asking is the order in the file; a truncated or damaged file is read as far as it goes; many
 // threads at once record each pipeline once; the hot path allocates nothing; the file stays bounded; the counts line.
 #include "../src/pipeline_order.h"
+#include "test_temp_dir.h"
 
 #include <algorithm>
 #include <atomic>
@@ -50,7 +51,7 @@ std::atomic<std::uint32_t> clock_ms{0};
 std::uint32_t fake_now() { return clock_ms.load(); }
 
 std::filesystem::path scratch(const char* name) {
-    const auto dir = std::filesystem::temp_directory_path() / "leonida_pipeline_order_test";
+    const auto dir = testfiles::temp_dir() / "leonida_pipeline_order_test";
     std::filesystem::create_directories(dir);
     const auto path = dir / name;
     std::error_code ec;
@@ -384,7 +385,7 @@ void test_file_is_bounded() {
 
 void test_unwritable() {
     // A directory where the file should be: the open fails, the recorder says so and the hot path goes on.
-    const auto dir = std::filesystem::temp_directory_path() / "leonida_pipeline_order_test" / "isdir.log";
+    const auto dir = testfiles::temp_dir() / "leonida_pipeline_order_test" / "isdir.log";
     std::filesystem::create_directories(dir);
     po::Recorder r(config(dir));
     CHECK(request(r, 1));

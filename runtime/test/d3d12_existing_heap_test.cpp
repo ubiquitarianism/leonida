@@ -6,6 +6,7 @@
 // committed range; without it, the device reports EXISTING_HEAPS unsupported and answers an accepted range E_NOTIMPL.
 // No shaders or game data.
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device3-openexistingheapfromaddress
+#include "test_temp_dir.h"
 #include "../shims/title_gpu_placements.h"
 #include "../shims/xg_xs_layout.h"
 #include "vk_test_device.h"
@@ -1099,7 +1100,7 @@ int check_kernel_write(ID3D12Device* device) {
     constexpr SIZE_T size = 4 * 0x10000;
     constexpr DWORD chunk = 0x2000;
     wchar_t directory[MAX_PATH]{}, path[MAX_PATH]{};
-    EXPECT(GetTempPathW(MAX_PATH, directory) && GetTempFileNameW(directory, L"lsh", 0, path));
+    EXPECT(wcscpy_s(directory, testfiles::temp_dir().c_str()) == 0 && GetTempFileNameW(directory, L"lsh", 0, path));
     std::vector<std::uint8_t> file_bytes(2 * chunk);
     for (size_t i = 0; i < file_bytes.size(); ++i) file_bytes[i] = std::uint8_t(i * 29u + 1u);
     {
@@ -1287,7 +1288,7 @@ int check_shared_pages(ID3D12Device* device) {
 
     // Step 4: a kernel write into page 1 (buffers 1 and 2) through the file shims.
     wchar_t directory[MAX_PATH]{}, path[MAX_PATH]{};
-    EXPECT(GetTempPathW(MAX_PATH, directory) && GetTempFileNameW(directory, L"lsp", 0, path));
+    EXPECT(wcscpy_s(directory, testfiles::temp_dir().c_str()) == 0 && GetTempFileNameW(directory, L"lsp", 0, path));
     std::vector<std::uint8_t> file_bytes(0x200);
     for (size_t i = 0; i < file_bytes.size(); ++i) file_bytes[i] = std::uint8_t(i * 7u + 3u);
     {
@@ -1840,7 +1841,7 @@ int check_write_watched(ID3D12Device* device, ID3D12Device* second, DWORD modifi
     EXPECT(pages != nullptr && VirtualAlloc(pages, size / 2, MEM_COMMIT, PAGE_READWRITE | modifier) == pages);
     leonida::title_write_watch::add(reinterpret_cast<std::uintptr_t>(pages), size);  // as xmem records it
     wchar_t directory[MAX_PATH]{}, path[MAX_PATH]{};
-    EXPECT(GetTempPathW(MAX_PATH, directory) && GetTempFileNameW(directory, L"lww", 0, path));
+    EXPECT(wcscpy_s(directory, testfiles::temp_dir().c_str()) == 0 && GetTempFileNameW(directory, L"lww", 0, path));
     std::vector<std::uint8_t> file_bytes(0x3000);
     for (size_t i = 0; i < file_bytes.size(); ++i) file_bytes[i] = std::uint8_t(i * 23u + 9u);
     {

@@ -1,5 +1,6 @@
 // The pipeline journal's file naming, reading and writing (pipeline_cache_journal.h). No Vulkan, no GPU.
 #include "../src/pipeline_cache_journal.h"
+#include "test_temp_dir.h"
 
 #include <chrono>
 #include <cstdint>
@@ -313,7 +314,7 @@ static int test_overlay(const fs::path& dir) {
 }
 
 int main() {
-    const auto dir = fs::temp_directory_path() /
+    const auto dir = testfiles::temp_dir() /
         ("leonida_pipeline_journal_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::error_code ec;
     fs::create_directories(dir, ec);

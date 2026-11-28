@@ -7,6 +7,7 @@
 // display is in SDR and GDI can read the screen. Under Wine, rootless XWayland can return black for desktop reads,
 // so the swapchain checks confirm the colour there. No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "window_station.h"
 #include "../shims/d3d12_com.h"
@@ -313,7 +314,7 @@ int main() {
     wchar_t capture_dir[MAX_PATH]{};
     {
         wchar_t temp[MAX_PATH]{};
-        if (GetTempPathW(MAX_PATH, temp))
+        if (wcscpy_s(temp, testfiles::temp_dir().c_str()) == 0)
             swprintf_s(capture_dir, L"%sleonida_present_capture_%lu", temp, GetCurrentProcessId());
         if (capture_dir[0]) {
             CreateDirectoryW(capture_dir, nullptr);

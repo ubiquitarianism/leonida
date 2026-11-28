@@ -7,6 +7,7 @@
 // not say pending yet lasts until its call returns; a host thread's write (kernel_writes::write) into a geometry tile
 // the watch made read-only lands and counts as a write; and a tile armed while another guard changes one of its pages
 // gives every page it protected back. No game data.
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <atomic>
@@ -207,7 +208,7 @@ int main() {
     check_geometry_write();
     check_arm_race();
     wchar_t dir[MAX_PATH], path[MAX_PATH];
-    GetTempPathW(MAX_PATH, dir);
+    wcscpy_s(dir, testfiles::temp_dir().c_str());
     GetTempFileNameW(dir, L"kwt", 0, path);
     std::vector<std::uint8_t> bytes(kFileBytes);
     for (DWORD i = 0; i < kFileBytes; ++i) bytes[i] = static_cast<std::uint8_t>(i * 7 + (i >> 9));

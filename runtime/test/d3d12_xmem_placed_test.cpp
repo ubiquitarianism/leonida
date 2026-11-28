@@ -6,6 +6,7 @@
 // pages hook (rt::d3d12_xs::set_placed_at_va_pages_hook, as gta6rt does), the pages are committed first: the buffer's
 // GPU VA is the window itself and a GPU copy reads what the CPU writes there afterwards.
 // Needs VK_EXT_external_memory_host (skipped otherwise). No shaders or game data.
+#include "test_temp_dir.h"
 #include "xmem_section_state.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
@@ -387,7 +388,7 @@ int paired_views(ID3D12Device* real) {
         EXPECT((protection_of(cpu + 0x11000) & 0xff) == PAGE_READWRITE);
         EXPECT(read_back(real, buffer.p, size, got) == 0 && got == want);
         wchar_t dir[MAX_PATH]{}, path[MAX_PATH]{};
-        EXPECT(GetTempPathW(MAX_PATH, dir) && GetTempFileNameW(dir, L"xpv", 0, path));
+        EXPECT(wcscpy_s(dir, testfiles::temp_dir().c_str()) == 0 && GetTempFileNameW(dir, L"xpv", 0, path));
         HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                                   FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
         DWORD moved = 0;

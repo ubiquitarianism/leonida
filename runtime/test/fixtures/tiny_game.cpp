@@ -18,6 +18,7 @@
 // with RtlPcToFileHeader, which the loader redirects in the host MSVC runtime. Arguments, not environment variables,
 // so scripts/run_wine_tests.py (which passes a test's command line but not its ENVIRONMENT) runs them too. stdout is
 // unbuffered, so a crash still shows how far the run got.
+#include "../test_temp_dir.h"
 #include <windows.h>
 
 #include <csignal>
@@ -87,7 +88,7 @@ int main(int argc, char** argv) {
     check(v[123456] == 123456, "a 4 MiB heap allocation works");
 
     char tmp[MAX_PATH] = {};
-    GetTempPathA(MAX_PATH, tmp);
+    strcpy_s(tmp, testfiles::temp_dir().string().c_str());
     std::string path = std::string(tmp) + "leonida_tiny_game_" + std::to_string(GetCurrentProcessId()) + ".txt";
     bool file_ok = false;
     if (FILE* f = std::fopen(path.c_str(), "wb")) {

@@ -6,6 +6,7 @@
 //   LEONIDA_AUDIO_FRAMES=<n>              (optional: stop after n video frames; default all)
 //
 // Output stays under %TEMP%\leonida_bink_audio. No movie, packet or PCM is committed.
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <algorithm>
@@ -423,7 +424,7 @@ int main() {
             }
         }
 
-        const std::filesystem::path out_dir = std::filesystem::temp_directory_path() / "leonida_bink_audio";
+        const std::filesystem::path out_dir = testfiles::temp_dir() / "leonida_bink_audio";
         std::filesystem::create_directories(out_dir, ec);
         const std::string stem = movie.stem().string();
         for (auto& t : tracks) {

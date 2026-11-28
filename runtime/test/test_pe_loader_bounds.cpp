@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 
+#include "test_temp_dir.h"
 #include <windows.h>
 #include <intrin.h>
 
@@ -985,7 +986,7 @@ int main() {
 
     const char* env_dir = std::getenv("LEONIDA_TEST_DIR");
     g_temp_dir = env_dir ? std::filesystem::path(env_dir)
-                         : std::filesystem::temp_directory_path() /
+                         : testfiles::temp_dir() /
                                ("leonida_pe_bounds_test_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(g_temp_dir);
 

@@ -3,6 +3,7 @@
 // Compares argument validation, StoreValue/FindValue semantics, size queries, duplicate rejection,
 // shared-session visibility, and SetDeleteOnDestroy against the host Windows D3D12 runtime when available.
 // No game data.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_copy_compare.h"
 #include "../shims/d3d12_com.h"
@@ -286,7 +287,7 @@ int main() {
     // D3D12_SHADER_CACHE_MODE_DISK persistence across session + device teardown and cleanup on SetDeleteOnDestroy.
     {
         const auto prev_cwd = std::filesystem::current_path();
-        const auto temp_dir = std::filesystem::temp_directory_path() / L"leonida_shader_cache_disk_test";
+        const auto temp_dir = testfiles::temp_dir() / L"leonida_shader_cache_disk_test";
         std::error_code ec;
         std::filesystem::remove_all(temp_dir, ec);
         std::filesystem::create_directories(temp_dir);

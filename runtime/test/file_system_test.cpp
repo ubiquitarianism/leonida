@@ -3,6 +3,7 @@
 // Every function is resolved through rt::shims::find under the DLL and name an import uses, so the test runs against
 // the table the runtime installs rather than a private copy. It works on folders it creates in %TEMP%: a package
 // folder that stands in for the game install, an overlay folder, and a "GAME:" path in each variant.
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <aclapi.h>
@@ -327,7 +328,7 @@ int main() {
     LARGE_INTEGER now{};
     QueryPerformanceCounter(&now);
     const std::filesystem::path root =
-        std::filesystem::temp_directory_path() / ("leonida_file_system_" + std::to_string(GetCurrentProcessId()) +
+        testfiles::temp_dir() / ("leonida_file_system_" + std::to_string(GetCurrentProcessId()) +
                                                   "_" + std::to_string(now.QuadPart));
     std::error_code ec;
     std::filesystem::remove_all(root, ec);

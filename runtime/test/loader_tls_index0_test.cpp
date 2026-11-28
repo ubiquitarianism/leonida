@@ -20,6 +20,7 @@
 // gta6rt_tls_host.dll must sit next to this EXE, as for loader_tls_test. No game files are needed. Every function
 // that runs before the reservation, or calls it, touches no thread_local data: MSVC may keep a TLS slot address in a
 // frame across calls, and the reservation has to come before any such frame exists (pe_loader.h).
+#include "test_temp_dir.h"
 #include <windows.h>
 #include <intrin.h>
 
@@ -338,7 +339,7 @@ void test_first_run(const fs::path& exe, const fs::path& dll, EarlyThread& early
 void test_second_run(const fs::path& exe) {
     std::printf("\n-- second run, and a second executable at once --\n");
     wchar_t temp[MAX_PATH];
-    GetTempPathW(MAX_PATH, temp);
+    wcscpy_s(temp, testfiles::temp_dir().c_str());
     const fs::path copy =
         fs::path(temp) / ("leonida_tls_index0_copy_" + std::to_string(GetCurrentProcessId()) + ".exe");
     // CopyFileW, not fs::copy_file: MSVC's copy_file calls CopyFile2, which Wine 9 doesn't implement.

@@ -4,6 +4,7 @@
 //
 //   xgameruntime_user_test                          the offline user, its handles, gamertag "Player"
 //   xgameruntime_user_test --expect-gamertag TAG    the same, run with LEONIDA_GAMERTAG=TAG
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <io.h>
@@ -64,7 +65,7 @@ struct StderrCapture {
     int saved = -1;
     StderrCapture() {
         char dir[MAX_PATH] = {};
-        GetTempPathA(sizeof(dir), dir);
+        strcpy_s(dir, testfiles::temp_dir().string().c_str());
         GetTempFileNameA(dir, "xur", 0, path);
         std::fflush(stderr);
         saved = _dup(2);

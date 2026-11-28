@@ -1,4 +1,5 @@
 // Exercise the fixture's output preparation without initializing Vulkan.
+#include "test_temp_dir.h"
 #include "xdxr_build_output.h"
 
 #include <chrono>
@@ -14,7 +15,7 @@ namespace fs = std::filesystem;
 
 int main() {
     const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
-    const auto root = fs::temp_directory_path() / ("leonida-xdxr-output-" + std::to_string(suffix));
+    const auto root = testfiles::temp_dir() / ("leonida-xdxr-output-" + std::to_string(suffix));
     CHECK(fs::create_directory(root));
     struct Cleanup {
         fs::path path;

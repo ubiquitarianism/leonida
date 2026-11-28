@@ -2,6 +2,7 @@
 // The same synthetic workload runs on native WARP and on the Vulkan layer, with actual GPU readback.
 // Under Wine the WARP runs are skipped (host_wine.h) and the layer is checked against the expected result alone.
 // Set LEONIDA_VK_VALIDATION=1 to enable Vulkan core and synchronization validation.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "shader_fixture_path.h"
@@ -224,7 +225,7 @@ int main(int argc, char** argv) {
     std::vector<std::uint8_t> program = fssm_program({0x1100u, 0x44u, 0x55u, 0x66u, 0x77u, 0x88u});
     for (UINT i = 0; i < 12; ++i) put32(program, 0xbf810000 + i);
     const auto container = shader_container(program);
-    const auto fixture = std::filesystem::temp_directory_path() /
+    const auto fixture = testfiles::temp_dir() /
                          ("leonida_indirect_dispatch_count_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(fixture);
     std::filesystem::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_INDIRECT_COUNT_SPV),

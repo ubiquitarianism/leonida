@@ -16,6 +16,7 @@
 // a plane format naming the other plane, and DECOMPRESS are refused by the layer and not run on the host.
 // WARP, measured: a resolve with Format D32_FLOAT removes the device (DXGI_ERROR_DRIVER_INTERNAL_ERROR), and a
 // D24S8 resolve of one plane writes both. So WARP skips those and is compared on the plane resolved.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "host_adapter.h"
 #include "host_wine.h"
@@ -388,7 +389,7 @@ int main() {
     {
         const auto program = d3d12test::fssm_program({0x56530848, 0xbf810000});
         edge_container = d3d12test::shader_container(program);
-        const auto library = std::filesystem::temp_directory_path() / "leonida_depth_resolve_test";
+        const auto library = testfiles::temp_dir() / "leonida_depth_resolve_test";
         std::filesystem::create_directories(library);
         std::filesystem::copy_file(LEONIDA_DEPTH_EDGE_VS_SPV, library / "vs.spv",
                                    std::filesystem::copy_options::overwrite_existing);

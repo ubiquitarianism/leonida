@@ -1,4 +1,5 @@
 // Explicit FullyCoveredEXT library contract versus native SV_InnerCoverage. Synthetic data only.
+#include "test_temp_dir.h"
 #include "conservative_raster_fixture.h"
 using namespace conservative_test;
 
@@ -108,7 +109,7 @@ int main(int argc, char** argv) {
     const auto vs_program=d3d12test::fssm_program({0x54335653,0xbf810000});
     const auto ps_program=d3d12test::fssm_program({0x54335053,0xbf810000});
     const auto vs_bytes=d3d12test::shader_container(vs_program), ps_bytes=d3d12test::shader_container(ps_program);
-    const auto dir=std::filesystem::temp_directory_path()/("leonida_conservative_tier3_"+std::to_string(GetCurrentProcessId()));
+    const auto dir=testfiles::temp_dir()/("leonida_conservative_tier3_"+std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(dir);
     std::filesystem::copy_file(LEONIDA_CONSERVATIVE_VS,dir/"vs.spv",std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_CONSERVATIVE_TIER3_PS,dir/"ps.spv",std::filesystem::copy_options::overwrite_existing);

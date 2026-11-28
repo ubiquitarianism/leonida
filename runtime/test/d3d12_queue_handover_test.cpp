@@ -17,6 +17,7 @@
 // compared byte for byte with the data written by the CPU: a consumer replayed against the layout from before its
 // producer ran reads a zero-filled texture and fails here (and with LEONIDA_VK_VALIDATION=1 under sync validation).
 // No game data.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 
@@ -388,12 +389,18 @@ bool cpu_gate(Rig& rig, Type producer, Type consumer, bool signal_first, int see
 // Runs `body` with stderr redirected to a file and returns what it wrote.
 std::string capture_stderr(const std::function<void()>& body) {
     char dir[MAX_PATH], path[MAX_PATH];
-    GetTempPathA(MAX_PATH, dir);
+    strcpy_s(dir, testfiles::temp_dir().string().c_str());
     GetTempFileNameA(dir, "qho", 0, path);
     std::fflush(stderr);
     const int saved = _dup(2);
     int file = -1;
-    _sopen_s(&file, path, _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+    const errno_t open_error =
+        _sopen_s(&file, path, _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+    if (open_error != 0) {
+        if (saved >= 0) _close(saved);
+        std::remove(path);
+        return "capture_stderr: _sopen_s failed with error " + std::to_string(open_error) + " for " + path;
+    }
     _dup2(file, 2);
     body();
     std::fflush(stderr);

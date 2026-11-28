@@ -1,5 +1,6 @@
 // Synthetic D3D12/Vulkan conservative coverage. Required/forbidden pixels come from geometric clipping,
 // not a driver snapshot: Tier 1 may over-cover by half a pixel, so uncertain pixels are not compared exactly.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_copy_compare.h"
 #include "d3d12_test_shaders.h"
@@ -259,7 +260,7 @@ int main(int argc, char** argv) {
     const auto vs_program = d3d12test::fssm_program({0x43525653, 0xbf810000});
     const auto ps_program = d3d12test::fssm_program({0x43525053, 0xbf810000});
     const auto vs_bytes = d3d12test::shader_container(vs_program), ps_bytes = d3d12test::shader_container(ps_program);
-    const auto directory = std::filesystem::temp_directory_path() / ("leonida_conservative_" + std::to_string(GetCurrentProcessId()));
+    const auto directory = testfiles::temp_dir() / ("leonida_conservative_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(directory);
     std::filesystem::copy_file(LEONIDA_CONSERVATIVE_VS, directory / "vs.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_CONSERVATIVE_PS, directory / "ps.spv", std::filesystem::copy_options::overwrite_existing);

@@ -18,6 +18,7 @@
 // must be above 0). The times are printed, not asserted.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation with synchronization validation (0 errors
 // required).
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -404,7 +405,7 @@ int main(int argc, char** argv) {
     const auto program = fssm_program({0x43530003, 0xbf810000});
     // One folder per process: ctest runs d3d12_bindless_churn and d3d12_bindless_churn_validated (the same
     // executable) in parallel under -j, and with a shared folder the first to finish removes the other's index.json.
-    const auto library = std::filesystem::temp_directory_path() /
+    const auto library = testfiles::temp_dir() /
                          ("leonida_bindless_churn_test_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_CS_SET0_SAMPLE_SPV, library / "cs_set0_sample.spv",

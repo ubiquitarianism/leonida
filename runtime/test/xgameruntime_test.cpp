@@ -5,6 +5,7 @@
 // work runs on the thread pool and whose completions the game loop dispatches by hand, run async work on it and on
 // the process queue, drive a custom XAsyncBegin provider to a result, then uninitialize. No game data; nothing
 // online.
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <atomic>
@@ -576,7 +577,7 @@ void check_run_time_load() {
     const GUID pls_class = {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}};
     const GUID pls3 = {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}};
     const std::filesystem::path scratch =
-        std::filesystem::temp_directory_path() / (L"gta6rt_pls_test_" + std::to_wstring(GetCurrentProcessId()));
+        testfiles::temp_dir() / (L"gta6rt_pls_test_" + std::to_wstring(GetCurrentProcessId()));
     std::error_code scratch_ec;
     std::filesystem::remove_all(scratch, scratch_ec);
     rt::fs::configure(scratch / L"game", scratch / L"overlay");
@@ -765,7 +766,7 @@ void check_run_time_load() {
         // string (with S_OK) when the package declares none.
         using Locale = HRESULT(STDMETHODCALLTYPE*)(void*, size_t, char*);
         char tmp[MAX_PATH] = {};
-        GetTempPathA(sizeof(tmp), tmp);
+        strcpy_s(tmp, testfiles::temp_dir().string().c_str());
         const std::string game = std::string(tmp) + "leonida_xpackage_locale_test";
         CreateDirectoryA(game.c_str(), nullptr);
         SetEnvironmentVariableA("LEONIDA_GAME_DIR", game.c_str());
@@ -802,7 +803,7 @@ void check_run_time_load() {
         {
             // A game folder outside every ANSI code page (U+16A0, a runic letter) reaches MicrosoftGame.Config intact.
             wchar_t wtmp[MAX_PATH] = {};
-            GetTempPathW(MAX_PATH, wtmp);
+            wcscpy_s(wtmp, testfiles::temp_dir().c_str());
             const std::wstring wide = std::wstring(wtmp) + L"leonida_xpackage_\u16a0ocale";
             CreateDirectoryW(wide.c_str(), nullptr);
             SetEnvironmentVariableW(L"LEONIDA_GAME_DIR", wide.c_str());
@@ -1040,7 +1041,7 @@ void check_run_time_load() {
             };
             const auto enumerate = reinterpret_cast<Enumerate>(slot(pk, 13));
             char tmp2[MAX_PATH] = {};
-            GetTempPathA(sizeof(tmp2), tmp2);
+            strcpy_s(tmp2, testfiles::temp_dir().string().c_str());
             const std::string chunk_game = std::string(tmp2) + "leonida_xpackage_chunk_test";
             CreateDirectoryA(chunk_game.c_str(), nullptr);
             SetEnvironmentVariableA("LEONIDA_GAME_DIR", chunk_game.c_str());
@@ -1169,7 +1170,7 @@ void check_run_time_load() {
             using LaunchNew = void(STDMETHODCALLTYPE*)(void*, const char*, const char*, void*);
             using Restart = HRESULT(STDMETHODCALLTYPE*)(void*, const char*, uint32_t);
             char tmp[MAX_PATH] = {};
-            GetTempPathA(sizeof(tmp), tmp);
+            strcpy_s(tmp, testfiles::temp_dir().string().c_str());
             const std::string game = std::string(tmp) + "leonida_xgame_title_test";
             CreateDirectoryA(game.c_str(), nullptr);
             SetEnvironmentVariableA("LEONIDA_GAME_DIR", game.c_str());
@@ -1354,7 +1355,7 @@ int main() {
     }
     {
         namespace fs = std::filesystem;
-        const auto folder = fs::temp_directory_path() /
+        const auto folder = testfiles::temp_dir() /
             (L"leonida_content_\u16a0_\U0001F680_" + std::to_wstring(GetCurrentProcessId()));
         std::error_code ec;
         const bool created = fs::create_directory(folder, ec);

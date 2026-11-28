@@ -8,6 +8,7 @@
 //
 // An optional final section reads LEONIDA_GAME_DIR and maps the 16 DLLs a retail package ships, without executing
 // any of them or copying any file. It skips when the variable is unset; see test_optional_package.
+#include "test_temp_dir.h"
 #include <windows.h>
 #include <share.h>
 
@@ -178,7 +179,7 @@ struct TempDir {
     fs::path path;
 
     TempDir() {
-        path = fs::temp_directory_path() / ("leonida_pe_loader_test_" + std::to_string(GetCurrentProcessId()));
+        path = testfiles::temp_dir() / ("leonida_pe_loader_test_" + std::to_string(GetCurrentProcessId()));
         std::error_code ec;
         fs::remove_all(path, ec);
         fs::create_directories(path);

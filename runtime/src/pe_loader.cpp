@@ -186,6 +186,15 @@ std::filesystem::path tls_host_base_path() {
 }
 
 std::filesystem::path tls_host_clone_dir() {
+    if (const char* dir = std::getenv("LEONIDA_TEST_DIR"); dir && *dir) return std::filesystem::path(dir);
+    const char* tmp = std::getenv("TMP");
+    const char* temp = std::getenv("TEMP");
+    const char* profile = std::getenv("USERPROFILE");
+    if ((!tmp || !*tmp) && (!temp || !*temp) && (!profile || !*profile)) {
+        std::error_code ec;
+        auto cwd = std::filesystem::current_path(ec);
+        if (!ec) return cwd;
+    }
     wchar_t buf[MAX_PATH];
     DWORD n = GetTempPathW(MAX_PATH, buf);
     if (n > 0 && n < MAX_PATH) return std::filesystem::path(buf);

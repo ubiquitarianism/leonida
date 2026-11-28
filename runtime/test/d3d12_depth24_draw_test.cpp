@@ -15,6 +15,7 @@
 //
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_depth.vert, ps_depth_empty.frag,
 // ps_depth_write.frag, gs_depth.geom). No game data.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -228,7 +229,7 @@ int main() {
     const auto ps_empty_program = fssm_program({0x50530309, 0xbf810000});
     const auto ps_write_program = fssm_program({0x50530310, 0xbf810000});
     const auto gs_program = fssm_program({0x47530309, 0xbf810000});
-    const auto library = std::filesystem::temp_directory_path() / "leonida_depth24_draw_test";
+    const auto library = testfiles::temp_dir() / "leonida_depth24_draw_test";
     std::filesystem::create_directories(library);
     const auto copy = std::filesystem::copy_options::overwrite_existing;
     std::filesystem::copy_file(LEONIDA_TEST_VS_DEPTH_SPV, library / "vs_depth.spv", copy);

@@ -2,6 +2,7 @@
 // the class id (or a later interface id), one vtable slot with `this` first. Slots follow xgameruntime-docs' layout;
 // arguments, limits and error codes follow the public GDK reference. Saves go to a temporary LEONIDA_SAVE_DIR; no
 // game data, nothing online.
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <cstdint>
@@ -145,7 +146,7 @@ int trace_index(const std::vector<std::string>& lines, const char* a, const char
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // a crash still shows the checks before it
     std::printf("xgameruntime_gamesave_test: XGameSaveImpl through QueryApiImpl\n");
-    const std::filesystem::path root = std::filesystem::temp_directory_path() / L"leonida_gamesave_test";
+    const std::filesystem::path root = testfiles::temp_dir() / L"leonida_gamesave_test";
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
     SetEnvironmentVariableW(L"LEONIDA_SAVE_DIR", root.c_str());

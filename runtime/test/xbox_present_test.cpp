@@ -10,6 +10,7 @@
 // Needs a window and a Vulkan GPU with presentation.
 // Set LEONIDA_VK_VALIDATION=1 for VK_LAYER_KHRONOS_validation; any validation error fails the test, except that
 // the NVIDIA layer's known sRGB-swapchain STORAGE check makes the run skip rather than pass or fail.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "xbox_present_readback_size.h"
 #include "../shims/d3d12_com.h"
@@ -511,7 +512,7 @@ int main() {
         {
             std::error_code ignored;
             const std::filesystem::path trace_file =
-                std::filesystem::temp_directory_path(ignored) / "leonida_xbox_present_trace.txt";
+                testfiles::temp_dir() / "leonida_xbox_present_trace.txt";
             std::string trace, untraced;
             HRESULT blank = E_FAIL, refused = S_OK, refused_untraced = S_OK;
             bool captured = false, captured_untraced = false;

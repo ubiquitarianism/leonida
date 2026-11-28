@@ -10,6 +10,7 @@
 // Exit 77 (skipped): no Vulkan device for the runtime, pre-Vulkan 1.3 device without core pipeline creation feedback,
 // vk_pipeline_check built no pipeline, cache written for another GPU/driver, or a driver that reports no hit even for
 // a cache this device wrote itself a moment before.
+#include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
 #include "../src/shader_library.h"
 
@@ -106,17 +107,7 @@ bool write_bytes(const std::filesystem::path& path, const void* data, std::size_
 }
 
 std::filesystem::path create_temp_dir() {
-    std::wstring base(MAX_PATH, L'\0');
-    const DWORD len = GetTempPathW(static_cast<DWORD>(base.size()), base.data());
-    std::filesystem::path root;
-    if (len > 0 && len < base.size()) {
-        base.resize(len);
-        root = base;
-    } else {
-        std::error_code ec;
-        root = std::filesystem::temp_directory_path(ec);
-        if (ec) return {};
-    }
+    const std::filesystem::path root = testfiles::temp_dir();
     const std::wstring name =
         L"leonida_pipeline_cache_seed_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
         std::to_wstring(GetTickCount64());

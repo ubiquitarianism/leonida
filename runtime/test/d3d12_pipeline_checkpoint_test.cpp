@@ -1,5 +1,6 @@
 // Portable C++20 tests for runtime/shims/d3d12_pipeline_checkpoint.h
 #include "../shims/d3d12_pipeline_checkpoint.h"
+#include "test_temp_dir.h"
 
 #include <atomic>
 #include <cstddef>
@@ -80,7 +81,7 @@ int main() {
     clean_stale_cache_files(fs::path{L"non_existent_dir_12345/dummy.cache"});
 
     // 5. CacheStagingFile invalid arguments
-    const auto test_dir = fs::temp_directory_path() / L"leonida_checkpoint_test";
+    const auto test_dir = testfiles::temp_dir() / L"leonida_checkpoint_test";
     std::error_code ec;
     fs::create_directories(test_dir, ec);
 

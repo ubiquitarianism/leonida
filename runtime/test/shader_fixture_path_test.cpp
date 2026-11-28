@@ -1,3 +1,4 @@
+#include "test_temp_dir.h"
 #include "shader_fixture_path.h"
 #include <cstdio>
 #include <chrono>
@@ -6,7 +7,7 @@
 
 int main() {
     namespace fs = std::filesystem;
-    const auto root = fs::temp_directory_path() / ("leonida_fixture_path_" +
+    const auto root = testfiles::temp_dir() / ("leonida_fixture_path_" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     fs::create_directories(root / "generated");
     const auto previous = fs::current_path();

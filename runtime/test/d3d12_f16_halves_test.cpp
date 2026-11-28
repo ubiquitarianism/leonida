@@ -11,6 +11,7 @@
 //      param14 & param15). `link_f16_halves` relocates BOTH PS and VS halves to Locations 28 & 29 and renders the
 //      exact same RGBA (64, 191, 128, 255).
 // Skips (77) when no usable Vulkan 1.3 device is present. No game data.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -247,7 +248,7 @@ int main() {
     const auto vs_low_c = shader_container(vs_low_prog);
     const auto ps_low_c = shader_container(ps_low_prog);
 
-    const auto lib_dir = std::filesystem::temp_directory_path() / "leonida_f16_halves_gpu_test";
+    const auto lib_dir = testfiles::temp_dir() / "leonida_f16_halves_gpu_test";
     std::filesystem::create_directories(lib_dir);
     write_spv(lib_dir / "vs_16p.spv", make_16param_vs());
     write_spv(lib_dir / "vs_10p.spv", make_10param_vs());

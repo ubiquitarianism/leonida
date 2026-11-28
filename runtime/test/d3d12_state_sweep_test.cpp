@@ -11,6 +11,7 @@
 // The layer's shaders are GLSL stand-ins for translated ones (test/glsl/vs_fullscreen.vert, ps_sweep.frag), found by
 // the FSSM hash of their containers in a translator-style index; the host's are HLSL compiled by d3dcompiler_47.
 // Synthetic data only.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "d3d12_test_shaders.h"
@@ -547,7 +548,7 @@ int main() {
 
     const auto vs_program = d3d12test::fssm_program({0x56530501, 0xbf810000});
     const auto ps_program = d3d12test::fssm_program({0x50530501, 0xbf810000});
-    const auto library = std::filesystem::temp_directory_path() / "leonida_state_sweep_test";
+    const auto library = testfiles::temp_dir() / "leonida_state_sweep_test";
     std::filesystem::create_directories(library);
     const auto overwrite = std::filesystem::copy_options::overwrite_existing;
     std::filesystem::copy_file(LEONIDA_SWEEP_VS_SPV, library / "vs.spv", overwrite);

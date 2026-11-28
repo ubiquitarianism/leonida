@@ -1,6 +1,7 @@
 // Host-parity validation and GPU execution sanity test for ID3D12GraphicsCommandList::ExecuteIndirect.
 // Compares Close() verdicts between the Vulkan layer, live Windows WARP, and live hardware D3D12 (0 disagreements),
 // then executes valid ExecuteIndirect dispatches on the Vulkan GPU with validation enabled. No game data.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "host_wine.h"
@@ -350,7 +351,7 @@ int main() {
     // Write minimal synthetic compute shader fixture for positive ExecuteIndirect dispatch.
     std::vector<std::uint8_t> program = fssm_program({0x2200u, 0x11u, 0x22u, 0x33u});
     const auto container = shader_container(program);
-    const auto fixture = std::filesystem::temp_directory_path() /
+    const auto fixture = testfiles::temp_dir() /
                          ("leonida_exec_ind_val_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(fixture);
     {

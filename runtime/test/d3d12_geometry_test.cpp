@@ -9,6 +9,7 @@
 // Also refused: a GS pipeline whose topology type is not the GS's input primitive (lines: E_INVALIDARG). Skipped where
 // the GPU lacks geometryShader. Shaders: test/glsl/vs_draw.vert, gs_double.geom, ps_draw.frag. No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -53,7 +54,7 @@ int main() {
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
     const auto vs_container = shader_container(vs_program), gs_container = shader_container(gs_program),
                ps_container = shader_container(ps_program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_geometry_test";
+    const auto library = testfiles::temp_dir() / "leonida_geometry_test";
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_GS_SPV, library / "gs_double.spv",

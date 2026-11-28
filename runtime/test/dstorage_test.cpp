@@ -1,5 +1,6 @@
 // DirectStorage shim (runtime/shims/dstorage.cpp): DStorageGetFactory resolved through the shim registry under its
 // three module names, driven the way a console title calls it, over synthetic files in %TEMP%. No game data, no GPU.
+#include "test_temp_dir.h"
 #include <windows.h>
 #include <d3d12.h>
 
@@ -1912,7 +1913,7 @@ void test_page_reads_wait_for_submit(Env& env) {
 
 int main() {
     wchar_t temp[MAX_PATH];
-    GetTempPathW(MAX_PATH, temp);
+    wcscpy_s(temp, testfiles::temp_dir().c_str());
     Env env;
     env.root = fs::path(temp) / (L"leonida_dstorage_test_" + std::to_wstring(GetCurrentProcessId()));
     env.game = env.root / L"game";

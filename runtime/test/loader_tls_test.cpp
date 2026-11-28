@@ -8,6 +8,7 @@
 //
 // The loader reserves its module TLS index with gta6rt_tls_host.dll, so that DLL must sit next to this EXE; CTest
 // builds and places both in the build directory. No game files are needed and no real package DLL is mapped.
+#include "test_temp_dir.h"
 #include <windows.h>
 #include <intrin.h>
 #include <process.h>
@@ -60,7 +61,7 @@ void write_file(const fs::path& path, const void* data, size_t size) {
 struct TempDir {
     fs::path path;
     TempDir() {
-        path = fs::temp_directory_path() / ("leonida_loader_tls_test_" + std::to_string(GetCurrentProcessId()));
+        path = testfiles::temp_dir() / ("leonida_loader_tls_test_" + std::to_string(GetCurrentProcessId()));
         std::error_code ec;
         fs::remove_all(path, ec);
         fs::create_directories(path);
@@ -707,11 +708,11 @@ std::vector<fs::path> own_clone_files() {
     const std::wstring own = L"leonida_tls_host_" + std::to_wstring(GetCurrentProcessId()) + L"_";
     std::vector<fs::path> found;
     WIN32_FIND_DATAW fd{};
-    HANDLE h = FindFirstFileW((fs::temp_directory_path() / (own + L"*.dll")).c_str(), &fd);
+    HANDLE h = FindFirstFileW((testfiles::temp_dir() / (own + L"*.dll")).c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return found;
     do {
         if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
-            found.push_back(fs::temp_directory_path() / fd.cFileName);
+            found.push_back(testfiles::temp_dir() / fd.cFileName);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
     return found;
@@ -726,7 +727,7 @@ void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
     dead.end();
     ChildProcess live;
 
-    const fs::path clone_root = fs::temp_directory_path();
+    const fs::path clone_root = testfiles::temp_dir();
     // An own-PID name stands in for a leftover of a dead run whose PID this process reused: the sweep runs before
     // this process has created any clone, so such a file is always ownerless here.
     const fs::path stale_file = clone_root / (L"leonida_tls_host_" + std::to_wstring(GetCurrentProcessId()) + L"_31.dll");

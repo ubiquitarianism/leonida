@@ -6,6 +6,7 @@
 //   - Empty viewport 0 with active viewports 1..3 (draw still rasterizes slots 1..3)
 // Compares all 64/64 pixels of the 8x8 RGBA8_UNORM render target byte-for-byte against the host Windows D3D12
 // runtime on the same adapter (matched by LUID). Self-contained: builds minimal SPIR-V 1.5 shaders in memory.
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "d3d12_test_shaders.h"
@@ -363,7 +364,7 @@ int main() {
 
     const auto vs_program = d3d12test::fssm_program({0x56534d56u, 0xbf810000u});
     const auto ps_program = d3d12test::fssm_program({0x50534d56u, 0xbf810000u});
-    const auto library = std::filesystem::temp_directory_path() /
+    const auto library = testfiles::temp_dir() /
                          ("leonida_multi_viewport_test_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(library);
     CHECK(write_spv(library / "vs.spv", make_multi_vp_vs_spv()));

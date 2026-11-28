@@ -9,6 +9,7 @@
 //   null     null EXCEPTION_POINTERS, ExceptionRecord or ContextRecord: no skip and no crash
 //   init     the variable is read when the trace opens: removed after open(), int3s are still skipped
 //   off      without the variable, nothing is skipped
+#include "test_temp_dir.h"
 #include <windows.h>
 
 #include <cstdio>
@@ -52,7 +53,7 @@ struct Trace {
     std::wstring path;
     Trace() {
         wchar_t temp[MAX_PATH];
-        GetTempPathW(MAX_PATH, temp);
+        wcscpy_s(temp, testfiles::temp_dir().c_str());
         path = std::wstring(temp) + L"int3_skip_test_" + std::to_wstring(GetCurrentProcessId()) + L".jsonl";
         DeleteFileW(path.c_str());
         check(rt::startup_trace::open(path.c_str()), "open the startup trace file");

@@ -10,6 +10,7 @@
 // LEONIDA_VK_VALIDATION=0) and any validation error fails the test: before the fix the second device gave -06340
 // and S_OK. Without the layer the test still checks the HRESULTs and the feature bits.
 // The shaders are GLSL written to the translator's runtime contract; nothing is drawn. No game data.
+#include "test_temp_dir.h"
 #include "d3d12_test_shaders.h"
 #include "shader_fixture_path.h"
 #include "vk_test_device.h"
@@ -121,7 +122,7 @@ int main() {
     const auto atomic_program = fssm_program({0x50530a70, 0xbf810000});
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
     const auto atomic_container = shader_container(atomic_program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_stores_atomics_test";
+    const auto library = testfiles::temp_dir() / "leonida_stores_atomics_test";
     std::filesystem::create_directories(library);
     const struct { const char* compiled; const char* name; } files[] = {
         {LEONIDA_TEST_VS_FULLSCREEN_SPV, "vs_fullscreen.spv"},
