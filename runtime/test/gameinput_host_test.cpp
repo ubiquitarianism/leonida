@@ -8,13 +8,18 @@
 //     GetGamepadState must succeed on the reading; the test passes with or without one.
 // Skips (exit 77) only where Windows itself cannot load GameInput.dll (asked before mapping, with LoadLibraryExW).
 // When the DLL is there, an import that binds to nothing is a failure, not a skip. No game files.
+//
+// Wine has a GameInput.dll of its own that loads and implements nothing: its GameInputCreate answers E_NOTIMPL
+// (wine-staging 11.21). There the import binding is still checked, and the calls into the library are skipped.
 #include <windows.h>
+#include <unknwn.h>
 
 #include <cstdio>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
 
+#include "host_wine.h"
 #include "pe_loader.h"
 
 namespace {
@@ -51,6 +56,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Asked of the host's DLL directly and before anything is mapped, for the same reason: what is skipped must not
+    // depend on the loader's answer. On Windows nothing is asked, and every failure below stays a failure.
+    bool host_is_a_stub = false;
+    if (hostwine::is_wine()) {
+        using CreateFn = HRESULT(WINAPI*)(IUnknown**);
+        if (const auto create = reinterpret_cast<CreateFn>(GetProcAddress(host_gameinput, "GameInputCreate"))) {
+            IUnknown* input = nullptr;
+            host_is_a_stub = create(&input) == E_NOTIMPL;
+            if (input) input->Release();
+        }
+    }
+
     try {
         rt::Loader loader(fixture.parent_path());
         rt::Module& m = loader.load(fixture);
@@ -65,21 +82,27 @@ int main(int argc, char** argv) {
             }
         check(seen == 1 && binding == rt::Binding::Host, "the GameInput.dll import binds to the host's copy");
 
-        loader.initialise();
-        const auto probe = reinterpret_cast<ProbeFn>(m.exports.at("gameinput_host_probe"));
-        long create_hr = -1, reading_hr = -1;
-        unsigned long long timestamp = 0;
-        int state_ok = 0;
-        const int created = probe(&create_hr, &timestamp, &reading_hr, &state_ok);
-        std::printf("     create hr=0x%08lX, timestamp=%llu, reading hr=0x%08lX\n", static_cast<unsigned long>(create_hr),
-                    timestamp, static_cast<unsigned long>(reading_hr));
-        check(created == 1 && create_hr == 0, "GameInputCreate succeeds from mapped code");
-        check(timestamp != 0, "GetCurrentTimestamp returns a time");
-        const bool pad = created == 1 && reading_hr == 0;
-        check(pad || static_cast<unsigned long>(reading_hr) == kReadingNotFound,
-              "GetCurrentReading says either 'reading' or 'no reading found'");
-        std::printf("     gamepad reading: %s\n", pad ? "yes (a gamepad is attached)" : "none (no gamepad attached)");
-        if (pad) check(state_ok == 1, "GetGamepadState succeeds on a real reading");
+        if (host_is_a_stub) {
+            std::printf("SKIP the calls into GameInput.dll (Wine's has no implementation: GameInputCreate answers "
+                        "E_NOTIMPL)\n");
+        } else {
+            loader.initialise();
+            const auto probe = reinterpret_cast<ProbeFn>(m.exports.at("gameinput_host_probe"));
+            long create_hr = -1, reading_hr = -1;
+            unsigned long long timestamp = 0;
+            int state_ok = 0;
+            const int created = probe(&create_hr, &timestamp, &reading_hr, &state_ok);
+            std::printf("     create hr=0x%08lX, timestamp=%llu, reading hr=0x%08lX\n",
+                        static_cast<unsigned long>(create_hr), timestamp, static_cast<unsigned long>(reading_hr));
+            check(created == 1 && create_hr == 0, "GameInputCreate succeeds from mapped code");
+            check(timestamp != 0, "GetCurrentTimestamp returns a time");
+            const bool pad = created == 1 && reading_hr == 0;
+            check(pad || static_cast<unsigned long>(reading_hr) == kReadingNotFound,
+                  "GetCurrentReading says either 'reading' or 'no reading found'");
+            std::printf("     gamepad reading: %s\n",
+                        pad ? "yes (a gamepad is attached)" : "none (no gamepad attached)");
+            if (pad) check(state_ok == 1, "GetGamepadState succeeds on a real reading");
+        }
     } catch (const std::exception& e) {
         std::printf("FAIL unexpected exception: %s\n", e.what());
         ++g_failures;

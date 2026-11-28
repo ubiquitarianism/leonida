@@ -1033,7 +1033,12 @@ void test_stats_timing(Env& env) {
     if (!q) return;
     IDStorageStatusArrayX* s = make_status(env, 1);
     GuardHold hold;
-    hold.page = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    // The guard page is the middle one of three, so the page below it is this allocation's own. An allocation of one
+    // page can land right above the queue worker's stack, and Wine drops the guard of a page that starts at the
+    // reading thread's StackBase without raising anything (wine-staging 11.21): the copy then never stops here.
+    auto* const pages =
+        static_cast<uint8_t*>(VirtualAlloc(nullptr, 3 * 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    hold.page = pages ? pages + 4096 : nullptr;
     hold.entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     hold.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!hold.page || !hold.entered || !hold.release) {
@@ -1076,7 +1081,7 @@ void test_stats_timing(Env& env) {
     g_hold = nullptr;
     CloseHandle(hold.entered);
     CloseHandle(hold.release);
-    VirtualFree(hold.page, 0, MEM_RELEASE);
+    VirtualFree(pages, 0, MEM_RELEASE);
     s->Release();
     q->Release();
 }

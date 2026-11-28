@@ -12,6 +12,7 @@ using NTSTATUS = LONG;
 #include <cstring>
 #include <thread>
 
+#include "host_wine.h"
 #include "shims.h"
 
 namespace rt::bcrypt_rng {
@@ -45,6 +46,12 @@ Fn resolve(const char* name) {
     return reinterpret_cast<Fn>(rt::shims::find("bcrypt.dll", name));
 }
 
+// The host's own BCryptOpenAlgorithmProvider, found the way the shim finds it. Null on a host with no bcrypt.dll.
+OpenAlgFn host_open_algorithm_provider() {
+    const HMODULE bcrypt = LoadLibraryExW(L"bcrypt.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    return bcrypt ? reinterpret_cast<OpenAlgFn>(GetProcAddress(bcrypt, "BCryptOpenAlgorithmProvider")) : nullptr;
+}
+
 void test_registry_coverage() {
     check(resolve<OpenAlgFn>("BCryptOpenAlgorithmProvider") != nullptr, "BCryptOpenAlgorithmProvider resolves");
     check(resolve<GenRandomFn>("BCryptGenRandom") != nullptr, "BCryptGenRandom resolves");
@@ -61,8 +68,26 @@ void test_provider_handles_and_validation() {
           "BCryptOpenAlgorithmProvider rejects null out handle");
     check(open_alg(&h, nullptr, nullptr, 0) == kStatusInvalidParameter,
           "BCryptOpenAlgorithmProvider rejects null algorithm id");
-    check(open_alg(&h, L"LEONIDA_NO_SUCH_ALG", nullptr, 0) == kStatusNotFound,
-          "BCryptOpenAlgorithmProvider reports STATUS_NOT_FOUND for unknown algorithm");
+    // An algorithm the shim does not serve is the host's to answer, and the shim hands the host's status back (with
+    // no host bcrypt it says STATUS_NOT_FOUND itself). Microsoft's bcrypt answers STATUS_NOT_FOUND for a name it does
+    // not know and Wine's answers 0xC0000002 (STATUS_NOT_IMPLEMENTED, wine-staging 11.21), so the shim is compared
+    // with the host, asked directly, and the value itself is checked wherever the host is not Wine.
+    NTSTATUS host_unknown = kStatusNotFound;
+    if (const OpenAlgFn host_open = host_open_algorithm_provider()) {
+        BCRYPT_ALG_HANDLE host_handle = nullptr;
+        host_unknown = host_open(&host_handle, L"LEONIDA_NO_SUCH_ALG", nullptr, 0);
+    }
+    const NTSTATUS shim_unknown = open_alg(&h, L"LEONIDA_NO_SUCH_ALG", nullptr, 0);
+    check(shim_unknown < 0 && shim_unknown == host_unknown && h == nullptr,
+          "BCryptOpenAlgorithmProvider reports the host's failure for an unknown algorithm");
+    if (hostwine::is_wine() && host_unknown != kStatusNotFound) {
+        std::printf("SKIP BCryptOpenAlgorithmProvider reports STATUS_NOT_FOUND for unknown algorithm (Wine's bcrypt "
+                    "answers 0x%08lX)\n",
+                    static_cast<unsigned long>(host_unknown));
+    } else {
+        check(shim_unknown == kStatusNotFound,
+              "BCryptOpenAlgorithmProvider reports STATUS_NOT_FOUND for unknown algorithm");
+    }
 
     check(open_alg(&h, BCRYPT_RNG_ALGORITHM, nullptr, 0) == kStatusSuccess && h != nullptr,
           "BCryptOpenAlgorithmProvider opens BCRYPT_RNG_ALGORITHM");

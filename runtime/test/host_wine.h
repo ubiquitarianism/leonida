@@ -12,8 +12,15 @@
 
 namespace hostwine {
 
-inline bool host_is_wine() {
+// Whether the host is Wine, with nothing printed: for the tests of other host libraries (bcrypt, GameInput, the
+// memory manager), which say themselves what Wine answers differently.
+inline bool is_wine() {
     static const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+    return wine;
+}
+
+inline bool host_is_wine() {
+    const bool wine = is_wine();
     static bool said = false;
     if (wine && !said) std::printf("host D3D12 is Wine's, not Microsoft's: comparisons with the host are skipped\n");
     said = true;

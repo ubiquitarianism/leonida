@@ -5,11 +5,19 @@ foreach(mode args no_args fail_init)
   elseif(mode STREQUAL "fail_init")
     set(args fail-init)
   endif()
+  # The native run is the control: it shows that what the fixture expects at process attach is what Microsoft's UCRT
+  # does. Through an emulator (RUNNER, the cross build's Wine) the C runtime is the emulator's own, and Wine's ucrtbase
+  # has __argc, __argv and __wargv set before process attach (wine-staging 11.21), so the control cannot hold there:
+  # it is reported and not required. The run through the loader below is checked on every host.
   if(NOT mode STREQUAL "fail_init")
     execute_process(COMMAND ${RUNNER} "${GUEST}" ${args} TIMEOUT 90
       RESULT_VARIABLE native_code OUTPUT_VARIABLE native_output ERROR_VARIABLE native_error)
     if(NOT native_code STREQUAL "0" OR NOT native_output MATCHES "tiny_startup_cmdline: PASS")
-      message(FATAL_ERROR "Native startup command line (${mode}) returned ${native_code}\n${native_output}\n${native_error}")
+      if("${RUNNER}" STREQUAL "")
+        message(FATAL_ERROR "Native startup command line (${mode}) returned ${native_code}\n${native_output}\n${native_error}")
+      endif()
+      message(STATUS "SKIP the native control (${mode}): it returned ${native_code} through ${RUNNER}, "
+        "whose C runtime is not Microsoft's")
     endif()
   endif()
   execute_process(

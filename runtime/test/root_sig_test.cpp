@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "d3d12_xs_rootsig.h"
+#include "host_wine.h"
 #include "shims.h"
 
 namespace {
@@ -621,13 +622,35 @@ void test_deserializer() {
         check(rewrote && out.size() == zero_hash.size() && std::memcmp(out.data() + 4, kZero, 16) == 0,
               "blob helper rewrites an all-zero-checksum Xbox blob and keeps its zero checksum");
 
-        ID3D12RootSignatureDeserializer* shim_zero = nullptr;
-        const HRESULT hr_zero = deserialize(zero_hash.data(), zero_hash.size(), IID_PPV_ARGS(&shim_zero));
-        check(SUCCEEDED(hr_zero) && shim_zero && shim_zero->GetRootSignatureDesc()->Flags == 0,
-              "shim deserializer accepts an all-zero-checksum Xbox blob with the high byte cleared");
-        if (shim_zero) shim_zero->Release();
+        // The shim forwards the cleared copy, so it can accept the blob only where the host takes a zero checksum.
+        // Microsoft's deserializer does. Wine's (vkd3d) refuses a container whose checksum is zeroed with E_INVALIDARG
+        // and takes the same one with its checksum intact (wine-staging 11.21), so the host is asked about the cleared
+        // copy directly, and Wine's refusal, and only Wine's, skips the check.
+        ID3D12RootSignatureDeserializer* host_zero = nullptr;
+        const HRESULT hr_host_zero =
+            D3D12CreateRootSignatureDeserializer(out.data(), out.size(), IID_PPV_ARGS(&host_zero));
+        if (host_zero) host_zero->Release();
+        if (FAILED(hr_host_zero) && hostwine::is_wine()) {
+            std::printf("SKIP shim deserializer accepts an all-zero-checksum Xbox blob with the high byte cleared "
+                        "(Wine's deserializer refuses a zero checksum)\n");
+        } else {
+            ID3D12RootSignatureDeserializer* shim_zero = nullptr;
+            const HRESULT hr_zero = deserialize(zero_hash.data(), zero_hash.size(), IID_PPV_ARGS(&shim_zero));
+            check(SUCCEEDED(hr_zero) && shim_zero && shim_zero->GetRootSignatureDesc()->Flags == 0,
+                  "shim deserializer accepts an all-zero-checksum Xbox blob with the high byte cleared");
+            if (shim_zero) shim_zero->Release();
+        }
 
-        if (versioned) {
+        // The versioned entry point forwards the same cleared copy to the host's versioned deserializer, which under
+        // Wine refuses the zero checksum too, so that one is asked the same way.
+        ID3D12VersionedRootSignatureDeserializer* host_v_zero = nullptr;
+        const HRESULT hr_host_v_zero =
+            D3D12CreateVersionedRootSignatureDeserializer(out.data(), out.size(), IID_PPV_ARGS(&host_v_zero));
+        if (host_v_zero) host_v_zero->Release();
+        if (versioned && FAILED(hr_host_v_zero) && hostwine::is_wine()) {
+            std::printf("SKIP versioned shim accepts an all-zero-checksum Xbox blob with the high byte cleared "
+                        "(Wine's deserializer refuses a zero checksum)\n");
+        } else if (versioned) {
             ID3D12VersionedRootSignatureDeserializer* v_zero = nullptr;
             const HRESULT v_hr_zero = versioned(zero_hash.data(), zero_hash.size(), IID_PPV_ARGS(&v_zero));
             const auto* desc = v_zero ? v_zero->GetUnconvertedRootSignatureDesc() : nullptr;

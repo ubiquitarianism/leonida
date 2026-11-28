@@ -100,6 +100,38 @@ unless you add the `x86_64-pc-windows-msvc` Rust target or pass a prebuilt stati
 `-DLEONIDA_XMA2_DECODER_LIB=<path>`, built yourself from this checkout's `runtime/xma_decoder` with the command in
 [runtime/xma_decoder/README.md](../runtime/xma_decoder/README.md).
 
+### What Wine answers differently
+
+Every import the loader does not shim binds to the host's DLLs, and under Wine those are Wine's own. A few of them
+answer differently from what the runtime's tests see on Windows. Measured on 2026-11-24 with wine-staging 11.21, a
+clang-cl and xwin build and an RTX 4070 Ti. A test that meets one of these prints a `SKIP` line saying what the host
+did, or avoids the difference on every host, and still checks the shim or the loader:
+
+- **bcrypt**: `BCryptOpenAlgorithmProvider` answers `0xC0000002` for an algorithm name it does not know, where
+  Windows answers `STATUS_NOT_FOUND`. The shim hands the host's status back, so `bcrypt_rng` compares the two.
+- **GameInput**: Wine's `GameInput.dll` loads, and its `GameInputCreate` answers `E_NOTIMPL`. `gameinput_host` checks
+  the import binding and skips the calls; a boot needs the SDL3-backed shim ([gameinput.md](gameinput.md)).
+- **Root signatures**: `D3D12CreateRootSignatureDeserializer` refuses a container whose checksum is zeroed
+  (`E_INVALIDARG`) and accepts the same container with its checksum intact; Windows accepts both. `root_sig` skips
+  that one check.
+- **C runtime startup**: Wine's `ucrtbase` has `__argc`, `__argv` and `__wargv` set before process attach. The
+  fixture of `run_startup_cmdline` expects them unset there, as on Windows, so its native control does not hold
+  through an emulator and is not required; the run through `gta6rt` is checked on every host.
+- **Reserve-only section views**: the first write to a `SEC_RESERVE` view goes through with no fault, and
+  `VirtualQuery` keeps reporting `MEM_RESERVE` for the page until something commits it. On Windows that write faults
+  and the XMem shim commits the page in its handler, which therefore never runs under Wine: a page the title has
+  written is usable there and still reported as reserved. `xmem` skips the reported state and protection there and
+  checks that the page is a read-write view that holds what was written.
+- **Guard pages**: a `PAGE_GUARD` page that starts exactly at the reading thread's `StackBase` loses its guard with
+  nothing raised; one page higher, the exception arrives. `dstorage` keeps its guard page inside an allocation of
+  its own, on every host.
+
+Two more differences still failed tests on that date. A file handle opened with `MAXIMUM_ALLOWED` reads and cannot
+write (`WriteFile` fails with error 6), and the file-system shim passes that mask to the host: six checks of
+`file_system`. The adapter `EnumWarpAdapter` returns is the hardware one, and `D3D12CreateDevice` on it succeeds at
+feature level 11_0 and answers `E_INVALIDARG` at 12_0 and 12_1: `device_proxy` and `device_proxy_trace` stop at device
+creation.
+
 ### Why there is no native Linux `gta6rt`
 
 A native (ELF) loader is not a matter of build flags:

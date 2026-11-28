@@ -429,8 +429,9 @@ returns the hardware adapter, so "WARP" is vkd3d-proton on the GPU. Most tests t
 skip that comparison under Wine and Proton (`runtime/test/host_wine.h`), and most of them still check the layer
 against Microsoft's answers recorded in the test (`d3d12_subresource_copy` and `d3d12_private_data` keep theirs in
 `d3d12_subresource_copy_answers.h` and `d3d12_private_data_answers.h`).
-A few still compare with the host (`root_sig`, `device_proxy`, and some of `d3d12_vulkan_device`'s cases), so some
-of those fail for that reason.
+A few still compare with the host (`device_proxy`, and some of `d3d12_vulkan_device`'s cases), so some of those fail
+for that reason. [linux.md](linux.md#what-wine-answers-differently) lists what Wine's other libraries answer
+differently and which tests skip a check for it.
 
 ### Run a Windows CI artifact under Wine
 
