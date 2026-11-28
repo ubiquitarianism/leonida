@@ -169,6 +169,9 @@ struct VulkanDeviceInfo {
     bool occlusion_query_precise = false;
     bool prepare_on_bind = false;
     bool cold_graphics_compile = false;  // Driver supports a cache-only create and reports when compilation is pending.
+    // pipelineCreationCacheControl is on for the heavy pipeline cache (src/heavy_pipeline_cache.h): a pipeline the
+    // offline cache does not have is created against the cache of pipeline_cache.heavy.bin, written back as it grows.
+    bool heavy_pipeline_cache = false;
     bool pipeline_statistics_query = false;
     bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
     // VK_KHR_swapchain_maintenance1 (or VK_EXT_swapchain_maintenance1) and its swapchainMaintenance1 feature are
@@ -328,6 +331,12 @@ bool title_shadow_buffer(ID3D12Resource* resource);
 std::uint64_t title_host_imports(ID3D12Device* device);
 // VirtualQuery calls made by the title-buffer shadows in their latest refresh. For tests.
 std::uint64_t title_shadow_refresh_queries(ID3D12Device* device);
+// The device's title windows now: how many and their bytes, how many were retired with their pages, and how many of
+// those still wait for the GPU before their memory is freed. For tests.
+struct TitleWindows {
+    std::uint64_t count = 0, bytes = 0, retired = 0, waiting = 0;
+};
+TitleWindows title_windows(ID3D12Device* device);
 // The trackers behind the title-buffer shadows and title windows (copies whose pages overlap or touch share one).
 // For tests.
 std::uint64_t title_shadow_trackers(ID3D12Device* device);
@@ -590,6 +599,11 @@ std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
 // nothing). Compute: at SetPipelineState; graphics: at each draw, with the render-target slots it binds (bit per slot)
 // and whether it binds a depth buffer.
 void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool depth_bound);
+// A LEONIDA_STUB_PIPELINES compute or mesh stub that `device` (a command list's attached device; null: any) created,
+// without a pipeline and so without an id above: its dispatches or mesh draws record nothing. none for every other
+// PSO, including a stub of another device and a PSO of another implementation, whose draws stay recording errors.
+enum class StubPipelineKind : std::uint8_t { none, compute, mesh };
+StubPipelineKind stub_pipeline_kind(ID3D12PipelineState* pipeline, IUnknown* device);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
 // The linked SPIR-V stage modules for a lazy pipeline (in recipe stages order); false when not a lazy pipeline.

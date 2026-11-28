@@ -2,11 +2,15 @@
 //
 //   - in-range records of every kind (draw, draw indexed, dispatch, mesh dispatch) come back bit-identical, and the
 //     pass counts nothing as clamped;
-//   - a garbage record is bounded (2^24 vertices, 2^26 vertex instances, 65 535 groups per dimension, 2^20 groups per
-//     dispatch) instead of asking for billions of groups;
+//   - a garbage record is bounded (2^26 vertex instances, 65 535 groups per dimension, 2^20 groups per dispatch)
+//     instead of asking for billions of groups, and a draw record of 2^23 vertices or more runs empty and free;
 //   - a counted batch clamps the count to max_command_count and empties the records past it;
 //   - a batch whose records fit but whose total work passes the 2^27 budget runs all but the records that no longer
-//     fit, so thousands of garbage records cannot run for seconds.
+//     fit, so thousands of garbage records cannot run for seconds;
+//   - a dispatch is bounded by the device's own maxComputeWorkGroupCount, not by Vulkan's minimum of 65 535: a real
+//     indirect dispatch of 70 000 x 1 x 1 groups (and of 65 535 in x or y, the old limit) through the clamped scratch
+//     runs every group exactly once (cs_group_marker.comp marks each one). The idea is from codec-d/cool_fox
+//     docs/findings.md ("blocky patches: indirect dispatches cut at 65,535 groups"); no code of theirs is used.
 //
 // A record that asks for billions of groups or vertices would run until the host resets the driver, so this test is
 // about the values the pass writes, never about running such a dispatch here: every case ends in a copy of the
@@ -17,6 +21,7 @@
 #include "vk_test_device.h"
 
 #include "../src/vulkan_indirect_clamp.h"
+#include "cs_group_marker_spv.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -98,6 +103,10 @@ struct Env {
         out.counters.records_clamped = after.records_clamped - before.records_clamped;
         out.counters.counts_clamped = after.counts_clamped - before.counts_clamped;
         out.counters.over_budget = after.over_budget - before.over_budget;
+        out.counters.dispatch_records = after.dispatch_records - before.dispatch_records;
+        out.counters.dispatch_wide = after.dispatch_wide - before.dispatch_wide;
+        out.counters.dispatch_widest = after.dispatch_widest;  // the largest so far: cases go from narrow to wide
+        out.counters.dispatch_cut = after.dispatch_cut - before.dispatch_cut;
         // The scratch is idle once the queue is; hand it back for the next case like a completed submission does.
         clamp.retire(VK_NULL_HANDLE, 0);
         clamp.collect();
@@ -167,17 +176,42 @@ int main() {
         CHECK(out.counters.records_clamped == 0 && out.counters.counts_clamped == 0);
     }
 
-    // 2. A draw that asks for four billion vertices in four billion instances is cut to 2^24 vertices, and the
-    //    instances to what keeps count * instances within 2^26.
+    // 2. A draw that asks for four billion vertices in four billion instances is an unfilled slot: it runs empty,
+    //    keeping its locations, and charges nothing.
     {
         const std::uint32_t values[4] = {0xFFFFFFF0u, 0xFFFFFFFFu, 4, 6};
         Clamped out{};
         CHECK(env.run(leonida::indirect_clamp_draw, 16, 1, 4, values, nullptr, out));
         const auto words = record(out, 0, 4);
-        CHECK(words[0] == leonida::indirect_clamp_max_vertices);
-        CHECK(words[1] == leonida::indirect_clamp_max_vertex_instances / leonida::indirect_clamp_max_vertices);
+        CHECK(words[0] == 0 && words[1] == 0);
         CHECK(words[2] == 4 && words[3] == 6);
-        CHECK(out.counters.records_clamped == 1);
+        CHECK(out.counters.records_clamped == 1 && out.counters.over_budget == 0);
+    }
+
+    // 2b. Just under the unfilled count a draw is a draw: its vertices stay, and its instances are cut to what keeps
+    //     count * instances within 2^26. At the unfilled count it runs empty.
+    {
+        const std::uint32_t most = leonida::indirect_clamp_unfilled_draw - 1;
+        const std::uint32_t values[4 * 2] = {most, 100, 0, 0, leonida::indirect_clamp_unfilled_draw, 1, 0, 0};
+        Clamped out{};
+        CHECK(env.run(leonida::indirect_clamp_draw, 16, 2, 4, values, nullptr, out));
+        const auto under = record(out, 0, 4);
+        CHECK(under[0] == most && under[1] == leonida::indirect_clamp_max_vertex_instances / most);
+        CHECK(record(out, 1, 4)[0] == 0 && record(out, 1, 4)[1] == 0);
+        CHECK(out.counters.records_clamped == 2);
+    }
+
+    // 2c. Garbage counts ahead of a real draw in one list: before, each was cut to 2^24 vertices and charged them, so
+    //     eight used up the 2^27 budget and every later draw ran empty. Now they are free and the real draw runs.
+    {
+        std::vector<std::uint32_t> values;
+        for (std::uint32_t r = 0; r < 16; ++r) values.insert(values.end(), {0x01000000u + r, 1, 0, 0});
+        const std::uint32_t valid[] = {300, 2, 3, 4};
+        values.insert(values.end(), valid, valid + 4);
+        Clamped out{};
+        CHECK(env.run(leonida::indirect_clamp_draw, 16, 17, 4, values.data(), nullptr, out));
+        CHECK(out.counters.over_budget == 0 && out.counters.records_clamped == 16);
+        CHECK(record(out, 16, 4) == std::vector<std::uint32_t>(valid, valid + 4));
     }
 
     // 3. A counted draw: the count is clamped to max_command_count, and the records past min(count, max) are empty.
@@ -210,14 +244,23 @@ int main() {
         CHECK(out.counters.counts_clamped == 1);
     }
 
-    // 4. An indexed draw keeps its two locations and its first instance, and bounds its index count.
+    // 4. An indexed draw keeps its two locations and its first instance: an unfilled index count runs empty, and a
+    //    real one keeps its indices with the instances bounded.
     {
         const std::uint32_t values[5] = {0xFFFFFFFFu, 0xFFFFFFFFu, 10, 20, 30};
         Clamped out{};
         CHECK(env.run(leonida::indirect_clamp_draw_indexed, 20, 1, 5, values, nullptr, out));
         const auto words = record(out, 0, 5);
-        CHECK(words[0] == leonida::indirect_clamp_max_vertices);
-        CHECK(words[1] == leonida::indirect_clamp_max_vertex_instances / leonida::indirect_clamp_max_vertices);
+        CHECK(words[0] == 0 && words[1] == 0);
+        CHECK(words[2] == 10 && words[3] == 20 && words[4] == 30);
+        CHECK(out.counters.records_clamped == 1);
+    }
+    {
+        const std::uint32_t values[5] = {3000, 0xFFFFFFFFu, 10, 20, 30};
+        Clamped out{};
+        CHECK(env.run(leonida::indirect_clamp_draw_indexed, 20, 1, 5, values, nullptr, out));
+        const auto words = record(out, 0, 5);
+        CHECK(words[0] == 3000 && words[1] == leonida::indirect_clamp_max_vertex_instances / 3000);
         CHECK(words[2] == 10 && words[3] == 20 && words[4] == 30);
         CHECK(out.counters.records_clamped == 1);
     }
@@ -241,16 +284,40 @@ int main() {
         CHECK(out.counters.records_clamped == 1);
     }
 
-    // 6b. A dispatch over the per-dimension limit is cut there, and one over 2^20 groups in all runs empty.
+    // 6b. A dispatch over the device's per-dimension limit is cut there (y here; a device whose y limit is above 2^20
+    //     runs it empty instead, as more than 2^20 groups), and one over 2^20 groups in all runs empty.
     {
-        const std::uint32_t values[3 * 2] = {0x10000000u, 1, 1, 65535, 65535, 1};
+        const std::uint32_t max_y = leonida::indirect_clamp_dispatch_limit(properties.limits, 1);
+        const std::uint32_t values[3 * 2] = {1, 0x10000000u, 1, 65535, 65535, 1};
         Clamped out{};
         CHECK(env.run(leonida::indirect_clamp_dispatch, 12, 2, 3, values, nullptr, out));
         const auto per_dimension = record(out, 0, 3);
-        CHECK(per_dimension[0] == leonida::indirect_clamp_max_group_dimension && per_dimension[1] == 1 &&
-              per_dimension[2] == 1);
+        if (max_y <= leonida::indirect_clamp_max_groups)
+            CHECK(per_dimension[0] == 1 && per_dimension[1] == max_y && per_dimension[2] == 1);
+        else
+            CHECK(all_zero(per_dimension));
         CHECK(all_zero(record(out, 1, 3)));
         CHECK(out.counters.records_clamped == 2);
+        // The dispatch counters: both records, neither wider than 65 535 in x, and the first cut at the device's
+        // limit where it still runs.
+        CHECK(out.counters.dispatch_records == 2 && out.counters.dispatch_wide == 0);
+        CHECK(out.counters.dispatch_cut == (max_y <= leonida::indirect_clamp_max_groups ? 1u : 0u));
+    }
+
+    // 6c. x within the device's limit is not cut at 65 535: 70 000 groups (fewer than 2^20) come back as asked on a
+    //     device that runs them, and are cut at its limit on one that does not.
+    {
+        const std::uint32_t max_x = leonida::indirect_clamp_dispatch_limit(properties.limits, 0);
+        const std::uint32_t values[3] = {70000, 1, 1};
+        Clamped out{};
+        CHECK(env.run(leonida::indirect_clamp_dispatch, 12, 1, 3, values, nullptr, out));
+        const auto words = record(out, 0, 3);
+        CHECK(words[0] == std::min<std::uint32_t>(70000, max_x) && words[1] == 1 && words[2] == 1);
+        CHECK(out.counters.records_clamped == (max_x >= 70000 ? 0u : 1u));
+        // Counted as wider than 65 535 where it runs so, and as cut at the device's limit where it is cut.
+        CHECK(out.counters.dispatch_records == 1 && out.counters.dispatch_wide == (max_x >= 70000 ? 1u : 0u));
+        CHECK(out.counters.dispatch_widest == std::min<std::uint32_t>(70000, max_x));
+        CHECK(out.counters.dispatch_cut == (max_x >= 70000 ? 0u : 1u));
     }
 
     // 7. A console mesh dispatch uses only x.
@@ -300,7 +367,7 @@ int main() {
 
     // Three calls on one list consume two full draw allowances. A fresh list starts at zero.
     {
-        const std::uint32_t args[] = {1u << 24, 4, 0, 0};
+        const std::uint32_t args[] = {1u << 22, 16, 0, 0};  // 2^26 units: half the list budget, a real draw
         std::memcpy(env.arguments_map, args, sizeof(args));
         auto batch = clamp.batch();
         leonida::ClampedIndirect jobs[4]{};
@@ -331,7 +398,7 @@ int main() {
     //    clamped, none falls back to the application's buffer; the calls past the slots only lose their counters.
     {
         std::memset(env.arguments_map, 0, size_t(env.argument_bytes));
-        const std::uint32_t huge[4] = {0xFFFFFFF0u, 0xFFFFFFFFu, 4, 6};
+        const std::uint32_t huge[4] = {0x00400000u, 0xFFFFFFFFu, 4, 6};  // 2^22 vertices: a draw, its instances cut
         std::memcpy(env.arguments_map, huge, sizeof huge);
         std::memset(env.readback_map, 0xcd, size_t(env.readback_bytes));
         const auto before = clamp.counters();
@@ -362,10 +429,110 @@ int main() {
             });
             CHECK(ok);
             const auto* words = static_cast<const std::uint32_t*>(env.readback_map);
-            CHECK(words[0] == leonida::indirect_clamp_max_vertices && words[2] == 4 && words[3] == 6);
+            CHECK(words[0] == 0x00400000u &&
+                  words[1] == leonida::indirect_clamp_max_vertex_instances / 0x00400000u && words[2] == 4 &&
+                  words[3] == 6);
         }
         clamp.retire(VK_NULL_HANDLE, 0);
         clamp.collect();
+    }
+
+    // 10. Real indirect dispatches through the clamped scratch: every group runs exactly once. 70 000 x 1 x 1 is past
+    //     the old fixed 65 535 (the groups past it never ran, leaving their output stale); 65 535 in x and in y are
+    //     exactly at it. A size past this device's own limit is skipped: the clamp cuts it there by design.
+    {
+        const auto vkfn = [&](const char* name) { return device.device_proc(device.device, name); };
+        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        module_info.codeSize = sizeof(leonida::cs_group_marker_spirv);
+        module_info.pCode = leonida::cs_group_marker_spirv;
+        VkShaderModule module = VK_NULL_HANDLE;
+        CHECK(reinterpret_cast<PFN_vkCreateShaderModule>(vkfn("vkCreateShaderModule"))(device.device, &module_info,
+                                                                                       nullptr, &module) == VK_SUCCESS);
+        struct MarkerPush {
+            VkDeviceAddress marks;
+            std::uint32_t groups;
+            std::uint32_t pad;
+        };
+        const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MarkerPush)};
+        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &range;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        CHECK(reinterpret_cast<PFN_vkCreatePipelineLayout>(vkfn("vkCreatePipelineLayout"))(
+                  device.device, &layout_info, nullptr, &layout) == VK_SUCCESS);
+        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = module;
+        pipeline_info.stage.pName = "main";
+        pipeline_info.layout = layout;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        CHECK(reinterpret_cast<PFN_vkCreateComputePipelines>(vkfn("vkCreateComputePipelines"))(
+                  device.device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) == VK_SUCCESS);
+
+        constexpr std::uint32_t kMostGroups = 70000;
+        void* marks_map = nullptr;
+        const VkBuffer marks = device.buffer(VkDeviceSize(kMostGroups + 1) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                             &marks_map);
+        CHECK(marks && marks_map && pipeline);
+        struct Case {
+            std::uint32_t x, y, z;
+        };
+        const Case cases[] = {{70000, 1, 1}, {65535, 1, 1}, {1, 65535, 1}};
+        for (const Case& c : cases) {
+            if (!marks || !pipeline) break;
+            const std::uint32_t groups = c.x * c.y * c.z;
+            if (c.x > leonida::indirect_clamp_dispatch_limit(properties.limits, 0) ||
+                c.y > leonida::indirect_clamp_dispatch_limit(properties.limits, 1) ||
+                c.z > leonida::indirect_clamp_dispatch_limit(properties.limits, 2)) {
+                std::printf("indirect_clamp_test: %u x %u x %u is past this device's maxComputeWorkGroupCount; "
+                            "skipped\n", c.x, c.y, c.z);
+                continue;
+            }
+            const std::uint32_t args[3] = {c.x, c.y, c.z};
+            std::memset(env.arguments_map, 0, size_t(env.argument_bytes));
+            std::memcpy(env.arguments_map, args, sizeof args);
+            std::memset(marks_map, 0, size_t(kMostGroups + 1) * 4);
+            {
+                auto batch = clamp.batch();
+                leonida::ClampedIndirect job{};
+                CHECK(batch->prepare(env.arguments, 0, VK_NULL_HANDLE, 0, leonida::indirect_clamp_dispatch, 12, 1,
+                                     job));
+                const MarkerPush push{device.device_address(marks), groups, 0};
+                CHECK(device.run([&](VkCommandBuffer cb) {
+                    clamp.emit(cb, job);  // its last barrier orders the records before the indirect read
+                    reinterpret_cast<PFN_vkCmdBindPipeline>(vkfn("vkCmdBindPipeline"))(
+                        cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+                    reinterpret_cast<PFN_vkCmdPushConstants>(vkfn("vkCmdPushConstants"))(
+                        cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
+                    reinterpret_cast<PFN_vkCmdDispatchIndirect>(vkfn("vkCmdDispatchIndirect"))(cb, job.buffer,
+                                                                                                job.offset);
+                    VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                    host.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                    host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                    device.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(
+                        cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr,
+                        0, nullptr);
+                    return true;
+                }));
+            }
+            clamp.retire(VK_NULL_HANDLE, 0);
+            clamp.collect();
+            const auto* m = static_cast<const std::uint32_t*>(marks_map);
+            std::uint32_t once = 0, never = 0, twice = 0;
+            for (std::uint32_t g = 0; g < groups; ++g) {
+                if (m[g] == 1) ++once;
+                else if (m[g] == 0) ++never;
+                else ++twice;
+            }
+            if (once != groups || m[groups] != 0)
+                std::fprintf(stderr, "indirect_clamp_test: %u x %u x %u: %u group(s) ran once, %u never, %u more than "
+                             "once, %u past the end\n", c.x, c.y, c.z, once, never, twice, m[groups]);
+            CHECK(once == groups && never == 0 && twice == 0 && m[groups] == 0);
+        }
+        reinterpret_cast<PFN_vkDestroyPipeline>(vkfn("vkDestroyPipeline"))(device.device, pipeline, nullptr);
+        reinterpret_cast<PFN_vkDestroyPipelineLayout>(vkfn("vkDestroyPipelineLayout"))(device.device, layout, nullptr);
+        reinterpret_cast<PFN_vkDestroyShaderModule>(vkfn("vkDestroyShaderModule"))(device.device, module, nullptr);
     }
 
     // Every case above ran under validation when LEONIDA_VK_VALIDATION=1.

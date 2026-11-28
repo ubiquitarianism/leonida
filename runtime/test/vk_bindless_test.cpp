@@ -967,7 +967,14 @@ int main(int argc, char** argv) {
         std::vector<std::uint32_t> filled;
         for (std::uint32_t i = 1; i < set.image_capacity(ImageDimension::dim_1d); ++i)
             filled.push_back(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL));
-        EXPECT(filled.front() == 1 && filled.back() == set.image_capacity(ImageDimension::dim_1d) - 1);
+        // Images without storage views take the indices above the storage arrays first, then the ones below: every
+        // index but the fallback's, once each.
+        std::vector<std::uint32_t> sorted = filled;
+        std::sort(sorted.begin(), sorted.end());
+        EXPECT(sorted.front() == 1 && sorted.back() == set.image_capacity(ImageDimension::dim_1d) - 1 &&
+               std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end());
+        const std::uint32_t storage_end = set.storage_capacity(ImageDimension::dim_1d);
+        EXPECT(filled.front() == (storage_end < set.image_capacity(ImageDimension::dim_1d) ? storage_end : 1u));
         EXPECT(set.free_images(ImageDimension::dim_1d) == 0);
         EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 0);
         set.remove_image(ImageDimension::dim_1d, 7);

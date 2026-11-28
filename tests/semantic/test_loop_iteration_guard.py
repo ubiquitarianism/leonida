@@ -32,18 +32,17 @@ class LoopGuardTests(unittest.TestCase):
         for lanes in (32, 64):
             with self.subTest(lanes=lanes):
                 (plain, plain_flow), (guarded, flow) = module(lanes, 0), module(lanes, 16)
-                expected_flow = "structured" if lanes == 32 else "emulated wave64 rounds"
+                # A single-wave emulated program keeps the structured form (no round fallback for `inline_all`).
+                expected_flow = "structured" if lanes == 32 else "emulated wave64 structured"
                 self.assertEqual((plain_flow, flow), (expected_flow, expected_flow))
                 self.assertNotIn("%loop_guard_", plain)
                 self.assertIn("%loop_guard_", guarded)
                 self.assertEqual(execute(plain, lanes, 6), [6] * lanes)
                 self.assertEqual(execute(guarded, lanes, 6), [6] * lanes)
-                # Round zero initializes the guest PC. Each remaining round adds two.
-                expected = 32 if lanes == 32 else 30
-                self.assertEqual(execute(guarded, lanes, 1), [expected] * lanes)
+                self.assertEqual(execute(guarded, lanes, 1), [32] * lanes)
 
     def test_round_budget_uses_the_scheduler_exit(self):
-        text, flow = module(64, 16)
+        text, flow = module(64, 16, structured=False)
         self.assertEqual(flow, "emulated wave64 rounds")
         # Counters and synchronization execute on the final round too. The guard
         # augments the scheduler's termination condition at its original branch.

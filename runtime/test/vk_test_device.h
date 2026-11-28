@@ -123,6 +123,7 @@ public:
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
     bool prepare_on_bind=false;
     bool cold_graphics_compile = false;
+    bool heavy_pipeline_cache = false;  // LEONIDA_HEAVY_PIPELINE_CACHE_MS set and pipelineCreationCacheControl on
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
     bool request_multi_draw_indirect = false, request_draw_indirect_count = false;
     bool draw_indirect_count_enabled = false;
@@ -412,8 +413,13 @@ private:
         // (zero-based VS ids) is in; harmless before.
         const char* compile_mode = std::getenv("LEONIDA_PIPELINE_COMPILE");
         const bool cache_only = compile_mode && std::strcmp(compile_mode, "cache-only") == 0;
-        v13_.enable_pipeline_cache_control = cache_only && v13_.core && v13_.pipeline_cache_control;
-        cold_graphics_compile = v13_.enable_pipeline_cache_control;
+        // LEONIDA_HEAVY_PIPELINE_CACHE_MS other than 0: the heavy pipeline cache path, as the runtime takes it by default
+        // (src/heavy_pipeline_cache.h). Tests leave it off unless asked.
+        const char* heavy_ms = std::getenv("LEONIDA_HEAVY_PIPELINE_CACHE_MS");
+        const bool heavy = heavy_ms && *heavy_ms && std::strcmp(heavy_ms, "0") != 0;
+        v13_.enable_pipeline_cache_control = (cache_only || heavy) && v13_.core && v13_.pipeline_cache_control;
+        cold_graphics_compile = cache_only && v13_.enable_pipeline_cache_control;
+        heavy_pipeline_cache = heavy && v13_.enable_pipeline_cache_control;
         prepare_on_bind = compile_mode && std::strcmp(compile_mode, "on-demand") == 0;
         VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                                   v13_.enable(conditional_rendering ? &enable_conditional : nullptr)};

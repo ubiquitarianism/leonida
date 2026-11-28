@@ -239,14 +239,15 @@ struct SetLayout {
     SetLayout& operator=(const SetLayout&) = delete;
 };
 
-// What size_bindings() grows to where the device's limits allow. At 32-64 bytes a descriptor the whole set is then
-// 5-10 MiB with 153697 descriptors when all MS classes and array bindings reach their limits (an RTX 5070).
-inline constexpr std::uint32_t max_2d_images = 65536;
-// The other single-sample dimensions: a title streams far more cube maps and texture arrays (and 1D lookup
-// textures) than the 1024 and 256 of the defaults, each distinct T# of one taking its own index.
-inline constexpr std::uint32_t max_2d_array_images = 16384;
-inline constexpr std::uint32_t max_3d_images = 4096;
-inline constexpr std::uint32_t max_1d_images = 4096;
+// What size_bindings() grows the sampled array of every single-sample dimension (2D, 2D array, 3D and 1D) to where
+// the device's limits allow: one size for all of them. Which dimensions its textures have is the title's choice, and
+// an image keeps its index (one for each distinct T# of it) for as long as the texture lives, so no dimension gets
+// less room than another: a world run kept 4090 live 1D textures, the whole of the 4096 1D indices the set once
+// stopped at, while the 2D arrays had room to spare. The bound is the set's memory, not the device's descriptor
+// limits (8388606 sampled images on RADV): every element of every array is in each generation's descriptor pool,
+// used or not. At 32-64 bytes a descriptor the whole set is 10-20 MiB with 325729 descriptors when all MS classes
+// and arrays reach their limits (an RTX 5070).
+inline constexpr std::uint32_t max_images = 65536;
 inline constexpr std::uint32_t max_storage_indices = 4096;  // in each storage array, at most its dimension's images
 // A full D3D12 shader-visible sampler heap (2048) and room for literal and static S#s, within what the device can
 // create (maxSamplerAllocationCount, at least 4000) less the samplers that are not in the set.
@@ -261,7 +262,8 @@ inline constexpr std::uint32_t growth_headroom = 64;
 // standalone samplers do not, though they count in an update-after-bind pool.
 //   1. The default counts, or as much of them as the device holds: samplers, then storage, then 2D images.
 //   2. The MS pairs that fit beside them (limit_ms_bindings, which may turn classes off).
-//   3. Growth towards the maximums above, in the same order, then the 2D-array, 3D and 1D images, within
+//   3. Growth towards the maximums above, in the same order, then the 2D-array, 3D and 1D images together (one
+//      count for the three, so a device whose limits stop growth short of max_images favours none of them), within
 //      maxPerSetDescriptors. That limit only says what is sure to work (vkGetDescriptorSetLayoutSupport may allow
 //      more), so it never shrinks step 1.
 // A storage array holds the smaller of the storage count and its dimension's sampled count: add_image never
@@ -363,11 +365,23 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     const std::uint32_t creatable =
         limits.maxSamplerAllocationCount - std::min(limits.maxSamplerAllocationCount, reserved_samplers);
     grow(samplers, std::max(samplers, std::min(max_samplers, creatable)), growth_headroom, set_limit);
-    grow(images, std::max(images, max_2d_images), growth_headroom, set_limit);
+    grow(images, std::max(images, max_images), growth_headroom, set_limit);
     grow(storage, std::max(storage, max_storage_indices), growth_headroom, set_limit);
-    grow(arrays, std::max(arrays, max_2d_array_images), growth_headroom, set_limit);
-    grow(volumes, std::max(volumes, max_3d_images), growth_headroom, set_limit);
-    grow(lines, std::max(lines, max_1d_images), growth_headroom, set_limit);
+    // The other three dimensions grow as one: each gets the larger of its count so far and the shared one.
+    const std::uint32_t arrays_before = arrays, volumes_before = volumes, lines_before = lines;
+    std::uint32_t together = 0;
+    const auto set_together = [&](std::uint32_t n) {
+        arrays = std::max(arrays_before, n);
+        volumes = std::max(volumes_before, n);
+        lines = std::max(lines_before, n);
+    };
+    for (std::uint32_t high = max_images; together < high;) {
+        const std::uint32_t n = together + (high - together + 1) / 2;
+        set_together(n);
+        if (fits(growth_headroom, set_limit)) together = n;
+        else high = n - 1;
+    }
+    set_together(together);
     apply(true);
     return full;
 }
@@ -484,7 +498,7 @@ public:
         StorageViews storage{};
     };
 
-    // Gives an image an index in its dimension's bindings: 0 when the dimension is full. `sampled` goes to the
+    // Gives an image an index in its dimension's bindings: 0 when the dimension is full (image_refusal says why). `sampled` goes to the
     // sampled array in `sampled_layout` (the layout the image is in when shaders read it); the storage views go to
     // the storage arrays in GENERAL. For MS views, sampled_class selects the float, uint or sint sampled array.
     // `mirror` adds the same index in the 2D arrays (a 2D-array or cube image's slice 0): the slot must then be free
@@ -551,6 +565,23 @@ public:
                                  : 0);
         }
         return index;
+    }
+
+    // Why add_image returned 0 for an image of `dimension` (with storage views when `stores`; sampled_class for the
+    // MS dimensions): the set has no array for it; every index of its dimension is taken (array_full: in use, or
+    // removed and held until the next flush that brings the table up to date); or only the storage arrays' shorter
+    // range is, which an image with storage views needs an index in (storage_full).
+    enum class ImageRefusal { no_array, array_full, storage_full };
+    ImageRefusal image_refusal(ImageDimension dimension, bool stores, std::uint32_t sampled_class = 0) const {
+        if (!stores && bindless::sampled_binding(dimension) == bindless::no_binding) return ImageRefusal::no_array;
+        if (bindless::multisampled(dimension) && (stores || !supports_ms_class(sampled_class)))
+            return ImageRefusal::no_array;
+        const auto& used = image_used_[std::uint32_t(dimension)];
+        const std::size_t low_end = std::min<std::size_t>(used.size(), storage_capacity(dimension));
+        const auto storage_end = used.begin() + std::ptrdiff_t(low_end);
+        const bool storage_free = low_end > 1 && std::find(used.begin() + 1, storage_end, std::uint8_t(0)) != storage_end;
+        return stores && !storage_free && free_images(dimension) ? ImageRefusal::storage_full
+                                                                 : ImageRefusal::array_full;
     }
 
     // New views or a new layout for an index add_image returned (a texture's state changed, say). `mirror` is

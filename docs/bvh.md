@@ -1125,7 +1125,10 @@ elements, so with N elements there are at most (3N - 2) / 4 nodes. `XdxrLayout` 
 sizes for that many when the build is recorded, and the same numbers answer
 `GetRaytracingAccelerationStructurePrebuildInfo`. The header's `totalSizeIn64BNodes` counts only the nodes the build
 wrote.
-A triangle with a NaN vertex gets an empty box (D3D12 treats it as inactive). So do an instance with mask 0, one with
+A triangle with a NaN vertex gets an empty box (D3D12 treats it as inactive). So does a triangle with a vertex
+index at or past the geometry's `VertexCount` (every triangle when it is 0): the builder reads no vertex for it, as
+the index would address past the vertex buffer, possibly by gigabytes (`vk_xdxr_build_test` case
+`blas_vertex_count`). So do an instance with mask 0, one with
 no BLAS and one with a singular transform. An instance record holds its BLAS address in 256-byte units in 32 bits,
 so BLAS addresses must be below 2^40, as console GPU addresses are. Where device addresses are wider (llvmpipe's are
 host pointers), the builder takes a bias that is added to the addresses read from instance descs.

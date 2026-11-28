@@ -1,6 +1,7 @@
 #pragma once
 
 #include "title_page_watch.h"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <vector>
@@ -72,7 +73,22 @@ inline void note_released(std::uintptr_t begin, std::uintptr_t end) {
     std::lock_guard subscribers_lock(s.subscribers_mutex);
     for (ReleaseQueue* q : s.subscribers) {
         std::lock_guard lock(q->mutex);
-        if (q->ranges.size() < 65536) {
+        bool room = q->ranges.size() < 65536;
+        if (!room) {
+            // Full: first the ranges that overlap or touch become one (unmaps report page runs, often neighbours), and
+            // only when that leaves it more than half full does it all become one covering range.
+            std::sort(q->ranges.begin(), q->ranges.end());
+            std::size_t kept = 0;
+            for (std::size_t i = 1; i < q->ranges.size(); ++i) {
+                if (q->ranges[i].first <= q->ranges[kept].second)
+                    q->ranges[kept].second = (std::max)(q->ranges[kept].second, q->ranges[i].second);
+                else
+                    q->ranges[++kept] = q->ranges[i];
+            }
+            q->ranges.resize(kept + 1);
+            room = q->ranges.size() <= 32768;
+        }
+        if (room) {
             q->ranges.emplace_back(begin, end);
         } else {
             std::uintptr_t merged_lo = begin;

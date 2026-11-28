@@ -80,8 +80,6 @@
 #include <new>
 #include <vector>
 #include <memory>
-#include <mutex>
-#include <new>
 #include <utility>
 #include <vector>
 
@@ -1195,7 +1193,71 @@ struct ChildProxy {
     // Queues only: the gate and write fences of list memory waits and writes (d3d12_xs_list_values.h), made at the
     // first submission that needs them, under queue_order.
     std::shared_ptr<list_values::QueueValues> values;
+    ChildKind kind = ChildKind::allocator;
+    ChildProxy* live_next = nullptr;  // protected by g_live_child_lock; no identity-tracking allocation
 };
+
+SRWLOCK g_live_child_lock = SRWLOCK_INIT;
+constexpr std::size_t kLiveChildBuckets = 256;
+ChildProxy* g_live_children[kLiveChildBuckets]{};
+
+std::size_t live_child_bucket(const void* object) {
+    const auto address = reinterpret_cast<std::uintptr_t>(object);
+    return ((address >> 4) ^ (address >> 12)) & (kLiveChildBuckets - 1);
+}
+
+void register_live_child(ChildProxy* child) {
+    AcquireSRWLockExclusive(&g_live_child_lock);
+    auto& head = g_live_children[live_child_bucket(child)];
+    child->live_next = head;
+    head = child;
+    ReleaseSRWLockExclusive(&g_live_child_lock);
+}
+
+void unregister_live_child(ChildProxy* child) {
+    AcquireSRWLockExclusive(&g_live_child_lock);
+    for (auto** at = &g_live_children[live_child_bucket(child)]; *at; at = &(*at)->live_next) {
+        if (*at != child) continue;
+        *at = child->live_next;
+        child->live_next = nullptr;
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_live_child_lock);
+}
+
+// Identity is the live allocation and its kind, not a candidate's first word. Hold the shared lock while a
+// reference is acquired so destruction cannot free the allocation; a zero count must never be resurrected.
+template <ChildKind K>
+ChildProxy* pin_live_child(const void* candidate) {
+    ChildProxy* pinned = nullptr;
+    AcquireSRWLockShared(&g_live_child_lock);
+    for (auto* child = g_live_children[live_child_bucket(candidate)]; child; child = child->live_next) {
+        if (child != candidate || child->kind != K) continue;
+        auto refs = child->refs.load(std::memory_order_relaxed);
+        while (refs && refs != (std::numeric_limits<unsigned long>::max)()) {
+            if (child->refs.compare_exchange_weak(refs, refs + 1, std::memory_order_relaxed)) {
+                pinned = child;
+                break;
+            }
+        }
+        break;
+    }
+    ReleaseSRWLockShared(&g_live_child_lock);
+    return pinned;
+}
+
+template <ChildKind K>
+bool is_live_child(const void* candidate) {
+    bool found = false;
+    AcquireSRWLockShared(&g_live_child_lock);
+    for (const auto* child = g_live_children[live_child_bucket(candidate)]; child; child = child->live_next) {
+        if (child != candidate || child->kind != K) continue;
+        found = child->refs.load(std::memory_order_relaxed) != 0;
+        break;
+    }
+    ReleaseSRWLockShared(&g_live_child_lock);
+    return found;
+}
 
 template <ChildKind K>
 struct ChildStats {
@@ -1523,6 +1585,7 @@ std::uint64_t fence_completed_value_address(ChildProxy* self, std::uint64_t valu
 // reference keeps the fence alive, the event stays open (one handle per such fence) and a later completion sets
 // that event, not a closed or reused handle.
 void destroy_child(ChildProxy* self) {
+    unregister_live_child(self);  // no foreign Release callback runs under the registry lock
     IUnknown* real = self->real;
     DeviceProxy* device = self->device;
     FenceMirror* mirror = self->mirror.load(std::memory_order_acquire);
@@ -1551,6 +1614,12 @@ void destroy_child(ChildProxy* self) {
     if (device) proxy_release(device);
 }
 
+unsigned long release_child_reference(ChildProxy* self) {
+    const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (refs == 0) destroy_child(self);
+    return refs;
+}
+
 template <ChildKind K>
 unsigned long child_add_ref(ChildProxy* self) {
     note_child_slot<K>(1);
@@ -1560,9 +1629,7 @@ unsigned long child_add_ref(ChildProxy* self) {
 template <ChildKind K>
 unsigned long child_release(ChildProxy* self) {
     note_child_slot<K>(2);
-    const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
-    if (refs == 0) destroy_child(self);
-    return refs;
+    return release_child_reference(self);
 }
 
 // The interfaces the proxy answers: the base chain and the object's own interface.
@@ -1653,7 +1720,7 @@ IUnknown* list_real_or_null(const void* object);
 
 template <ChildKind K>
 bool is_child_proxy(const void* object) {
-    return object && *reinterpret_cast<void* const*>(object) == reinterpret_cast<void*>(get_child_vtable<K>());
+    return is_live_child<K>(object);
 }
 
 // The real object behind a heap, queue, fence or list proxy, or null when `object` is none of them.
@@ -1661,9 +1728,14 @@ IUnknown* proxy_real_object(const void* object) {
     if (!object) return nullptr;
     void* const vtable = *reinterpret_cast<void* const*>(object);
     if (vtable == reinterpret_cast<void*>(get_heap_vtable())) return static_cast<const HeapProxy*>(object)->real;
-    if (vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::queue>()) ||
-        vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::fence>()) ||
-        vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::allocator>()))
+    // Native objects take no registry lock or walk. A child-vtable match only selects the one identity lookup;
+    // matching bytes alone still do not establish that the candidate is a live child proxy.
+    if ((vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::queue>()) &&
+         is_child_proxy<ChildKind::queue>(object)) ||
+        (vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::fence>()) &&
+         is_child_proxy<ChildKind::fence>(object)) ||
+        (vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::allocator>()) &&
+         is_child_proxy<ChildKind::allocator>(object)))
         return static_cast<const ChildProxy*>(object)->real;
     if (IUnknown* real = list_real_or_null(object)) return real;
     return nullptr;
@@ -2289,6 +2361,12 @@ HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageB
     if (!map && rt::xmem::copy_page_mappings_fn) map = &copy_page_mappings_default;
     if (!map || !count) return S_OK;
     if (!batches || flags) return E_INVALIDARG;
+    // Which implementation remaps, once: a boot's read-fault reports belong to that route's tests.
+    static std::atomic<bool> route_logged{false};
+    if (!route_logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: CopyPageMappingsBatchX remaps through %s\n",
+                     map == &copy_page_mappings_default ? "xmem's range callback (copy_page_mappings_fn)"
+                                                        : "the installed batch hook (set_copy_page_mappings_hook)");
     auto* queue = reinterpret_cast<ID3D12CommandQueue*>(self->real);
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
@@ -2461,6 +2539,20 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         return fence_completed_value_address(self, a1, a2, a3);
     } else {
         note_child_slot<K>(Slot);
+        // A reentrant Release can drop the caller's last reference while this call is still forwarding.
+        // The internal references also contribute to AddRef and Release return counts until this call returns.
+        using Pin = std::unique_ptr<ChildProxy, decltype(&release_child_reference)>;
+        Pin queue_pin(nullptr, &release_child_reference), fence_pin(nullptr, &release_child_reference);
+        if constexpr (K == ChildKind::queue) {
+            queue_pin.reset(pin_live_child<ChildKind::queue>(self));
+            if (!queue_pin) return hr_to_u64(E_INVALIDARG);
+            if constexpr (Slot == kQueueSignal || Slot == kQueueWait || Slot == 16 || Slot == 17 ||
+                          Slot == 23 || Slot == 25)
+                fence_pin.reset(pin_live_child<ChildKind::fence>(reinterpret_cast<const void*>(a1)));
+        }
+        const auto fence_argument = [&]() {
+            return fence_pin ? fence_pin->real : proxy_real_object(reinterpret_cast<const void*>(a1));
+        };
         std::unique_lock<std::mutex> queue_order;
         // Both queue-order fixes: only work that orders on the queue takes queue_order. The markers do not, and
         // neither does slot 18 - an ExecuteCommandListsX holds it for its whole replay, which can include building a
@@ -2473,7 +2565,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         if constexpr (K == ChildKind::queue) {
             bool orders = queue_slot_orders_work(Slot);
             if (orders && (Slot == 16 || Slot == 17))
-                orders = proxy_real_object(reinterpret_cast<const void*>(a1)) != nullptr;
+                orders = fence_argument() != nullptr;
             if (orders && (Slot == 19 || Slot == 20)) {
                 const unsigned char own = self->queue_layout.load(std::memory_order_relaxed);
                 const bool newer = own == ChildProxy::kQueueLayoutNewer ||
@@ -2541,7 +2633,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 return own == ChildProxy::kQueueLayoutUnknown && shared == ChildProxy::kQueueLayoutNewer;
             }();
             if (Slot == 16 || Slot == 17) {
-                if (IUnknown* fence = proxy_real_object(reinterpret_cast<const void*>(a1))) {
+                if (IUnknown* fence = fence_argument()) {
                     self->queue_layout.store(ChildProxy::kQueueLayoutNewer, std::memory_order_relaxed);
                     self->device->console_layout.store(ChildProxy::kQueueLayoutNewer,
                                                        std::memory_order_relaxed);
@@ -2557,7 +2649,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                     self->device->console_layout.store(ChildProxy::kQueueLayoutOlder,
                                                        std::memory_order_relaxed);
                 }
-            } else if ((Slot == 14 || Slot == 15) && !proxy_real_object(reinterpret_cast<const void*>(a1)) &&
+            } else if ((Slot == 14 || Slot == 15) && !fence_argument() &&
                        newer) {
                 return hr_to_u64(S_OK);  // the newer layout's two inserted console methods, unmeasured
             }
@@ -2581,7 +2673,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 // alternative is the fence itself carrying the layout evidence, per the comment above; a
                 // proven-older queue still leaves slot 25 to the console-only no-op, since its fence-taking
                 // methods sit at 14/15/23 there.
-                if (IUnknown* fence = proxy_real_object(reinterpret_cast<const void*>(a1))) {
+                if (IUnknown* fence = fence_argument()) {
                     if (Slot == 25u && !newer) {
                         self->queue_layout.store(ChildProxy::kQueueLayoutNewer,
                                                  std::memory_order_relaxed);
@@ -2681,7 +2773,8 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                     self->real, reinterpret_cast<UINT64*>(a1)));
             }
         }
-        if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
+        if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait))
+            a1 = fence_pin ? reinterpret_cast<std::uint64_t>(fence_pin->real) : unwrap_object(a1);
         UnwrappedArray unwrapped_lists;
         if constexpr (K == ChildKind::queue && Slot == 10) {
             if (!unwrapped_lists.fill(a2, a1)) return hr_to_u64(E_OUTOFMEMORY);
@@ -2777,7 +2870,9 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
         proxy->slot_count = kAllocatorPublicSlots;
     }
     proxy->refs.store(1, std::memory_order_relaxed);
+    proxy->kind = K;
     proxy_add_ref(device);  // the object keeps its Xbox-ABI device alive for GetDevice
+    register_live_child(proxy);  // before QueryInterface publishes the output pointer
 
     const HRESULT hr = child_query_interface<K>(proxy, riid, out);
     if (FAILED(hr)) {
@@ -2840,6 +2935,32 @@ struct UploadArena {
 
 constexpr std::size_t kUploadChunkMin = 8 << 20;  // one chunk serves a title's whole frame of uploads
 
+// LEONIDA_UPLOAD_LOG=1 (diagnostic): each upload chunk (its CPU base, device address and size), and the first 96 and
+// then every 8192nd AllocateUploadMemory result as an offset into its chunk, so the addresses the title builds
+// descriptors from can be matched with the memory it was handed.
+inline bool upload_log() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_UPLOAD_LOG");
+        return v && *v == '1';
+    }();
+    return on;
+}
+inline void log_upload_result(const UploadChunk* chunk, std::uint64_t result, std::uint64_t size,
+                              std::uint64_t alignment) {
+    if (!upload_log() || !chunk) return;
+    static std::atomic<std::uint64_t> calls{0};
+    const std::uint64_t n = ++calls;
+    if (n > 96 && (n % 8192)) return;
+    const std::uint64_t base = reinterpret_cast<std::uint64_t>(chunk->cpu_base);
+    std::fprintf(stderr,
+                 "[rt] upload-log: #%llu result 0x%llx = chunk 0x%llx + offset 0x%llx (size %llu, alignment %llu; "
+                 "chunk device address 0x%llx)\n",
+                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(result),
+                 static_cast<unsigned long long>(base), static_cast<unsigned long long>(result - base),
+                 static_cast<unsigned long long>(size), static_cast<unsigned long long>(alignment),
+                 static_cast<unsigned long long>(chunk->gpu_base));
+}
+
 UploadChunk* upload_chunk_new(DeviceProxy* device, std::size_t size) {
     auto* chunk = new (std::nothrow) UploadChunk{};
     if (!chunk) return nullptr;
@@ -2865,6 +2986,24 @@ UploadChunk* upload_chunk_new(DeviceProxy* device, std::size_t size) {
         chunk->resource = resource;
         chunk->cpu_base = static_cast<std::uint8_t*>(cpu);
         chunk->gpu_base = resource->GetGPUVirtualAddress();
+        // LEONIDA_UPLOAD_ALIAS=1 (experiment): the title takes the pointer AllocateUploadMemory hands it for a GPU
+        // address too (the console's memory is unified) and writes it into the descriptors it builds itself. Entered in
+        // the title VA table, the chunk's CPU range answers with the chunk's console VA (its device address minus
+        // heap_base), so a V# the title wrote with such a pointer is rewritten to the chunk instead of left empty. A
+        // chunk below the arena has a negative console VA, usable in a V# only with LEONIDA_IMPORT_BELOW_ARENA=1.
+        static const bool alias = [] {
+            const char* v = std::getenv("LEONIDA_UPLOAD_ALIAS");
+            return v && *v == '1';
+        }();
+        if (alias) {
+            const bool added = leonida::title_va_aliases().add(reinterpret_cast<std::uint64_t>(chunk->cpu_base),
+                                                               chunk->size, chunk->gpu_base);
+            std::fprintf(stderr, "[rt] d3d12_xs: upload chunk 0x%llx (%llu bytes) entered as an alias of console VA "
+                                 "0x%llx: %s\n",
+                         static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(chunk->cpu_base)),
+                         static_cast<unsigned long long>(chunk->size), static_cast<unsigned long long>(chunk->gpu_base),
+                         added ? "ok" : "refused");
+        }
         return chunk;
     }
     if (resource) resource->Release();
@@ -2912,7 +3051,9 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
         const std::size_t aligned = (chunk->used + (alignment - 1)) & ~(static_cast<std::size_t>(alignment) - 1);
         if (aligned >= chunk->used && aligned <= chunk->size && need <= chunk->size - aligned) {
             chunk->used = aligned + need;
-            return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+            const std::uint64_t result = reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+            log_upload_result(chunk, result, size, alignment);
+            return result;
         }
     }
     const std::size_t chunk_size = need + alignment > kUploadChunkMin ? need + alignment : kUploadChunkMin;
@@ -2926,7 +3067,14 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
     arena->chunks = chunk;
     const std::size_t aligned = (alignment - 1) & ~(static_cast<std::size_t>(alignment) - 1);  // 0-based
     chunk->used = aligned + need;
-    return reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+    if (upload_log())
+        std::fprintf(stderr, "[rt] upload-log: new chunk at 0x%llx, device address 0x%llx, %llu bytes (%s)\n",
+                     static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(chunk->cpu_base)),
+                     static_cast<unsigned long long>(chunk->gpu_base), static_cast<unsigned long long>(chunk->size),
+                     chunk->resource ? "mapped upload buffer" : "VirtualAlloc fallback");
+    const std::uint64_t result = reinterpret_cast<std::uint64_t>(chunk->cpu_base + aligned);
+    log_upload_result(chunk, result, size, alignment);
+    return result;
 }
 
 // An address inside an upload chunk becomes the chunk's device address plus the offset; anything else — a
@@ -2949,6 +3097,9 @@ void destroy_upload_state(void* upload_state) {
     for (UploadChunk* chunk = arena->chunks; chunk;) {
         UploadChunk* next = chunk->next;
         if (chunk->resource) {
+            const char* alias = std::getenv("LEONIDA_UPLOAD_ALIAS");
+            if (alias && *alias == '1')
+                leonida::title_va_aliases().remove(reinterpret_cast<std::uint64_t>(chunk->cpu_base), chunk->gpu_base);
             chunk->resource->Unmap(0, nullptr);
             chunk->resource->Release();
         } else {

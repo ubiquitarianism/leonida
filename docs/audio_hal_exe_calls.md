@@ -52,6 +52,26 @@ turns such an address back into a pointer. That is an inference from the shapes;
 `XApuEnqueueCommand` and `XApuDequeueResult` share one handle global, which `XApuDisconnect` clears: a command queue
 with a result queue, connected once and torn down once. How `chad.dll`'s handle relates to it is not read.
 
+`runtime/shims/xapu_queue.cpp` serves the five `xapu.dll` imports and `runtime/shims/xapu_chad.cpp` the five
+`chad.dll` ones.
+The `xapu.dll` signatures, structure layouts, command kinds, option bits and error codes come from Marvisak/VIctory
+(<https://github.com/Marvisak/VIctory>, GPL-3.0-or-later, `crates/victory-hle/src/modules/apu.rs` at commit `ffe310e`),
+which runs the retail executable through these calls. Only the facts are used (see
+[related_projects.md](related_projects.md)); the top of `xapu_queue.cpp` lists them. They agree with the shapes above:
+
+| Shape measured here | What the layout says |
+|---|---|
+| `XApuConnect`: a 24-byte title global first, a 16-byte output second | the global is an input of six dwords (processing kind, streams, commands per stream, memory bytes, frames per output, options); the output is the zeroed memory and a result event |
+| `XApuEnqueueCommand`: a stack-built command whose first dword is 1, 2 or 3 and second a stream slot, then 0 | a 24-byte command id (kind, stream, sequence, options, context): 1 activates, 2 deactivates, 3 processes an Opus packet; the third argument is an optional count of the commands accepted |
+| `XApuDequeueResult`: a 0x50-byte result, read at +0, +4 and +0x34 | the command id at +0, the output byte count at +0x34; `0x8AC81001` while none is ready |
+| `XApuDisconnect`: the handle, then `0x20` | the second argument is not read |
+
+What the results carry is the shim's own: each accepted command gets one result in command order, with the error codes
+of the layout. A process result carries the frame count and PCM when `runtime/opus_decoder` is built, and otherwise the
+frame count of the Opus packet's table-of-contents byte (RFC 6716, section 3.1) with zeros in its output (silence).
+`xapu_chad_test` covers the layouts and the silent path; `xapu_opus_test` covers the decoded path with a generated
+packet.
+
 ## `xg_xs.dll` and `XCRDAPI.dll`
 
 | Import | Sites | What the sites show |

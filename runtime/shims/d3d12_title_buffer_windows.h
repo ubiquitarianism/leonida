@@ -38,6 +38,10 @@ class TitleBufferWindows {
     std::chrono::steady_clock::time_point failed_at_{};
     bool failed_ = false;
     bool local_refused_ = false;  // device-local blocks refused once: host memory from then on
+    // SystemMemory: where a device_local allocation goes instead (set_system_memory; GeometryViews from
+    // LEONIDA_GEOMETRY_HOST).
+    int system_memory_ = 0;
+    bool system_memory_logged_ = false;
     std::uint64_t quick_refusals_ = 0;
     // The blocks' (device address, capacity), readable without the owner's lock: published in order, a slot never
     // reused before release(). A destroyed block's slot keeps its other fields and only its address goes to 0 (the
@@ -73,7 +77,38 @@ class TitleBufferWindows {
         blocks_.erase(it);
     }
 
+    // The memory types a system-memory block may take: host-visible ones outside device-local memory (the GPU reads
+    // them over the bus), the write-back (cached) ones only when `cached`, else the write-combined ones only. None of
+    // them: every type `bits` allows (an integrated GPU, whose memory is all device-local).
+    template<class Device>
+    static std::uint32_t system_memory_types(const Device& d, std::uint32_t bits, bool cached) {
+        if constexpr (requires { d.memory.memoryTypes[0].propertyFlags; d.memory.memoryTypeCount; }) {
+            std::uint32_t host = 0, wanted = 0;
+            for (std::uint32_t i = 0; i < d.memory.memoryTypeCount && i < 32; ++i) {
+                if (!(bits & (1u << i))) continue;
+                const VkMemoryPropertyFlags f = d.memory.memoryTypes[i].propertyFlags;
+                if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+                    !(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                    continue;
+                host |= 1u << i;
+                if (bool(f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) == cached) wanted |= 1u << i;
+            }
+            return wanted ? wanted : host ? host : bits;
+        } else {
+            (void)d;
+            (void)cached;
+            return bits;
+        }
+    }
+
 public:
+    // Where blocks asked for as device_local go: kDeviceLocal (Resizable BAR while the driver gives it, the default),
+    // kSystemCached (host memory outside VRAM, write-back where the device offers it: what VIctory gives its copies
+    // of title memory) or kSystemUncached (host memory outside VRAM, write-combined). The GPU reads the system-memory
+    // kinds over the bus. Set before the first allocation.
+    static constexpr int kDeviceLocal = 0, kSystemCached = 1, kSystemUncached = 2;
+    void set_system_memory(int kind) { system_memory_ = kind; }
+    int system_memory() const { return system_memory_; }
     VkDeviceSize reserved() const { return reserved_; }
     // f(device address, capacity) for each live block; from any thread.
     template <class F>
@@ -186,10 +221,26 @@ public:
         // story load the driver refused every 4 MiB device-local, host-visible block with a device address
         // (VK_ERROR_OUT_OF_HOST_MEMORY, speed-8/-9) while host memory still served: once that happens, later blocks
         // go straight to host memory instead of through DeviceState::allocate's sleeping retries first.
+        // A device_local request under set_system_memory takes system memory instead, out of the types that are not
+        // device-local (memory_type_order would otherwise give the first host-visible type, which can be the BAR).
         VkMemoryPropertyFlags chosen = 0;
-        const bool want_local = device_local && !local_refused_;
-        b.memory = d.allocate(req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                              want_local ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0, &chosen, true);
+        const bool system = device_local && system_memory_ != kDeviceLocal;
+        const bool want_local = device_local && !local_refused_ && !system;
+        VkMemoryRequirements types = req;
+        if (system) types.memoryTypeBits = system_memory_types(d, req.memoryTypeBits, system_memory_ == kSystemCached);
+        b.memory = d.allocate(types, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                              want_local ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+                              : system && system_memory_ == kSystemCached ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT
+                                                                          : 0,
+                              &chosen, true);
+        if (b.memory && system && !system_memory_logged_) {
+            system_memory_logged_ = true;
+            std::fprintf(stderr, "[rt] d3d12: title buffer copies in system memory (LEONIDA_GEOMETRY_HOST): memory "
+                                 "flags 0x%x (%s, %s)\n",
+                         unsigned(chosen),
+                         (chosen & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "device-local: no other type" : "not VRAM",
+                         (chosen & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? "write-back" : "write-combined");
+        }
         if (b.memory && want_local && !(chosen & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
             local_refused_ = true;
             std::fprintf(stderr, "[rt] d3d12: title buffer windows: device-local memory refused a %llu KiB block; "

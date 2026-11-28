@@ -150,6 +150,7 @@ int main(int argc, char** argv) {
         rt::d3d12::VulkanDeviceInfo info{};
         info.prepare_on_bind=d.prepare_on_bind;
         info.cold_graphics_compile=d.cold_graphics_compile;
+        info.heavy_pipeline_cache=d.heavy_pipeline_cache;
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
         info.physical = d.physical;
@@ -161,6 +162,7 @@ int main(int argc, char** argv) {
         info.mesh_shader = mesh;
         info.mesh_shader_queries = mesh && d.mesh_shader_queries;
         info.pipeline_statistics_query = d.pipeline_statistics_query;
+        info.conservative_rasterization = d.conservative_rasterization;
         return info;
     };
     const auto make_device = [&](bool mesh, Ref<ID3D12Device>& device) {
@@ -253,6 +255,34 @@ int main(int argc, char** argv) {
         vs_stream.add(TopologySubobject{.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE});
         vs_stream.add(TargetsSubobject{.inner = one_target()});
         EXPECT(SUCCEEDED(create(device.p, vs_stream, vs_pso)));
+        // Conservative rasterization in a mesh pipeline: its stream has no input assembler, so it need not name a topology
+        // type. A vertex pipeline without TRIANGLE is still refused, as is a wireframe mesh one.
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof options)));
+            if (options.ConservativeRasterizationTier != D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED) {
+                std::printf("conservative rasterization tier %d: mesh pipelines checked\n", int(options.ConservativeRasterizationTier));
+                D3D12_RASTERIZER_DESC conservative{};
+                conservative.FillMode = D3D12_FILL_MODE_SOLID;
+                conservative.CullMode = D3D12_CULL_MODE_NONE;
+                conservative.DepthClipEnable = TRUE;
+                conservative.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+                Ref<ID3D12PipelineState> made;
+                Stream conservative_mesh = mesh_stream;
+                conservative_mesh.add(RasterizerSubobject{.inner = conservative});
+                EXPECT(SUCCEEDED(create(device.p, conservative_mesh, made)) && made.p);
+                conservative.FillMode = D3D12_FILL_MODE_WIREFRAME;
+                Stream wireframe_mesh = mesh_stream;
+                wireframe_mesh.add(RasterizerSubobject{.inner = conservative});
+                EXPECT(create(device.p, wireframe_mesh, refused) == E_INVALIDARG && !refused.p);
+                conservative.FillMode = D3D12_FILL_MODE_SOLID;
+                Stream no_topology_vs;
+                no_topology_vs.add(RootSubobject{.inner = root.p}).add(VsSubobject{.inner = vs}).add(PsSubobject{.inner = ps});
+                no_topology_vs.add(TargetsSubobject{.inner = one_target()});
+                no_topology_vs.add(RasterizerSubobject{.inner = conservative});
+                EXPECT(create(device.p, no_topology_vs, refused) == E_INVALIDARG && !refused.p);
+            }
+        }
         // A mesh shader translated before the graphics root window would read its root arguments from the wrong
         // dwords: refused, with a log line that asks for the shaders stage again.
         {

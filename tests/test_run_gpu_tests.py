@@ -431,11 +431,17 @@ class ComputeFeatureUnsupported(unittest.TestCase):
 
 
 class FilterWithoutRunnableCases(unittest.TestCase):
-    """A filter selecting only an input shader (cs_bench_mix) must not report 0/0 passed with exit 0."""
+    """Selecting only an input shader (cs_bench_mix) must not report 0/0 passed with exit 0."""
 
-    def run_filter(self, name, translate_rc=0, spv=True):
+    def run_filter(self, name, translate_rc=0, spv=True, *, replay=False):
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+            if replay:
+                listings = Path(tmp) / "listings"
+                listings.mkdir()
+                (listings / f"{name}.s").write_text("; synthetic\n", encoding="utf-8", newline="\n")
+                args.filter = ""
+                args.disasm_dir = str(listings)
 
             def translate(_cmd, env=None, gpu=True):
                 if spv:
@@ -459,6 +465,15 @@ class FilterWithoutRunnableCases(unittest.TestCase):
         self.assertIn("benchmark tool", err)
         self.assertIn("=== rdna2spirv.py ===", out)
         self.assertNotIn("0/0 passed", out)
+
+    def test_disassembly_replay_of_benchmark_input_reports_no_runnable_cases(self):
+        rc, out, err, assemble, run = self.run_filter("cs_bench_mix", replay=True)
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("--disasm-dir", err)
+        self.assertIn("selected cs_bench_mix but no runnable GPU test cases", err)
+        self.assertNotIn("0/0 passed", out)
+        assemble.assert_not_called()
+        run.assert_called_once()
 
     def test_translation_failure_stays_a_failure(self):
         rc, out, err, _, _ = self.run_filter("cs_bench_mix", translate_rc=1)
@@ -870,6 +885,56 @@ class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
         rc, rows, out = self.run_one("cs_imgstore", 0, "device: X\ncs_imgstore: 64 texels match\n")
         self.assertEqual((rc, rows), (0, []), out)
         self.assertIn("PASS  cs_imgstore           cs_imgstore: 64 texels match", out)
+
+
+class DumpRowThatExitsNonZero(unittest.TestCase):
+    """A "dump" row whose program printed the right words and then exited non-zero (validation errors, under the
+    validation layer) fails with the program's output, not with the words alone (TEST-GPU-OOB-AND-HARNESS-MSG)."""
+    ERROR = "validation: vkCmdDispatch(): Out of bounds: trying to write 4 bytes"
+
+    def run_one(self, name, code, printed):
+        envs = []
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name + ".asm", build=tmp, llvm_mc="unused", require_pass=False)
+
+            def launch(cmd, **kwargs):
+                if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                envs.append(kwargs.get("env") or {})
+                return SimpleNamespace(returncode=code, stdout=printed, stderr="")
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt.subprocess, "run", side_effect=launch),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                rc = rgt.run_suite(args, tmp)
+        return rc, output.getvalue(), envs
+
+    def test_the_fail_line_keeps_the_message(self):
+        words = "out[0..7] = " + " ".join(map(str, check.PK_MUL_LO_WORDS)) + "\n"
+        for name, printed in (("cs_pk_mul_lo_const", words), ("cs_user_sgprs", "out[0..7] = "
+                              + " ".join(map(str, check.USER_SGPRS_WORDS)) + "\n")):
+            with self.subTest(name=name):
+                rc, out, _ = self.run_one(name, 1, printed + self.ERROR + "\n")
+                self.assertEqual(rc, 1, out)
+                fail = [ln for ln in out.splitlines() if ln.startswith("  FAIL")]
+                self.assertEqual(len(fail), 1, out)
+                self.assertIn("exit 1:", fail[0], out)
+                self.assertIn(self.ERROR, out)
+
+    def test_the_words_alone_still_pass(self):
+        rc, out, _ = self.run_one("cs_pk_mul_lo_const", 0,
+                                  "out[0..7] = " + " ".join(map(str, check.PK_MUL_LO_WORDS)) + "\n")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS  cs_pk_mul_lo_const", out)
+
+    def test_pk_mul_lo_const_gets_its_128_words(self):
+        # 32 lanes store 16 bytes each: the default 64-word buffer let lanes 16-31 write past its end (GPU-AV).
+        _rc, out, envs = self.run_one("cs_pk_mul_lo_const", 0,
+                                      "out[0..7] = " + " ".join(map(str, check.PK_MUL_LO_WORDS)) + "\n")
+        self.assertEqual([e.get("VKC_OUT_WORDS") for e in envs], ["128"], out)
 
 
 class FmaFusedSuite(unittest.TestCase):

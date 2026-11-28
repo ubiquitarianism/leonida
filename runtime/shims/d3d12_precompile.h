@@ -8,6 +8,11 @@
 // (src/pipeline_cache_journal.h) under the name the game looks it up by, and in the driver's own disk cache, which
 // NVIDIA keys by the executable's name. Entries whose journal file is there are skipped, so a run can be stopped at
 // any time and started again.
+//
+// LEONIDA_SKIP_COMPUTE (the play-time list of compute programs whose dispatches are dropped) does not narrow the
+// build: a player runs this with the game's environment, and a program kept out of the journal here would stay out
+// after the list is shortened. --skip-listed leaves the listed entries out on purpose. The last line counts what was
+// built, what was journaled already and what was left out, and why.
 #pragma once
 
 #include <cstddef>
@@ -25,6 +30,7 @@ struct PrecompileOptions {
     std::size_t limit = 0;             // at most this many entries (0: all)
     std::size_t min_bytes = 0, max_bytes = 0;  // SPIR-V size bounds (0: none)
     std::vector<std::string> filters;  // only entries whose name contains one of these
+    bool skip_listed = false;          // --skip-listed: leave out the entries LEONIDA_SKIP_COMPUTE names
     bool dry_run = false;              // --list: print the plan, build nothing
     bool via_helper = false;           // --via-helper: as a title does with LEONIDA_COMPILE_HELPER=1 (a test)
 };

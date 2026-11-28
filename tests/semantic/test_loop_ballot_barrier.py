@@ -1059,11 +1059,12 @@ class DivergentLoopBallotTests(unittest.TestCase):
         configs = [
             ("native_64", 64, 64, False, True),
             ("native_128", 128, 64, False, True),
-            # Single-wave inline exchange barriers in this loop require a round fallback.
+            # a reducible multi-block loop takes the structured emulation since #2089 (no round OpSwitch); a
+            # single wave keeps its exchange barriers under `%pc`-only guards (inline_all, no round fallback) ...
             ("emulate_64_sg32", 64, 32, True, True),
             ("emulate_128_sg32", 128, 32, True, True),
             ("emulate_40_partial_sg32", 40, 32, True, True),
-            # Forced dispatch must produce the same per-lane reference words.
+            # ... and --dispatch-loop keeps the round scheduler: both must give the native words
             ("emulate_64_sg32_rounds", 64, 32, True, False),
             ("emulate_128_sg32_rounds", 128, 32, True, False),
             ("emulate_40_partial_sg32_rounds", 40, 32, True, False),
@@ -1073,10 +1074,14 @@ class DivergentLoopBallotTests(unittest.TestCase):
                 spv, gen = _translate_cs("cs_div_loop_" + label, prog, threads=threads, emulate=emulate,
                                          structured=structured)
                 if emulate:
-                    use_hybrid = structured and threads == 128
-                    expected_flow = "emulated wave64 structured" if use_hybrid else "emulated wave64 rounds"
-                    self.assertEqual(gen.control_flow, expected_flow)
-                    self.assertFalse(rdna2spirv.barriers_under_control_flow(spv))
+                    self.assertEqual(gen.control_flow,
+                                     "emulated wave64 structured" if structured else "emulated wave64 rounds")
+                    if structured and threads <= 64:
+                        self.assertEqual(gen.emulate_plan["mode"], "inline_all")
+                        self.assertNotIn("OpSwitch", spv)
+                    else:
+                        # multi-wave (and the round scheduler): every barrier in uniform control flow
+                        self.assertFalse(rdna2spirv.barriers_under_control_flow(spv))
                 mem = run_compute_workgroup(spv, threads, sg_sz, push_constants=VSHARP)
                 want = expected_for(threads)
                 for t in range(threads):
@@ -1394,7 +1399,7 @@ class BarrierInLoopsTests(unittest.TestCase):
         """
         prog = self._ring_shift_loop_cs(wave64=True, threads=128, iters=5)
         spv, gen = _translate_cs("cs_bar_loop_w64_emulate", prog, threads=128, lds_bytes=512, emulate=True)
-        self.assertEqual(gen.control_flow, "emulated wave64 rounds")
+        self.assertEqual(gen.control_flow, "emulated wave64 structured")  # the loop is in the tail scheduler
         for rev in (False, True):
             with self.subTest(reverse_subgroups=rev):
                 mem = run_compute_workgroup(spv, 128, 32, push_constants=VSHARP, reverse_subgroups=rev)
@@ -1467,7 +1472,7 @@ class BarrierInLoopsTests(unittest.TestCase):
         spv_em, gen_em = _translate_cs(
             "cs_div_bar_em", self._wave_divergent_barrier_loop_cs(True), threads=128, lds_bytes=512, emulate=True
         )
-        self.assertEqual(gen_em.control_flow, "emulated wave64 rounds")
+        self.assertEqual(gen_em.control_flow, "emulated wave64 structured")  # the loop is in the tail scheduler
         mem_em = run_compute_workgroup(spv_em, 128, 32, push_constants=VSHARP)
         self.assertEqual([mem_em[4 * t] for t in range(128)], [2] * 64 + [4] * 64)
 

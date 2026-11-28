@@ -117,6 +117,9 @@ struct Mock {
     Mock* completes_with;    // fence: once its completed value reaches completes_at, a GetCompletedValue first
     std::uint64_t completes_at, completes_value;  // signals that fence to completes_value (GPU order across queues)
     bool signals_complete;   // queue: a Signal (slot 14) completes the fence at once, as an idle GPU would
+    const void* observed_queue;  // optional proxy pair to sample during a forwarded fence call
+    const void* observed_fence;
+    unsigned long observed_queue_refs, observed_fence_refs;
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][6];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
@@ -580,6 +583,10 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         if (slot == 9) return static_cast<std::uint32_t>(m->list_error ? E_INVALIDARG : S_OK);  // Close
         if (slot == 48 && mock_is_null_rtv(static_cast<SIZE_T>(a1))) m->list_error = true;  // ClearRenderTargetView
         if (slot == 80) mock_barrier(m, a1, a2);                                             // Barrier
+    }
+    if (m->kind == Kind::queue && (slot == 14 || slot == 15) && m->observed_queue) {
+        m->observed_queue_refs = xs::command_object_proxy_ref_count(m->observed_queue);
+        m->observed_fence_refs = xs::command_object_proxy_ref_count(m->observed_fence);
     }
     return S_OK;
 }
@@ -3288,9 +3295,16 @@ int check_tail(bool want_guarded) {
     EXPECT(queue && fence);
     EXPECT(xs::command_object_tables_guarded() == want_guarded);
     Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
-    // Signal (14) still reaches the real queue, with the real fence.
-    EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
-           queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
+    // Both wrappers keep a reference until the native call returns.
+    queue_mock->observed_queue = queue;
+    queue_mock->observed_fence = fence;
+    for (unsigned slot : {14u, 15u}) {
+        queue_mock->observed_queue_refs = queue_mock->observed_fence_refs = 0;
+        EXPECT(hr_of(raw(queue, slot, word(fence), 5)) == S_OK && queue_mock->calls[slot] == 1 &&
+               queue_mock->args[slot][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[slot][1] == 5);
+        EXPECT(queue_mock->observed_queue_refs == 2 && queue_mock->observed_fence_refs == 2);
+        EXPECT(xs::command_object_proxy_ref_count(queue) == 1 && xs::command_object_proxy_ref_count(fence) == 1);
+    }
     // Console-only queue methods (the tail past the PC chain, SignalX, PresentX) report S_OK instead of
     // refusing: frame pacing flows through them. Nothing is forwarded — the real queue never sees them.
     for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
@@ -3299,6 +3313,16 @@ int check_tail(bool want_guarded) {
     }
     EXPECT(raw(fence, 12) != 0);  // the completed value's address (check_fence_completed_value)
     for (unsigned slot = 13; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
+    for (unsigned slot : {16u, 17u, 25u}) {
+        const unsigned native_slot = slot == 17u ? 15u : 14u;
+        const unsigned expected_calls = queue_mock->calls[native_slot] + 1;
+        queue_mock->observed_queue_refs = queue_mock->observed_fence_refs = 0;
+        EXPECT(hr_of(raw(queue, slot, word(fence), 6)) == S_OK && queue_mock->calls[native_slot] == expected_calls &&
+               queue_mock->args[native_slot][0] == word(xs::fence_proxy_real_fence(fence)) &&
+               queue_mock->args[native_slot][1] == 6);
+        EXPECT(queue_mock->observed_queue_refs == 2 && queue_mock->observed_fence_refs == 2);
+        EXPECT(xs::command_object_proxy_ref_count(queue) == 1 && xs::command_object_proxy_ref_count(fence) == 1);
+    }
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
     return 0;
@@ -4643,6 +4667,85 @@ int check_list_values_more() {
            ms_since(started) >= 90);
     WaitForSingleObject(job, INFINITE);
     CloseHandle(job);
+
+    // 11. Work-aware timeout in Pump (src/list_value_wait_budget.h):
+    //   a) a matching in-flight producer pauses a held memory gate past the idle timeout until the producer lands;
+    //   b) a busy releaser executing an action gate pauses a concurrent memory gate past the idle timeout;
+    //   c) a demoted gate (4 ms budget) scales its pause caps with its short budget so unrelated active work does not
+    //      hold it for the full timeout's cap;
+    //   d) a matching producer stuck behind an unsignalled fence still hits a finite pause cap instead of hanging.
+    const auto write_on_a = [&](int index, std::uint64_t value, std::uint64_t& signal_value) -> bool {
+        if (FAILED(hr_of(raw(direct, 139, word(allocator), 0)))) return false;
+        raw(direct, 14, 1, 1, 1);  // Dispatch
+        raw(direct, 72, word(&g_cells2[index]), value, 0, 0);  // write64
+        if (FAILED(hr_of(raw(direct, 9)))) return false;
+        g_queue_call_count = 0;
+        if (submit(qa, direct) != 0) return false;
+        signal_value = logged_signal(qa_mock, a_written);
+        return signal_value != 0;
+    };
+    xs::set_list_value_wait_timeout_ms(40);
+    xs::reset_list_value_stats();
+    // 11a. Wait on qb before qa submits its matching write (so relay() misses it and Pump holds a gate).
+    EXPECT(hold_on(qb, 27, 1));
+    std::uint64_t producer_sig = 0;
+    EXPECT(write_on_a(27, 1, producer_sig));
+    EXPECT(!xs::list_values_idle(150));  // >3x the 40 ms idle timeout: pauses while producer is in flight
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_timed_out == 0 && stats.gates_met == 0 && cell2(27) == 0);
+    fence_signal(a_written, producer_sig);
+    EXPECT(xs::list_values_idle(3000) && cell2(27) == 1);
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_met == 1 && stats.gates_timed_out == 0);
+
+    // 11b. Releaser inside a 150 ms action gate pauses a concurrent memory gate past the 40 ms idle timeout.
+    xs::set_copy_page_mappings_hook([](std::uint32_t, const rt::xmem::PageBatch*, std::uintptr_t, std::uint32_t,
+                                       std::uint32_t) -> bool {
+        Sleep(150);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells2[28]), 1);
+        return true;
+    });
+    g_queue_call_count = 0;
+    EXPECT(hr_of(raw(qc, 31, 1, word(remap), 0x7000000000, 16, 0)) == S_OK);
+    const std::uint64_t action_sig = logged_signal(qc_mock, c_written);
+    EXPECT(action_sig != 0);
+    const std::uint64_t met_before_rel = xs::list_value_stats().gates_met;
+    const std::uint64_t to_before_rel = xs::list_value_stats().gates_timed_out;
+    EXPECT(hold_on(qb, 28, 1));
+    fence_signal(c_written, action_sig);
+    EXPECT(xs::list_values_idle(3000) && cell2(28) == 1);
+    xs::set_copy_page_mappings_hook(nullptr);
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_met == met_before_rel + 1 && stats.gates_timed_out == to_before_rel);
+
+    // 11c. Demoted gate (3 timeouts -> 4 ms budget) with unrelated in-flight work on qa times out in a few ms, not
+    // the 12 s active-work cap of the 40 ms full timeout.
+    for (int i = 0; i < 3; ++i) EXPECT(hold_on(qb, 29, 1) && xs::list_values_idle(3000));
+    std::uint64_t unrelated_sig = 0;
+    EXPECT(write_on_a(30, 1, unrelated_sig));
+    const std::uint64_t short_before_dem = xs::list_value_stats().gates_short;
+    const std::uint64_t to_before_dem = xs::list_value_stats().gates_timed_out;
+    started = Clock::now();
+    EXPECT(hold_on(qb, 29, 1));
+    for (int i = 0; i < 1000 && xs::list_value_stats().gates_timed_out == to_before_dem; ++i) Sleep(1);
+    const auto demoted_active_ms = ms_since(started);
+    EXPECT(xs::list_value_stats().gates_timed_out == to_before_dem + 1 &&
+           xs::list_value_stats().gates_short == short_before_dem + 1 && demoted_active_ms < 500);
+    fence_signal(a_written, unrelated_sig);
+    EXPECT(xs::list_values_idle(3000));
+
+    // 11d. Stuck matching producer (fence never signals) still hits the finite max pause cap instead of hanging.
+    const std::uint64_t to_before_stuck = xs::list_value_stats().gates_timed_out;
+    started = Clock::now();
+    EXPECT(hold_on(qb, 29, 1));
+    std::uint64_t stuck_sig = 0;
+    EXPECT(write_on_a(29, 1, stuck_sig));
+    for (int i = 0; i < 1000 && xs::list_value_stats().gates_timed_out == to_before_stuck; ++i) Sleep(1);
+    const auto stuck_producer_ms = ms_since(started);
+    EXPECT(xs::list_value_stats().gates_timed_out == to_before_stuck + 1 && stuck_producer_ms < 500);
+    fence_signal(a_written, stuck_sig);
+    EXPECT(xs::list_values_idle(3000));
+    xs::set_list_value_wait_timeout_ms(5000);
 
     // 8. stop() ends both threads. Afterwards nothing new is landed or opened (the process is ending: a gate
     // signalled from another thread could open one whose remap was skipped, or go below one still to come), and

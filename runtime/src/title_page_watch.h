@@ -9,7 +9,8 @@
 //
 // 1. Aliases (title_page_aliases). xmem maps one physical page at as many VAs as the title asks
 //    (XMemMapPhysicalPages): a write through one VA changes what the others read without touching them. xmem
-//    reports each 64 KiB page mapped at more than one address; a shadow copies those at every submission.
+//    reports each 64 KiB page mapped at more than one address; a shadow guards those at every address with the
+//    geometry watch's cells (title_geometry_watch.h), or copies them at every submission while it can't.
 //
 // 2. Kernel writes (kernel_writes). A read-only page makes ReadFile fail with ERROR_NOACCESS instead of faulting
 //    into a user-mode handler. The file shims (read_file and the rest, below) pin the destination before the kernel

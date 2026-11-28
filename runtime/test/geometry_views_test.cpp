@@ -16,7 +16,10 @@
 //  13. a submission's sequence on an idle GPU (completed == submitted): a view retired by the drain in before_execute_
 //      (kAfterExecutes) is freed only after every replay begun before the retirement recorded its submissions and those
 //      completed (a ticket read in the drain reaps it at once); its answers made without an alias are invalidated
-//      (forget_copy); its destroyed block leaves the lock-free block list and is reported to the device.
+//      (forget_copy); its destroyed block leaves the lock-free block list and is reported to the device;
+//  14. LEONIDA_GEOMETRY_HOST picks a system-memory type (write-back for 1, write-combined for 2), never the BAR;
+//  15. a retired view is copied once more from its pages when they are readable, not when they are not;
+//  16. a full release queue joins touching ranges before it collapses to one covering range.
 #include <windows.h>
 
 #include <cstdint>
@@ -61,7 +64,7 @@ VKAPI_ATTR void VKAPI_CALL requirements(VkDevice, VkBuffer buffer, VkMemoryRequi
     *out = {};
     out->size = reinterpret_cast<FakeBuffer*>(buffer)->size;
     out->alignment = 65536;
-    out->memoryTypeBits = 1;
+    out->memoryTypeBits = 0xf;  // the four types of test 14's device
 }
 VKAPI_ATTR VkResult VKAPI_CALL bind(VkDevice, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize) {
     reinterpret_cast<FakeBuffer*>(buffer)->memory = memory;
@@ -465,12 +468,17 @@ int main() {
         const std::uint64_t own = fly.execute_begin();
         leonida::TitleVaAliases aliases;
         aliases.record_removals(true);
-        std::uint64_t cursor = 0;
-        {
-            leonida::DescriptorRanges skip;
-            aliases.changed_ranges(cursor, skip);
-        }
-        const std::uint64_t invalidations = aliases.invalidations();
+        // What the console heaps' slot records are told (TitleVaAliases::add_listener).
+        struct Heard {
+            bool removed;
+            std::uint64_t title_va, bytes, shader_va;
+        };
+        std::vector<Heard> heard;
+        aliases.add_listener(&heard, [](void* to, leonida::TitleVaAliases::Change change, std::uint64_t va,
+                                        std::uint64_t bytes, std::uint64_t shader_va) {
+            static_cast<std::vector<Heard>*>(to)->push_back(
+                {change == leonida::TitleVaAliases::Change::removed, va, bytes, shader_va});
+        });
         leonida::geometry_writes::note_released(flybase, flybase + kView);
         fly.drain_released(device, rt::d3d12::GeometryViews::kAfterExecutes, submitted,
                            [&](std::uintptr_t source, std::size_t size, VkDeviceSize va) {
@@ -480,13 +488,12 @@ int main() {
                   fly.bytes() == kView && g_gone_blocks == gone,
               "a view retired in before_execute_ is not reaped there, though the GPU is idle");
 
-        leonida::DescriptorRanges changed;
-        const bool read = aliases.changed_ranges(cursor, changed);
-        changed.merge();
         std::vector<std::pair<std::uint64_t, std::uint64_t>> removed;
         aliases.take_removed(removed);
-        check(read && aliases.invalidations() != invalidations && changed.overlaps(flybase, kView) &&
-                  removed.size() == 1 && removed[0].first == va_f && removed[0].second == kView,
+        aliases.remove_listener(&heard);
+        check(heard.size() == 1 && heard[0].removed && heard[0].title_va == flybase && heard[0].bytes == kView &&
+                  heard[0].shader_va == va_f && removed.size() == 1 && removed[0].first == va_f &&
+                  removed[0].second == kView,
               "the retirement invalidates the heap slots and key answers made through the view without an alias");
 
         submitted = 8;  // this replay's submission
@@ -509,6 +516,109 @@ int main() {
         fly.release(device);
     }
     VirtualFree(fly_title, 0, MEM_RELEASE);
+
+    // 14. LEONIDA_GEOMETRY_HOST: the copies' memory type. A discrete GPU's types: 0 VRAM, 1 VRAM through the BAR,
+    // 2 system memory write-combined, 3 system memory write-back. 1 takes type 3 (write-back preferred), 2 type 2,
+    // unset any host-visible type with device-local preferred (the BAR); a device whose host-visible types are all
+    // device-local (an integrated GPU) keeps them all.
+    {
+        struct TypedDevice : FakeDevice {
+            VkPhysicalDeviceMemoryProperties memory{};
+            std::uint32_t bits = 0;
+            VkMemoryPropertyFlags preferred = 0;
+            VkDeviceMemory allocate(const VkMemoryRequirements& r, VkMemoryPropertyFlags required,
+                                    VkMemoryPropertyFlags wanted, VkMemoryPropertyFlags* chosen, bool address) {
+                bits = r.memoryTypeBits;
+                preferred = wanted;
+                return FakeDevice::allocate(r, required, wanted, chosen, address);
+            }
+        };
+        constexpr VkMemoryPropertyFlags kLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                        kHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                        kCached = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        TypedDevice discrete;
+        discrete.memory.memoryTypeCount = 4;
+        const VkMemoryPropertyFlags discrete_types[4] = {kLocal, kLocal | kHost, kHost, kHost | kCached};
+        for (int i = 0; i < 4; ++i) discrete.memory.memoryTypes[i].propertyFlags = discrete_types[i];
+        TypedDevice integrated;
+        integrated.memory.memoryTypeCount = 2;
+        integrated.memory.memoryTypes[0].propertyFlags = kLocal;
+        integrated.memory.memoryTypes[1].propertyFlags = kLocal | kHost | kCached;
+        auto* host_title =
+            static_cast<std::uint8_t*>(VirtualAlloc(nullptr, kView, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!host_title) return 1;
+        const auto hbase = reinterpret_cast<std::uintptr_t>(host_title);
+        const auto made_with = [&](TypedDevice& dev, const char* setting) {
+            _putenv_s("LEONIDA_GEOMETRY_HOST", setting);
+            dev.bits = ~0u;
+            dev.preferred = 0;
+            rt::d3d12::GeometryViews v;
+            const bool made = v.resolve(dev, hbase, kView, copy) != 0;
+            const int kind = v.system_memory();
+            v.release(dev);
+            return made ? kind : -1;
+        };
+        check(made_with(discrete, "1") == rt::d3d12::TitleBufferWindows::kSystemCached && discrete.bits == 1u << 3 &&
+                  discrete.preferred == kCached,
+              "LEONIDA_GEOMETRY_HOST=1 puts the copies in write-back system memory, never the BAR");
+        check(made_with(discrete, "2") == rt::d3d12::TitleBufferWindows::kSystemUncached && discrete.bits == 1u << 2 &&
+                  discrete.preferred == 0,
+              "LEONIDA_GEOMETRY_HOST=2 puts them in write-combined system memory");
+        check(made_with(discrete, "") == rt::d3d12::TitleBufferWindows::kDeviceLocal && discrete.bits == 0xfu &&
+                  discrete.preferred == kLocal,
+              "unset, every type the buffer allows is tried, device-local first");
+        check(made_with(integrated, "1") == rt::d3d12::TitleBufferWindows::kSystemCached && integrated.bits == 0xfu,
+              "on a device with no host type outside device-local memory, the types are left as they are");
+        _putenv_s("LEONIDA_GEOMETRY_HOST", "");
+        check(g_live_buffers == 0, "the memory-type views free their blocks");
+
+        // 15. A retired view is copied once more from the title's pages when they are readable (they hold new bytes),
+        // and keeps what it held when they are not (decommitted or unmapped).
+        rt::d3d12::GeometryViews last;
+        std::memset(host_title, 0x11, kView);
+        const std::uint64_t va_l = last.resolve(device, hbase, kView, copy);
+        std::uint64_t host_l = 0, bytes_l = 0;
+        check(va_l && last.lookup(device.arena.address + va_l, host_l, bytes_l), "a view to retire");
+        auto* held = reinterpret_cast<const std::uint8_t*>(host_l);
+        // The pages' new bytes: the watched tiles are opened first (no fault handler here).
+        leonida::geometry_writes::notify(hbase, hbase + kView, leonida::geometry_writes::Event::open);
+        std::memset(host_title, 0x22, kView);
+        g_copies.clear();
+        check(last.retire_range(hbase, hbase + kView, 1, [](std::uintptr_t, std::size_t, VkDeviceSize) {}, copy) == 1 &&
+                  held[0] == 0x22 && held[kView - 1] == 0x22 && last.final_copies() == 1 && g_copies.size() == 1,
+              "a retired view whose pages are readable is copied from them once more");
+        const std::uint64_t va_l2 = last.resolve(device, hbase, kView, copy);
+        std::uint64_t host_l2 = 0;
+        check(va_l2 && last.lookup(device.arena.address + va_l2, host_l2, bytes_l), "and made again");
+        auto* held2 = reinterpret_cast<const std::uint8_t*>(host_l2);
+        leonida::geometry_writes::notify(hbase, hbase + kView, leonida::geometry_writes::Event::open);
+        std::memset(host_title, 0x33, kView);
+        const auto unreadable = [](std::uint8_t*, const std::uint8_t*, std::size_t) {
+            return rt::d3d12::GeometryCopy::unreadable;
+        };
+        check(last.retire_range(hbase, hbase + kView, 2, [](std::uintptr_t, std::size_t, VkDeviceSize) {},
+                                unreadable) == 1 &&
+                  held2[0] == 0x22 && last.final_copies() == 1,
+              "one whose pages are not readable keeps what it held");
+        check(last.reap(device, 2) == 2 && last.bytes() == 0, "both are freed at their tickets");
+        last.release(device);
+
+        // 16. A full release queue first joins ranges that touch (unmaps report page runs): 65536 neighbouring ranges
+        // and one apart from them are two ranges, not one covering everything between them.
+        rt::d3d12::GeometryViews coalesce;
+        check(coalesce.resolve(device, hbase, kView, copy) != 0, "a view to watch the pages");
+        for (std::size_t i = 0; i < 65536; ++i)
+            leonida::geometry_writes::note_released(hbase + i * 8, hbase + i * 8 + 8);
+        leonida::geometry_writes::note_released(hbase + kView - 4096, hbase + kView);
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> joined;
+        leonida::geometry_writes::take_released(coalesce.release_queue(), joined);
+        check(joined.size() == 2 && joined[0] == std::make_pair(hbase, hbase + 65536 * 8) &&
+                  joined[1] == std::make_pair(hbase + kView - 4096, hbase + kView),
+              "65536 touching ranges become one, and a range apart from them stays apart");
+        coalesce.release(device);
+        VirtualFree(host_title, 0, MEM_RELEASE);
+    }
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

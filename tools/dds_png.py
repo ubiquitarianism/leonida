@@ -1,9 +1,11 @@
 """Pure standard-library DDS to PNG decoder and 2x box-filter downscaler.
 
 Supports legacy and DX10 DDS headers across uncompressed 32-bit formats
-(BGRA8, RGBA8, BGRX8, RGBX8, R10G10B10A2_UNORM, and arbitrary 32-bit RGB/RGBA bitmasks), the
-legacy 24-bit RGB layouts (BGR8/RGB8, e.g. the D3DFMT_R8G8B8 byte order),
-and block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
+(BGRA8, RGBA8, BGRX8, RGBX8, R10G10B10A2_UNORM/UINT/TYPELESS, and arbitrary 32-bit RGB/RGBA bitmasks), the
+legacy 24-bit RGB layouts (BGR8/RGB8, e.g. the D3DFMT_R8G8B8 byte order), the DX10 16-bit packed
+B5G6R5_UNORM and B5G5R5A1_UNORM (5- and 6-bit channels widened by bit replication, as for BC1 endpoints),
+the DX10 8-bit R8 and R8G8 formats (UNORM, SNORM, UINT, SINT), the 64-bit R16G16B16A16 UNORM, SNORM and
+FLOAT formats, and block-compressed formats (BC1, BC2, BC3, BC4, BC5, BC7).
 
 BC7 covers all eight modes. Decoding DXGI 97/98/99 (typeless, UNORM, UNORM_SRGB)
 preserves the stored RGBA8 values. The reserved mode (no mode bit in the first
@@ -11,12 +13,19 @@ byte) decodes as transparent black. BC6H is not supported.
 DXT2, DXT4 and premultiplied DX10 images are converted to straight alpha for PNG.
 For tagged sRGB images, unpremultiplication and downscaling use linear light. The PNG stores sRGB bytes.
 
-DX10 R16_FLOAT (54), R32_FLOAT (41) and R16G16B16A16_FLOAT (10) are read as linear values and
+DX10 R16G16B16A16_UNORM (11) is normalized to RGBA8 with half-up rounding. R16_FLOAT (54),
+R32_FLOAT (41) and R16G16B16A16_FLOAT (10) are read as linear values and
 written like the UNORM formats, with no tone mapping or sRGB transfer: clamp to
 [0, 1], then round(v * 255) half up. +inf saturates to 255; -inf, negative values
 and NaN map to 0. The single-channel formats fill red, with green and blue 0 and alpha 255;
 R16G16B16A16_FLOAT keeps its own alpha.
-R11G11B10_FLOAT previews clamp RGB to [0, 1], map NaN to zero and use opaque alpha.
+R16G16B16A16_SNORM (13) maps its signed normalized channels from [-1, 1] to [0, 255],
+with both -32768 and -32767 representing -1.0.
+R11G11B10_FLOAT and R9G9B9E5_SHAREDEXP (67, mantissa * 2^(exponent - 24) per channel) previews clamp RGB
+to [0, 1] and use opaque alpha; NaN maps to zero for R11G11B10_FLOAT.
+R8 and R8G8 previews fill red (and green), with blue 0 and alpha 255. SNORM maps [-1, 1] to [0, 255] like
+BC4/BC5 SNORM (-128 and -127 are both -1.0); UINT keeps the byte; SINT adds 128 for display.
+R10G10B10A2_UINT and _TYPELESS are shown like R10G10B10A2_UNORM: each field scaled from its bit width.
 
 Usage:
     python -I tools/dds_png.py <in.dds> --info
@@ -87,8 +96,21 @@ _DXGI_MAP: dict[int, str] = {
     93: "BGRX8",
     26: "R11G11B10_FLOAT",
     41: "R32_FLOAT",
+    49: "R8G8_UNORM",
     56: "R16_UNORM",
+    61: "R8_UNORM",
+    11: "RGBA16_UNORM",
+    13: "RGBA16_SNORM",
+    51: "RG8_SNORM",
+    50: "RG8_UINT",
+    52: "RG8_SINT",
+    63: "R8_SNORM",
+    62: "R8_UINT",
+    64: "R8_SINT",
     65: "A8_UNORM",
+    67: "R9G9B9E5_FLOAT",
+    85: "B5G6R5_UNORM",
+    86: "B5G5R5A1_UNORM",
     70: "BC1",
     71: "BC1",
     72: "BC1",
@@ -265,7 +287,7 @@ def _parse_header_internal(
                     f"Truncated DX10 DDS header: {len(data)} bytes (need at least {DDS_DX10_HEADER_SIZE})"
                 )
             dxgi_format = struct.unpack_from("<I", data, 128)[0]
-            if dxgi_format == 24:  # DXGI_FORMAT_R10G10B10A2_UNORM, R in the low bits.
+            if dxgi_format in (23, 24, 25):  # R10G10B10A2_TYPELESS/UNORM/UINT, R in the low bits.
                 fmt = "RGBA8"
                 masks = (0x000003FF, 0x000FFC00, 0x3FF00000, 0xC0000000)
             else:
@@ -366,9 +388,16 @@ class _Plane(NamedTuple):
 
 
 _TEXEL_BYTES = {
-    "RGBA8": 4, "BGRA8": 4, "BGRX8": 4, "RGBX8": 4, "R11G11B10_FLOAT": 4,
+    "RGBA8": 4, "BGRA8": 4, "BGRX8": 4, "RGBX8": 4,
+    "R11G11B10_FLOAT": 4, "R9G9B9E5_FLOAT": 4,
     "BGR8": 3, "RGB8": 3, "R16_UNORM": 2, "A8_UNORM": 1,
-    "R32_FLOAT": 4,
+    "R32_FLOAT": 4, "R8_UNORM": 1, "R8G8_UNORM": 2,
+    "RGBA16_UNORM": 8, "RGBA16_SNORM": 8,
+    "B5G6R5_UNORM": 2, "B5G5R5A1_UNORM": 2,
+    "RG8_SNORM": 2,
+    "RG8_UINT": 2, "RG8_SINT": 2,
+    "R8_SNORM": 1,
+    "R8_UINT": 1, "R8_SINT": 1,
     **{fmt: layout[0] for fmt, layout in _HALF_FLOAT_LAYOUT.items()},
 }
 
@@ -576,6 +605,32 @@ def _decode_uncompressed_24(
     return bytes(out)
 
 
+def _decode_packed_16(payload: memoryview, width: int, height: int, fmt: str, pitch: int) -> bytes:
+    """Decode DXGI B5G6R5_UNORM or B5G5R5A1_UNORM pixels to RGBA8."""
+    row_bytes = width * 2
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid {fmt} row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
+    if len(payload) < expected:
+        raise DdsError(f"Truncated {fmt} payload: {len(payload)} bytes (need {expected})")
+
+    out = bytearray(width * height * 4)
+    dst = 0
+    for start in range(0, height * pitch, pitch):
+        for (pixel,) in struct.iter_unpack("<H", payload[start:start + row_bytes]):
+            if fmt == "B5G6R5_UNORM":
+                r, g, b = (pixel >> 11) & 0x1F, (pixel >> 5) & 0x3F, pixel & 0x1F
+                out[dst:dst + 4] = bytes(((r << 3) | (r >> 2), (g << 2) | (g >> 4),
+                                          (b << 3) | (b >> 2), 255))
+            else:
+                r, g, b = (pixel >> 10) & 0x1F, (pixel >> 5) & 0x1F, pixel & 0x1F
+                out[dst:dst + 4] = bytes(((r << 3) | (r >> 2), (g << 3) | (g >> 2),
+                                          (b << 3) | (b >> 2), 255 if pixel & 0x8000 else 0))
+            dst += 4
+    return bytes(out)
+
+
 def _bc_interp_lut(v0: int, v1: int) -> tuple[int, int, int, int, int, int, int, int]:
     """Build the 8-entry BC3-alpha / BC4 / BC5 unsigned interpolation table."""
     if v0 > v1:
@@ -602,19 +657,20 @@ def _bc_interp_lut(v0: int, v1: int) -> tuple[int, int, int, int, int, int, int,
 
 
 def _bc_interp_lut_snorm(b0: int, b1: int) -> tuple[int, int, int, int, int, int, int, int]:
-    """Build the 8-entry BC4_SNORM / BC5_SNORM table mapped from [-1, 1] to [0, 255]."""
-    s0 = b0 - 256 if b0 >= 128 else b0
-    s1 = b1 - 256 if b1 >= 128 else b1
-    if s0 == -128:
-        s0 = -127
-    if s1 == -128:
-        s1 = -127
+    """Build the 8-entry BC4_SNORM / BC5_SNORM table mapped from [-1, 1] to [0, 255].
+
+    The eight- or six-value ramp is chosen by comparing the stored int8 endpoints, as D3D's BC4_SNORM rule does;
+    -128 is read as -127 only once it becomes a value. So 0x81, 0x80 (-127 > -128) is an eight-value block, which
+    clamping before the compare would turn into a six-value one with +1.0 at index 7."""
+    r0 = b0 - 256 if b0 >= 128 else b0
+    r1 = b1 - 256 if b1 >= 128 else b1
+    s0, s1 = max(r0, -127), max(r1, -127)
 
     def to_u8(v: float) -> int:
         # Map [-127.0, 127.0] -> [0, 255]
         return int(round((v / 127.0 * 0.5 + 0.5) * 255.0))
 
-    if s0 > s1:
+    if r0 > r1:
         return (
             to_u8(s0),
             to_u8(s1),
@@ -1055,8 +1111,33 @@ def _decode_r11g11b10(payload: memoryview, width: int, height: int, pitch: int) 
     return bytes(rgba)
 
 
-def _decode_single_channel(payload: memoryview, width: int, height: int, pitch: int, fmt: str) -> bytes:
-    """Red-only R16_UNORM/R32_FLOAT and alpha-only A8_UNORM."""
+def _decode_r9g9b9e5(payload: memoryview, width: int, height: int, pitch: int) -> bytes:
+    """Decode DXGI R9G9B9E5_SHAREDEXP, clamping its shared-exponent RGB values to [0, 1]."""
+    row_bytes = width * 4
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid R9G9B9E5_FLOAT row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
+    if len(payload) < expected:
+        raise DdsError(f"Truncated R9G9B9E5_FLOAT payload: {len(payload)} bytes (need {expected})")
+
+    rgba = bytearray(width * height * 4)
+    rgba[3::4] = b"\xff" * (width * height)
+    dst = 0
+    for start in range(0, height * pitch, pitch):
+        for (pixel,) in struct.iter_unpack("<I", payload[start:start + row_bytes]):
+            exponent = (pixel >> 27) & 0x1F
+            scale = exponent - 24
+            for shift in (0, 9, 18):
+                value = math.ldexp((pixel >> shift) & 0x1FF, scale)
+                rgba[dst] = 255 if value >= 1.0 else int(value * 255.0 + 0.5)
+                dst += 1
+            dst += 1
+    return bytes(rgba)
+
+
+def _decode_channels(payload: memoryview, width: int, height: int, pitch: int, fmt: str) -> bytes:
+    """Preview R, RG and alpha-only texels with zero for absent color channels."""
     bpp = _TEXEL_BYTES[fmt]
     row_bytes = width * bpp
     pitch = pitch or row_bytes
@@ -1072,7 +1153,22 @@ def _decode_single_channel(payload: memoryview, width: int, height: int, pitch: 
     dst = 0
     for start in range(0, height * pitch, pitch):
         row = payload[start:start + row_bytes]
-        if fmt == "R16_UNORM":
+        if fmt in ("R8_UNORM", "R8G8_UNORM"):
+            for channel in range(bpp):
+                rgba[dst + channel:dst + width * 4:4] = row[channel::bpp]
+            dst += width * 4
+        elif fmt == "R8_UINT":
+            rgba[dst:dst + 4 * width:4] = row
+            dst += 4 * width
+        elif fmt == "R8_SINT":
+            for (v,) in struct.iter_unpack("<b", row):
+                rgba[dst] = v + 128
+                dst += 4
+        elif fmt == "R8_SNORM":
+            for (v,) in struct.iter_unpack("<b", row):
+                rgba[dst] = int(round((max(-127, v) / 127.0 * 0.5 + 0.5) * 255.0))
+                dst += 4
+        elif fmt == "R16_UNORM":
             for (v,) in struct.iter_unpack("<H", row):
                 rgba[dst] = (v * 255 + 32767) // 65535
                 dst += 4
@@ -1086,6 +1182,97 @@ def _decode_single_channel(payload: memoryview, width: int, height: int, pitch: 
         else:
             rgba[dst + 3:dst + 4 * width:4] = row
             dst += 4 * width
+    return bytes(rgba)
+
+
+def _decode_rgba16_unorm(payload: memoryview, width: int, height: int, pitch: int) -> bytes:
+    """Decode DXGI R16G16B16A16_UNORM to RGBA8 with half-up normalization."""
+    row_bytes = width * 8
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid RGBA16_UNORM row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
+    if len(payload) < expected:
+        raise DdsError(f"Truncated RGBA16_UNORM payload: {len(payload)} bytes (need {expected})")
+
+    rgba = bytearray(width * height * 4)
+    dst = 0
+    for start in range(0, height * pitch, pitch):
+        for (r, g, b, a) in struct.iter_unpack("<4H", payload[start:start + row_bytes]):
+            rgba[dst:dst + 4] = bytes(((r * 255 + 32767) // 65535,
+                                      (g * 255 + 32767) // 65535,
+                                      (b * 255 + 32767) // 65535,
+                                      (a * 255 + 32767) // 65535))
+            dst += 4
+    return bytes(rgba)
+
+
+def _decode_rgba16_snorm(payload: memoryview, width: int, height: int, pitch: int) -> bytes:
+    """Decode DXGI R16G16B16A16_SNORM into a displayable RGBA8 representation."""
+    row_bytes = width * 8
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid RGBA16_SNORM row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
+    if len(payload) < expected:
+        raise DdsError(f"Truncated RGBA16_SNORM payload: {len(payload)} bytes (need {expected})")
+
+    rgba = bytearray(width * height * 4)
+    dst = 0
+    for start in range(0, height * pitch, pitch):
+        for (r, g, b, a) in struct.iter_unpack("<4h", payload[start:start + row_bytes]):
+            # SNORM maps -32768 and -32767 to -1.0; the preview maps [-1, 1] to [0, 255].
+            channels = (max(r, -32767), max(g, -32767), max(b, -32767), max(a, -32767))
+            rgba[dst:dst + 4] = bytes((((v + 32767) * 255 + 32767) // 65534) for v in channels)
+            dst += 4
+    return bytes(rgba)
+
+
+def _decode_rg8_snorm(payload: memoryview, width: int, height: int, pitch: int) -> bytes:
+    """Decode DXGI R8G8_SNORM to red/green preview channels with opaque alpha."""
+    row_bytes = width * 2
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid R8G8_SNORM row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
+    if len(payload) < expected:
+        raise DdsError(f"Truncated R8G8_SNORM payload: {len(payload)} bytes (need {expected})")
+
+    def to_u8(value: int) -> int:
+        return int(round((max(-127, value) / 127.0 * 0.5 + 0.5) * 255.0))
+
+    rgba = bytearray(width * height * 4)
+    rgba[3::4] = b"\xff" * (width * height)
+    dst = 0
+    for start in range(0, height * pitch, pitch):
+        row = payload[start:start + row_bytes]
+        for red, green in struct.iter_unpack("<bb", row):
+            rgba[dst:dst + 2] = bytes((to_u8(red), to_u8(green)))
+            dst += 4
+    return bytes(rgba)
+
+
+def _decode_rg8_integer(payload: memoryview, width: int, height: int, pitch: int, fmt: str) -> bytes:
+    """Preview DXGI R8G8_UINT as bytes and R8G8_SINT by offsetting [-128, 127] to [0, 255]."""
+    row_bytes = width * 2
+    pitch = pitch or row_bytes
+    if pitch < row_bytes:
+        raise DdsError(f"Invalid {fmt} row pitch: {pitch} bytes (need at least {row_bytes})")
+    expected = (height - 1) * pitch + row_bytes
+    if len(payload) < expected:
+        raise DdsError(f"Truncated {fmt} payload: {len(payload)} bytes (need {expected})")
+
+    rgba = bytearray(width * height * 4)
+    rgba[3::4] = b"\xff" * (width * height)
+    dst = 0
+    unpack = struct.Struct("<BB").iter_unpack if fmt == "RG8_UINT" else struct.Struct("<bb").iter_unpack
+    for start in range(0, height * pitch, pitch):
+        for red, green in unpack(payload[start:start + row_bytes]):
+            if fmt == "RG8_SINT":
+                red += 128
+                green += 128
+            rgba[dst:dst + 2] = bytes((red, green))
+            dst += 4
     return bytes(rgba)
 
 
@@ -1248,6 +1435,12 @@ def _decode_plane(data: bytes | bytearray | memoryview, plane: _Plane, info: _Dd
 
     if fmt in ("RGBA8", "BGRA8", "BGRX8", "RGBX8"):
         rgba = _decode_uncompressed_32(payload, width, height, fmt, masks, pitch)
+    elif fmt == "RGBA16_UNORM":
+        rgba = _decode_rgba16_unorm(payload, width, height, pitch)
+    elif fmt == "RGBA16_SNORM":
+        rgba = _decode_rgba16_snorm(payload, width, height, pitch)
+    elif fmt in ("B5G6R5_UNORM", "B5G5R5A1_UNORM"):
+        rgba = _decode_packed_16(payload, width, height, fmt, pitch)
     elif fmt in _HALF_FLOAT_LAYOUT:
         rgba = _decode_half_float(payload, width, height, fmt, pitch)
     elif fmt in _RGB24_LAYOUTS.values():
@@ -1269,8 +1462,14 @@ def _decode_plane(data: bytes | bytearray | memoryview, plane: _Plane, info: _Dd
         rgba = _decode_bc5(payload, 0, width, height, signed=True)
     elif fmt == "R11G11B10_FLOAT":
         rgba = _decode_r11g11b10(payload, width, height, pitch)
-    elif fmt in ("R16_UNORM", "R32_FLOAT", "A8_UNORM"):
-        rgba = _decode_single_channel(payload, width, height, pitch, fmt)
+    elif fmt == "RG8_SNORM":
+        rgba = _decode_rg8_snorm(payload, width, height, pitch)
+    elif fmt in ("RG8_UINT", "RG8_SINT"):
+        rgba = _decode_rg8_integer(payload, width, height, pitch, fmt)
+    elif fmt == "R9G9B9E5_FLOAT":
+        rgba = _decode_r9g9b9e5(payload, width, height, pitch)
+    elif fmt in ("R8_UNORM", "R8G8_UNORM", "R8_SNORM", "R8_UINT", "R8_SINT", "R16_UNORM", "R32_FLOAT", "A8_UNORM"):
+        rgba = _decode_channels(payload, width, height, pitch, fmt)
     elif fmt == "BC7":
         rgba = _decode_bc7(payload, 0, width, height)
     else:
@@ -1295,10 +1494,10 @@ def _decode_dds(data: bytes, *, mip: int = 0, layer: int = 0, face: str | None =
 
 
 def decode_dds(data: bytes, *, mip: int = 0, layer: int = 0, face: str | None = None,
-               z: int = 0) -> tuple[int, int, bytes]:
-    """Decode one DDS image plane into top-down row-major RGBA8 with straight alpha."""
-    width, height, rgba, _ = _decode_dds(data, mip=mip, layer=layer, face=face, z=z)
-    return width, height, rgba
+               z: int = 0, max_size: int = 0) -> tuple[int, int, bytes]:
+    """Decode a straight-alpha RGBA8 plane, optionally filtering in its declared color space."""
+    width, height, rgba, srgb = _decode_dds(data, mip=mip, layer=layer, face=face, z=z)
+    return downscale_rgba(width, height, rgba, max_size, srgb=srgb)
 
 
 def _box_spans(source: int, target: int) -> list:
@@ -1411,17 +1610,15 @@ def encode_png(width: int, height: int, rgba: bytes) -> bytes:
 
     ihdr = _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
 
-    raw = bytearray(height * (stride + 1))
-    mv = memoryview(rgba)
-    dst = 1
-    src = 0
-    dst_step = stride + 1
-    for _ in range(height):
-        raw[dst : dst + stride] = mv[src : src + stride]
-        dst += dst_step
-        src += stride
+    compressor = zlib.compressobj()
+    compressed = bytearray()
+    pixels = memoryview(rgba)
+    for start in range(0, expected, stride):
+        compressed.extend(compressor.compress(b"\x00"))  # PNG filter type 0
+        compressed.extend(compressor.compress(pixels[start:start + stride]))
+    compressed.extend(compressor.flush())
 
-    idat = _png_chunk(b"IDAT", zlib.compress(raw))
+    idat = _png_chunk(b"IDAT", compressed)
     iend = _png_chunk(b"IEND", b"")
     return PNG_SIGNATURE + ihdr + idat + iend
 

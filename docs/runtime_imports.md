@@ -170,7 +170,7 @@ policy "other" (none is counted as returning an `HRESULT`), and they come from s
 | `xg_xs.dll` | 2: `XGCreateTextureComputer`, `XGSuggestSwizzleMode` | texture layout computation |
 | `XCRDAPI.dll` | 1: `DStorageGetFactory` | DirectStorage |
 | `chad.dll` | 5: `XDspActivate`, `XDspConnectWithMaximumStreamLimit`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand` | the audio DSP |
-| `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit |
+| `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit (Opus decode when `runtime/opus_decoder` is built) |
 | `AcpHal.dll` | 9: `AcpHalAllocateShapeContexts`, `AcpHalCreate`, `AcpHalReleaseShapeContexts`, `ApuAlloc`, `ApuCreateHeap`, `ApuFree`, `ApuIsVirtualAddressValid`, `ApuMapApuAddress`, `ApuMapVirtualAddress` | the audio hardware layer |
 
 The game executable imports two functions from `xg_xs.dll`, the console's texture layout library:
@@ -203,17 +203,19 @@ again at detach (reason 0), and there is no `exception`, `error` or `unimplement
 unimplemented imports is reached by the TLS callbacks or the `DllMain`s.
 
 The executable's audio imports `xapu.dll` (`XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`,
-`XApuEnqueueCommand`, `XApuGetResultCount`) and `chad.dll` (`XDspActivate`, `XDspConnectWithMaximumStreamLimit`,
-`XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`) are served by `runtime/shims/xapu_chad.cpp`. The shapes were
-read statically from the executable's call sites: one each, four for `XApuEnqueueCommand`. Both connects succeed with
-a handle; the APU connect also returns a zeroed shared buffer the title writes stream input to and reads output from.
-Commands are accepted and not processed, so the audio stays silent. A stream open (type 1) and a stream close
-(type 2) each queue one result of the same type and slot, because the title frees a stream id only when the close
-result arrives. `XDspActivate` writes its two outputs as pointers to zeroed memory, which the title reads as "command
-done" after each `XDspSubmitCommand`. `XApuConnect` leaves its first argument, a global of the title, untouched. The
-buffer size (128 stream slots), the two results and the zeroed DSP status are hypotheses, explained in the file.
-`xapu_chad_test` calls all ten in those shapes. With `--trace`, the first call of each, and the first command of each type, is an
-`audio_queue` event.
+`XApuEnqueueCommand`, `XApuGetResultCount`) are served by `runtime/shims/xapu_queue.cpp`; `chad.dll`
+(`XDspActivate`, `XDspConnectWithMaximumStreamLimit`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`) by
+`runtime/shims/xapu_chad.cpp`. The shapes were read statically from the executable's call sites: one each, four for
+`XApuEnqueueCommand`. `XApuConnect` reads the title's 24-byte `ConnectInput` (process 1 = Opus at 48 kHz, stream
+count, commands per stream, a shared buffer, options) and returns `{shared buffer, result event}`; it never writes the
+input. Activate, process, deactivate and reset commands are copied from the title's stack command, and each queues one
+result in order. A process command decodes its Opus packet through `runtime/opus_decoder` (Rust over the BSD-3-Clause
+`opus-pure`) into the slot's output, honouring first frame, frame count, output length and the deinterleaved option;
+without the crate the result carries the table-of-contents frame count and silence. The layouts follow Marvisak/VIctory
+`crates/victory-hle/src/modules/apu.rs` (GPL-3.0-or-later). `XDspActivate` writes its two outputs as pointers to zeroed
+memory, which the title reads as "command done" after each `XDspSubmitCommand`; the DSP stays silent. `xapu_chad_test`
+covers the layouts, the queue and the silent path; `xapu_opus_test` the decoded path. With `--trace`, the first call of
+each, and the first command of each type, is an `audio_queue` event.
 The table above was measured before this shim and still lists these ten as unimplemented; they are served now. The call shapes agree with `docs/audio_hal_exe_calls.md`, which was measured with `tools/import_call_sites.py`.
 
 What this does not show: `--run` has not been run, so the entry point has not been called and no import is known to be
@@ -567,7 +569,16 @@ trio (23-25). What the slots must answer is still **not measured**; that is the 
   and `XGameSaveGetContainerInfo` of a missing container returns `S_OK` without a callback. `syncOnDemand` is
   ignored: nothing syncs offline.
 
-`xgameruntime_gamesave_test` drives every slot against a temporary `LEONIDA_SAVE_DIR`.
+`LEONIDA_TRACE_XGAMESAVE=1` logs every call of these slots as one `[rt] xgamesave:` line on stderr, with the
+milliseconds since the process started and the thread: the handles, container and blob names, sizes and
+HRESULT, never the blob contents. An async call (`InitializeProvider`, `GetRemainingQuota`, `DeleteContainer`,
+`ReadBlobData`, `SubmitUpdate`, `FilesGetFolderWithUi`) logs four more lines: `schedule` when `XAsyncSchedule` is
+called, `run` when the work starts on the title's queue (`waited=` is the gap), `complete` with its HRESULT and
+the `...Result` call that collects it. A job that waits behind a stalled queue, or a result the title never
+collects, then shows in a run's log. Unset, nothing is logged beyond the one line when the provider opens.
+
+`xgameruntime_gamesave_test` drives every slot against a temporary `LEONIDA_SAVE_DIR`. With the trace on, it
+checks the lines of a write and a read.
 
 `XStoreImpl` (`runtime/shims/xgameruntime_store.cpp`), from the same layout; the game-license struct is measured
 on the executable, the rest is not:

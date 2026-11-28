@@ -554,6 +554,7 @@ public:
     void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override {
         d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
+        if (stub_kind_ == StubPipelineKind::mesh) return;  // a mesh stub's draw: nothing to run
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
         // A mesh shader reads the root arguments from s16 through a 16-dword window (RootArgumentLayout::mesh_ok).
         if (!graphics_.layout->mesh_ok) {
@@ -1582,6 +1583,7 @@ private:
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
     bool unregistered_pipeline_ = false;  // the bound PSO has no pipeline here (a stub): see set_pipeline
+    StubPipelineKind stub_kind_ = StubPipelineKind::none;  // which stub the bound PSO is, if it is one
     std::uintptr_t graphics_pipeline_ = 0;
     ID3D12DescriptorHeap* cbv_srv_uav_heap_ = nullptr;
     ID3D12DescriptorHeap* sampler_heap_ = nullptr;
@@ -1663,11 +1665,14 @@ private:
         compute_pipeline_ = compute_pipeline_id(state);
         graphics_pipeline_ = graphics_pipeline_id(state);
         if (compute_pipeline_) request_pipeline_build(compute_pipeline_, 0, false);  // starts its build, if asynchronous
-        // A pipeline this device never registered: a LEONIDA_STUB_PIPELINES stub (its translated shader is missing),
-        // or one from another device. Its draws resolve to nothing in replay; its dispatches are no-ops too
-        // (record_dispatch), so the list still closes.
+        // A pipeline this device never registered: a LEONIDA_STUB_PIPELINES compute or mesh stub (its translated
+        // shader is missing), or one from another device. A mesh stub's draws (DispatchMesh) are not recorded, so the
+        // list still closes, when this list's device made the stub; a draw with any other unregistered PSO fails the
+        // list, as before the stubs. Dispatches with an unregistered PSO are not recorded either (record_dispatch,
+        // D3D-482).
         unregistered_pipeline_ = state && !compute_pipeline_ && !graphics_pipeline_;
-        if (unregistered_pipeline_)
+        stub_kind_ = unregistered_pipeline_ ? stub_pipeline_kind(state, attached_device()) : StubPipelineKind::none;
+        if (unregistered_pipeline_ && stub_kind_ == StubPipelineKind::none)
             stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
     }
 
@@ -2387,7 +2392,15 @@ public:
 
     ~CommandQueue() override {
         if (!stamp_.pool) return;
+        if (!wait_stamp() && !context_.is_device_lost()) {
+            // A failed host wait can leave the timestamp command buffer in flight.
+            std::lock_guard submit_lock(context_.submit_mutex());
+            const auto result = context_.observe_result(context_.vk.vkQueueWaitIdle(vk_queue_),
+                                                        "vkQueueWaitIdle (calibration teardown)");
+            if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) return;
+        }
         const VkDevice device = context_.device();
+        context_.vk.vkDestroySemaphore(device, stamp_.completion, nullptr);
         stamp_.destroy_query_pool(device, stamp_.queries, nullptr);
         context_.vk.vkDestroyCommandPool(device, stamp_.pool, nullptr);
     }
@@ -2671,13 +2684,13 @@ public:
     static CommandQueue* from(IUnknown* object) { return Child::from<CommandQueue>(object); }
 
 private:
-    // The fallback without calibrated timestamps: wait for the queue to go idle, then submit a timestamp write and
-    // wait for it, with QueryPerformanceCounter read just before the submission and just after it completes. The
-    // GPU timestamp falls between the two; the midpoint is the answer, off by at most half the round trip (tens of
-    // microseconds). It stalls the queue, which is acceptable for a call profilers make once per capture.
+    // Work already submitted on this VkQueue is drained by an empty marker before taking the CPU bracket.
+    // Wait for the marker and timestamp outside the submission lock so other queues can still submit.
     HRESULT submitted_calibration(UINT64& gpu, UINT64& cpu) {
-        std::lock_guard lock(mutex_);
-        if (!clock_.timestamp_valid_bits || !clock_.get_device_proc || !create_stamp()) return E_FAIL;
+        std::lock_guard lock(stamp_mutex_);
+        if (context_.is_device_lost() || !clock_.timestamp_valid_bits || !clock_.get_device_proc ||
+            !create_stamp() || !wait_stamp())
+            return E_FAIL;
         auto& vk = context_.vk;
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -2685,21 +2698,10 @@ private:
         stamp_.reset_query_pool(stamp_.commands, stamp_.queries, 0, 1);
         stamp_.write_timestamp(stamp_.commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, stamp_.queries, 0);
         if (vk.vkEndCommandBuffer(stamp_.commands) != VK_SUCCESS) return E_FAIL;
-        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &stamp_.commands;
+        if (!submit_stamp(VK_NULL_HANDLE) || !wait_stamp()) return E_FAIL;
         LARGE_INTEGER before{}, after{};
-        {
-            std::lock_guard submit_lock(context_.submit_mutex());
-            if (context_.observe_result(vk.vkQueueWaitIdle(vk_queue_), "vkQueueWaitIdle (calibration)") != VK_SUCCESS)
-                return E_FAIL;
-            QueryPerformanceCounter(&before);
-            if (context_.observe_result(vk.vkQueueSubmit(vk_queue_, 1, &submit, VK_NULL_HANDLE),
-                                        "vkQueueSubmit (calibration)") != VK_SUCCESS ||
-                context_.observe_result(vk.vkQueueWaitIdle(vk_queue_), "vkQueueWaitIdle (calibration)") != VK_SUCCESS)
-                return E_FAIL;
-            QueryPerformanceCounter(&after);
-        }
+        if (!submit_stamp(stamp_.commands, &before) || !wait_stamp()) return E_FAIL;
+        QueryPerformanceCounter(&after);
         std::uint64_t stamp = 0;
         if (context_.observe_result(stamp_.get_query_pool_results(context_.device(), stamp_.queries, 0, 1,
                                                                 sizeof(stamp), &stamp, sizeof(stamp),
@@ -2712,7 +2714,40 @@ private:
         return S_OK;
     }
 
-    // The fallback's command buffer and one-query timestamp pool, made on first use. Called with mutex_ held.
+    bool submit_stamp(VkCommandBuffer commands, LARGE_INTEGER* before = nullptr) {
+        const std::uint64_t next = stamp_.value + 1;
+        VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        timeline.signalSemaphoreValueCount = 1;
+        timeline.pSignalSemaphoreValues = &next;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
+        submit.commandBufferCount = commands ? 1 : 0;
+        submit.pCommandBuffers = commands ? &commands : nullptr;
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &stamp_.completion;
+        std::lock_guard submit_lock(context_.submit_mutex());
+        if (before) QueryPerformanceCounter(before);
+        if (context_.observe_result(context_.vk.vkQueueSubmit(vk_queue_, 1, &submit, VK_NULL_HANDLE),
+                                    "vkQueueSubmit (calibration)") != VK_SUCCESS)
+            return false;
+        stamp_.value = next;
+        stamp_.pending = true;
+        return true;
+    }
+
+    bool wait_stamp() {
+        if (!stamp_.pending) return true;
+        if (context_.is_device_lost()) return false;
+        VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wait.semaphoreCount = 1;
+        wait.pSemaphores = &stamp_.completion;
+        wait.pValues = &stamp_.value;
+        const auto result = context_.observe_result(
+            context_.vk.vkWaitSemaphores(context_.device(), &wait, UINT64_MAX), "vkWaitSemaphores (calibration)");
+        if (result == VK_SUCCESS) stamp_.pending = false;
+        return result == VK_SUCCESS;
+    }
+
+    // The fallback's timestamp pool, command buffer and completion timeline. Called with stamp_mutex_ held.
     bool create_stamp() {
         if (stamp_.pool) return true;
         const VkDevice device = context_.device();
@@ -2739,7 +2774,14 @@ private:
         allocate.commandBufferCount = 1;
         if (vk.vkCreateCommandPool(device, &pool, nullptr, &stamp_.pool) == VK_SUCCESS) {
             allocate.commandPool = stamp_.pool;
-            if (vk.vkAllocateCommandBuffers(device, &allocate, &stamp_.commands) == VK_SUCCESS) return true;
+            if (vk.vkAllocateCommandBuffers(device, &allocate, &stamp_.commands) == VK_SUCCESS) {
+                VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+                type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+                VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+                if (context_.observe_result(vk.vkCreateSemaphore(device, &semaphore, nullptr, &stamp_.completion),
+                                            "vkCreateSemaphore (calibration)") == VK_SUCCESS)
+                    return true;
+            }
             vk.vkDestroyCommandPool(device, stamp_.pool, nullptr);
             stamp_.pool = VK_NULL_HANDLE;
         }
@@ -2823,6 +2865,7 @@ private:
     VkQueue vk_queue_;
     std::uint32_t family_;
     QueueClock clock_;
+    std::mutex stamp_mutex_;
     struct {
         PFN_vkCreateQueryPool create_query_pool = nullptr;
         PFN_vkDestroyQueryPool destroy_query_pool = nullptr;
@@ -2832,6 +2875,9 @@ private:
         VkQueryPool queries = VK_NULL_HANDLE;
         VkCommandPool pool = VK_NULL_HANDLE;
         VkCommandBuffer commands = VK_NULL_HANDLE;
+        VkSemaphore completion = VK_NULL_HANDLE;
+        std::uint64_t value = 0;
+        bool pending = false;
     } stamp_;
 };
 

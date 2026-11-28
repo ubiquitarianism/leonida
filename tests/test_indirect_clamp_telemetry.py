@@ -47,9 +47,10 @@ def mesh_counter_ops(header):
 class TestIndirectClampTelemetry(unittest.TestCase):
     def test_embedded_preclamp_mesh_counters(self):
         src = Path(__file__).resolve().parents[1] / "runtime" / "src"
-        # Active mesh records + records requesting y/z > 1; max y and max z before clamping.
+        # Active mesh records + records requesting y/z > 1; max y and max z before clamping. Then the dispatch
+        # records: wider than 65 535 groups in x, the widest x, cut at the device's limits, and all of them.
         self.assertEqual(mesh_counter_ops((src / "indirect_clamp_spv.h").read_text(encoding="ascii")),
-                         {(8, 234), (9, 234), (10, 239), (11, 239)})
+                         {(8, 234), (9, 234), (10, 239), (11, 239), (12, 234), (13, 239), (14, 234), (15, 234)})
 
 
 if __name__ == "__main__":
