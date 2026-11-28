@@ -120,7 +120,7 @@ these four slots. Measured on 1.0.2.1 (counts only):
 | Image | `ID3D12*` IIDs it contains | Imports from `d3d12_xs.dll` | Calls at `0x40`/`0x48`/`0x60`/`0x120` on the device |
 |---|---|---|---|
 | `XboxBvhBuilder.dll` | `PipelineState`, `RootSignature` | `D3D12SerializeVersionedRootSignature` | none: no indirect call at any of the four offsets |
-| `amd_fidelityfx_upscaler_xbox.dll` | `CommandSignature`, `DescriptorHeap`, `Device`, `Heap`, `PipelineState`, `Resource`, `RootSignature`, `RootSignatureDeserializer` | `D3D12CreateRootSignatureDeserializer` | none: the 3 calls at `0x40` are `ID3D12Resource::Map` on a resource it has just created, the 29 at `0x48` are `Close`/`Unmap`-shaped calls with no `(type, &IID, &out)` arguments, the 4 at `0x60` are a function-pointer field in a plain struct (no vtable load), and there are none at `0x120` |
+| `amd_fidelityfx_upscaler_xbox.dll` | `CommandSignature`, `DescriptorHeap`, `Device`, `Heap`, `PipelineState`, `Resource`, `RootSignature`, `RootSignatureDeserializer` | `D3D12CreateRootSignatureDeserializer` | none: the 3 calls at `0x40` are `ID3D12Resource::Map` on a resource it has just created, the 29 at `0x48` are `Close`/`Unmap`-shaped calls with no `(type, &IID, &out)` arguments (§2.1a explains why that shape rules out `CreateCommandAllocator`), the 4 at `0x60` are a function-pointer field in a plain struct (no vtable load), and there are none at `0x120` |
 | `amd_fidelityfx_loader_xbox.dll`, `Bink2Scarlett.dll` | none | none | — |
 
 Neither image contains the IID of `ID3D12CommandQueue`, `ID3D12CommandAllocator`,
@@ -171,6 +171,83 @@ at `0x142478B56` → `0x142478B71` ([retail_boot_chain.md](retail_boot_chain.md)
 [#523](https://github.com/ubiquitarianism/leonida/issues/523)); the carried
 `IID_ID3D12GraphicsCommandList` (`0x1461ECFA0`) is passed to slot 73 at a separate site
 (`0x1417F6D1D` → `0x1417F6D34`).
+
+### 2.1a A byte offset is not a method: `0x48` and `0x50`
+
+`0x48` and `0x50` are the worst pair in the whole surface because the same two numbers name a
+*device factory* in one receiver and two *descriptor-heap getters* in another. The offset alone
+therefore decides nothing; a call site has to be resolved to its receiver's interface first. On
+the device (this page's subject) `0x48` is `CreateCommandAllocator` and `0x50` is not used at
+all. On an `ID3D12DescriptorHeap` the same two offsets are `GetCPUDescriptorHandleForHeapStart`
+and `GetGPUDescriptorHandleForHeapStart`, because `ID3D12DescriptorHeap` inherits
+`IUnknown` + `ID3D12Object` + `ID3D12DeviceChild` (eight slots) and puts `GetDesc` at `0x40`,
+the CPU getter at `0x48` and the GPU getter at `0x50` (`d3d12.h:5768`, `:5775`, `:5782`).
+
+| Receiver | `0x48` | `0x50` |
+|---|---|---|
+| `ID3D12Device` | `CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE, REFIID, void**)`, `HRESULT` | — (no call site in the image) |
+| `ID3D12CommandQueue` (§2.2) | `CopyTileMappings(...)`, `HRESULT` | `ExecuteCommandLists(...)`, no return |
+| `ID3D12DescriptorHeap` | `GetCPUDescriptorHandleForHeapStart()`, 8-byte handle in `RAX` | `GetGPUDescriptorHandleForHeapStart()`, 8-byte handle in `RAX` |
+
+Three interfaces, three meanings at each offset, and the shapes do not overlap, which is what
+makes the resolution possible: a device factory call is `(rcx = device, edx = type, rdx = &IID,
+r8 = &out)` and tests `eax`; a heap getter is `(rcx = heap)` alone and consumes `rax`; a queue
+call passes list arrays or does not return a value.
+
+**Measured, device side.** The device object lives in the global `0x148759D00` and is set up in
+`0x142478440`. That function has six sites at `+0x48`: two are the device
+(`0x142478B2D` with `xor edx, edx` and `0x142478C3B` with `mov edx, 2`), each passing
+`&IID_ID3D12CommandAllocator` at `0x1461E0658`
+(`6102dee4-af59-4b09-b999-b44d73f09b24`, `d3d12.h:5192`) and a distinct out slot; two are
+`ID3D12GraphicsCommandList::Close` on the list it just created, and two are no-argument calls on
+the globals `0x1475E7390`/`0x1475E7420` (the getter shape). Across the whole image, scanning the rip-relative
+device load in front of every `+0x48` and `+0x50` call site finds **2 device sites at `0x48` and
+none at `0x50`**: the game never calls anything at device `0x50`, so a replacement runtime
+should leave that slot inert rather than guess a meaning for it.
+
+**Measured, heap side.** `0x141CF3280` is the clearest anchor. It calls device `0x70`
+(`CreateDescriptorHeap`, see §4.2 for that slot) with a `D3D12_DESCRIPTOR_HEAP_DESC` and
+`&IID_ID3D12DescriptorHeap` (`0x1461E0628`, `8efb471d-616c-4f49-90f7-127bb763fa51`,
+`d3d12.h:5763`), then calls the returned object at `0x48` and `0x50` with only `this`: it caches
+the CPU handle, asserts it equals the expected base address, and subtracts it from the GPU
+handle to store the GPU−CPU base delta. `0x141C744F0` does the same `0x70`/`0x48` pair and
+strides the returned CPU handle by the `GetDescriptorHandleIncrementSize` value from device
+`0x78` while filling a descriptor array. Both are `create → get handle → arithmetic`, which is
+what the two getters are for.
+
+| Shape | Site | Receiver |
+|---|---|---|
+| CPU getter, base for a descriptor array | `0x141C74559` | heap returned by device `0x70` |
+| CPU getter, asserted against the expected base | `0x141CF3358` | heap returned by device `0x70` |
+| GPU getter, minus the CPU handle = base delta | `0x141CF3392` | heap returned by device `0x70` |
+
+**How often the shapes collide.** Of the 33 functions that contain a `+0x70` call and a `+0x48`
+call, and the 81 that contain `+0x70` and `+0x50`, 19 trace a `+0x48`/`+0x50` receiver back to
+the `CreateDescriptorHeap` return: 47 sites, 14 of them passing only `this`. In a heap-creating
+function, a bare `(this)` call at `0x48`/`0x50` whose result comes back in `RAX` is therefore a
+getter, and the `(type, &IID, &out)` form at the same offset is the device factory.
+
+**Where one hop is not enough.** Four shapes in the same function population are *not* heap
+getters and would be misfiled by offset alone:
+
+- `0x14080C3E0` passes `plVar1[1]`, an inner object, at `0x48`/`0x50` and tests the returned
+  `char`: a boolean pair, not handles;
+- `0x14049E200` passes an out buffer in `rdx` at `0x50`, the C `RetVal` variant from
+  `d3d12.h:5784`;
+- `0x140087040` is a dispatch thunk that forwards `rdx`/`r8` to whichever slot matches a tag
+  byte, so both offsets show two extra argument registers there;
+- `0x141993B30` reloads `rcx` from a factory global before its `0x50` call, so a trace that only
+  remembers "this register once held the heap" mislabels it.
+
+Confidence: the device/handle distinction is **Measured**; the getter *names* come from the SDK
+declarations and are matched to the measured `create → handle → arithmetic` shape, not read from
+the runtime, which the package does not ship (§1.1).
+
+Reproduce: the receiver scan disassembles each function holding a `+0x70` call, tracks the
+`RAX` return into the registers and stack slots it is stored to, and prints the argument
+registers in front of every `+0x48`/`+0x50` call that resolves to that object; the device side
+resolves rip-relative globals to `0x148759D00` the same way. Ghidra's decompiler of
+`0x141CF3280`, `0x141C744F0` and `0x142478440` shows the same three shapes in one screen.
 
 ### 2.2 Queue, allocator and fence
 
