@@ -120,6 +120,21 @@ int main() {
         EXPECT(tokens->issue() == outside + 2);
         EXPECT(pacer.check_present_token(outside + 2) == pacer_hr::ok);
         EXPECT(pacer.check_present_token(outside + 3) == pacer_hr::invalid_arg);
+        FrameStatistic event{};
+        std::uint32_t count = 1;
+        EXPECT(pacer.get_frame_statistics(token, stat_frame_event, &count, &event) == pacer_hr::ok &&
+               event.time_us == period);
+        clock.advance_us(period);
+        std::uint64_t newest = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &newest) == pacer_hr::ok && newest == token + 2);
+        count = 1;
+        EXPECT(pacer.get_frame_statistics(token + 1, stat_frame_event, &count, &event) == pacer_hr::false_ && count == 0);
+        pacer.commit_present_token(newest, 1);
+        count = 1;
+        EXPECT(pacer.get_frame_statistics(newest, stat_frame_event, &count, &event) == pacer_hr::ok &&
+               event.time_us == 2 * period);
+        count = 1;
+        EXPECT(pacer.get_frame_statistics(token, stat_present, &count, &event) == pacer_hr::false_ && count == 0);
     }
 
     // An offset delays the event inside the period: origin n comes at n * period + offset.
@@ -193,6 +208,20 @@ int main() {
         EXPECT(blocked(next));
         clock.advance_us(period * 3 / 4);
         EXPECT(next.get().token == 4);
+
+        pacer.suspend();
+        pacer.resume();
+        std::uint64_t unregistered = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &unregistered) == pacer_hr::ok &&
+               unregistered == 5);
+        EXPECT(setup(pacer, 1));
+        clock.advance_us(period);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 6);
+        count = 1;
+        EXPECT(pacer.get_frame_statistics(unregistered, stat_frame_event, &count, &stat) == pacer_hr::false_ && count == 0);
+        count = 1;
+        EXPECT(pacer.get_frame_statistics(token, stat_frame_event, &count, &stat) == pacer_hr::ok &&
+               stat.time_us == clock.now_us());
     }
 
     // A current-token poll before the first origin offset still issues immediately.

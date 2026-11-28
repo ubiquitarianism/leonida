@@ -288,9 +288,7 @@ public:
         if (!count) return pacer_hr::invalid_arg;
         std::lock_guard guard(mutex_);
         retire_locked(clock_.now_us());
-        const Record* record = nullptr;
-        for (const Record& r : records_)
-            if (r.token == token) record = &r;
+        const Record* record = token_record_locked(token);
         FrameStatistic found[3];
         std::uint32_t n = 0, expected = 0;
         auto add = [&](std::uint32_t type, bool present, std::uint64_t time) {
@@ -353,9 +351,9 @@ public:
         retire_locked(now);
         timing.period_us = period_us_;
         if (!pending_.empty()) return timing;
-        for (const Record& r : records_)
-            if (r.token == token && !r.presented && token > last_presented_ && now > r.due_us)
-                timing.late_us = now - r.due_us;
+        if (const auto* record = token_record_locked(token);
+            record && !record->presented && token > last_presented_ && now > record->due_us)
+            timing.late_us = now - record->due_us;
         return timing;
     }
 
@@ -367,11 +365,14 @@ public:
         std::lock_guard guard(mutex_);
         const std::uint64_t now = clock_.now_us();
         retire_locked(now);
-        record_present_timing_locked(now, token);
+        Record* record = token_record_locked(token);
+        record_present_timing_locked(now, token ? record : nullptr);
         last_presented_ = std::max(last_presented_, token);
         if (!interval_set_ || !any_armed_locked() || uncapped_) {  // not paced or uncapped: shows at once
-            for (Record& r : records_)
-                if (r.token == token) { r.presented = r.displayed = true; r.present_us = r.display_us = now; }
+            if (record) {
+                record->presented = record->displayed = true;
+                record->present_us = record->display_us = now;
+            }
             return;
         }
         const bool queued_before = !pending_.empty();
@@ -380,14 +381,15 @@ public:
         if (sync == PresentSync::immediate && !queued_before) {
             flip = now;
             std::uint64_t late_us = 0;
-            for (const Record& r : records_)
-                if (r.token == token && now > r.due_us) late_us = now - r.due_us;
+            if (record && now > record->due_us) late_us = now - record->due_us;
             percent = scan_percent(late_us, period_us_);
             ++immediate_presents_;
         }
         pending_.push_back(Pending{token, flip, percent});
-        for (Record& r : records_)
-            if (r.token == token) { r.presented = true; r.present_us = now; }
+        if (record) {
+            record->presented = true;
+            record->present_us = now;
+        }
         retire_locked(now);
         cv_.notify_all();
     }
@@ -396,7 +398,7 @@ public:
     void note_untokened_present() {
         std::lock_guard guard(mutex_);
         const std::uint64_t now = clock_.now_us();
-        record_present_timing_locked(now, 0);
+        record_present_timing_locked(now, nullptr);
         if (!interval_set_ || !any_armed_locked() || uncapped_) return;
         retire_locked(now);
         const std::uint64_t flip = queue_flip_locked(now);
@@ -514,7 +516,17 @@ private:
         return flip;
     }
 
-    void record_present_timing_locked(std::uint64_t now, std::uint64_t token) {
+    Record* token_record_locked(std::uint64_t token) {
+        if (records_.empty()) return nullptr;
+        const auto newest = records_.back().token;
+        // A shared token source and unregistered polls can leave gaps between local records.
+        // Compare unsigned distances from the newest retained token to preserve their order at rollover.
+        const auto found = std::lower_bound(records_.begin(), records_.end(), newest - token,
+            [newest](const Record& record, std::uint64_t age) { return newest - record.token > age; });
+        return found != records_.end() && found->token == token ? &*found : nullptr;
+    }
+
+    void record_present_timing_locked(std::uint64_t now, const Record* record) {
         ++presents_recorded_;
         if (has_last_present_ && now >= last_present_us_) {
             interval_ring_[interval_head_] = now - last_present_us_;
@@ -523,29 +535,22 @@ private:
         }
         has_last_present_ = true;
         last_present_us_ = now;
-        if (token != 0) {
-            for (const Record& r : records_) {
-                if (r.token == token) {
-                    if (now >= r.origin_us) {
-                        latency_ring_[latency_head_] = now - r.origin_us;
-                        latency_head_ = (latency_head_ + 1) % frame_pacing_window;
-                        if (latency_count_ < frame_pacing_window) ++latency_count_;
-                    }
-                    break;
-                }
-            }
+        if (record && now >= record->origin_us) {
+            latency_ring_[latency_head_] = now - record->origin_us;
+            latency_head_ = (latency_head_ + 1) % frame_pacing_window;
+            if (latency_count_ < frame_pacing_window) ++latency_count_;
         }
     }
 
     // Frames whose vblank has come are shown.
     void retire_locked(std::uint64_t now) {
         while (!pending_.empty() && pending_.front().flip_us <= now) {
-            for (Record& r : records_)
-                if (r.token == pending_.front().token && pending_.front().token) {
-                    r.displayed = true;
-                    r.display_us = pending_.front().flip_us;
-                    r.percent_scanned = pending_.front().percent_scanned;
-                }
+            const auto& presented = pending_.front();
+            if (auto* record = presented.token ? token_record_locked(presented.token) : nullptr) {
+                record->displayed = true;
+                record->display_us = presented.flip_us;
+                record->percent_scanned = presented.percent_scanned;
+            }
             pending_.pop_front();
         }
     }
