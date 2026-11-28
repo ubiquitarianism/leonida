@@ -50,6 +50,10 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(leonida_mods.joaat("player_story000_00"), 0xE472B687)
         self.assertEqual(leonida_mods.joaat("cs_mandy"), 0xD7C0CDFF)
         self.assertEqual(leonida_mods.parse_model_id("0xD7C0CDFF"), 0xD7C0CDFF)
+        self.assertEqual(leonida_mods.parse_model_id("  player_story000_00 \t"), 0xE472B687)
+        self.assertEqual(leonida_mods.parse_model_id("\n0xD7C0CDFF "), 0xD7C0CDFF)
+        with self.assertRaises(ValueError):
+            leonida_mods.parse_model_id(" \t\n ")
         with self.assertRaises(ValueError):
             leonida_mods.parse_model_id("0x")
         with self.assertRaises(ValueError):
@@ -60,6 +64,12 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(mod.name, "Mandy in the prison intro")
         self.assertEqual(mod.swaps[0].from_id, 0xE472B687)
         self.assertEqual(mod.swaps[0].to_id, 0xD7C0CDFF)
+
+        padded = dict(MANDY)
+        padded["archetype_swaps"] = [{"from": " player_story000_00 ", "to": " cs_mandy\t"}]
+        padded_mod = leonida_mods.validate_manifest(padded, "padded_names")
+        self.assertEqual(padded_mod.swaps[0].from_id, 0xE472B687)
+        self.assertEqual(padded_mod.swaps[0].to_id, 0xD7C0CDFF)
 
         def bad(data, needle):
             with self.assertRaises(leonida_mods.ModsError) as cm:

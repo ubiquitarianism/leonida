@@ -92,6 +92,9 @@ def joaat(name: str) -> int:
 def parse_model_id(text: str) -> int:
     if not isinstance(text, str) or not text:
         raise ValueError("empty model name")
+    text = text.strip()
+    if not text:
+        raise ValueError("empty model name")
     if text.startswith(("0x", "0X")):
         digits = text[2:]
         if not digits:

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <intrin.h>
+#include <share.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
@@ -10,7 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
@@ -77,9 +78,16 @@ std::string path_utf8(const std::filesystem::path& path) {
 }
 
 std::vector<uint8_t> read_file(const std::filesystem::path& p) {
-    std::ifstream f(p, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + path_utf8(p));
-    return {std::istreambuf_iterator<char>(f), {}};
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> file(
+        _wfsopen(p.c_str(), L"rb", _SH_DENYNO), std::fclose);
+    if (!file) throw std::runtime_error("cannot open " + path_utf8(p));
+
+    std::vector<uint8_t> bytes;
+    std::array<uint8_t, 64 * 1024> block;
+    while (const auto count = std::fread(block.data(), 1, block.size(), file.get()))
+        bytes.insert(bytes.end(), block.data(), block.data() + count);
+    if (std::ferror(file.get())) throw std::runtime_error("cannot read " + path_utf8(p));
+    return bytes;
 }
 
 template <class T>
@@ -1341,6 +1349,15 @@ void* bundled_load_w(void* ctx, const std::wstring& basename, uint32_t flags, bo
     return static_cast<Loader*>(ctx)->load_runtime_module_w(basename, flags, handled);
 }
 
+void* bundled_compat_module(void* ctx, const std::wstring& basename, const std::wstring& name, bool load,
+                            uint32_t flags, bool& handled) {
+    return static_cast<Loader*>(ctx)->runtime_compat_module(basename, name, load, flags, handled);
+}
+
+bool bundled_owns_compat_handle(void* ctx, void* module) {
+    return static_cast<Loader*>(ctx)->owns_compat_handle(module);
+}
+
 const shims::BundledModuleOps kBundledOps{
     &bundled_find_loaded,
     &bundled_load,
@@ -1348,6 +1365,8 @@ const shims::BundledModuleOps kBundledOps{
     &bundled_owns_handle,
     &bundled_find_loaded_w,
     &bundled_load_w,
+    &bundled_compat_module,
+    &bundled_owns_compat_handle,
 };
 
 // Marks what a run-time load maps as a dynamic load for as long as it is in scope (the caller holds the mutex).
@@ -1363,7 +1382,18 @@ struct RuntimeLoadScope {
 Loader::Loader(std::filesystem::path game_dir) : game_dir_(std::move(game_dir)) {
     std::vector<wchar_t> compat(32768);
     const DWORD n = GetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", compat.data(), static_cast<DWORD>(compat.size()));
-    if (n > 0 && n < compat.size()) compat_dir_ = std::filesystem::path(compat.data());
+    if (n > 0 && n < compat.size()) {
+        // Absolute, with backslashes and no trailing separator: LoadLibraryExW with LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+        // needs a full path, and owns_compat_handle() compares it with a module's own folder.
+        std::error_code ec;
+        compat_dir_ = std::filesystem::absolute(std::filesystem::path(compat.data()), ec).lexically_normal();
+        compat_dir_.make_preferred();
+        if (!compat_dir_.has_filename()) compat_dir_ = compat_dir_.parent_path();
+        for (std::filesystem::directory_iterator it(compat_dir_, ec), end; !ec && it != end; it.increment(ec)) {
+            std::error_code file_ec;
+            if (it->is_regular_file(file_ec)) compat_files_.push_back(it->path().filename());
+        }
+    }
     shims::add_module_lookup(this, &lookup_in_loader);
     shims::add_bundled_loader(this, &kBundledOps);
 }
@@ -1504,6 +1534,8 @@ void* Loader::load_runtime_module_w(const std::wstring& basename, uint32_t flags
         if (prefer_host_copy(narrow)) return nullptr;
 
     std::lock_guard lock(mutex_);
+    // As load_runtime_module: a run-time load, so DllMain gets a null lpvReserved.
+    const RuntimeLoadScope dynamic(runtime_loads_);
     Module* existing = find_wide_module(basename);
     const std::filesystem::path candidate = game_dir_ / basename;
     std::error_code ec;
@@ -1890,6 +1922,25 @@ void Loader::initialize_tls(Module& m) {
                 throw std::runtime_error(m.name + ": reserved TLS index is out of range");
         }
 
+        // An EXE's code may read its TLS at index 0 directly (/GA); index 0 is gta6rt.exe's here (pe_loader.h,
+        // tls_ga_slot). Patched before any of the image's code runs, TLS callbacks included, and before the owner is
+        // published below: from then on a thread event (install_thread_block) reads m.tls_ga_slot
+        // (RT-LOADER-RUNTIME-SCOPE-AND-TLS-SLOT).
+        if (executable && total && index != 0 && ga_tls_patch_enabled()) {
+            static const DWORD ga_slot = TlsAlloc();
+            if (ga_slot == TLS_OUT_OF_INDEXES || ga_slot >= 64) {
+                std::fprintf(stderr, "[rt] loader: %s: no TlsAlloc slot below 64 for its index-0 TLS reads\n",
+                             m.name.c_str());
+            } else {
+                m.tls_ga_sites = patch_ga_tls_reads(m, ga_slot);
+                if (m.tls_ga_sites) m.tls_ga_slot = ga_slot;
+                std::fprintf(stderr,
+                             "[rt] loader: %s: %zu index-0 TLS reads (gs:[58h]) now read its own TLS (TlsSlots[%lu]); "
+                             "its module TLS index is %u\n",
+                             m.name.c_str(), m.tls_ga_sites, static_cast<unsigned long>(ga_slot), index);
+            }
+        }
+
         // The fields are complete before a thread event can see the owner.
         ExclusiveTlsLock lock;
         Module* expected = nullptr;
@@ -1907,26 +1958,6 @@ void Loader::initialize_tls(Module& m) {
         // The index lives in a writable section and protect_sections() has not run yet, so the write needs no
         // VirtualProtect dance.
         if (index_rva) *reinterpret_cast<uint32_t*>(m.base + index_rva) = index;
-    }
-    {
-        // An EXE's code may read its TLS at index 0 directly (/GA); index 0 is gta6rt.exe's here (pe_loader.h,
-        // tls_ga_slot). Patched before any of the image's code runs, TLS callbacks included.
-        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m.base);
-        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m.base + dos->e_lfanew);
-        if (!(nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && total && index != 0 && ga_tls_patch_enabled()) {
-            static const DWORD ga_slot = TlsAlloc();
-            if (ga_slot == TLS_OUT_OF_INDEXES || ga_slot >= 64) {
-                std::fprintf(stderr, "[rt] loader: %s: no TlsAlloc slot below 64 for its index-0 TLS reads\n",
-                             m.name.c_str());
-            } else {
-                m.tls_ga_sites = patch_ga_tls_reads(m, ga_slot);
-                if (m.tls_ga_sites) m.tls_ga_slot = ga_slot;
-                std::fprintf(stderr,
-                             "[rt] loader: %s: %zu index-0 TLS reads (gs:[58h]) now read its own TLS (TlsSlots[%lu]); "
-                             "its module TLS index is %u\n",
-                             m.name.c_str(), m.tls_ga_sites, static_cast<unsigned long>(ga_slot), index);
-            }
-        }
     }
     try {
         install_thread_block(m);
@@ -2046,35 +2077,126 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
     return reinterpret_cast<void*>(p);
 }
 
+const std::filesystem::path* Loader::compat_file(const std::wstring& basename) const {
+    if (basename.empty()) return nullptr;
+    for (const auto& file : compat_files_)
+        if (same_module_name(file.c_str(), basename.c_str())) return &file;
+    return nullptr;
+}
+
+void* Loader::compat_handle(const std::filesystem::path& file, bool load, uint32_t& error) {
+    error = ERROR_SUCCESS;
+    const std::string key = lower(path_utf8(file));
+    if (auto it = compat_modules_.find(key); it != compat_modules_.end()) return it->second;
+    const std::filesystem::path candidate = compat_dir_ / file;
+    // Already live without a lookup through here: Windows loaded it from the folder as another compat DLL's
+    // dependency (LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR), or something loaded it by its path. That is the module a
+    // static import or a run-time load must share. The reference taken here is kept, as for the DLLs loaded below.
+    if (HMODULE live = nullptr; GetModuleHandleExW(0, candidate.c_str(), &live) && live) {
+        compat_modules_.emplace(key, live);
+        std::fprintf(stderr, "[rt] compat: %s -> %s (already loaded)\n", path_utf8(file).c_str(),
+                     path_utf8(candidate).c_str());
+        return live;
+    }
+    if (!load) return nullptr;
+    // The full path, with the compat folder on the DLL's own search path for its dependencies; never the game
+    // folder. Windows maps it, so its CRT, TLS and SEH work as for any host DLL.
+    // A file Windows cannot map (truncated, wrong machine, not a PE image) otherwise raises a modal "Bad Image"
+    // box and LoadLibraryExW does not return until someone clicks it: a headless run would hang on a failure
+    // that the caller reports anyway. The mode is this thread's, and goes back as it was.
+    DWORD previous_mode = 0;
+    const bool mode_set = SetThreadErrorMode(GetThreadErrorMode() | SEM_FAILCRITICALERRORS, &previous_mode) != 0;
+    HMODULE h = LoadLibraryExW(candidate.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    error = h ? ERROR_SUCCESS : GetLastError();
+    if (mode_set) SetThreadErrorMode(previous_mode, nullptr);
+    if (!h) return nullptr;
+    compat_modules_.emplace(key, h);
+    std::fprintf(stderr, "[rt] compat: %s -> %s\n", path_utf8(file).c_str(), path_utf8(candidate).c_str());
+    return h;
+}
+
 bool Loader::resolve_compat(const std::string& key, const std::string& dll, const std::string& name, uint16_t ordinal,
                             bool by_ordinal, void*& out) {
     out = nullptr;
     if (compat_dir_.empty() || key.empty() || key.find_first_of("/\\:") != std::string::npos) return false;
-    HMODULE h = nullptr;
-    if (auto it = compat_modules_.find(key); it != compat_modules_.end()) {
-        h = static_cast<HMODULE>(it->second);
-    } else {
-        const std::filesystem::path candidate = compat_dir_ / std::filesystem::path(dll);
-        std::error_code ec;
-        if (!std::filesystem::is_regular_file(candidate, ec)) return false;
-        // The full path, with the compat folder on the DLL's own search path for its dependencies; never the game
-        // folder. Windows maps it, so its CRT, TLS and SEH work as for any host DLL.
-        // A file Windows cannot map (truncated, wrong machine, not a PE image) otherwise raises a modal "Bad Image"
-        // box and LoadLibraryExW does not return until someone clicks it: a headless run would hang on a failure
-        // that is reported right below anyway. The mode is this thread's, and goes back as it was.
-        DWORD previous_mode = 0;
-        const bool mode_set = SetThreadErrorMode(GetThreadErrorMode() | SEM_FAILCRITICALERRORS, &previous_mode) != 0;
-        h = LoadLibraryExW(candidate.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-        const DWORD load_error = h ? ERROR_SUCCESS : GetLastError();
-        if (mode_set) SetThreadErrorMode(previous_mode, nullptr);
-        if (!h)
-            throw std::runtime_error("LEONIDA_COMPAT_DIR: " + path_utf8(candidate) + " exists but Windows could not " +
-                                     "load it (error " + std::to_string(load_error) + ")");
-        compat_modules_.emplace(key, h);
-        std::fprintf(stderr, "[rt] compat: %s -> %s\n", dll.c_str(), path_utf8(candidate).c_str());
-    }
+    const std::filesystem::path* file = compat_file(acp_to_wide(dll));
+    if (!file) return false;
+    uint32_t error = ERROR_SUCCESS;
+    HMODULE h = static_cast<HMODULE>(compat_handle(*file, true, error));
+    if (!h)
+        throw std::runtime_error("LEONIDA_COMPAT_DIR: " + path_utf8(compat_dir_ / *file) +
+                                 " exists but Windows could not load it (error " + std::to_string(error) + ")");
     out = reinterpret_cast<void*>(GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str()));
     return true;
+}
+
+void* Loader::runtime_compat_module(const std::wstring& basename, const std::wstring& name, bool load,
+                                    uint32_t flags, bool& handled) {
+    handled = false;
+    if (compat_dir_.empty()) return nullptr;
+    std::lock_guard lock(mutex_);
+    const std::filesystem::path* file = compat_file(basename);
+    if (!file) return nullptr;
+    const std::filesystem::path compat_path = compat_dir_ / *file;
+    // A name with a directory names one file, which Windows would load even when another of the same name is in use:
+    // the compat DLL answers it only when it is that file (".dll" added as LoadLibrary adds it). Any other path goes
+    // on as without the folder.
+    if (name.find_first_of(L"\\/:") != std::wstring::npos) {
+        std::filesystem::path given(name);
+        given.replace_filename(basename);
+        std::error_code ec;
+        if (!std::filesystem::equivalent(given, compat_path, ec)) return nullptr;
+    }
+    handled = true;
+    // DONT_RESOLVE_DLL_REFERENCES maps a DLL without its dependencies, TLS or DllMain. The compat DLL is shared with
+    // static imports, initialised, so refuse it before loading or returning a handle, as for bundled DLLs
+    // (load_runtime_candidate).
+    if (load && (flags & DONT_RESOLVE_DLL_REFERENCES) != 0) {
+        std::fprintf(stderr, "[rt] compat: LoadLibraryEx(%s, DONT_RESOLVE_DLL_REFERENCES) is not supported\n",
+                     path_utf8(compat_path).c_str());
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+    uint32_t error = ERROR_SUCCESS;
+    void* h = compat_handle(*file, load, error);
+    if (!h && load) {
+        // As a LoadLibrary of a file Windows refuses: null and its error, never the shim (the player put the DLL
+        // there to own the module).
+        std::fprintf(stderr, "[rt] compat: %s exists but Windows could not load it (error %u, run-time load)\n",
+                     path_utf8(compat_path).c_str(), error);
+        SetLastError(error);
+    } else if (!h) {
+        SetLastError(ERROR_MOD_NOT_FOUND);  // GetModuleHandle of a module nothing has loaded yet
+    }
+    return h;
+}
+
+bool Loader::owns_compat_handle(void* module) {
+    if (!module || compat_dir_.empty()) return false;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& [key, h] : compat_modules_)
+            if (h == module) return true;
+    }
+    // A DLL from the folder that no lookup has seen yet (Windows loaded it as another compat DLL's dependency): its
+    // exports are its own too. Recorded, with a kept reference, through compat_handle(). GetModuleFileNameW can take
+    // the Windows loader lock, so the path is read without mutex_ held; compat_dir_ and compat_files_ do not change
+    // after construction.
+    std::vector<wchar_t> path(MAX_PATH);
+    DWORD length = 0;
+    for (;;) {
+        length = GetModuleFileNameW(static_cast<HMODULE>(module), path.data(), static_cast<DWORD>(path.size()));
+        if (!length || length < path.size() || path.size() >= 32768) break;
+        path.resize(path.size() * 2);
+    }
+    if (!length || length >= path.size()) return false;
+    const std::filesystem::path file(std::wstring(path.data(), length));
+    if (!same_module_name(file.parent_path().c_str(), compat_dir_.c_str())) return false;
+    const std::filesystem::path* entry = compat_file(file.filename().native());
+    if (!entry) return false;
+    std::lock_guard lock(mutex_);
+    uint32_t error = ERROR_SUCCESS;
+    return compat_handle(*entry, false, error) == module;
 }
 
 void* Loader::resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal) {

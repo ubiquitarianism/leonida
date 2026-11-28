@@ -111,12 +111,23 @@ python -I tools/rdna2spirv.py <work>/shaders/dxbc/disasm --out <scratch> --shard
 Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`. Report translated and
 `spirv-val`-valid counts before and after; a change that lowers either is a regression.
 
+## Runtime traps
+
+- **No `thread_local` with a destructor in `gta6rt.exe`.** It makes the loader register a thread-exit callback with
+  the shared C runtime, which accepts one per process; the title's own registration then fails and the title aborts
+  with `0xC0000409` before its first frame. Keep per-thread scratch in the thread's own frame (a worker's loop) or
+  in a plain-data `thread_local`.
+- **A console method that returns a struct by value** takes a hidden return pointer as its first argument (RCX)
+  and `this` in RDX, as MSVC does for COM methods returning structs (`GetCustomHeapProperties`, `GetDesc`-style
+  slots); a proxy that reads RCX as `this` faults on a null vtable.
+
 ## Conventions
 
 - Python tools run with `python -I` and use only the standard library unless a file says otherwise; the exceptions
-  are the texture and model tools that import numpy or Pillow: `bc_feature.py`, `amd_swizzle.py`, `tile_probe.py`,
-  `swizzle_search.py`, `tex_export.py`, `tex_mode_probe.py`, `calibrated_texture.py`, `world_grid_atlas.py`,
-  `tex_headers.py` and `skinned_glb.py` (which fall back to the standard library when numpy is absent).
+  are the texture, model and control tools that import numpy or Pillow: `bc_feature.py`, `amd_swizzle.py`,
+  `tile_probe.py`, `swizzle_search.py`, `tex_export.py`, `tex_mode_probe.py`, `calibrated_texture.py`,
+  `world_grid_atlas.py`, `port_ctl.py`, `tex_headers.py` and `skinned_glb.py` (the last two fall back to the
+  standard library when numpy is absent).
 - A text file a tool writes names its line ending - `open(path, "w", encoding="utf-8", newline="\n")` - so the same
   input gives the same bytes on every platform; `tests/test_text_write_line_endings.py` catches a writer that forgets.
 - Keep `make_game.py` working on Windows first: paths through `os.path`, no bash in the build.

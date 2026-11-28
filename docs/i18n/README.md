@@ -13,7 +13,7 @@ A language is added when a contributor volunteers to maintain it and keeps the s
 | Language | File | Synced commit | Maintainer |
 |---|---|---|---|
 | Français (`fr`) | [`fr/quickstart.md`](fr/quickstart.md) | `aa2988cc` | `@Urban225` |
-| Português (Brasil) (`pt-BR`) | [`pt-BR/quickstart.md`](pt-BR/quickstart.md) | `f847748c` | `@Andretuta` |
+| Português (Brasil) (`pt-BR`) | [`pt-BR/quickstart.md`](pt-BR/quickstart.md) | `b1619e0a` | `@Andretuta` |
 | Português (Portugal) (`pt-PT`) | [`pt-PT/quickstart.md`](pt-PT/quickstart.md) | `867d922f` | `@enzoduarte1` |
 | 简体中文 (`zh-CN`) | [`zh-CN/quickstart.md`](zh-CN/quickstart.md) | `aa2988cc` | `@liang-kai-shui` |
 | Polski (Polish) (`pl-PL`) | [`pl-PL/quickstart.md`](pl-PL/quickstart.md) | `f847748c` | `@Dom-in, @t91a60` |
@@ -24,6 +24,7 @@ A language is added when a contributor volunteers to maintain it and keeps the s
 | Deutsch (`de`) | [`de/quickstart.md`](de/quickstart.md) | `aa2988cc` | `@zGLados` |
 | Italiano (`it`) | [`it/quickstart.md`](it/quickstart.md) | `49475796` | `@MeNoSkills` |
 | العربية (`ar`) | [`ar/quickstart.md`](ar/quickstart.md) | `561b65a` | `@Mohamed-Leo` |
+| Tiếng Việt (`vi`) | [`vi/quickstart.md`](vi/quickstart.md) | `507029d1` | `@dung997tb` |
 
 ## Other community translations
 
