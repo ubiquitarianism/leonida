@@ -4730,6 +4730,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_quad_list_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_quad_list COMMAND replay_quad_list_test)
+    # emit's viewports on the one-viewport and with-count paths: no zero-size viewport, depths in [0, 1] (no GPU).
+    add_executable(replay_viewport_test test/replay_viewport_test.cpp)
+    target_link_libraries(replay_viewport_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_viewport_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_viewport COMMAND replay_viewport_test)
     # emit of an enhanced texture barrier: no heap allocation for one layout piece, one barrier for each piece (no GPU).
     add_executable(replay_texture_barrier_test test/replay_texture_barrier_test.cpp)
     target_link_libraries(replay_texture_barrier_test PRIVATE Vulkan::Headers)

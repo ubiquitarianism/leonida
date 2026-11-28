@@ -5573,6 +5573,19 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
+            // Vulkan takes viewport depths in [0, 1] only, unless VK_EXT_depth_range_unrestricted is on
+            // (VUID-VkViewport-minDepth-01234, VUID-VkViewport-maxDepth-01235); D3D12 takes the same range.
+            const auto viewport_depth = [&](float z, float if_nan) {
+                if (vk.depth_range_unrestricted) return z;
+                return std::isnan(z) ? if_nan : std::clamp(z, 0.0f, 1.0f);
+            };
+            const auto vulkan_viewport = [&](const Viewport& v) {
+                return VkViewport{v.x, v.y + v.height, v.width, -v.height, viewport_depth(v.min_depth, 0.0f),
+                                  viewport_depth(v.max_depth, 1.0f)};
+            };
+            // Vulkan forbids width/height == 0 (VUID-VkViewport-width-01770, -height-01773); an empty D3D12 viewport
+            // draws nothing, so it becomes a 1x1 dummy viewport paired with an empty scissor.
+            const VkViewport dummy_viewport{0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
             if (graphics.viewport_with_count) {
                 std::array<VkViewport, DrawViewports::max_count> vps{};
                 std::array<VkRect2D, DrawViewports::max_count> scs{};
@@ -5583,13 +5596,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                     const Viewport v = (draw->viewports && k < vp_n) ? draw->viewports->viewports[k]
                                                                      : (k == 0 ? draw->viewport : Viewport{});
                     const bool valid_vp = (k < vp_n) && (v.width > 0.0f) && (v.height > 0.0f);
-                    if (valid_vp) {
-                        vps[k] = {v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
-                    } else {
-                        // Vulkan forbids width/height == 0; pair a 1x1 dummy viewport with an empty scissor so nothing
-                        // rasterizes into an unbound/empty D3D12 viewport slot.
-                        vps[k] = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
-                    }
+                    vps[k] = valid_vp ? vulkan_viewport(v) : dummy_viewport;
                     if (valid_vp && k < sc_n) {
                         const Rect s = draw->viewports ? draw->viewports->scissors[k] : draw->scissor;
                         const std::int32_t left = std::max(0, s.left);
@@ -5604,13 +5611,18 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.set_viewport_with_count(command_buffer, count, vps.data());
                 vk.set_scissor_with_count(command_buffer, count, scs.data());
             } else {
+                // One viewport (no multiViewport): viewport 0 may still be empty when a later slot is not, and the
+                // draw is kept (any_nonempty_viewport).
                 const Viewport& v = draw->viewport;
-                const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
+                const bool valid_vp = v.width > 0.0f && v.height > 0.0f;
+                const VkViewport viewport = valid_vp ? vulkan_viewport(v) : dummy_viewport;
                 vk.set_viewport(command_buffer, 0, 1, &viewport);
                 const Rect& s = draw->scissor;
-                const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
-                                       {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
-                                        std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
+                const VkRect2D scissor = valid_vp
+                    ? VkRect2D{{std::max(0, s.left), std::max(0, s.top)},
+                               {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
+                                std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}}
+                    : VkRect2D{{0, 0}, {0, 0}};
                 vk.set_scissor(command_buffer, 0, 1, &scissor);
             }
             // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
