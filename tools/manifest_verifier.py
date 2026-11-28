@@ -27,11 +27,12 @@ import stat
 import sys
 import tempfile
 import time
+import unicodedata
 from typing import Callable, Optional, TextIO
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
-from report_paths import same_report_path  # noqa: E402
+from report_paths import case_insensitive_volume, path_key, same_report_path  # noqa: E402
 
 CHUNK = 8 * 1024 * 1024
 DEFAULT_MANIFEST = os.path.join(os.path.dirname(__file__), "..", "reports", "manifest.json")
@@ -176,20 +177,26 @@ def walk(target_dir: str, *, exclude: str | tuple[str, ...] | None = None):
     def scan_failed(error: OSError) -> None:
         raise error
 
+    def name_key(name: str, folding: bool) -> str:
+        name = os.path.normcase(name)
+        return unicodedata.normalize("NFD", name.casefold()) if folding else name
+
     excluded: dict[str, set[str]] = {}
     for path in (exclude,) if isinstance(exclude, str) else exclude or ():
         if path is None:
             continue
         directory, name = os.path.split(os.path.abspath(path))
-        excluded.setdefault(os.path.normcase(os.path.realpath(directory)), set()).add(os.path.normcase(name))
+        key = path_key(directory)
+        excluded.setdefault(key, set()).add(name_key(name, case_insensitive_volume(directory)))
 
     # os.walk otherwise treats missing or unreadable directories as empty.
     for root, _, files in os.walk(target_dir, onerror=scan_failed):
-        dir_exclusions = excluded.get(os.path.normcase(os.path.realpath(root)))
+        dir_exclusions = excluded.get(path_key(root))
+        folding = case_insensitive_volume(root) if dir_exclusions else False
         for name in sorted(files):
-            if dir_exclusions and os.path.normcase(name) in dir_exclusions:
-                continue
             abs_p = os.path.join(root, name)
+            if dir_exclusions and name_key(name, folding) in dir_exclusions:
+                continue
             rel_p = os.path.relpath(abs_p, target_dir).replace(os.sep, "/")
             yield rel_p, abs_p
 

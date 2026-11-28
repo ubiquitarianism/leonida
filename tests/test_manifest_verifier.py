@@ -150,6 +150,29 @@ class TestManifestVerifier(unittest.TestCase):
         for rel in items:
             self.assertNotIn("\\", rel)
 
+    def test_walk_excludes_case_aliases_without_excluding_other_hardlinks(self) -> None:
+        manifest = os.path.join(self.game_dir, "Manifest.json")
+        cache = os.path.join(self.game_dir, "Cache.json")
+        with open(manifest, "w", encoding="utf-8", newline="\n") as f:
+            f.write("{}\n")
+        with open(cache, "w", encoding="utf-8", newline="\n") as f:
+            f.write("{}\n")
+        link = os.path.join(self.game_dir, "hardlink.json")
+        try:
+            os.link(manifest, link)
+        except OSError:
+            self.skipTest("hard links unavailable")
+        alias_dir = os.path.join(self.root, "GAME")
+        aliases = (os.path.join(alias_dir, "manifest.JSON"), os.path.join(alias_dir, "cache.JSON"))
+        # Model a case-folding volume without depending on the host filesystem.
+        with (patch.object(mv, "path_key", side_effect=lambda p: os.path.realpath(p).casefold()),
+              patch.object(mv, "case_insensitive_volume", return_value=True)):
+            names = dict(mv.walk(self.game_dir, exclude=aliases))
+        self.assertNotIn("Manifest.json", names)
+        self.assertNotIn("Cache.json", names)
+        self.assertIn("hardlink.json", names)
+        self.assertIn("alpha.bin", names)
+
     def test_posix_backslash_filename_cannot_match_a_nested_path(self) -> None:
         payload = b"same bytes as the expected file"
         nested = "nested/echo.bin"
