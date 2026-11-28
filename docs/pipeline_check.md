@@ -256,10 +256,12 @@ acceptance only.
 
 A SPIR-V module larger than 4 MiB is "large". [#884](https://github.com/ItsNotRexed/Leonida/issues/884)
 showed why that matters: several compiles that each needed gigabytes of host RAM ran at the same time. Large
-modules now share a memory budget (`runtime/test/large_module_gate.h`): each one reserves 512 bytes of RAM per
+modules now share a memory budget (`runtime/src/large_module_gate.h`): each one reserves 512 bytes of RAM per
 SPIR-V byte, and they enter the driver while their reservations fit three quarters of the memory available when
 the run starts, up to `--jobs` of them. One large module always gets in when none is compiling, so a module
-bigger than the whole budget still compiles, alone among the large ones. Small modules are never held back. On
+bigger than the whole budget still compiles, alone among the large ones. Small modules are never held back, and a
+large module that doesn't fit yet doesn't hold its thread: it goes back in the queue and the thread takes the next
+module. The oldest one put back gets in first once it fits, and no later large module passes it. On
 Linux the budget is the smaller of `MemAvailable` and the room under the cgroup v2 `memory.max` of the process and
 every cgroup above it (a container, or `systemd-run -p MemoryMax=...`); on Windows it is `ullAvailPhys`. Where
 neither can be read, every large module compiles alone, as before. After each large module, glibc builds call
@@ -457,6 +459,10 @@ driver gives it the same cache key in both programs. Measured on Windows with an
   `VK_KHR_maintenance8` into the pipeline cache key even for compute shaders, so the checker enables both whenever
   supported and keeps `meshShaderQueries` on.
 - On a Windows RTX 5070 Ti (617.42), a compute-only seed missed with mesh features omitted and hit with the supported mesh and mesh-query features enabled on both devices. The shader, push constants and pipeline layout were identical. Cache-producing runs request this device configuration for every selected shader batch.
+- On Windows with an AMD Radeon RX 7900 XT, `VK_EXT_transform_feedback` (with `transformFeedback` enabled, and
+  `geometryStreams` when the device offers it) is part of the key: the runtime enables it whenever the extension is
+  present (D3D-302), so the checker enables it too. Without it, `pipeline_cache_seed` failed 3 of 3 on that GPU and
+  passed 3 of 3 on `main`. NVIDIA leaves it out of the key, which is why it did not show up on the RTX 3080 Ti.
 - The executable's file name is part of the key; its folder is not. A copy of the checker under another name
   misses the cache the original wrote, and the runtime's device hits the checker's cache only from a program
   with the checker's file name. So on this driver a cache written by `vk_pipeline_check.exe` does not hit in

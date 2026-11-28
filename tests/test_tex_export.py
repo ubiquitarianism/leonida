@@ -219,7 +219,7 @@ def test_export_picks_the_top_mip_placement_and_writes_dds(eq, tmp_path, fmt, na
 def test_fmt_reuses_the_indexer_table_without_12_byte_rgb32():
     from tex_headers import FMT_INFO
     assert T.FMT == {f: v for f, v in FMT_INFO.items() if f not in (6, 7, 8)}
-    assert len(T.FMT) == 56
+    assert len(T.FMT) == 57
 
 
 @pytest.mark.parametrize("fmt", sorted(T.FMT))
@@ -478,14 +478,30 @@ def test_packed_r10g10b10a2_writes_a_png(eq, tmp_path, monkeypatch, capsys):
     assert read_png(stem.with_suffix(".png")) == (2, 1, bytes((255, 0, 0, 255, 0, 0, 255, 85)))
 
 
+def test_shared_exponent_r9g9b9e5_writes_a_png(eq, tmp_path, monkeypatch, capsys):
+    # The indexer's table lists DXGI 67, so the export reaches dds_png instead of stopping at "unsupported format".
+    # Texels (R, G, B mantissa, exponent): (256, 128, 0, 16) -> 1.0, 0.5, 0; (511, 64, 1, 15) -> 511/512, 1/8, 1/512.
+    eq(4)
+    packed = struct.pack("<II", 256 | (128 << 9) | (16 << 27), 511 | (64 << 9) | (1 << 18) | (15 << 27))
+    carve = str(tmp_path / "carve")
+    write_blob(carve, "x.rpf", 0x1000, packed + bytes(4096 - len(packed)))
+    t = texture(67, "R9G9B9E5_SHAREDEXP", 2, 1, mips=1)
+    out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
+    assert code is None
+    assert text.splitlines() == ["1 textures: {'ok:first': 1} -> " + str(out), "png: {'written': 1}"]
+    stem = out / "x.rpf" / f"{0xABC:012x}_3_2x1_R9G9B9E5_SHAREDEXP"
+    assert stem.with_suffix(".dds").read_bytes()[148:] == packed
+    assert read_png(stem.with_suffix(".png")) == (2, 1, bytes((255, 128, 0, 255, 255, 32, 0, 255)))
+
+
 def test_undecodable_format_keeps_the_dds_and_counts_unsupported(eq, tmp_path, monkeypatch, capsys):
-    # R10G10B10A2_UNORM_SRGB: dds_png has no decoder for its DXGI code
-    carve, expected = build_case(eq, tmp_path, 25, top_first=True)
-    t = texture(25, "R10G10B10A2_UNORM_SRGB", 64, 64, mips=2)
+    # R8G8B8A8_UINT: dds_png has no decoder for its DXGI code
+    carve, expected = build_case(eq, tmp_path, 30, top_first=True)
+    t = texture(30, "R8G8B8A8_UINT", 64, 64, mips=2)
     out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
     assert code is None  # main() returns None, so the process exits 0
-    assert tree(out) == ["export_log.json", f"x.rpf{os.sep}{0xABC:012x}_3_64x64_R10G10B10A2_UNORM_SRGB.dds"]
-    assert (out / "x.rpf" / f"{0xABC:012x}_3_64x64_R10G10B10A2_UNORM_SRGB.dds").read_bytes()[148:] == expected
+    assert tree(out) == ["export_log.json", f"x.rpf{os.sep}{0xABC:012x}_3_64x64_R8G8B8A8_UINT.dds"]
+    assert (out / "x.rpf" / f"{0xABC:012x}_3_64x64_R8G8B8A8_UINT.dds").read_bytes()[148:] == expected
     assert json.loads((out / "export_log.json").read_text(encoding="utf-8"))[0]["export"]["png"] == "unsupported"
     assert text.splitlines()[1:] == ["png: {'unsupported': 1}"]
 
@@ -495,7 +511,7 @@ def test_mixed_run_counts_each_kind(eq, tmp_path, monkeypatch, capsys):
     with open(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"), "rb") as f:
         write_blob(carve, "x.rpf", 0x2000, f.read())  # same 4 bpe size, so the equation is already in place
     textures = [texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2),
-                texture(25, "R10G10B10A2_UNORM_SRGB", 64, 64, mips=2, gpu=0x2000),
+                texture(30, "R8G8B8A8_UINT", 64, 64, mips=2, gpu=0x2000),
                 texture(9999, "X", 4, 4, 1, gpu=0x3000)]
     out, code, text = png_main(tmp_path, monkeypatch, capsys, textures, carve, "--png")
     assert text.splitlines()[1] == "png: {'written': 1, 'unsupported': 1}"
@@ -714,3 +730,113 @@ def test_main_refuses_to_overwrite_input_index_as_export_log(tmp_path, monkeypat
         err = capsys.readouterr().err
         assert "ERROR:" in err and "must not overwrite" in err, err
         assert index.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("we,he", [(0, 1), (1, -2), (True, 1)])
+def test_detile_offsets_rejects_invalid_dimensions(eq, we, he):
+    eq(4)
+    with pytest.raises(ValueError):
+        T.detile_offsets(4, we, he)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"w": 0, "h": 4},
+    {"w": True, "h": 4},
+    {"archive": "../escape"},
+    {"archive": "/abs/escape"},
+    {"fmt_name": "sub/name"},
+])
+def test_export_one_rejects_bad_dimensions_and_path_traversal(eq, tmp_path, overrides):
+    eq(4)
+    row = texture(28, "R8G8B8A8_UNORM", 4, 4, 1)
+    row.update(overrides)
+    with pytest.raises(ValueError):
+        T.export_one(row, str(tmp_path / "carve"), str(tmp_path / "out"), {})
+    assert not (tmp_path / "out").exists()
+
+
+def test_failed_dds_write_removes_partial_file(eq, tmp_path, monkeypatch):
+    carve, _ = build_case(eq, tmp_path, 28, top_first=True)
+    out = tmp_path / "out"
+    t = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2)
+    real_open = open
+
+    class FailingWriter:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._inner.close()
+            return False
+
+        def write(self, _data):
+            raise OSError("disk full")
+
+    def fail_dds(path, mode="r", *args, **kwargs):
+        inner = real_open(path, mode, *args, **kwargs)
+        if mode == "wb" and str(path).endswith(".dds"):
+            return FailingWriter(inner)
+        return inner
+
+    monkeypatch.setattr("builtins.open", fail_dds)
+    with pytest.raises(OSError, match="disk full"):
+        T.export_one(t, carve, str(out), {})
+    assert list(out.rglob("*.dds")) == []
+
+
+def test_main_rejects_whitespace_paths_and_deep_json(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    for bad in [(str(index), str(tmp_path), "   "), (str(index), "", str(tmp_path / "out")),
+                ("   ", str(tmp_path), str(tmp_path / "out"))]:
+        _argv(monkeypatch, *bad)
+        assert T.main() == 2
+        assert "ERROR:" in capsys.readouterr().err
+    assert os.listdir(cwd) == []
+
+    monkeypatch.setattr(T.json, "load", lambda _f: (_ for _ in ()).throw(RecursionError("deep")))
+    _argv(monkeypatch, index, tmp_path, tmp_path / "out")
+    assert T.main() == 2
+    assert "ERROR: cannot read" in capsys.readouterr().err
+
+
+def test_export_log_write_is_atomic_on_failure(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    report = out / "export_log.json"
+    prior = '[{"prior": true}]'
+    report.write_text(prior, encoding="utf-8", newline="\n")
+    real_open = open
+
+    class FailingWriter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def write(self, _data):
+            raise OSError("disk full")
+
+    def fail_report(path, mode="r", *args, **kwargs):
+        if "w" in mode and os.path.abspath(str(path)) == os.path.abspath(str(report)):
+            real_open(path, "w", encoding="utf-8", newline="\n").close()
+            return FailingWriter()
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fail_report)
+    if hasattr(T, "replace_retry"):
+        monkeypatch.setattr(T, "replace_retry", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    _argv(monkeypatch, index, tmp_path, out)
+    assert T.main() == 1
+    assert "ERROR: cannot write" in capsys.readouterr().err
+    assert report.read_text(encoding="utf-8") == prior
+    assert list(out.glob("*.tmp")) == []

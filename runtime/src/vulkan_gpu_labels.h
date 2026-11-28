@@ -1,5 +1,6 @@
 #pragma once
 #include "gpu_label_memory.h"
+#include "value_write_sink.h"
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <atomic>
@@ -22,6 +23,8 @@
 #endif
 
 namespace leonida::label {
+// LEONIDA_GPU_LABELS=1 records list slots 71 and 72 here, for the lists the list values (shims/d3d12_xs_list_values.h,
+// LEONIDA_LIST_VALUES) do not track: those land their writes themselves, and one address has one writer.
 inline bool enabled() {
     static const bool active = [] {
         const char *v = std::getenv("LEONIDA_GPU_LABELS");
@@ -37,6 +40,25 @@ inline bool enabled() {
 // (kernel_writes::begin_write), so the label reaches it and the layer copies the page again; a page that stays
 // read-only after that is the title's own doing and the label is dropped, as before. Called with no shadow lock held.
 inline bool store_value(const Target &target, std::uint64_t value) {
+    // The runtime's own memory first (src/value_write_sink.h): an arena offset is not a host address, so it goes to the
+    // arena and never to the store below; a page xmem maps PAGE_NOACCESS is written through xmem's own mapping. The
+    // value is written little-endian, the way the console's x64 writes it: the low 'width' bytes of the word. A
+    // target neither takes - the title's own private pages - is left to the path below, which opens a read-only page
+    // the way a kernel write does.
+    {
+        const std::uint64_t word = value;
+        bool refused = false;
+        if (memory().publish(target, [&](std::uintptr_t address, unsigned width, std::uintptr_t) {
+                const value_sink::Landing landing = value_sink::arena(address, &word, width);
+                if (landing != value_sink::Landing::elsewhere) {
+                    refused = landing == value_sink::Landing::refused;
+                    return !refused;
+                }
+                return value_sink::title_pages(reinterpret_cast<const void *>(address), &word, width);
+            }))
+            return true;
+        if (refused) return false;
+    }
 #ifdef _WIN32
     return memory().publish(target, [&](std::uintptr_t address, unsigned width, std::uintptr_t allocation_base) {
         MEMORY_BASIC_INFORMATION mbi{};

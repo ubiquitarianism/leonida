@@ -23,11 +23,18 @@
 
 namespace leonida::pipeline_cache_store {
 
-// A session cache normally holds what one boot compiled (a few MB to a few hundred MB). The cap is what keeps a
-// cache seeded from the multi-GB corpus file -- whose data comes back as the whole union -- from being rewritten
-// at every exit. Past it the previous session file is left alone; raise the limit with
-// LEONIDA_PIPELINE_CACHE_BYTES when a session really compiles that much.
-inline constexpr std::size_t default_save_limit = std::size_t{256} << 20;  // 256 MiB
+// A session cache holds what the boots so far compiled: 1.28 GB after a few world frames on NVIDIA and still growing,
+// where a 256 MiB cap kept every later build from being saved. The limit applies to what the session adds: a cache
+// seeded from the offline corpus file comes back from the driver as the whole union, so the seed's size is not
+// counted (over_save_limit), and a 9.7 GB seed plus a few hundred MB of new builds is still saved. Past the limit the
+// previous session file is left alone; raise it with LEONIDA_PIPELINE_CACHE_BYTES when a session really compiles that
+// much.
+inline constexpr std::size_t default_save_limit = std::size_t{4096} << 20;  // 4 GiB
+
+// Whether a cache of `size` bytes, created from an offline seed of `seed` bytes (0: none), adds more than `limit`.
+inline bool over_save_limit(std::size_t size, std::size_t seed, std::size_t limit) {
+    return size - (seed < size ? seed : size) > limit;
+}
 
 struct SaveLimit {
     std::size_t bytes = default_save_limit;

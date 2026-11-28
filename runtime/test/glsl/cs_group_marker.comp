@@ -1,0 +1,16 @@
+// indirect_clamp_test's marker: every workgroup adds 1 to its own word, so a dispatch whose groups all ran exactly
+// once leaves 1 in each of its words. Only one dimension of a test dispatch is larger than 1, so x + y + z names the
+// group; a group past `groups` (which the dispatch should never run) counts in the word after them.
+// SPIR-V: runtime/test/cs_group_marker_spv.h (glslangValidator -V --target-env vulkan1.2 -Os).
+#version 460
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Marks { uint data[]; };
+layout(push_constant) uniform Params {
+    Marks marks;
+    uint groups;
+} p;
+void main() {
+    const uint group = gl_WorkGroupID.x + gl_WorkGroupID.y + gl_WorkGroupID.z;
+    atomicAdd(p.marks.data[min(group, p.groups)], 1u);
+}

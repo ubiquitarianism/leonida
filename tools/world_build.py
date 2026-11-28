@@ -38,6 +38,7 @@ import stat
 import statistics
 import sys
 import tempfile
+import unicodedata
 
 try:
     import fcntl
@@ -1272,9 +1273,12 @@ def _exclusive_output(out_dir: str):
     # and a successful one must contain only chunks/ and world.json.  Key it on the resolved
     # path so every spelling of one folder (8.3 names, junctions, symlinks) shares a lock; for
     # a folder that does not exist yet, realpath resolves the part that does and appends the rest.
-    key = hashlib.sha256(
-        os.path.normcase(os.path.realpath(out_dir)).encode("utf-8", "surrogatepass")
-    ).hexdigest()[:20]
+    # Fold conservatively on every platform: the output volume may ignore case or
+    # Unicode normalization even when os.path.normcase does not (APFS, for example).
+    # Distinct folders that fold alike can contend, but cannot publish concurrently.
+    resolved = os.path.normcase(os.path.realpath(out_dir))
+    lock_name = unicodedata.normalize("NFD", unicodedata.normalize("NFD", resolved).casefold())
+    key = hashlib.sha256(lock_name.encode("utf-8", "surrogatepass")).hexdigest()[:20]
     lock_path = os.path.join(tempfile.gettempdir(), _WORLD_BUILD_LOCK + key)
     with open(lock_path, "a+b") as fh:
         fd = fh.fileno()
@@ -1663,6 +1667,16 @@ def build_world(
     return world_doc
 
 
+class _SharedPng:
+    """One DDS decode shared by the chunks that use it: the first decodes, the others wait for `done`."""
+
+    __slots__ = ("done", "png")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.png: bytes | None = None
+
+
 def _build_staged_world(
     staging_dir: str,
     chunks_dir: str,
@@ -1680,48 +1694,58 @@ def _build_staged_world(
     placement_stats: dict | None = None,
 ) -> dict:
     """Write every chunk into staging_dir, verify them all, then publish them with world.json."""
-    # Thread-safe single-flight PNG decode cache keyed by normalized DDS path.
+    sorted_cells = sorted(cells.items(), key=lambda kv: kv[0])
+    cell_textures: dict[tuple[int, int], dict[str, str]] = {}
+    for cell_key, cell_models in sorted_cells:
+        cell_dds: dict[str, str] = {}
+        for m in cell_models:
+            cell_dds.update(m["mat_to_dds"])
+        cell_textures[cell_key] = cell_dds
+
+    # Thread-safe single-flight PNG decode cache keyed by normalized DDS path. Every chunk's use of a texture
+    # is counted up front, and the entry leaves the cache when its last chunk takes it, so the build holds
+    # the PNGs of the chunks being written and those a later chunk still needs, not every PNG of the world.
     tex_lock = threading.Lock()
-    tex_cache: dict[str, bytes | None] = {}
-    tex_inflight: dict[str, threading.Event] = {}
+    tex_cache: dict[str, _SharedPng] = {}
+    tex_uses: dict[str, int] = {}
+    if textures:
+        for cell_dds in cell_textures.values():
+            for dds_path in cell_dds.values():
+                norm = os.path.normcase(os.path.abspath(dds_path))
+                tex_uses[norm] = tex_uses.get(norm, 0) + 1
 
     def decode_dds_cached(dds_path: str) -> bytes | None:
         assert dds_mod is not None
         norm = os.path.normcase(os.path.abspath(dds_path))
         with tex_lock:
-            if norm in tex_cache:
-                return tex_cache[norm]
-            ev = tex_inflight.get(norm)
-            if ev is None:
-                ev = threading.Event()
-                tex_inflight[norm] = ev
-                owner = True
-            else:
-                owner = False
+            shared = tex_cache.get(norm)
+            owner = shared is None
+            if owner:
+                shared = tex_cache[norm] = _SharedPng()
+            left = tex_uses.get(norm, 0) - 1
+            if left > 0:
+                tex_uses[norm] = left
+            else:   # last use: only this chunk (and any still waiting on the decode) keeps it
+                tex_uses.pop(norm, None)
+                del tex_cache[norm]
         if not owner:
-            ev.wait()
-            with tex_lock:
-                return tex_cache.get(norm)
+            shared.done.wait()
+            return shared.png
 
-        png_bytes: bytes | None = None
         try:
-            png_bytes = dds_mod.dds_file_to_png_bytes(dds_path, max_size=max_tex_size)
+            shared.png = dds_mod.dds_file_to_png_bytes(dds_path, max_size=max_tex_size)
         except (dds_mod.DdsError, OSError):
-            png_bytes = None
+            shared.png = None
         finally:
-            with tex_lock:
-                tex_cache[norm] = png_bytes
-                tex_inflight.pop(norm, None)
-            ev.set()
-        return png_bytes
+            shared.done.set()
+        return shared.png
 
     def build_cell(cell_key: tuple[int, int], cell_models: list[dict]) -> tuple[dict, int, int, int]:
         ix, iz = cell_key
         cell_prims: list[dict] = []
-        cell_dds: dict[str, str] = {}
         for m in cell_models:
             cell_prims.extend(m["prims"])
-            cell_dds.update(m["mat_to_dds"])
+        cell_dds = cell_textures[cell_key]
 
         materials: dict[str, dict] = {}
         skipped_keys: set[str] = set()
@@ -1759,7 +1783,6 @@ def _build_staged_world(
         }
         return chunk_rec, int(info.get("textures", 0)), cell_skipped, int(info["bytes"])
 
-    sorted_cells = sorted(cells.items(), key=lambda kv: kv[0])
     chunks: list[dict] = []
     total_triangles = 0
     textures_embedded = 0

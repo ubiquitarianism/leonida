@@ -32,8 +32,11 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+from file_mode import published_mode  # noqa: E402
 import ps_oracle  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 SIZE = (16, 16)
 TRI = ((-1.0, -1.0), (1.3, -1.0), (-1.0, 0.9))
@@ -180,34 +183,46 @@ def analyze(res, size=SIZE, tri=TRI):
     waves = {}
     for p in cov:
         waves.setdefault(entry[p], []).append(p)
-    entry_ok, wqm_ok, packed, detail = True, True, True, []
-    for e, pix in sorted(waves.items()):
-        lanes = [lane[p] for p in pix]
-        quads = {ln // 4 for ln in lanes}
-        w = {wqm[p] for p in pix}
+    if cov:
+        entry_ok, wqm_ok, packed, detail = True, True, True, []
         bits = lambda m: {i for i in range(64) if m >> i & 1}   # noqa: E731
-        entry_ok &= len(set(lanes)) == len(lanes) and bits(e) == set(lanes)
-        wqm_ok &= len(w) == 1 and bits(w.pop() if len(w) == 1 else 0) == {4 * q + i for q in quads for i in range(4)}
-        packed &= quads == set(range(len(quads)))
-        detail.append(f"0x{e:016x}: {len(pix)} covered lanes in {len(quads)} quads")
-    out.append(("entry EXEC = the covered pixels (helpers off)", entry_ok, f"{len(waves)} waves: " + "; ".join(detail)))
+        for e, pix in sorted(waves.items()):
+            lanes = [lane[p] for p in pix]
+            quads = {ln // 4 for ln in lanes}
+            w = {wqm[p] for p in pix}
+            entry_ok &= len(set(lanes)) == len(lanes) and bits(e) == set(lanes)
+            wqm_ok &= len(w) == 1 and bits(w.pop() if len(w) == 1 else 0) == {4 * q + i for q in quads for i in range(4)}
+            packed &= quads == set(range(len(quads)))
+            detail.append(f"0x{e:016x}: {len(pix)} covered lanes in {len(quads)} quads")
+        waves_detail = f"{len(waves)} waves: " + "; ".join(detail)
+    else:
+        entry_ok = wqm_ok = packed = False
+        waves_detail = "0 waves (no covered pixels)"
+    out.append(("entry EXEC = the covered pixels (helpers off)", entry_ok, waves_detail))
     out.append(("s_wqm turns on exactly the quads with a covered pixel", wqm_ok, ""))
     out.append(("quads packed from lane 0; none without a covered pixel", packed, ""))
-    order = {(p[0] & 1) + 2 * (p[1] & 1) == lane[p] % 4 for p in cov}
-    out.append(("lane % 4 = (x & 1) + 2 (y & 1): 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right",
-                order == {True}, ""))
-    err_c = max(max(abs(f32(res["self"][p][2]) - ndc(p, size)[0]), abs(f32(res["self"][p][3]) - ndc(p, size)[1]))
-                for p in cov)
-    err_h = 0.0
-    for p, k in helpers:
-        got = {1: res["nb12"][p][0:2], 2: res["nb12"][p][2:4], 3: res["nb3"][p][0:2]}[k]
-        ex = ndc(neighbour(p, k), size)
-        err_h = max(err_h, abs(f32(got[0]) - ex[0]), abs(f32(got[1]) - ex[1]))
-    out.append(("after s_wqm a helper interpolates its own pixel centre, as precisely as a covered pixel",
-                err_h <= 1.5 * err_c + 1e-6, f"helper |error| max {err_h:.2e}, covered {err_c:.2e}"))
-    nm = res["nowqm_masks"]
-    out.append(("without s_wqm EXEC stays the entry mask", all(
-        (nm[p][1] | nm[p][2] << 32) == entry[p] and nm[p][3] == entry[p] & 0xFFFFFFFF for p in cov), ""))
+    if cov:
+        order = {(p[0] & 1) + 2 * (p[1] & 1) == lane[p] % 4 for p in cov}
+        out.append(("lane % 4 = (x & 1) + 2 (y & 1): 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right",
+                    order == {True}, ""))
+        err_c = max(max(abs(f32(res["self"][p][2]) - ndc(p, size)[0]), abs(f32(res["self"][p][3]) - ndc(p, size)[1]))
+                    for p in cov)
+        err_h = 0.0
+        for p, k in helpers:
+            got = {1: res["nb12"][p][0:2], 2: res["nb12"][p][2:4], 3: res["nb3"][p][0:2]}[k]
+            ex = ndc(neighbour(p, k), size)
+            err_h = max(err_h, abs(f32(got[0]) - ex[0]), abs(f32(got[1]) - ex[1]))
+        out.append(("after s_wqm a helper interpolates its own pixel centre, as precisely as a covered pixel",
+                    err_h <= 1.5 * err_c + 1e-6, f"helper |error| max {err_h:.2e}, covered {err_c:.2e}"))
+        nm = res["nowqm_masks"]
+        out.append(("without s_wqm EXEC stays the entry mask", all(
+            (nm[p][1] | nm[p][2] << 32) == entry[p] and nm[p][3] == entry[p] & 0xFFFFFFFF for p in cov), ""))
+    else:
+        out.append(("lane % 4 = (x & 1) + 2 (y & 1): 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right",
+                    False, "no covered pixels"))
+        out.append(("after s_wqm a helper interpolates its own pixel centre, as precisely as a covered pixel",
+                    False, "no covered pixels"))
+        out.append(("without s_wqm EXEC stays the entry mask", False, "no covered pixels"))
     h1 = [p for p in cov if neighbour(p, 1) not in cov]
     ij = {p: (f32(res["nowqm_ij"][p][0]), f32(res["nowqm_ij"][p][1])) for p in h1}
     err_ij = max([max(abs(g[0] - bary(neighbour(p, 1), size, tri)[0]), abs(g[1] - bary(neighbour(p, 1), size, tri)[1]))
@@ -251,11 +266,104 @@ def _run(o):
         o.close()
 
 
+def _validate_json_out(raw_path):
+    """Validate --json output path before running the GPU harness; return (abs_path, err_msg)."""
+    if not raw_path.strip():
+        return None, "--json path must not be empty"
+    if raw_path.endswith(("/", "\\")) or (os.sep and raw_path.endswith(os.sep)):
+        return None, f"--json is a directory path: {raw_path}"
+    out_path = os.path.abspath(raw_path)
+    if os.path.isdir(out_path):
+        return None, f"--json is a directory: {out_path}"
+    cur = os.path.dirname(out_path)
+    while cur:
+        if os.path.exists(cur):
+            if not os.path.isdir(cur):
+                return None, f"--json parent path is not a directory: {cur}"
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return out_path, None
+
+
+def _write_json_atomic(path, payload):
+    dest = os.path.realpath(path)
+    parent = os.path.dirname(dest) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".tmp-", suffix=".json")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f, indent=1)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, published_mode(dest))
+        replace_retry(tmp, dest)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def validate_json_path(path):
+    """Return an error string if `path` cannot be used as a --json output file, or None."""
+    if not path or not path.strip():
+        return "--json path must not be empty"
+    if "\x00" in path:
+        return "--json path contains a NUL byte"
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+        return f"--json path is a directory: {path}"
+    cur = os.path.dirname(os.path.abspath(path))
+    while cur:
+        if os.path.isdir(cur):
+            break
+        if os.path.lexists(cur):
+            return f"--json parent is not a directory: {cur}"
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
+
+
+def write_json_report(path, data):
+    """Write `data` atomically as LF-terminated JSON (preserving symlinks), or return an error string."""
+    try:
+        _write_json_atomic(path, data)
+    except OSError as e:
+        return f"cannot write --json {path}: {e.strerror or e}"
+    return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--build", required=True, help="runtime build folder with vk_harness")
     ap.add_argument("--json", help="write {device, checks, words} here")
     a = ap.parse_args(argv)
+    if a.json is not None:
+        err = validate_json_path(a.json)
+        if err:
+            print(f"ps_helper_probe: {err}", file=sys.stderr)
+            return 2
+    out_path = None
+    if a.json is not None:
+        out_path, err_msg = _validate_json_out(a.json)
+        if err_msg:
+            print(f"ps_helper_probe: {err_msg}", file=sys.stderr)
+            return 2
     try:
         device, res = measure(a.build)
     except ps_oracle.Unavailable as e:
@@ -273,11 +381,16 @@ def main(argv=None):
         print(f"{'ok  ' if ok else 'FAIL'} {name}" + (f" ({detail})" if detail else ""))
     good = sum(ok for _n, ok, _d in checks)
     print(f"{good}/{len(checks)} checks hold")
-    if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"device": device, "checks": [[n, ok, d] for n, ok, d in checks],
-                       "words": {n: {f"{x},{y}": list(w) for (x, y), w in px.items()} for n, px in res.items()}},
-                      fh, indent=1)
+    if out_path is not None:
+        payload = {
+            "device": device,
+            "checks": [[n, ok, d] for n, ok, d in checks],
+            "words": {n: {f"{x},{y}": list(w) for (x, y), w in px.items()} for n, px in res.items()},
+        }
+        err = write_json_report(out_path, payload)
+        if err:
+            print(f"ps_helper_probe: {err}", file=sys.stderr)
+            return 2
     return 0 if good == len(checks) else 1
 
 

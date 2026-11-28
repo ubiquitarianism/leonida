@@ -51,6 +51,16 @@ class Rules(unittest.TestCase):
         self.assertEqual(pr.models32("unorm", 16, 0xFFFF)["f32_rte"], 0x3F800000)
         self.assertEqual(pr.models32("unorm", 8, 0x80)["f32_rte"], 0x3F008081)          # 128 / 255
 
+    def test_models_are_cached_but_each_call_gets_its_own_dict(self):
+        for models, cached, key in ((pr.models16, pr._models16, "rte"), (pr.models32, pr._models32, "f32_rte")):
+            m = models("unorm", 16, 0xFFEF)
+            hits = cached.cache_info().hits
+            want = dict(m)
+            m[key] ^= 1
+            self.assertEqual(models("unorm", 16, 0xFFEF), want)
+            self.assertEqual(cached.cache_info().hits, hits + 1)  # the second call reused the first one's words
+        self.assertEqual(set(pr.models16("snorm", 8, 1)), set(pr.KEYS16))
+
     def test_round_frac_matches_the_fraction_form(self):
         """round_frac works in integers; the Fraction form it replaced is the reference here, for f16 and f32 and
         both modes: 16-bit format quotients, the first and last significands of a binade exact, at a tie and just
@@ -302,6 +312,93 @@ class ReportPathTests(unittest.TestCase):
             self.assertNotIn("Traceback", err.getvalue())
             with open(blocker, "rb") as f:
                 self.assertEqual(f.read(), b"keep me")
+
+    def test_blocked_json_parent_fails_before_opening_oracle(self):
+        with tempfile.TemporaryDirectory() as d:
+            blocker = os.path.join(d, "not_a_folder")
+            with open(blocker, "wb") as f:
+                f.write(b"keep me")
+            err = io.StringIO()
+            with mock.patch.object(runner, "open_oracle", side_effect=AssertionError("oracle must not open")), \
+                    redirect_stderr(err):
+                rc = pr.main(["--formats", "unorm8", "--json", os.path.join(blocker, "r.json")])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR: cannot write", err.getvalue())
+
+    def test_empty_malformed_cli_and_deduped_formats_waves_and_unknown_arch(self):
+        for argv in (
+            ["--formats", "unorm8,"],
+            ["--formats", ",unorm8"],
+            ["--waves", "32,"],
+            ["--waves", ",64"],
+            ["--hw-arch", ""],
+            ["--hw-arch", "   "],
+            ["--json", ""],
+            ["--json", "   "],
+        ):
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    pr.main(argv)
+                self.assertEqual(ctx.exception.code, 2)
+
+        # Whitespace around format names is stripped and duplicate formats/waves are deduplicated.
+        oracle = FakeOracle()
+        seen_calls = []
+        orig_run = oracle.run
+
+        def spy_run(kernels, words=4):
+            seen_calls.append(len(kernels))
+            return orig_run(kernels, words=words)
+
+        oracle.run = spy_run
+        with mock.patch.object(runner, "open_oracle", return_value=oracle), redirect_stdout(io.StringIO()):
+            rc = pr.main(["--formats", " unorm8 , unorm8 ", "--waves", "32, 32"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(seen_calls), 1)
+
+        # Unknown arch family (ValueError from asm.family) exits 77 cleanly and closes oracle.
+        class BadArchOracle(FakeOracle):
+            arch = "gfx900"
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        bad = BadArchOracle()
+        rc, out = run_main(bad)
+        self.assertEqual(rc, 77, out)
+        self.assertIn("hardware oracle unavailable", out)
+        self.assertTrue(bad.closed)
+
+    def test_atomic_write_preserves_symlink_mode_trailing_lf_devnull_and_rejects_nan(self):
+        with tempfile.TemporaryDirectory() as d:
+            real_path = os.path.join(d, "real.json")
+            with open(real_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}\n")
+            if os.name != "nt":
+                os.chmod(real_path, 0o600)
+                link_path = os.path.join(d, "link.json")
+                os.symlink(real_path, link_path)
+            else:
+                link_path = real_path
+
+            self.assertTrue(pr.write_report(link_path, {"ok": 1}))
+            if os.name != "nt":
+                self.assertTrue(os.path.islink(link_path))
+                self.assertEqual(os.stat(real_path).st_mode & 0o777, 0o600)
+            raw = Path(real_path).read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertEqual(json.loads(raw), {"ok": 1})
+
+            # Non-regular target (/dev/null) succeeds cleanly.
+            self.assertTrue(pr.write_report(os.devnull, {"ok": 1}))
+
+            # Non-finite JSON value is rejected without overwriting existing file.
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertFalse(pr.write_report(real_path, {"bad": float("nan")}))
+            self.assertIn("ERROR: cannot write", err.getvalue())
+            self.assertEqual(json.loads(Path(real_path).read_text(encoding="utf-8")), {"ok": 1})
 
 
 if __name__ == "__main__":

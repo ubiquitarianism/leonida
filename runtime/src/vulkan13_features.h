@@ -40,6 +40,9 @@ public:
     bool subgroup_size_control = false;
     bool compute_full_subgroups = false;
     bool extended_dynamic_state = false;  // core on 1.3; on 1.2 both VK_EXT_extended_dynamic_state(2) extensions
+    // VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT, asking a pipeline cache "do you have it?" without a
+    // compile (pipeline_cache_journal.h). Core 1.3 only; a 1.2 device goes without.
+    bool pipeline_creation_cache_control = false;
 
     bool usable() const { return dynamic_rendering && synchronization2; }
 
@@ -49,7 +52,7 @@ public:
         core = api_version >= VK_API_VERSION_1_3;
         pipeline_cache_control=false;enable_pipeline_cache_control=false;
         dynamic_rendering = synchronization2 = subgroup_size_control = compute_full_subgroups = false;
-        extended_dynamic_state = false;
+        extended_dynamic_state = pipeline_creation_cache_control = false;
         if (!features2) return;
         if (core) {
             VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -60,6 +63,7 @@ public:
             synchronization2 = f13.synchronization2 == VK_TRUE;
             subgroup_size_control = f13.subgroupSizeControl == VK_TRUE;
             compute_full_subgroups = f13.computeFullSubgroups == VK_TRUE;
+            pipeline_creation_cache_control = f13.pipelineCreationCacheControl == VK_TRUE;
             extended_dynamic_state = true;  // core in 1.3, no feature bit
             return;
         }
@@ -108,6 +112,7 @@ public:
         subgroup_size_control = from.subgroup_size_control;
         compute_full_subgroups = from.compute_full_subgroups;
         extended_dynamic_state = from.extended_dynamic_state;
+        pipeline_creation_cache_control = from.pipeline_creation_cache_control;
     }
 
     // The structs that enable both features, ahead of `chain`; returns their head for VkPhysicalDeviceVulkan12Features'
@@ -120,6 +125,7 @@ public:
             enable13_.synchronization2 = VK_TRUE;
             enable13_.subgroupSizeControl = subgroup_size_control ? VK_TRUE : VK_FALSE;
             enable13_.computeFullSubgroups = compute_full_subgroups ? VK_TRUE : VK_FALSE;
+            enable13_.pipelineCreationCacheControl = pipeline_creation_cache_control ? VK_TRUE : VK_FALSE;
             return &enable13_;
         }
         if (subgroup_size_control) {

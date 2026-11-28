@@ -80,7 +80,7 @@ def _dominators(rpo, preds):
     return idom, pos
 
 
-def structure(succ):
+def structure(succ, out_pcs=None):
     rpo, back, preds = _order(succ)
     idom, pos = _dominators(rpo, preds)
 
@@ -158,7 +158,8 @@ def structure(succ):
             out_list.append(("loop", x, lbody))
         else:
             out_list.append(("block", x))
-        if kind == "b" and len(below) == 1 and list(succ[x]) == [below[0][1]]:
+        if (kind == "b" and len(below) == 1 and list(succ[x]) == [below[0][1]]
+                and (out_pcs is None or set(out_pcs[x]) == {below[0][1]})):
             stack.append(("emit", out_list, parent_list, below[0], depth))
         else:
             hoist = (parent_list is not None and below
@@ -347,3 +348,66 @@ def run(tree, choose, limit):
             else:
                 stack.pop()
     return trace
+
+
+def unwrap_known_pc_guards(tree, out_pcs, entry_pc=0):
+    """Unwrap `("guard", g, body)` nodes whenever abstract interpretation proves `%pc == g` on all incoming paths.
+
+    `structure()` wraps post-dominating join blocks after a diamond or loop in `("guard", g, ...)`. When every
+    incoming path guarantees `%pc == g` (e.g. a merge block with `s_barrier` after a wave-divergent branch like
+    `ms_wave_info_s3`), unwrapping the tautological guard keeps `OpControlBarrier` in uniform top-level control
+    flow (avoiding an AMD Windows LLPC 0xC0000005 pipeline-creation crash in MeshEXT and preventing false
+    `needs_barrier_rounds` triggers) and avoids redundant `%pc` merge phis.
+
+    `out_pcs[b]` is the finite set of `%pc` values block `b` may write (`{END}` when `b` terminates).
+    """
+    root_out = []
+    stack = [[collections.deque(tree), root_out, {entry_pc}, None]]
+    while stack:
+        frame = stack[-1]
+        q, dst, cur_pc, tag = frame
+        if not q:
+            if len(stack) > 1 and tag[0] == "guard" and len(cur_pc) == 1:
+                nxt_g = next(iter(cur_pc))
+                skip_pc = tag[3]
+                parent_q = stack[-2][0]
+                if parent_q and parent_q[0][0] == "guard" and parent_q[0][1] == nxt_g and nxt_g not in skip_pc:
+                    for child in reversed(parent_q.popleft()[2]):
+                        q.appendleft(child)
+                    continue
+            stack.pop()
+            if not stack:
+                break
+            parent = stack[-1]
+            if tag[0] == "guard":
+                _, g, child_dst, skip_pc = tag
+                parent[1].append(("guard", g, child_dst))
+                parent[2] = skip_pc | cur_pc
+            else:
+                _, h, child_dst = tag
+                parent[1].append(("loop", h, child_dst))
+                parent[2] = cur_pc - {h}
+            continue
+        it = q.popleft()
+        kind = it[0]
+        if kind == "block":
+            b = it[1]
+            dst.append(it)
+            frame[2] = set(out_pcs[b])
+        elif kind == "guard":
+            g, gbody = it[1], it[2]
+            if cur_pc == {g}:
+                for child in reversed(gbody):
+                    q.appendleft(child)
+            else:
+                child_dst = []
+                skip_pc = set(cur_pc)
+                skip_pc.discard(g)
+                stack.append([collections.deque(gbody), child_dst, {g}, ("guard", g, child_dst, skip_pc)])
+        else:
+            h, lbody = it[1], it[2]
+            child_dst = []
+            # In a structure() tree lbody[0] is always ("block", h), which overwrites cur_pc with out_pcs[h];
+            # keep cur_pc | {h} defensively so back-edge iterations stay sound even on non-structure() trees.
+            stack.append([collections.deque(lbody), child_dst, set(cur_pc) | {h}, ("loop", h, child_dst)])
+    return root_out

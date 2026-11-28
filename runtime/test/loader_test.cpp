@@ -654,6 +654,93 @@ void test_initialise_rejects() {
     }
 }
 
+// IMAGE_FILE_RELOCS_STRIPPED against a relocation directory, when the preferred base is taken. Measured on the
+// Windows 11 (26200) loader with synthetic DLLs (runtime/README.md): with no relocation directory the flag refuses
+// the move and an image with the flag clear is moved with nothing fixed up; with a relocation table the image is
+// moved and fixed up whatever the flag says. The DllMain stub stores through an absolute address in this process,
+// not in the image, so it runs correctly wherever the image lands.
+void test_moved_without_relocations() {
+    auto img = make_image();
+    auto* nt = nt_of(img);
+    nt->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+    nt->OptionalHeader.ImageBase = leonida_test::free_image_base(0x1C0000000);
+    nt->OptionalHeader.AddressOfEntryPoint = 0x1040;
+    emit_store_stub(img, 0x240, reinterpret_cast<uint64_t>(&g_main_ran), 5, 1);
+    const uint64_t preferred = nt->OptionalHeader.ImageBase;
+    void* held = VirtualAlloc(reinterpret_cast<void*>(preferred), 0x2000, MEM_RESERVE, PAGE_NOACCESS);
+    if (!held) {
+        // Something else holds it already, which is the case under test as well; but make sure it is held.
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void*>(preferred), &info, sizeof info) || info.State == MEM_FREE)
+            return failed("an image without relocations moves when its base is taken", "cannot hold its base");
+    }
+    {
+        const char* what = "an image without relocations, flag clear, moves when its base is taken";
+        g_main_ran = 0;
+        auto p = write_image(img);
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(p);
+            if (reinterpret_cast<uint64_t>(m.base) == preferred || !m.relocated)
+                failed(what, "it was not moved");
+            else if (std::memcmp(m.base + 0x1000, text_raw(img), 0x200) != 0)
+                failed(what, "the mapped section doesn't match the file (something was fixed up)");
+            else {
+                loader.initialise();
+                if (g_main_ran != 5) failed(what, "its DllMain never ran at the new address");
+                else pass(what);
+            }
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+    {
+        auto stripped = img;
+        nt_of(stripped)->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
+        std::string error;
+        const char* what = "an image with IMAGE_FILE_RELOCS_STRIPPED is refused when its base is taken";
+        if (load(write_image(stripped), error) == 0) failed(what, "the image loaded");
+        else if (error.find("stripped") == std::string::npos) failed(what, "refused for another reason: " + error);
+        else pass(what);
+    }
+    if (held) VirtualFree(held, 0, MEM_RELEASE);
+    {
+        // At a free base such an image maps, as it did before. Not Windows parity: the Windows 11 loader refused these
+        // DLLs (error 487) at a free base too, for a reason not yet known; runtime/README.md keeps the question.
+        auto stripped = img;
+        nt_of(stripped)->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
+        expect_loads("an image with IMAGE_FILE_RELOCS_STRIPPED and no relocations maps at its free base", stripped);
+    }
+    {
+        // With a relocation table the flag does not stop the move: the table is applied, as Windows does it.
+        // ImageBase 0 makes the loader move it; the one DIR64 entry points at the qword at RVA 0x1100.
+        const char* what = "an image with IMAGE_FILE_RELOCS_STRIPPED and a relocation table is moved and fixed up";
+        auto stripped = make_image();
+        auto* snt = nt_of(stripped);
+        snt->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
+        snt->OptionalHeader.ImageBase = 0;
+        snt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1000, 0x0A};
+        auto* block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(stripped.data() + 0x200);
+        block->VirtualAddress = 0x1000;
+        block->SizeOfBlock = 0x0A;
+        reinterpret_cast<uint16_t*>(block + 1)[0] = (IMAGE_REL_BASED_DIR64 << 12) | 0x100;
+        uint64_t original;
+        std::memcpy(&original, stripped.data() + 0x300, sizeof original);
+        auto p = write_image(stripped);
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(p);
+            uint64_t moved;
+            std::memcpy(&moved, m.base + 0x1100, sizeof moved);
+            if (!m.relocated) failed(what, "it was not moved");
+            else if (moved != original + reinterpret_cast<uint64_t>(m.base)) failed(what, "the pointer wasn't fixed up");
+            else pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+}
+
 // The images below jump to host observers so notifications remain observable after the mappings are freed.
 // The FLS destructor itself starts in mapped code: leaving it registered would call unmapped memory at exit.
 void emit_jump_stub(std::vector<uint8_t>& img, size_t off, uint64_t target) {
@@ -902,6 +989,23 @@ void test_attach_reserved() {
         else pass("a run-time load's DllMain gets a NULL lpvReserved");
     } catch (const std::exception& e) {
         failed("a run-time load's DllMain gets a NULL lpvReserved", e.what());
+    }
+
+    // The same load through the wide path (LoadLibraryW / LoadLibraryExW). It had no RuntimeLoadScope, so its DllMain
+    // got the static load's non-NULL lpvReserved (RT-LOADER-RUNTIME-SCOPE-AND-TLS-SLOT, @kevincommits on #1608).
+    reset_notifications();
+    try {
+        write_image_as(make_lifecycle_image(), "attach_reserved_dynamic_w.dll");
+        rt::Loader loader(g_dir);
+        bool handled = false;
+        void* h = loader.load_runtime_module_w(L"attach_reserved_dynamic_w.dll", 0, handled);
+        const char* what = "a wide run-time load's DllMain gets a NULL lpvReserved";
+        if (!handled || !h) failed(what, "the run-time load failed");
+        else if (!g_attach_seen) failed(what, "DllMain was not called");
+        else if (g_attach_reserved) failed(what, "lpvReserved was non-NULL");
+        else pass(what);
+    } catch (const std::exception& e) {
+        failed("a wide run-time load's DllMain gets a NULL lpvReserved", e.what());
     }
 }
 
@@ -1309,8 +1413,8 @@ std::string written_images_blocked() {
 }
 
 // A DLL Windows' own loader accepts (LEONIDA_COMPAT_DIR loads with LoadLibraryExW, not with rt::Loader): no entry
-// point, no imports, one export "Answer" (ordinal 1) whose code returns 42.
-std::vector<uint8_t> make_os_dll(uint64_t image_base) {
+// point, no imports, one export "Answer" (ordinal 1) whose code returns `answer` (42 unless a case tells two apart).
+std::vector<uint8_t> make_os_dll(uint64_t image_base, uint8_t answer = 42) {
     auto img = make_image();
     std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});
     auto* nt = nt_of(img);
@@ -1339,11 +1443,37 @@ std::vector<uint8_t> make_os_dll(uint64_t image_base) {
     *reinterpret_cast<uint32_t*>(img.data() + 0x320) = 0x1160;
     *reinterpret_cast<uint16_t*>(img.data() + 0x340) = 0;
     std::memcpy(img.data() + 0x360, "Answer\0", 7);
-    const uint8_t code[] = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};  // mov eax, 42; ret
+    const uint8_t code[] = {0xB8, answer, 0x00, 0x00, 0x00, 0xC3};  // mov eax, answer; ret
     std::memcpy(img.data() + 0x380, code, sizeof(code));
     auto& dir = oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     dir.VirtualAddress = 0x1000;
     dir.Size = 0x170;
+    return img;
+}
+
+// make_os_dll with one import, `dll`!`symbol` by name, which Windows resolves when it loads the DLL. The section
+// grows to 0x400 bytes for the import tables at RVA 0x1200, and is writable: Windows fills the address table in place.
+std::vector<uint8_t> make_os_importer_dll(uint64_t image_base, const char* dll, const char* symbol) {
+    auto img = make_os_dll(image_base);
+    img.resize(0x600, 0);
+    auto* nt = nt_of(img);
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    sec->Misc.VirtualSize = 0x400;
+    sec->SizeOfRawData = 0x400;
+    sec->Characteristics |= IMAGE_SCN_MEM_WRITE;
+    nt->OptionalHeader.SizeOfCode = 0x400;
+    auto* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(img.data() + 0x400);  // then the zero descriptor
+    d->OriginalFirstThunk = 0x1240;
+    d->FirstThunk = 0x1260;
+    d->Name = 0x1280;
+    *reinterpret_cast<uint64_t*>(img.data() + 0x440) = 0x12A0;  // lookup table -> hint/name
+    *reinterpret_cast<uint64_t*>(img.data() + 0x460) = 0x12A0;  // address table, before binding
+    std::memcpy(img.data() + 0x480, dll, std::strlen(dll) + 1);
+    *reinterpret_cast<uint16_t*>(img.data() + 0x4A0) = 0;
+    std::memcpy(img.data() + 0x4A2, symbol, std::strlen(symbol) + 1);
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    dir.VirtualAddress = 0x1200;
+    dir.Size = 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR);
     return img;
 }
 
@@ -1444,6 +1574,224 @@ void test_compat_modules() {
         while (HMODULE h = GetModuleHandleW(p.c_str())) FreeLibrary(h);
 }
 
+// LEONIDA_COMPAT_DIR at run time: a mapped image's LoadLibrary / GetModuleHandle / GetProcAddress / FreeLibrary go
+// through shims/library_loader.cpp, which must give the compat DLL ahead of the shim, as static imports get it.
+void test_compat_runtime_loads() {
+    using LoadW = HMODULE(WINAPI*)(LPCWSTR);
+    using ModuleW = HMODULE(WINAPI*)(LPCWSTR);
+    using ProcA = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+    using FreeLib = BOOL(WINAPI*)(HMODULE);
+    const auto load_w = reinterpret_cast<LoadW>(rt::shims::find("kernel32.dll", "LoadLibraryW"));
+    const auto module_w = reinterpret_cast<ModuleW>(rt::shims::find("kernel32.dll", "GetModuleHandleW"));
+    const auto proc = reinterpret_cast<ProcA>(rt::shims::find("kernel32.dll", "GetProcAddress"));
+    const auto free_lib = reinterpret_cast<FreeLib>(rt::shims::find("kernel32.dll", "FreeLibrary"));
+    if (!load_w || !module_w || !proc || !free_lib) {
+        failed("LEONIDA_COMPAT_DIR at run time", "the library_loader shims are not registered");
+        return;
+    }
+    const std::filesystem::path compat = g_dir / "compat_rt";
+    std::filesystem::create_directories(compat);
+    const auto dll_path = compat / "testshim.dll";
+    write_image_as(make_os_dll(0x1C0000000), "compat_rt/testshim.dll");  // has Answer, not the shim's F
+    write_image_as(std::vector<uint8_t>(64, 0x5A), "compat_rt/testbad.dll");
+    struct Reset {
+        ~Reset() { SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", nullptr); }
+    } reset;
+    try {
+        {
+            const char* what = "without LEONIDA_COMPAT_DIR a run-time load of a shim's module gives the shim";
+            SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", nullptr);
+            rt::Loader loader(g_dir);
+            HMODULE h = load_w(L"testshim.dll");
+            if (!h) failed(what, "LoadLibraryW returned NULL");
+            else if (proc(h, "F") != reinterpret_cast<FARPROC>(&test_shim_function)) failed(what, "F is not the shim's");
+            else pass(what);
+        }
+        SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", compat.c_str());
+        rt::Loader loader(g_dir);
+        {
+            const char* what = "with LEONIDA_COMPAT_DIR GetModuleHandle of a compat module not loaded yet is NULL";
+            if (module_w(L"testshim.dll")) failed(what, "it returned a handle (the shim's?)");
+            else pass(what);
+        }
+        HMODULE h = load_w(L"TestShim.dll");
+        {
+            const char* what = "with LEONIDA_COMPAT_DIR a run-time LoadLibrary gives the drop-in DLL";
+            if (!h) failed(what, "LoadLibraryW returned NULL");
+            else if (h != GetModuleHandleW(dll_path.c_str())) failed(what, "the handle is not the compat DLL's");
+            else pass(what);
+        }
+        if (h) {
+            const char* what = "a run-time compat module answers GetModuleHandle, with or without the extension";
+            if (module_w(L"testshim.dll") != h || module_w(L"TESTSHIM") != h) failed(what, "another handle came back");
+            else pass(what);
+        }
+        if (h) {
+            const char* what = "GetProcAddress on a run-time compat module gives its own exports, never the shim's";
+            const FARPROC answer = proc(h, "Answer");
+            if (!answer || reinterpret_cast<int (*)()>(answer)() != 42) failed(what, "Answer is missing or wrong");
+            else if (proc(h, "F")) failed(what, "F, which the DLL lacks, resolved (to the shim?)");
+            else pass(what);
+        }
+        if (h) {
+            const char* what = "a static import of the same module binds to the run-time handle's export";
+            rt::Module& m = loader.load(write_image(make_import_image("testshim.dll", "Answer")));
+            void* bound = *reinterpret_cast<void**>(m.base + 0x1180);
+            if (bound != reinterpret_cast<void*>(GetProcAddress(h, "Answer"))) failed(what, "another export was bound");
+            else pass(what);
+        }
+        if (h) {
+            const char* what = "FreeLibrary leaves a compat module loaded (static imports may use it)";
+            if (!free_lib(h) || GetModuleHandleW(dll_path.c_str()) != h) failed(what, "the DLL was unloaded");
+            else pass(what);
+        }
+        {
+            const char* what = "a compat file Windows cannot load fails that LoadLibrary, without the shim or a throw";
+            SetLastError(ERROR_SUCCESS);
+            HMODULE bad = load_w(L"testbad.dll");
+            const DWORD error = GetLastError();
+            if (bad) failed(what, "LoadLibraryW returned a handle");
+            else if (error == ERROR_SUCCESS) failed(what, "no Windows error was set");
+            else pass(what);
+        }
+    } catch (const std::exception& e) {
+        failed("LEONIDA_COMPAT_DIR at run time", e.what());
+    }
+    while (HMODULE h = GetModuleHandleW(dll_path.c_str())) FreeLibrary(h);
+}
+
+// Run-time LEONIDA_COMPAT_DIR cases where Windows itself decides: LoadLibraryEx flags, a path naming another file of a
+// compat module's name, a name outside ASCII, and a compat DLL that Windows loaded as another compat DLL's dependency.
+void test_compat_runtime_edges() {
+    using LoadW = HMODULE(WINAPI*)(LPCWSTR);
+    using LoadExA = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
+    using LoadExW = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
+    using ModuleW = HMODULE(WINAPI*)(LPCWSTR);
+    using ProcA = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+    const auto load_w = reinterpret_cast<LoadW>(rt::shims::find("kernel32.dll", "LoadLibraryW"));
+    const auto load_ex_a = reinterpret_cast<LoadExA>(rt::shims::find("kernel32.dll", "LoadLibraryExA"));
+    const auto load_ex_w = reinterpret_cast<LoadExW>(rt::shims::find("kernel32.dll", "LoadLibraryExW"));
+    const auto module_w = reinterpret_cast<ModuleW>(rt::shims::find("kernel32.dll", "GetModuleHandleW"));
+    const auto proc = reinterpret_cast<ProcA>(rt::shims::find("kernel32.dll", "GetProcAddress"));
+    if (!load_w || !load_ex_a || !load_ex_w || !module_w || !proc) {
+        failed("LEONIDA_COMPAT_DIR at run time (edges)", "the library_loader shims are not registered");
+        return;
+    }
+    const std::filesystem::path compat = g_dir / "compat_edges";
+    const std::filesystem::path other = g_dir / "compat_edges_other";
+    const std::filesystem::path dep = g_dir / "compat_dep";
+    for (const auto& d : {compat, other, dep}) std::filesystem::create_directories(d);
+    write_image_as(make_os_dll(0x1D0000000, 42), "compat_edges/testpath.dll");
+    write_image_as(make_os_dll(0x1E0000000, 43), "compat_edges_other/testpath.dll");
+    const auto wide_dll = compat / L"tëstcompat.dll";  // write_image_as takes a narrow name
+    {
+        const auto img = make_os_dll(0x1F0000000, 44);
+        std::ofstream out(wide_dll, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(img.data()), static_cast<long long>(img.size()));
+    }
+    write_image_as(make_os_dll(0x200000000), "compat_dep/testshim.dll");  // has Answer, not the shim's F
+    write_image_as(make_os_importer_dll(0x210000000, "testshim.dll", "Answer"), "compat_dep/depimporter.dll");
+    const auto path_dll = compat / "testpath.dll";
+    const auto other_dll = other / "testpath.dll";
+    const auto dep_shim = dep / "testshim.dll";
+    const auto dep_importer = dep / "depimporter.dll";
+    const auto answer = [](HMODULE h) {
+        const FARPROC f = h ? GetProcAddress(h, "Answer") : nullptr;
+        return f ? reinterpret_cast<int (*)()>(f)() : -1;
+    };
+    struct Reset {
+        ~Reset() { SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", nullptr); }
+    } reset;
+    try {
+        SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", compat.c_str());
+        {
+            rt::Loader loader(g_dir);
+            {
+                const char* what = "LoadLibraryExA/W of a compat module with DONT_RESOLVE_DLL_REFERENCES is refused";
+                SetLastError(ERROR_SUCCESS);
+                const HMODULE a = load_ex_a("testpath.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES);
+                const DWORD error_a = GetLastError();
+                SetLastError(ERROR_SUCCESS);
+                const HMODULE w = load_ex_w(L"testpath.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES);
+                const DWORD error_w = GetLastError();
+                if (a || w) failed(what, "a handle came back");
+                else if (error_a != ERROR_NOT_SUPPORTED || error_w != ERROR_NOT_SUPPORTED)
+                    failed(what, "errors " + std::to_string(error_a) + " and " + std::to_string(error_w));
+                else if (GetModuleHandleW(path_dll.c_str())) failed(what, "the DLL was loaded anyway");
+                else pass(what);
+            }
+            const HMODULE h = load_w(L"testpath");
+            {
+                const char* what = "DONT_RESOLVE_DLL_REFERENCES is refused for a compat module already loaded too";
+                SetLastError(ERROR_SUCCESS);
+                const HMODULE again = load_ex_w(L"testpath.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES);
+                if (!h) failed(what, "the plain LoadLibraryW failed");
+                else if (again || GetLastError() != ERROR_NOT_SUPPORTED) failed(what, "the loaded handle came back");
+                else pass(what);
+            }
+            {
+                const char* what = "a full path to another file of a compat module's name loads that file";
+                const HMODULE o = load_w(other_dll.c_str());
+                if (!o) failed(what, "LoadLibraryW returned NULL");
+                else if (o == h || answer(o) != 43) failed(what, "the compat DLL came back instead");
+                else pass(what);
+                if (o && o != h) FreeLibrary(o);
+            }
+            {
+                const char* what = "a full path to the compat file itself gives the compat module";
+                if (!h || load_w(path_dll.c_str()) != h || module_w(path_dll.c_str()) != h)
+                    failed(what, "another handle came back");
+                else pass(what);
+            }
+            {
+                const char* what = "a compat module whose name is outside ASCII answers LoadLibraryW and GetModuleHandleW";
+                const HMODULE u = load_w(L"TËSTCOMPAT");
+                if (!u) failed(what, "LoadLibraryW returned NULL");
+                else if (u != GetModuleHandleW(wide_dll.c_str()) || answer(u) != 44)
+                    failed(what, "the handle is not the compat DLL's");
+                else if (module_w(L"tëstcompat.dll") != u) failed(what, "GetModuleHandleW did not find it");
+                else pass(what);
+            }
+        }
+        // Windows loads the pair itself; each case below then asks a fresh Loader, which has looked nothing up yet, so
+        // the two ways of recognising the dependency (by its handle's folder, by its name) are checked apart.
+        HMODULE importer = nullptr, live = nullptr;
+        if (GetModuleHandleW(L"testshim.dll")) {
+            failed("a compat DLL Windows loaded as another's dependency", "a testshim.dll from an earlier case is loaded");
+        } else {
+            importer = LoadLibraryExW(dep_importer.c_str(), nullptr,
+                                      LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+            const DWORD error = GetLastError();
+            live = GetModuleHandleW(dep_shim.c_str());
+            if (!importer || !live)
+                failed("a compat DLL Windows loaded as another's dependency",
+                       "Windows did not load the pair (error " + std::to_string(error) + ")");
+        }
+        if (live) {
+            SetEnvironmentVariableW(L"LEONIDA_COMPAT_DIR", dep.c_str());
+            {
+                const char* what = "GetProcAddress on a compat DLL Windows loaded as a dependency gives only its exports";
+                rt::Loader loader(g_dir);
+                if (proc(live, "F")) failed(what, "F, which the DLL lacks, was filled in from the shim");
+                else pass(what);
+            }
+            {
+                const char* what = "GetModuleHandle / LoadLibrary of a compat DLL Windows loaded as a dependency give it";
+                rt::Loader loader(g_dir);
+                if (module_w(L"testshim.dll") != live) failed(what, "GetModuleHandle did not return the live DLL");
+                else if (load_w(L"testshim.dll") != live) failed(what, "LoadLibrary did not return the live DLL");
+                else pass(what);
+            }
+        }
+        if (importer) FreeLibrary(importer);
+    } catch (const std::exception& e) {
+        failed("LEONIDA_COMPAT_DIR at run time (edges)", e.what());
+    }
+    // Loaders keep compat DLLs for the process lifetime; drop the references so the work folder can be removed.
+    for (const auto& p : {path_dll, other_dll, wide_dll, dep_importer, dep_shim})
+        while (HMODULE m = GetModuleHandleW(p.c_str())) FreeLibrary(m);
+}
+
 }  // namespace
 
 int main() {
@@ -1471,6 +1819,7 @@ int main() {
         test_section_bounds();
         test_truncation();
         test_relocations();
+        test_moved_without_relocations();
         test_exports();
         test_empty_named_export();
         test_imports();
@@ -1491,6 +1840,8 @@ int main() {
         test_unwind_registration();
         test_lookup_during_loads();
         test_compat_modules();
+        test_compat_runtime_loads();
+        test_compat_runtime_edges();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.
         failed("writing the test images", e.what());

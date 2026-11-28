@@ -350,7 +350,7 @@ def main(argv=None):
             if parent and not os.path.isdir(parent):
                 print("bvh_groups: output directory does not exist: %s" % parent, file=sys.stderr)
                 return 2
-        if same_report_path(a.archive, a.json):
+        if same_report_path(a.json, a.archive):
             print("bvh_groups: --json would replace the archive", file=sys.stderr)
             return 2
     try:

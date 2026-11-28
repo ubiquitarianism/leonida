@@ -10,11 +10,13 @@ import contextlib
 import io
 import json
 import os
+import re
 import struct
 import sys
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -638,6 +640,200 @@ class SectionSpanTest(unittest.TestCase):
         self.assertEqual(img.offset(0x2000), b_raw)
 
 
+RSRC = 0x1100  # where with_resources puts the resource directory, inside build_image's one section
+# Made-up version strings: none of them may appear in the JSON, the Markdown or stdout.
+VERSION_VALUES = {"CompanyName": "Imaginary Fixture Works", "ProductName": "Placeholder Title Nine",
+                  "FileVersion": "1.2.3.4 (fixture-branch-xyz)", "MadeUpCustomKey": "Custom Value Nobody Ships"}
+
+
+def utf16z(text: str) -> bytes:
+    return text.encode("utf-16-le") + b"\0\0"
+
+
+def vs_block(key: str, value: bytes = b"", children: tuple = (), text: bool = False) -> bytes:
+    """One VS_VERSIONINFO-style block: header, key, value and children, each padded to 4 bytes."""
+    out = bytearray(6) + utf16z(key)
+    out += bytes(-len(out) % 4) + value
+    for child in children:
+        out += bytes(-len(out) % 4) + child
+    struct.pack_into("<HHH", out, 0, len(out), len(value) // 2 if text else len(value), 1 if text else 0)
+    return bytes(out)
+
+
+def version_block(signature: int = 0xFEEF04BD) -> bytes:
+    """VS_VERSIONINFO: file version 1.2.3.4, product version 5.6.7.8, PRERELEASE and PRIVATEBUILD set, NT_WINDOWS32,
+    APP; a 040904b0 string table holding VERSION_VALUES; a Translation of 0409/1200."""
+    fixed = struct.pack("<13I", signature, 0x10000, (1 << 16) | 2, (3 << 16) | 4, (5 << 16) | 6, (7 << 16) | 8,
+                        0x3F, 0x02 | 0x08 | 0x40, 0x40004, 1, 0, 0, 0)
+    strings = tuple(vs_block(k, utf16z(v), text=True) for k, v in VERSION_VALUES.items())
+    string_info = vs_block("StringFileInfo", children=(vs_block("040904b0", children=strings),))
+    var_info = vs_block("VarFileInfo", children=(vs_block("Translation", struct.pack("<HH", 0x0409, 1200)),))
+    return vs_block("VS_VERSION_INFO", fixed, (string_info, var_info))
+
+
+def with_resources(version: bytes | None = None, dir_size: int = 0x400) -> bytearray:
+    """build_image() without its directories, plus a resource directory at RSRC: a VERSION type (one name, language
+    0x409) and a MANIFEST type (one name, language 0) whose data is 32 bytes."""
+    buf = bytearray(build_image(with_directories=False))
+    struct.pack_into("<II", buf, OPT + 112 + 2 * 8, RSRC, dir_size)
+
+    def directory(at: int, entries: list[tuple[int, int]]) -> None:
+        place(buf, RSRC + at, struct.pack("<IIHHHH", 0, 0, 0, 0, 0, len(entries)))
+        for i, (name, child) in enumerate(entries):
+            place(buf, RSRC + at + 16 + i * 8, struct.pack("<II", name, child))
+
+    sub = 0x80000000
+    version = version_block() if version is None else version
+    directory(0x00, [(16, sub | 0x20), (24, sub | 0x50)])                    # types: VERSION, MANIFEST
+    directory(0x20, [(1, sub | 0x38)])                                         # VERSION's names
+    directory(0x38, [(0x409, 0x80)])                                           # its languages
+    directory(0x50, [(1, sub | 0x68)])
+    directory(0x68, [(0, 0x90)])
+    place(buf, RSRC + 0x80, struct.pack("<IIII", RSRC + 0x100, len(version), 1200, 0))
+    place(buf, RSRC + 0x90, struct.pack("<IIII", RSRC + 0xA0, 32, 0, 0))
+    place(buf, RSRC + 0x100, version)
+    return buf
+
+
+class ResourceVersionTest(unittest.TestCase):
+    """The resource directory and its RT_VERSION block: numbers, languages, key names and hashes, never a value."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+
+    def inspect(self, data: bytes, name: str = "versioned.exe") -> dict:
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return pe_inspect.inspect(path, None)
+
+    def test_types_fixed_info_languages_and_keys(self):
+        import hashlib
+        res = self.inspect(with_resources())["resources"]
+        self.assertTrue(res["present"])
+        self.assertEqual(res["problems"], [])
+        self.assertEqual([(t["type"], t["id"], t["entries"]) for t in res["types"]],
+                         [("VERSION", 16, 1), ("MANIFEST", 24, 1)])
+        self.assertEqual(res["types"][1]["bytes"], 32)
+        v = res["version"]
+        self.assertEqual((v["language"], v["codepage"], v["size"]), (0x409, 1200, len(version_block())))
+        f = v["fixed"]
+        self.assertEqual((f["file_version"], f["product_version"], f["struct_version"]), ("1.2.3.4", "5.6.7.8", "1.0"))
+        self.assertEqual(f["flag_names"], ["PRERELEASE", "PRIVATEBUILD"])   # 0x40 is outside the mask
+        self.assertEqual((f["flags"], f["flags_mask"]), (0x4A, 0x3F))
+        self.assertEqual((f["os_name"], f["type_name"], f["subtype"], f["date"]), ("NT_WINDOWS32", "APP", 0, 0))
+        self.assertEqual(v["translations"], ["040904b0"])
+        self.assertEqual(v["string_count"], 4)
+        self.assertEqual(v["other_blocks"], 0)
+        [table] = v["string_tables"]
+        self.assertEqual(table["lang_codepage"], "040904b0")
+        self.assertEqual([s["key"] for s in table["strings"]], ["CompanyName", "ProductName", "FileVersion", None])
+        values = list(VERSION_VALUES.values())
+        self.assertEqual([s["chars"] for s in table["strings"]], [len(x) for x in values])
+        self.assertEqual([s["sha256"] for s in table["strings"]],
+                         [hashlib.sha256(x.encode()).hexdigest() for x in values])
+        self.assertEqual(table["strings"][3]["key_sha256"], hashlib.sha256(b"MadeUpCustomKey").hexdigest())
+
+    def test_values_and_custom_keys_appear_in_no_output(self):
+        path = os.path.join(self.dir, "versioned.exe")
+        with open(path, "wb") as f:
+            f.write(with_resources())
+        out = os.path.join(self.dir, "reports")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pe_inspect.main([path, "--out", out]), 0)
+        with open(os.path.join(out, "versioned.exe.json"), encoding="utf-8") as f:
+            text_json = f.read()
+        with open(os.path.join(out, "versioned.exe.md"), encoding="utf-8") as f:
+            text_md = f.read()
+        self.assertIn("file version 1.2.3.4, product version 5.6.7.8", text_md)
+        self.assertIn("| 040904b0 | CompanyName |", text_md)
+        self.assertIn("versioned.exe: version block file 1.2.3.4, product 5.6.7.8, 4 string keys", stdout.getvalue())
+        for output, text in (("json", text_json), ("markdown", text_md), ("stdout", stdout.getvalue())):
+            for secret in [*VERSION_VALUES.values(), "MadeUpCustomKey", "fixture-branch-xyz"]:
+                with self.subTest(output=output, secret=secret):
+                    self.assertNotIn(secret.lower(), text.lower())
+
+    def test_no_resource_directory(self):
+        r = self.inspect(build_image(), "plain.dll")
+        self.assertEqual(r["resources"], {"present": False, "types": [], "named_types": 0, "version": None,
+                                          "problems": []})
+        self.assertTrue(pe_inspect.to_markdown(r).endswith("## Resources\n\nnone\n"))
+        self.assertIsNone(pe_inspect.version_summary(r))
+
+    def test_directory_rva_outside_every_section(self):
+        buf = with_resources()
+        struct.pack_into("<I", buf, OPT + 112 + 2 * 8, 0x9000)
+        res = self.inspect(buf)["resources"]
+        self.assertIsNone(res["version"])
+        self.assertEqual(res["problems"], ["resource directory RVA 0x9000 has no file bytes"])
+
+    def test_file_cut_inside_the_version_block(self):
+        full = with_resources()
+        cut = TEXT_RAW + (RSRC - TEXT_RVA) + 0x100 + 120   # past the fixed info, inside the string table
+        res = self.inspect(bytes(full[:cut]))["resources"]
+        v = res["version"]
+        self.assertEqual(v["fixed"]["file_version"], "1.2.3.4")
+        self.assertTrue(any("bytes declared" in p for p in res["problems"]), res["problems"])
+        self.assertNotIn("Placeholder", json.dumps(res))
+
+    def test_every_cut_length_gives_a_report(self):
+        full = bytes(with_resources())
+        for n in range(TEXT_RAW, len(full), 8):
+            with self.subTest(length=n):
+                self.assertIn("resources", self.inspect(full[:n], "sweep.exe"))
+
+    def test_malformed_blocks_are_problems(self):
+        bad_signature = version_block(signature=0x12345678)
+        res = self.inspect(with_resources(bad_signature))["resources"]
+        self.assertIsNone(res["version"]["fixed"])
+        self.assertIn("version block: VS_FIXEDFILEINFO signature 0x12345678 is not 0xfeef04bd", res["problems"])
+        self.assertEqual(res["version"]["string_count"], 4)        # the tables after it are still read
+
+        block = bytearray(version_block())
+        struct.pack_into("<H", block, 0, 0xFFF0)                   # wLength far past the resource
+        res = self.inspect(with_resources(bytes(block)))["resources"]
+        self.assertTrue(any("declares more bytes" in p for p in res["problems"]), res["problems"])
+
+        block = bytearray(version_block())
+        table = block.find(utf16z("040904b0")) - 6
+        first = table + 6 + len(utf16z("040904b0"))
+        first += -first % 4
+        struct.pack_into("<H", block, first, 3)                    # a child shorter than a header
+        res = self.inspect(with_resources(bytes(block)))["resources"]
+        self.assertTrue(any("is malformed" in p for p in res["problems"]), res["problems"])
+        self.assertEqual(res["version"]["string_count"], 0)
+
+        res = self.inspect(with_resources(b"\x02\x00"))["resources"]
+        self.assertIn("version block: VS_VERSIONINFO header is malformed", res["problems"])
+
+    def test_a_loop_in_the_tree_is_read_once(self):
+        buf = with_resources()
+        struct.pack_into("<II", buf, TEXT_RAW + (RSRC - TEXT_RVA) + 0x20 + 16, 1, 0x80000000)   # name -> root
+        res = self.inspect(buf)["resources"]
+        self.assertTrue(any("reached a second time" in p for p in res["problems"]), res["problems"])
+        self.assertIsNone(res["version"])
+        self.assertEqual([t["type"] for t in res["types"]], ["MANIFEST"])
+
+        buf = with_resources()
+        struct.pack_into("<II", buf, TEXT_RAW + (RSRC - TEXT_RVA) + 0x38 + 16, 0x409, 0x80000038)  # language -> itself
+        res = self.inspect(buf)["resources"]
+        self.assertTrue(any("only three levels are read" in p for p in res["problems"]), res["problems"])
+        self.assertIsNone(res["version"])
+
+    def test_named_types_are_counted_not_named(self):
+        buf = with_resources()
+        name_at = 0x400                                            # after the version data
+        place(buf, RSRC + name_at, struct.pack("<H", 9) + "SECRETTYP".encode("utf-16-le"))
+        struct.pack_into("<I", buf, TEXT_RAW + (RSRC - TEXT_RVA) + 16 + 8, 0x80000000 | name_at)  # MANIFEST -> named
+        r = self.inspect(buf)
+        self.assertEqual(r["resources"]["named_types"], 1)
+        self.assertEqual([t["type"] for t in r["resources"]["types"]], ["VERSION", "(named)"])
+        self.assertNotIn("SECRETTYP", json.dumps(r) + pe_inspect.to_markdown(r))
+
+
 class LongNameTest(unittest.TestCase):
     def test_a_long_decorated_import_name_is_read_whole(self):
         # the section is 0x1000 bytes, so the longest name that fits after the fixtures is used: 1,200 characters
@@ -974,6 +1170,201 @@ class SectionBoundaryReadTest(unittest.TestCase):
                 image2[0x3FE:0x400] = straddle[:2]
                 image2[b_raw2:b_raw2 + width - 2] = straddle[2:]
                 self.assertEqual(pe_inspect._tls_callbacks(pe_inspect.PeImage(bytes(image2))), 1)
+
+
+def build_apiset_schema(contracts: dict[str, str]) -> bytes:
+    """A version-6 API-set schema: {contract name without ".dll": host DLL, or "" for a contract with no host}."""
+    header, entry, value = 28, 24, 20
+    strings = bytearray()
+    offset = header + len(contracts) * (entry + value)
+    entries, values = bytearray(), bytearray()
+    for i, (name, host) in enumerate(contracts.items()):
+        name_at = offset + len(strings)
+        strings += name.encode("utf-16-le")
+        host_at = offset + len(strings)
+        strings += host.encode("utf-16-le")
+        hashed = name.rindex("-") * 2
+        value_at = header + len(contracts) * entry + i * value
+        entries += struct.pack("<6I", 0, name_at, len(name) * 2, hashed, value_at, 1)
+        values += struct.pack("<5I", 0, 0, 0, host_at, len(host) * 2)
+    body = entries + values + strings
+    return struct.pack("<7I", 6, header + len(body), 0, len(contracts), header, 0, 31) + body
+
+
+def build_apiset_dll(schema: bytes) -> bytes:
+    """A 64-bit image whose one section is the .apiset section Wine's apisetschema.dll carries."""
+    raw = 0x200
+    size = (len(schema) + 0x1FF) & ~0x1FF
+    buf = bytearray(raw + size)
+    buf[0:2] = b"MZ"
+    struct.pack_into("<I", buf, 0x3C, 0x40)
+    buf[0x40:0x44] = b"PE\0\0"
+    struct.pack_into("<HHIIIHH", buf, 0x44, 0x8664, 1, 0, 0, 0, 240, 0x2022)
+    struct.pack_into("<H", buf, 0x58, 0x20B)
+    struct.pack_into("<Q", buf, 0x58 + 24, IMAGE_BASE)
+    struct.pack_into("<I", buf, 0x58 + 56, 0x1000 + size)
+    struct.pack_into("<I", buf, 0x58 + 60, raw)
+    struct.pack_into("<I", buf, 0x58 + 108, 16)
+    section = 0x58 + 240
+    buf[section:section + 8] = b".apiset\0"
+    struct.pack_into("<IIII", buf, section + 8, len(schema), 0x1000, size, raw)
+    struct.pack_into("<I", buf, section + 36, 0x40000040)  # initialized data, readable
+    buf[raw:raw + len(schema)] = schema
+    return bytes(buf)
+
+
+class HostClassesTest(unittest.TestCase):
+    """classify_dll on a host that isn't Windows (a Wine prefix's system32, or none) and on Windows, simulated by
+    patching IS_WINDOWS and SYSTEM32, so every branch runs on every OS."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        env = mock.patch.dict(os.environ, {"WINEPREFIX": os.path.join(self.dir, "no-such-prefix")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.host(windows=False)
+
+    def host(self, windows: bool, system32: str | None = None):
+        for name, value in (("IS_WINDOWS", windows), ("SYSTEM32", system32 or pe_inspect.SYSTEM32)):
+            patch = mock.patch.object(pe_inspect, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def folder(self, *parts: str, files=()) -> str:
+        path = os.path.join(self.dir, *parts)
+        os.makedirs(path, exist_ok=True)
+        for name in files:
+            open(os.path.join(path, name), "wb").close()
+        return path
+
+    def prefix(self, files=(), schema: dict[str, str] | None = None) -> str:
+        """A fake Wine prefix whose system32 holds `files` (and an apisetschema.dll for `schema`); made current."""
+        root = os.path.join(self.dir, "prefix")
+        system32 = self.folder("prefix", "drive_c", "windows", "system32", files=files)
+        if schema is not None:
+            with open(os.path.join(system32, "apisetschema.dll"), "wb") as f:
+                f.write(build_apiset_dll(build_apiset_schema(schema)))
+        os.environ["WINEPREFIX"] = root
+        return system32
+
+    def report(self, game_dir: str | None = None) -> dict:
+        path = os.path.join(self.dir, "image.dll")
+        with open(path, "wb") as f:
+            f.write(build_image())
+        return pe_inspect.inspect(path, game_dir)
+
+    def test_bundled_names_compare_without_case(self):
+        game = self.folder("game", files=("msvcp140.dll", "Bink2.DLL"))
+        os.makedirs(os.path.join(game, "folder.dll"))
+        for windows in (False, True):
+            with self.subTest(windows=windows):
+                self.host(windows)
+                self.assertEqual(pe_inspect.classify_dll("MSVCP140.dll", game), "bundled")
+                self.assertEqual(pe_inspect.classify_dll("bink2.dll", game), "bundled")
+                self.assertNotEqual(pe_inspect.classify_dll("folder.dll", game), "bundled", "a folder isn't a DLL")
+        # A file added after the folder was first listed is seen too.
+        self.host(False)
+        open(os.path.join(game, "Late.dll"), "wb").close()
+        os.utime(game, ns=(os.stat(game).st_atime_ns, os.stat(game).st_mtime_ns + 1_000_000))
+        self.assertEqual(pe_inspect.classify_dll("LATE.dll", game), "bundled")
+
+    def test_wine_prefix_system32_is_compared_without_case(self):
+        system32 = self.prefix(files=("KERNEL32.dll", "advapi32.dll", "winhttp.dll"))
+        self.assertEqual(pe_inspect.classify_dll("kernel32.dll", None), "system")
+        self.assertEqual(pe_inspect.classify_dll("ADVAPI32.dll", None), "system")
+        self.assertEqual(pe_inspect.classify_dll("WinHttp.dll", None), "system", "as on Windows, where it's in System32")
+        self.assertEqual(pe_inspect.classify_dll("contoso.dll", None), "shim")
+        self.assertEqual(pe_inspect.classify_dll("xmem.dll", None), "shim")
+        self.assertEqual(pe_inspect.system_dll_source(), ("wine-prefix", system32))
+        r = self.report()
+        self.assertEqual(r["system_dlls"], {"checked": "wine-prefix", "dir": system32})
+        where = {i["dll"]: i["where"] for i in r["imports"]}
+        self.assertEqual((where["kernel32.dll"], where["xmem.dll"]), ("system", "shim"))
+        self.assertIn(f"System DLLs checked in the Wine prefix's `{system32}`.", pe_inspect.to_markdown(r))
+
+    def test_home_wine_prefix_when_wineprefix_is_unset(self):
+        home = self.folder("home")
+        system32 = self.folder("home", ".wine", "drive_c", "windows", "system32", files=("kernel32.dll",))
+        del os.environ["WINEPREFIX"]
+        with mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}):
+            self.assertEqual(pe_inspect.wine_system32(), system32)
+            self.assertEqual(pe_inspect.classify_dll("Kernel32.dll", None), "system")
+
+    def test_no_prefix_reports_unverified_except_what_the_shims_own(self):
+        self.assertIsNone(pe_inspect.wine_system32())
+        self.assertEqual(pe_inspect.classify_dll("contoso.dll", None), "unverified")
+        self.assertEqual(pe_inspect.classify_dll("kernel32.dll", None), "unverified", "a host DLL the shims patch")
+        self.assertEqual(pe_inspect.classify_dll("xmem.dll", None), "shim")
+        self.assertEqual(pe_inspect.classify_dll("XMEM.DLL", None), "shim")
+        self.assertEqual(pe_inspect.classify_dll("D3D12_xs.dll", None), "shim")
+        game = self.folder("game", files=("XMEM.dll",))
+        self.assertEqual(pe_inspect.classify_dll("xmem.dll", game), "bundled")
+        r = self.report()
+        self.assertEqual(r["system_dlls"], {"checked": "none", "dir": None})
+        md = pe_inspect.to_markdown(r)
+        self.assertIn("| kernel32.dll | normal | system (unverified) | 1 |", md)
+        self.assertIn("| xmem.dll | normal | shim | 1 |", md)
+        self.assertIn("System DLLs could not be checked: no Wine prefix", md)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pe_inspect.main([os.path.join(self.dir, "image.dll"),
+                                              "--out", os.path.join(self.dir, "reports")]), 0)
+        self.assertIn("shim-imports=2 ", out.getvalue(), "xmem.dll, imported and delay-imported")
+        self.assertIn("unverified-imports=1", out.getvalue(), "kernel32.dll")
+        self.assertIn("System DLLs could not be checked", out.getvalue())
+
+    def test_api_sets_on_a_host_that_is_not_windows(self):
+        self.assertEqual(pe_inspect.classify_dll("api-ms-win-core-synch-l1-2-0.dll", None), "unverified",
+                         "no prefix: an API set is never a shim the runtime owns")
+        self.prefix(files=("api-ms-win-crt-runtime-l1-1-0.dll",),
+                    schema={"api-ms-win-core-synch-l1-2-0": "kernelbase.dll", "api-ms-win-core-empty-l1-1-0": "",
+                            "ext-ms-win-gdi-dc-l1-2-0": "gdi32.dll"})
+        self.assertEqual(pe_inspect.classify_dll("api-ms-win-core-synch-l1-2-0.dll", None), "system")
+        self.assertEqual(pe_inspect.classify_dll("API-MS-WIN-Core-Synch-L1-2-1.dll", None), "system",
+                         "a lookup compares the name up to its last hyphen")
+        self.assertEqual(pe_inspect.classify_dll("ext-ms-win-gdi-dc-l1-2-0.dll", None), "system")
+        self.assertEqual(pe_inspect.classify_dll("api-ms-win-core-empty-l1-1-0.dll", None), "shim", "no host")
+        self.assertEqual(pe_inspect.classify_dll("api-ms-win-core-missing-l1-1-0.dll", None), "shim")
+        self.assertEqual(pe_inspect.classify_dll("API-MS-WIN-CRT-RUNTIME-L1-1-0.DLL", None), "system", "the file")
+
+    def test_windows_classification_is_unchanged(self):
+        system32 = self.folder("System32", files=("kernel32.dll",))
+        self.host(True, system32)
+        self.prefix(files=("contoso.dll", "kernel32.dll"))  # a Wine prefix is not consulted on Windows
+        self.assertEqual(pe_inspect.system_dll_source(), ("windows", system32))
+        self.assertEqual(pe_inspect.classify_dll("kernel32.dll", None), "system")
+        self.assertEqual(pe_inspect.classify_dll("contoso.dll", None), "shim", "never unverified on Windows")
+        self.assertEqual(pe_inspect.classify_dll("xmem.dll", None), "shim")
+        for resolves, expected in ((True, "system"), (False, "shim")):
+            with mock.patch.object(pe_inspect, "_apiset_resolves", lambda name, r=resolves: r):
+                self.assertEqual(pe_inspect.classify_dll("api-ms-win-core-synch-l1-2-0.dll", None), expected)
+        game = self.folder("game", files=("xmem.dll",))
+        self.assertEqual(pe_inspect.classify_dll("xmem.dll", game), "bundled")
+        r = self.report()
+        self.assertEqual(r["system_dlls"], {"checked": "windows", "dir": system32})
+        md = pe_inspect.to_markdown(r)
+        self.assertNotIn("System DLLs", md, "the Windows report reads as before")
+        self.assertIn("| kernel32.dll | normal | system | 1 |", md)
+
+    def test_runtime_shim_dlls_follow_the_registry(self):
+        owned = pe_inspect.runtime_shim_dlls()
+        self.assertTrue({"xmem.dll", "d3d12_xs.dll"} <= owned, owned)
+        self.assertFalse({"kernel32.dll", "kernelbase.dll", "msvcrt.dll"} & owned)
+        self.assertFalse([n for n in owned if n.startswith(("api-ms-", "ext-ms-"))])
+        with open(os.path.join(ROOT, "runtime", "shims", "registry.cpp"), encoding="utf-8") as f:
+            text = f.read()
+        body = text[text.index("bool owns_dll("):]
+        host = body[body.index("host[] = {") + len("host[] = {"):body.index("};")]
+        self.assertEqual(set(re.findall(r'"([^"]+)"', host)), set(pe_inspect._SHIM_HOST_DLLS),
+                         "_SHIM_HOST_DLLS is owns_dll's host list")
+        src = self.folder("shims")
+        with open(os.path.join(src, "a.cpp"), "w", encoding="utf-8", newline="\n") as f:
+            f.write('static const char* x = "notatable.dll";\nfind("alsonot.dll", "f");\n'
+                    'SHIM_TABLE(a,\n    {"Foo.dll", "F", reinterpret_cast<void*>(&f)},\n    MACRO("bar.dll"),\n'
+                    '    {"kernel32.dll", "K", nullptr},\n    MACRO("api-ms-win-core-file-l1-1-0.dll"),\n);\n')
+        self.assertEqual(pe_inspect.runtime_shim_dlls(src), {"foo.dll", "bar.dll"})
+        self.assertEqual(pe_inspect.runtime_shim_dlls(os.path.join(self.dir, "missing")), frozenset())
 
 
 if __name__ == "__main__":

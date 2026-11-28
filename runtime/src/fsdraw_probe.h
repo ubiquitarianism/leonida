@@ -5,6 +5,8 @@
 // CPU and what the GPU address arena holds at the same VA (the shader's heap_base + VA), which T#s have a bindless
 // entry, and which render targets the present-probe should read back as well.
 
+#include "title_va_alias.h"
+
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -36,7 +38,26 @@ inline State& state() {
     return s;
 }
 
+// What backs a title VA on the GPU side (set by the device: "slot-133 shadow", ...), for the CB comparison below.
+inline std::atomic<const char* (*)(std::uint64_t)>& backing_hook() {
+    static std::atomic<const char* (*)(std::uint64_t)> hook{nullptr};
+    return hook;
+}
+
+// LEONIDA_FSDRAW_PROBE=1 turns the records and lines on (so does LEONIDA_COMPUTE_INPUTS, whose probe reads the T#
+// and CBV records). Off by default: they take this mutex at every T# registered, CBV made, pipeline created and
+// table submitted. The arena mapping (note_arena) is kept either way.
+inline bool enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_FSDRAW_PROBE");
+        const char* inputs = std::getenv("LEONIDA_COMPUTE_INPUTS");
+        return (v && *v == '1') || (inputs && *inputs);
+    }();
+    return on;
+}
+
 inline void note_pipeline(std::uintptr_t id, std::string text) {
+    if (!enabled()) return;
     std::lock_guard lock(state().mutex);
     state().pipelines[id] = std::move(text);
 }
@@ -53,6 +74,7 @@ inline std::string pipeline(std::uintptr_t id) {
 }
 
 inline void note_tsharp(const std::uint32_t* words) {
+    if (!enabled()) return;
     std::array<std::uint32_t, 8> key{};
     std::memcpy(key.data(), words, sizeof(key));
     std::lock_guard lock(state().mutex);
@@ -60,6 +82,7 @@ inline void note_tsharp(const std::uint32_t* words) {
 }
 
 inline bool has_tsharp(const std::uint32_t* words) {
+    if (!enabled()) return false;
     std::array<std::uint32_t, 8> key{};
     std::memcpy(key.data(), words, sizeof(key));
     std::lock_guard lock(state().mutex);
@@ -82,22 +105,25 @@ inline void forget_arena(const std::uint8_t* mapped) {
     }
 }
 
-// A render target a fullscreen draw wrote: the present-probe reads it back with the source (at most 4 kept).
+// A render target a fullscreen draw wrote, or a traced texture (LEONIDA_TRACE_TEXTURE): the present-probe reads it back
+// with the source (at most 24 kept).
 inline void note_target(std::uint64_t id) {
-    if (!id) return;
+    if (!id || !enabled()) return;
     std::lock_guard lock(state().mutex);
     auto& r = state().readback;
     for (const std::uint64_t x : r)
         if (x == id) return;
-    if (r.size() < 4) r.push_back(id);
+    if (r.size() < 24) r.push_back(id);
 }
 
 inline std::vector<std::uint64_t> targets() {
+    if (!enabled()) return {};
     std::lock_guard lock(state().mutex);
     return state().readback;
 }
 
 inline void note_table(std::uint64_t translated, std::uint64_t original) {
+    if (!enabled()) return;
     std::lock_guard lock(state().mutex);
     auto& m = state().table_origin;
     if (m.size() > 8192) m.clear();
@@ -105,12 +131,14 @@ inline void note_table(std::uint64_t translated, std::uint64_t original) {
 }
 
 inline std::uint64_t table_origin(std::uint64_t va) {
+    if (!enabled()) return va;
     std::lock_guard lock(state().mutex);
     const auto it = state().table_origin.find(va);
     return it == state().table_origin.end() ? va : it->second;
 }
 
 inline void note_cbv(std::uint64_t base, std::uint64_t location, std::uint32_t size) {
+    if (!enabled()) return;
     std::lock_guard lock(state().mutex);
     auto& m = state().cbv_origin;
     if (m.size() > 8192) m.clear();
@@ -118,6 +146,7 @@ inline void note_cbv(std::uint64_t base, std::uint64_t location, std::uint32_t s
 }
 
 inline bool cbv_origin(std::uint64_t base, std::uint64_t& location) {
+    if (!enabled()) return false;
     std::lock_guard lock(state().mutex);
     const auto it = state().cbv_origin.find(base);
     if (it == state().cbv_origin.end()) return false;
@@ -155,7 +184,13 @@ inline std::uint64_t arena_size() {
 // arena has its first 16 dwords printed from the arena.
 inline void describe_table(const char* tag, std::uint64_t va, std::uint32_t slots, const std::uint8_t* cpu,
                            const char* heap_kind) {
-    const std::uint32_t shown = slots < 4 ? slots : 4;
+    // LEONIDA_FSDRAW_SLOTS=<n>: how many of a table's slots are shown (4 by default; a composite's textures sit later).
+    static const std::uint32_t limit = [] {
+        const char* v = std::getenv("LEONIDA_FSDRAW_SLOTS");
+        const unsigned long n = v ? std::strtoul(v, nullptr, 10) : 0;
+        return n ? std::uint32_t(n < 64 ? n : 64) : 4u;
+    }();
+    const std::uint32_t shown = slots < limit ? slots : limit;
     std::fprintf(stderr, "[rt] fsdraw: %s table va 0x%llx slots %u heap %s (arena size 0x%llx)\n", tag,
                  static_cast<unsigned long long>(va), slots, heap_kind, static_cast<unsigned long long>(arena_size()));
     for (std::uint32_t i = 0; i < shown; ++i) {
@@ -185,6 +220,32 @@ inline void describe_table(const char* tag, std::uint64_t va, std::uint32_t slot
                 if (!all.empty() && arena_words(base, all.data(), all.size()))
                     for (const std::uint32_t x : all) nonzero += x != 0;
             }
+            // A V# in the arena: the title bytes it was copied from, beside the arena copy the GPU reads, and what
+            // keeps that copy (a coherence gap shows as title nonzero / arena zero, repeatedly).
+            std::uint64_t source = 0, range_va = 0, range_bytes = 0;
+            if (in_arena && title_va_aliases().title_of_shader(base, source, range_va, range_bytes)) {
+                std::uint64_t lo = 0, hi = 0;
+                std::uint32_t title_words[16]{};
+                const bool title_readable =
+                    title_va_aliases().title_memory(source, lo, hi) && hi - source >= sizeof title_words;
+                if (title_readable)
+                    std::memcpy(title_words, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(source)),
+                                sizeof title_words);
+                const auto hook = backing_hook().load(std::memory_order_acquire);
+                std::fprintf(stderr, "[rt] fsdraw: %s   slot %u arena 0x%llx comes from title 0x%llx (alias range 0x%llx, "
+                                     "%llu bytes; backing %s): title [%s]%s\n",
+                             tag, i, static_cast<unsigned long long>(base), static_cast<unsigned long long>(source),
+                             static_cast<unsigned long long>(range_va), static_cast<unsigned long long>(range_bytes),
+                             hook ? hook(source) : "unknown",
+                             title_readable ? hex_words(title_words, 16).c_str() : "not readable",
+                             !title_readable ? ""
+                             // Only the alias range's own bytes (at most the 64 shown): the rest is another object's.
+                             : std::memcmp(title_words, data, std::size_t(std::min<std::uint64_t>(
+                                               sizeof data, range_va + range_bytes - source))) ? " DIFFER" : " SAME");
+            } else if (in_arena) {
+                std::fprintf(stderr, "[rt] fsdraw: %s   slot %u arena 0x%llx: no title range maps to it (the layer's own memory)\n",
+                             tag, i, static_cast<unsigned long long>(base));
+            }
             std::uint64_t location = 0;
             const bool made = cbv_origin(base, location);
             std::fprintf(stderr, "[rt] fsdraw: %s   slot %u V# base 0x%llx stride %u records %u -> %s [%s] nonzero dwords "
@@ -192,7 +253,11 @@ inline void describe_table(const char* tag, std::uint64_t va, std::uint32_t slot
                          tag, i, static_cast<unsigned long long>(base), stride, w[2],
                          in_arena ? "arena" : "outside the arena buffer", in_arena ? hex_words(data, 16).c_str() : "",
                          nonzero, made ? "" : " (no CreateConstantBufferView made this V#)");
-            if (made && !in_arena && location) {  // the CB as the title wrote it (title memory, CPU view)
+            // The CB as the title wrote it, when its location is the title's memory (CPU view): an upload buffer's
+            // VA, also outside the arena, is no CPU address.
+            std::uint64_t title_lo = 0, title_hi = 0;
+            if (made && !in_arena && location && title_va_aliases().title_memory(location, title_lo, title_hi) &&
+                title_hi - location >= 64) {
                 std::uint32_t cb[16]{};
                 std::memcpy(cb, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(location)), sizeof cb);
                 std::fprintf(stderr, "[rt] fsdraw: %s   slot %u CB at title 0x%llx: [%s]\n", tag, i,

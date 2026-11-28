@@ -28,7 +28,8 @@ class Memory {
 
   public:
     void track(std::uintptr_t base, std::uintptr_t bytes, std::uintptr_t allocation_base, bool heap) {
-        if (!base || !bytes || !allocation_base || bytes > std::numeric_limits<std::uintptr_t>::max() - base) return;
+        // A base of 0 is the GPU address arena: its address space starts at 0 (runtime/shims/d3d12_vulkan_device.cpp).
+        if (!bytes || !allocation_base || bytes > std::numeric_limits<std::uintptr_t>::max() - base) return;
         const auto end = base + bytes;
         std::lock_guard lock(mutex_);
         auto previous = regions_.upper_bound(base);

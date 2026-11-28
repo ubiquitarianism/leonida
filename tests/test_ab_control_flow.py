@@ -1129,5 +1129,167 @@ class PipelineExecutionTest(unittest.TestCase):
         self.assertEqual(content, f"ps_test\t{expected}\n")
 
 
+class HardeningRegressionTest(unittest.TestCase):
+    def test_select_candidates_strips_bom_crlf_and_blank_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            names = os.path.join(tmp, "names.txt")
+            with open(names, "wb") as f:
+                f.write(b"\xef\xbb\xbfps_alpha\r\n\r\n  ps_beta  \r\n\n")
+            self.assertEqual(
+                AB.select_candidates({}, tmp, tmp, names_file=names),
+                ["ps_alpha", "ps_beta"],
+            )
+
+    def test_main_reads_utf8_bom_index_json(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, "repo")
+            shaders = os.path.join(tmp, "shaders")
+            out = os.path.join(tmp, "out")
+            os.makedirs(os.path.join(repo, "runtime", "build"))
+            os.makedirs(os.path.join(shaders, "dxbc", "disasm"))
+            os.makedirs(os.path.join(shaders, "spirv"))
+            with open(os.path.join(shaders, "spirv", "index.json"), "wb") as f:
+                f.write(b"\xef\xbb\xbf" + json.dumps({"ps_bom": {"stage": "ps"}}).encode("utf-8"))
+            with open(os.path.join(shaders, "dxbc", "disasm", "ps_bom.s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("\ts_cbranch_scc0 10\n\ts_branch 20\n\ts_endpgm\n")
+            with open(os.path.join(shaders, "spirv", "ps_bom.spv"), "wb") as f:
+                f.write(b"stub")
+
+            def side_effect(args, **kwargs):
+                if "spirv-as" in str(args[0]):
+                    with open(args[-1], "wb") as fh:
+                        fh.write(b"vs")
+                    return SimpleNamespace(returncode=0, stdout="ok")
+                if "spirv-val" in str(args[0]):
+                    return SimpleNamespace(returncode=0, stdout="ok")
+                if "rdna2spirv.py" in str(args):
+                    out_dir = args[args.index("--out") + 1]
+                    os.makedirs(out_dir, exist_ok=True)
+                    with open(os.path.join(out_dir, "ps_bom.spvasm"), "w", encoding="utf-8", newline="\n") as fh:
+                        fh.write("%out_mrt0 = OpVariable %po Output\n")
+                    with open(os.path.join(out_dir, "ps_bom.spv"), "wb") as fh:
+                        fh.write(b"spv")
+                    return SimpleNamespace(returncode=0, stdout="1 pass spirv-val\n")
+                with open(args[3], "wb") as fh:
+                    fh.write(bytes(AB.READBACK_BYTES))
+                return SimpleNamespace(returncode=0, stdout="ok")
+
+            with patch("subprocess.run", side_effect=side_effect), contextlib.redirect_stdout(io.StringIO()):
+                rc = AB.main([repo, shaders, out, "--count", "1", "--harness", "dummy.exe"])
+            self.assertEqual(rc, 0)
+            with open(os.path.join(out, "outcomes.tsv"), encoding="utf-8") as f:
+                self.assertEqual(f.read(), "ps_bom\tidentical MRT0: non-clear\n")
+
+    def test_write_outcomes_atomic_preserves_existing_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "outcomes.tsv")
+            with open(target, "w", encoding="utf-8", newline="\n") as f:
+                f.write("prev\tidentical\n")
+            with patch.object(AB.replace_retry, "replace", side_effect=PermissionError("locked")):
+                with self.assertRaises(PermissionError):
+                    AB.write_outcomes(tmp, [("new", "DIFFERENT")])
+            with open(target, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "prev\tidentical\n")
+            self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".outcomes-")], [])
+
+            with patch.object(AB.replace_retry, "replace", wraps=AB.replace_retry.replace) as spy:
+                out_path = AB.write_outcomes(tmp, [("new", "DIFFERENT")])
+            spy.assert_called_once()
+            with open(out_path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "new\tDIFFERENT\n")
+
+    def test_render_targets_passes_utf8_replace_to_subprocess(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dir_a, dir_b, out = os.path.join(tmp, "a"), os.path.join(tmp, "b"), os.path.join(tmp, "out")
+            for d in (dir_a, dir_b, out):
+                os.makedirs(d)
+            seen = []
+
+            def fake_run(cmd, **kwargs):
+                seen.append(kwargs)
+                return SimpleNamespace(returncode=1)
+
+            with patch("subprocess.run", side_effect=fake_run):
+                AB.render_targets((("old", dir_a), ("new", dir_b)), "ps_x", "harness", "vs", out, 1, 5, [0], [0], False)
+            self.assertEqual(len(seen), 2)
+            for kw in seen:
+                self.assertEqual(kw.get("encoding"), "utf-8")
+                self.assertEqual(kw.get("errors"), "replace")
+
+    def test_upfront_out_harness_and_names_validation_runs_before_index_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shaders = os.path.join(tmp, "missing_shaders")
+            file_blocker = os.path.join(tmp, "blocker")
+            dir_blocker = os.path.join(tmp, "subdir")
+            os.makedirs(dir_blocker)
+            with open(file_blocker, "wb") as f:
+                f.write(b"x")
+            bad_invocations = (
+                ([tmp, shaders, "", "--names", "n"], "out directory must not be empty"),
+                ([tmp, shaders, "   ", "--names", "n"], "out directory must not be empty"),
+                ([tmp, shaders, file_blocker], "cannot create"),
+                ([tmp, shaders, os.path.join(file_blocker, "nested")], "cannot create"),
+                ([tmp, shaders, os.path.join(tmp, "out"), "--harness", ""], "--harness"),
+                ([tmp, shaders, os.path.join(tmp, "out"), "--harness", dir_blocker], "--harness"),
+                ([tmp, shaders, os.path.join(tmp, "out"), "--names", ""], "--names"),
+                ([tmp, shaders, os.path.join(tmp, "out"), "--names", "   "], "--names"),
+            )
+            for argv, expected in bad_invocations:
+                with self.subTest(argv=argv):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                        AB.main(argv)
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn(expected, err.getvalue())
+                    self.assertNotIn("index.json", err.getvalue())
+
+    def test_main_handles_spvasm_bom_and_missing_spvasm_oserror(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, "repo")
+            shaders = os.path.join(tmp, "shaders")
+            out = os.path.join(tmp, "out")
+            os.makedirs(os.path.join(repo, "runtime", "build"))
+            os.makedirs(os.path.join(shaders, "dxbc", "disasm"))
+            os.makedirs(os.path.join(shaders, "spirv"))
+            with open(os.path.join(shaders, "spirv", "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"ps_a": {"stage": "ps"}, "ps_b": {"stage": "ps"}}, f)
+            for name in ("ps_a", "ps_b"):
+                with open(os.path.join(shaders, "dxbc", "disasm", f"{name}.s"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("\ts_cbranch_scc0 10\n\ts_branch 20\n\ts_endpgm\n")
+                with open(os.path.join(shaders, "spirv", f"{name}.spv"), "wb") as f:
+                    f.write(b"stub")
+
+            def side_effect(args, **kwargs):
+                if "spirv-as" in str(args[0]):
+                    with open(args[-1], "wb") as fh:
+                        fh.write(b"vs")
+                    return SimpleNamespace(returncode=0, stdout="ok")
+                if "spirv-val" in str(args[0]):
+                    return SimpleNamespace(returncode=0, stdout="ok")
+                if "rdna2spirv.py" in str(args):
+                    out_dir = args[args.index("--out") + 1]
+                    os.makedirs(out_dir, exist_ok=True)
+                    src_name = os.path.splitext(os.path.basename(args[3]))[0]
+                    if src_name == "ps_a":
+                        with open(os.path.join(out_dir, f"{src_name}.spvasm"), "wb") as fh:
+                            fh.write(b"\xef\xbb\xbf%out_mrt0 = OpVariable %po Output\n")
+                    return SimpleNamespace(returncode=0, stdout="1 pass spirv-val\n")
+                with open(args[3], "wb") as fh:
+                    fh.write(bytes(AB.READBACK_BYTES))
+                return SimpleNamespace(returncode=0, stdout="ok")
+
+            with patch("subprocess.run", side_effect=side_effect), contextlib.redirect_stdout(io.StringIO()):
+                rc = AB.main([repo, shaders, out, "--count", "2", "--harness", "dummy.exe"])
+            self.assertEqual(rc, 0)
+            with open(os.path.join(out, "outcomes.tsv"), encoding="utf-8") as f:
+                tsv = f.read()
+            self.assertIn("ps_a\tidentical MRT0: non-clear\n", tsv)
+            self.assertIn("ps_b\tcannot read translated assembly:", tsv)
+
+
 if __name__ == "__main__":
     unittest.main()

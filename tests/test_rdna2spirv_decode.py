@@ -236,14 +236,17 @@ class TestFormatDecoderBoundary(unittest.TestCase):
     def test_format_decode_call_builds_and_caches_function(self):
         words = ["%w0", "%w1", "%w2", "%w3"]
         self.assertIsNone(self.gen.fmt_fn)
-        comps1 = self.gen.format_decode_call("%fmt_var", words)
-        self.assertEqual(len(comps1), 4)
+        wvec = self.gen.format_decode_words(words)
         self.assertIsNotNone(self.gen.fmt_fn)
         first_fn = self.gen.fmt_fn
+        before = len(self.gen.body)
+        r = self.gen.format_decode_call("%fmt_var", wvec, "%k")
+        # One component, one call: the component index is the call's last argument.
+        self.assertEqual(self.gen.body[before:], [f"         {r} = OpFunctionCall %uint %fmt_dec %fmt_var {wvec} %k"])
 
-        # Subsequent call reuses the cached function
-        comps2 = self.gen.format_decode_call("%fmt_var2", words)
-        self.assertEqual(len(comps2), 4)
+        # Subsequent calls reuse the cached function
+        self.gen.format_decode_words(words)
+        self.gen.format_decode_call("%fmt_var2", wvec, "%k2")
         self.assertIs(self.gen.fmt_fn, first_fn)
 
     def test_encode_format_saturation_and_boundary(self):
@@ -386,10 +389,9 @@ class TestTranslateIntegrationBoundaryChecks(unittest.TestCase):
         mov1 = [0xF2, 0x02, 0x02, 0x7E]
         export = [0x0F, 0x18, 0x00, 0xF8, 0x00, 0x01, 0x00, 0x01]
         endpgm = [0x00, 0x00, 0x81, 0xBF]
-        # The word of the finding was [0x00,0x50,0x16,0xCC, 0x01,0x05,0x0E,0x0C]; the translator recovers that one
-        # v_dot4_i32_i8 form from the program's words now (restore_skipped_instructions), so it is no longer a gap.
-        # This is the same instruction with another op_sel, which is not recovered and stays skipped.
-        gap = [0x00, 0x58, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]
+        # The finding's word with clamp set: the measured op_sel 2 / op_sel_hi 5 form is now decoded from the blob
+        # (rdna2spirv.skipped_form), this one is not.
+        gap = [0x00, 0xD0, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]
 
         def enc(words):
             return ",".join(f"0x{b:02x}" for b in words)
@@ -424,7 +426,7 @@ class TestTranslateIntegrationBoundaryChecks(unittest.TestCase):
         # code range the header declares, so the path runs into them as well
         mov0 = [0xF2, 0x02, 0x00, 0x7E]
         mov1 = [0xF2, 0x02, 0x02, 0x7E]
-        gap = [0x00, 0x58, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]   # a form that is not recovered, as above
+        gap = [0x00, 0xD0, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]   # clamp set: not a form restored from the blob
 
         def enc(words):
             return ",".join(f"0x{b:02x}" for b in words)

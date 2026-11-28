@@ -50,6 +50,10 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(leonida_mods.joaat("player_story000_00"), 0xE472B687)
         self.assertEqual(leonida_mods.joaat("cs_mandy"), 0xD7C0CDFF)
         self.assertEqual(leonida_mods.parse_model_id("0xD7C0CDFF"), 0xD7C0CDFF)
+        self.assertEqual(leonida_mods.parse_model_id("  player_story000_00 \t"), 0xE472B687)
+        self.assertEqual(leonida_mods.parse_model_id("\n0xD7C0CDFF "), 0xD7C0CDFF)
+        with self.assertRaises(ValueError):
+            leonida_mods.parse_model_id(" \t\n ")
         with self.assertRaises(ValueError):
             leonida_mods.parse_model_id("0x")
         with self.assertRaises(ValueError):
@@ -60,6 +64,12 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(mod.name, "Mandy in the prison intro")
         self.assertEqual(mod.swaps[0].from_id, 0xE472B687)
         self.assertEqual(mod.swaps[0].to_id, 0xD7C0CDFF)
+
+        padded = dict(MANDY)
+        padded["archetype_swaps"] = [{"from": " player_story000_00 ", "to": " cs_mandy\t"}]
+        padded_mod = leonida_mods.validate_manifest(padded, "padded_names")
+        self.assertEqual(padded_mod.swaps[0].from_id, 0xE472B687)
+        self.assertEqual(padded_mod.swaps[0].to_id, 0xD7C0CDFF)
 
         def bad(data, needle):
             with self.assertRaises(leonida_mods.ModsError) as cm:
@@ -145,6 +155,56 @@ class ManagerTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("skipped broken:", out)
             self.assertEqual(err, "")
+
+    def test_swap_conflicts_appear_in_json_text_and_strict_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mods = Path(tmp, "mods")
+            write_json(mods / "a_first" / "mod.json", MANDY)
+            write_json(mods / "b_disabled" / "mod.json", {**MANDY, "enabled": False})
+            write_json(mods / "c_second" / "mod.json", {
+                "name": "Second swap",
+                "enabled": True,
+                "game_version": "1.0.2.1",
+                "archetype_swaps": [
+                    {"from": "0xE472B687", "to": "cs_monalisa", "when": "always"},
+                ],
+            })
+
+            code, out, err = cli("--dir", str(mods), "check")
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("(overrides a_first)", out)
+            self.assertNotIn("overrides b_disabled", out)
+
+            code, out, err = cli("--dir", str(mods), "list", "--json")
+            self.assertEqual((code, err), (0, ""))
+            report = json.loads(out)
+            self.assertEqual(report["conflicts"], [{
+                "from_hash": "0xE472B687",
+                "from": "0xE472B687",
+                "winner": "c_second",
+                "overrides": "a_first",
+            }])
+            by_folder = {m["folder"]: m for m in report["mods"]}
+            self.assertNotIn("overrides", by_folder["a_first"]["archetype_swaps"][0])
+            self.assertNotIn("overrides", by_folder["b_disabled"]["archetype_swaps"][0])
+            self.assertEqual(by_folder["c_second"]["archetype_swaps"][0]["overrides"], "a_first")
+
+            code, out, err = cli("--dir", str(mods), "check", "--strict")
+            self.assertEqual((code, err), (1, ""))
+
+    def test_strict_check_fails_on_manifest_warnings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mods = Path(tmp, "mods")
+            write_json(mods / "empty_mod" / "mod.json", {
+                "name": "Empty",
+                "enabled": True,
+                "game_version": "1.0.2.1",
+                "archetype_swaps": [],
+            })
+            code, _, err = cli("--dir", str(mods), "check")
+            self.assertEqual((code, err), (0, ""))
+            code, _, err = cli("--dir", str(mods), "check", "--strict")
+            self.assertEqual((code, err), (1, ""))
 
     def test_run_print_builds_gta6rt_command(self):
         with tempfile.TemporaryDirectory() as tmp:
