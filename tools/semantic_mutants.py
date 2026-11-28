@@ -426,7 +426,9 @@ def run_test(test_file: str, tools_dir: str, timeout: int) -> tuple[bool, str]:
                            encoding="utf-8", errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         return False, f"timed out after {timeout} s"
-    if p.returncode == 5:                         # unittest's exit status when it found no tests (Python 3.12+)
+    # unittest can exit successfully after a class or module fixture skips every test before it starts.
+    zero_tests = re.search(r"^Ran 0 tests in .+\n\nOK(?: \(skipped=\d+\))?$", p.stderr, re.M)
+    if p.returncode == 5 or (p.returncode == 0 and zero_tests):
         return False, "no tests ran"
     tail = ((p.stdout or "") + (p.stderr or "")).strip().splitlines()
     return p.returncode == 0, tail[-1] if tail else ""

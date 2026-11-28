@@ -263,11 +263,14 @@ class EndToEnd(unittest.TestCase):
         self.skipTest("v_sad_u8's UMax line moved")
 
     def run_tool(self, extra, main_block=True):
-        line = self.umax_line()
         source = SAD_TEST.format(semantic=os.path.join(ROOT, "tests", "semantic"), extra=extra)
         if not main_block:
             source = source.replace(MAIN_BLOCK, "")
             self.assertNotIn("__main__", source)
+        return self.run_source(source)
+
+    def run_source(self, source):
+        line = self.umax_line()
         with tempfile.TemporaryDirectory() as tmp:
             test = os.path.join(tmp, "test_sad_probe.py")
             with open(test, "w", encoding="utf-8", newline="\n") as f:
@@ -293,15 +296,25 @@ class EndToEnd(unittest.TestCase):
         self.assertRegex(out, r"caught\s+line \d+: last operand \{ya\} -> \{xa\}")
 
     def test_file_with_no_tests_is_a_baseline_error(self):
-        line = self.umax_line()
-        with tempfile.TemporaryDirectory() as tmp:
-            test = os.path.join(tmp, "test_empty_probe.py")
-            with open(test, "w", encoding="utf-8", newline="\n") as f:
-                f.write("import unittest\n")
-            p = subprocess.run([sys.executable, "-I", TOOL, test, "--lines", f"{line}-{line}"],
-                               capture_output=True, text=True, timeout=600)
-        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
-        self.assertIn("no tests ran", p.stderr)
+        code, out = self.run_source("import unittest\n")
+        self.assertEqual(code, 2, out)
+        self.assertIn("no tests ran", out)
+
+    def test_class_skipped_before_any_test_is_a_baseline_error(self):
+        code, out = self.run_source(textwrap.dedent('''\
+            import unittest
+
+            class T(unittest.TestCase):
+                @classmethod
+                def setUpClass(cls):
+                    raise unittest.SkipTest("synthetic fixture unavailable")
+
+                def test_probe(self):
+                    raise AssertionError("fixture is required")
+            '''))
+        self.assertEqual(code, 2, out)
+        self.assertIn("no tests ran", out)
+        self.assertNotIn("SURVIVED", out)
 
 
 class SourceOption(unittest.TestCase):
