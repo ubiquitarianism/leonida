@@ -111,16 +111,20 @@ async function loadWorld() {
   if (new URLSearchParams(location.search).has("test")) return testWorld("Test mode was requested.");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), WORLD_MANIFEST_TIMEOUT_MS);
-  let response, world;
+  let world, stage = "fetch";
   try {
-    response = await fetch("world/world.json", { cache: "no-store", signal: controller.signal });
+    const response = await fetch("world/world.json", { cache: "no-store", signal: controller.signal });
     if (response.status === 404) return testWorld("world/world.json was not found.");
     if (!response.ok) return testWorld(`world/world.json returned HTTP ${response.status}.`);
-    world = await response.json();
+    stage = "read";
+    const text = await response.text();
+    stage = "parse";
+    world = JSON.parse(text);
   } catch {
     if (controller.signal.aborted) return testWorld("world/world.json download timed out.");
-    return testWorld(response ? "world/world.json could not be read as valid JSON."
-                              : "world/world.json could not be loaded.");
+    if (stage === "read") return testWorld("world/world.json could not be read.");
+    if (stage === "parse") return testWorld("world/world.json could not be read as valid JSON.");
+    return testWorld("world/world.json could not be loaded.");
   } finally {
     clearTimeout(timer);
   }

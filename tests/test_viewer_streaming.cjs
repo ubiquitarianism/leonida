@@ -14,12 +14,12 @@ const worldSource = html.slice(worldBegin, worldEnd);
 
 function loadWorld(fetch, search = '', timers = { setTimeout, clearTimeout }) {
     return vm.runInNewContext(worldSource + '\nloadWorld()', {
-        fetch, location: { search }, URLSearchParams, AbortController, ...timers,
+        fetch, location: { search }, URLSearchParams, AbortController, JSON, ...timers,
     });
 }
 
 function manifestResponse(manifest) {
-    return async () => ({ ok: true, json: async () => manifest });
+    return async () => ({ ok: true, text: async () => JSON.stringify(manifest) });
 }
 
 const worldChunk = { id: 'cell', url: 'world/chunks/cell.glb', bounds: [-1, -2, -3, 1, 2, 3] };
@@ -68,7 +68,7 @@ test('test mode, a missing manifest, and an unreadable manifest have distinct me
     const explicit = await loadWorld(async () => assert.fail('test mode must not fetch'), '?test');
     const missing = await loadWorld(async () => ({ ok: false, status: 404 }));
     const unavailable = await loadWorld(async () => ({ ok: false, status: 503 }));
-    const invalid = await loadWorld(async () => ({ ok: true, json: async () => { throw new SyntaxError(); } }));
+    const invalid = await loadWorld(async () => ({ ok: true, text: async () => '{ "spawn": ' }));
     const unreachable = await loadWorld(async () => { throw new TypeError(); });
     for (const world of [explicit, missing, unavailable, invalid, unreachable]) assert.equal(world.test, true);
     assert.match(explicit.reason, /requested/);
@@ -76,6 +76,21 @@ test('test mode, a missing manifest, and an unreadable manifest have distinct me
     assert.match(unavailable.reason, /HTTP 503/);
     assert.match(invalid.reason, /valid JSON/);
     assert.match(unreachable.reason, /could not be loaded/);
+});
+
+test('a body read that fails after a 200 response is reported as a read failure, not as invalid JSON', async () => {
+    const dropped = await loadWorld(async () => ({ ok: true, status: 200, text: async () => { throw new TypeError('network drop'); } }));
+    assert.equal(dropped.test, true);
+    assert.match(dropped.reason, /could not be read\./);
+    assert.doesNotMatch(dropped.reason, /valid JSON/);
+    const genericRead = await loadWorld(async () => ({ ok: true, status: 200, text: async () => { throw new Error('io error'); } }));
+    assert.match(genericRead.reason, /could not be read\./);
+});
+
+test('a valid manifest body still loads after the read and parse are split', async () => {
+    const world = await loadWorld(async () => ({ ok: true, status: 200, text: async () => '{"spawn":[1,2,3],"chunks":[]}' }));
+    assert.equal(world.test, false);
+    assert.equal(world.spawn.join(','), '1,2,3');
 });
 
 test('a stalled world manifest falls back to generated terrain at the startup deadline', async t => {
@@ -92,7 +107,7 @@ test('a stalled world manifest falls back to generated terrain at the startup de
                     signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
                 });
                 if (phase === 'headers') return stall();
-                return Promise.resolve({ ok: true, json() { readingBody = true; return stall(); } });
+                return Promise.resolve({ ok: true, text() { readingBody = true; return stall(); } });
             }, '', timers);
             await new Promise(setImmediate);
             assert.equal(readingBody, phase === 'body');
