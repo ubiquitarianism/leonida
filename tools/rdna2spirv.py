@@ -6689,14 +6689,14 @@ class Gen:
     def quad_any(self, v):
         """This lane's value after whole-quad mode: all ones if any of the 4 lanes of its quad (4n .. 4n+3 of the
         wave) has `v` non-zero, else 0. A quad never crosses the 32/32 half of a wave64, so a 32-wide subgroup is
-        exact. Without emulation the subgroup's quad ops do it (the invocations of a quad are 4 consecutive subgroup
-        invocations; in a fragment shader the 2x2 quad, which on hardware is also 4 consecutive lanes; vertex,
-        geometry and mesh shaders shuffle, as quad operations are only guaranteed in fragment and compute stages);
-        emulated, the four lanes' values are read through the exchange buffer. Not handled: an absent invocation in
-        a partial quad (a compute group whose size is not a multiple of 4) gives an undefined value natively."""
-        b = self.tmp()
-        self.emit(f"{b} = OpSelect %uint {self.tmp_bool_nz(v)} {self.cu(1)} {self.cu(0)}")
+        exact. Without emulation, fragment shaders use quad swaps (2x2 quads always have 4 invocations); compute,
+        vertex, geometry and mesh shaders use a subgroup ballot so partial quads (workgroups or draws whose size is
+        not a multiple of 4) keep absent invocations at 0 instead of reading an undefined value; emulated, the four
+        lanes' values are read through the exchange buffer."""
+        nz = self.tmp_bool_nz(v)
         if self.emulate:
+            b = self.tmp()
+            self.emit(f"{b} = OpSelect %uint {nz} {self.cu(1)} {self.cu(0)}")
             lane, base = self.wave_lane(), self.tmp()
             self.emit(f"{base} = OpBitwiseAnd %uint {lane} {self.cu(0xFFFFFFFC)}")
             read = self.x_round(data=b)[0]
@@ -6711,7 +6711,9 @@ class Gen:
                     o = self.tmp()
                     self.emit(f"{o} = OpBitwiseOr %uint {acc} {w}")
                     acc = o
-        elif self.stage in ("ps", "cs"):
+        elif self.stage == "ps":
+            b = self.tmp()
+            self.emit(f"{b} = OpSelect %uint {nz} {self.cu(1)} {self.cu(0)}")
             self.uses_subgroup = self.uses_quad = True
             acc = b
             for d in (0, 1):                      # horizontal, then vertical neighbour
@@ -6720,19 +6722,29 @@ class Gen:
                 self.emit(f"{o} = OpBitwiseOr %uint {acc} {sw}")
                 acc = o
         else:
-            # Quad operations are only guaranteed in fragment and compute shaders (quadOperationsInAllStages):
-            # vertex, geometry and mesh shaders shuffle from the four lanes of the quad instead.
-            self.uses_subgroup = True
-            lane, base = self.tmp(), self.tmp()
+            # Quad operations are only guaranteed in fragment and compute shaders (quadOperationsInAllStages),
+            # and both OpGroupNonUniformQuadSwap and OpGroupNonUniformShuffle are undefined when a partner
+            # invocation is absent in a partial quad (CS workgroups or VS/GS/MS draws whose size is not a
+            # multiple of 4). OpGroupNonUniformBallot leaves absent invocations at 0, so checking the quad's four
+            # bits via BallotBitExtract is exact for full and partial quads alike; bitwise OR avoids short-circuiting
+            # in MSL.
+            self.uses_subgroup = self.uses_ballot = True
+            lane, base, ballot = self.tmp(), self.tmp(), self.tmp()
             self.sub_lane(lane)
             self.emit(f"{base} = OpBitwiseAnd %uint {lane} {self.cu(0xFFFFFFFC)}")
-            acc = b
+            self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {nz}")
+            acc = None
             for k in range(4):
-                i, w, o = self.tmp(), self.tmp(), self.tmp()
+                i, bit, w = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{i} = OpIAdd %uint {base} {self.cu(k)}")
-                self.g_shuffle(w, b, i)
-                self.emit(f"{o} = OpBitwiseOr %uint {acc} {w}")
-                acc = o
+                self.emit(f"{bit} = OpGroupNonUniformBallotBitExtract %bool {self.cu(3)} {ballot} {self.wave_source_lane(i)}")
+                self.emit(f"{w} = OpSelect %uint {bit} {self.cu(1)} {self.cu(0)}")
+                if acc is None:
+                    acc = w
+                else:
+                    o = self.tmp()
+                    self.emit(f"{o} = OpBitwiseOr %uint {acc} {w}")
+                    acc = o
         r = self.tmp()
         self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(acc)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
         return r
