@@ -825,8 +825,12 @@ class BlockRebuildTest(unittest.TestCase):
             bcpack.decode(raw_bad, 6, 16)
 
     def test_bc7_config_completeness_and_empty_defaults(self):
-        # BC7_CONFIG must be a bijection over all 285 valid D3D11 BC7 mode
-        # configurations plus the (255, 255, 0, 0) sentinel at rank 285.
+        # BC7_CONFIG must cover all 285 valid D3D11 BC7 mode configurations plus
+        # the (255, 255, 0, 0) sentinel at rank 285. It is NOT a bijection: the
+        # rank-152 override (mode MEASURED by the ANCHOR status rule, partition
+        # inferred; see `test_bc7_rank152_override_deviation` in
+        # tests/test_bcpack_tables_bptc.py) duplicates rank 119's (3, 21, 0, 0)
+        # and drops (2, 38, 0, 0), leaving 284 unique configs.
         self.assertEqual(len(bptc.BC7_CONFIG), 286)
         self.assertEqual(bptc.BC7_CONFIG[-1], (255, 255, 0, 0))
         expected = (
@@ -840,11 +844,13 @@ class BlockRebuildTest(unittest.TestCase):
             | {(7, p, 0, 0) for p in range(64)}
         )
         self.assertEqual(len(expected), 285)
-        self.assertEqual(set(bptc.BC7_CONFIG[:-1]), expected)
+        self.assertEqual(set(bptc.BC7_CONFIG[:-1]), expected - {(2, 38, 0, 0)})
         self.assertEqual(len(bptc.BC7_CONFIG_INFERRED), 10)
         for rank in bptc.BC7_CONFIG_INFERRED:
             self.assertTrue(0 <= rank < 285)
-            self.assertEqual(bptc.BC7_CONFIG[rank][0], 2)
+            # Rank 152's measured mode 3 (ANCHOR status rule); every other
+            # inferred rank stays a mode-2 reading.
+            self.assertEqual(bptc.BC7_CONFIG[rank][0], 3 if rank == 152 else 2)
 
         # Default history loaders embed no fitted/game-derived history tables.
         _, _, ec, ic = bptc.load_bc6h()

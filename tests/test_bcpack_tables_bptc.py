@@ -134,7 +134,7 @@ class TestBc7ConfigAndStaticTables(unittest.TestCase):
             sorted(bptc._BC7_MODE2_HEAD, reverse=True),
         )
 
-    def test_bc7_config_bijection_bounds_and_order(self) -> None:
+    def test_bc7_config_structure_bounds_and_order(self) -> None:
         self.assertEqual(bptc._build_bc7_config(), bptc.BC7_CONFIG)
         self.assertIsInstance(bptc.BC7_CONFIG, tuple)
         self.assertEqual(len(bptc.BC7_CONFIG), 286)
@@ -151,8 +151,10 @@ class TestBc7ConfigAndStaticTables(unittest.TestCase):
             | {(7, p, 0, 0) for p in range(64)}
         )
         self.assertEqual(len(expected_configs), 285)
-        self.assertEqual(len(set(bptc.BC7_CONFIG[:-1])), 285)
-        self.assertEqual(set(bptc.BC7_CONFIG[:-1]), expected_configs)
+        # The table is NOT strictly bijective after the rank-152 override (it
+        # duplicates rank 119's (3, 21) and drops (2, 38)) — pinned in
+        # test_bc7_rank152_override_deviation below.
+        self.assertEqual(len(set(bptc.BC7_CONFIG[:-1])), 284)
 
         for rank, entry in enumerate(bptc.BC7_CONFIG[:-1]):
             mode, part, rot, isel = entry
@@ -173,7 +175,33 @@ class TestBc7ConfigAndStaticTables(unittest.TestCase):
             tuple((4, 0, (7 - r) >> 1, (7 - r) & 1) for r in range(8)),
         )
         self.assertEqual(bptc.BC7_CONFIG[77:141], tuple((3, 63 - r, 0, 0) for r in range(64)))
-        self.assertEqual(bptc.BC7_CONFIG[141:163], tuple((2, p, 0, 0) for p in bptc._BC7_MODE2_HEAD))
+        expected_head_block = [
+            (2, p, 0, 0) for p in bptc._BC7_MODE2_HEAD
+        ]
+        expected_head_block[152 - 141] = (3, 21, 0, 0)  # override, see next test
+        self.assertEqual(bptc.BC7_CONFIG[141:163], tuple(expected_head_block))
+
+    def test_bc7_rank152_override_deviation(self) -> None:
+        # Rank 152's mode is MEASURED — the ANCHOR status rule rejects every
+        # mode-2 reading of every corpus chunk that uses it (full 64-partition
+        # scan over the retail ttdb_* pools) — while partition 21 is INFERRED:
+        # colour-coherence top-1 of >=10 status-clean mode-3 partitions. A
+        # retail story-load run supports the mode-3 family, NOT the partition
+        # (the last standing `dstorage_failure 0x89240030` refusal cleared once
+        # 152 read as mode 3; any status-clean mode-3 reading would have). The
+        # override duplicates rank 119, which upstream does not treat as
+        # inferred: if 119 is ever confirmed at (3, 21), this entry or the
+        # mode-3 block order is wrong.
+        self.assertEqual(bptc.BC7_CONFIG[152], (3, 21, 0, 0))
+        self.assertEqual(bptc.BC7_CONFIG[119], (3, 21, 0, 0))
+        self.assertEqual(
+            sum(1 for e in bptc.BC7_CONFIG[:-1] if e == (3, 21, 0, 0)), 2
+        )
+        self.assertNotIn((2, 38, 0, 0), bptc.BC7_CONFIG[:-1])
+        self.assertEqual(len(set(bptc.BC7_CONFIG[:-1])), 284)
+        # Safety: the guess is not a skip list — 152 stays inferred, so strict
+        # decoding (tools/bcpack.py) still refuses chunks that reference it.
+        self.assertIn(152, bptc.BC7_CONFIG_INFERRED)
         self.assertEqual(bptc.BC7_CONFIG[163:227], tuple((1, 63 - r, 0, 0) for r in range(64)))
         self.assertEqual(
             bptc.BC7_CONFIG[227:241],
@@ -195,7 +223,14 @@ class TestBc7ConfigAndStaticTables(unittest.TestCase):
         )
         for rank in bptc.BC7_CONFIG_INFERRED:
             self.assertTrue(0 <= rank < 285)
-            self.assertEqual(bptc.BC7_CONFIG[rank][0], 2)
+            if rank == 152:
+                # Mode MEASURED (ANCHOR status rule refutes every mode-2
+                # reading); partition 21 INFERRED (top-1 of the status-clean
+                # mode-3 candidates). Details pinned by
+                # test_bc7_rank152_override_deviation.
+                self.assertEqual(bptc.BC7_CONFIG[rank], (3, 21, 0, 0))
+            else:
+                self.assertEqual(bptc.BC7_CONFIG[rank][0], 2)
 
     def test_bc7_static_tables_and_rank_of_grid(self) -> None:
         static = bptc._bc7_static()

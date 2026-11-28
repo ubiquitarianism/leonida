@@ -955,7 +955,12 @@ For BC6H and BC7 (16 lanes, 2 elements per 16-byte block):
 data (2- and 3-subset partition masks and anchor pixel indices) and the 286-entry BC7
 lane-15 signature permutation (`BC7_CONFIG`, built programmatically from closed-form
 descending ranges for modes 1 and 3–7 plus the mode-0/mode-2 partition order, with 10
-inferred-only mode-2 ranks flagged in `BC7_CONFIG_INFERRED`).
+inferred-only mode-2 ranks flagged in `BC7_CONFIG_INFERRED`). Rank 152 is the one
+exception: its MODE is measured — the ANCHOR status rule rejects every mode-2 reading
+of every corpus chunk that uses it (full 64-partition scan over the retail `ttdb_*`
+pools), so the table pins it to mode 3 — while its partition (21) stays a colour-
+coherence guess among the status-clean mode-3 readings; it remains flagged in
+`BC7_CONFIG_INFERRED` and strict mode still refuses chunks that reference it.
 
 BCPack's 256-entry initial endpoint/index history buffers for BC6H and BC7 are unpublished
 codec constants that cannot be derived from public specifications alone; they are **not**
@@ -996,7 +1001,7 @@ default BC1/BC3/BC4/BC5 rank/history tables (extendable or replaceable via `--hi
 | BC4 | `tools/bcpack_tables.py` (+ optional `--history`) | 2 confirmed / 170 provisional | 64 pair entries populated; entries 52 and 190 confirmed; 172 total entries cover the UI pool BC4 chunks in provisional mode (unpopulated entries still require `--history`) |
 | BC5 | `tools/bcpack_tables.py` (+ optional `--history`) | 5 confirmed / 209 provisional | 64 pair entries populated; entries 105, 182, 183, 222 and 255 confirmed |
 | BC6H | external `--history <path>` | Empty by default (`history=None`) | Self-contained chunks decode strictly; external JSON supplies class 1/2/3 entries |
-| BC7 | external `--history <path>` | Empty by default (`history=None`) | Self-contained chunks decode strictly; 286 signature ranks (10 inferred-only refused in strict mode); partial-depth endpoints (`>= 4` bits) mid-range filled in provisional mode |
+| BC7 | external `--history <path>` | Empty by default (`history=None`) | Self-contained chunks decode strictly; 286 signature ranks (10 inferred ranks refused in strict mode; rank 152 is mode-measured, partition-inferred); partial-depth endpoints (`>= 4` bits) mid-range filled in provisional mode |
 
 `tools/bcpack.py` and `tools/ttpf_mips.py` run in **strict mode by default**: any chunk
 referencing an unconfirmed/unknown built-in history entry or inferred BC7 signature raises

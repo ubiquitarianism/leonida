@@ -78,24 +78,38 @@ _BC7_MODE2_HEAD = (
 def _build_bc7_config():
     head_set = set(_BC7_MODE2_HEAD)
     mode2_tail = tuple(p for p in range(63, -1, -1) if p not in head_set)
-    return (
-        tuple((7, 63 - r, 0, 0) for r in range(64))
-        + ((6, 0, 0, 0),)
-        + tuple((5, 0, 3 - r, 0) for r in range(4))
-        + tuple((4, 0, (7 - r) >> 1, (7 - r) & 1) for r in range(8))
-        + tuple((3, 63 - r, 0, 0) for r in range(64))
-        + tuple((2, p, 0, 0) for p in _BC7_MODE2_HEAD)
-        + tuple((1, 63 - r, 0, 0) for r in range(64))
-        + tuple((0, p, 0, 0) for p in (*range(15, 7, -1), *range(5, -1, -1)))
-        + tuple((2, p, 0, 0) for p in mode2_tail)
-        + ((0, 7, 0, 0), (0, 6, 0, 0), (255, 255, 0, 0))
-    )
+    cfg = [
+        *((7, 63 - r, 0, 0) for r in range(64)),
+        (6, 0, 0, 0),
+        *((5, 0, 3 - r, 0) for r in range(4)),
+        *((4, 0, (7 - r) >> 1, (7 - r) & 1) for r in range(8)),
+        *((3, 63 - r, 0, 0) for r in range(64)),
+        *((2, p, 0, 0) for p in _BC7_MODE2_HEAD),
+        *((1, 63 - r, 0, 0) for r in range(64)),
+        *((0, p, 0, 0) for p in (*range(15, 7, -1), *range(5, -1, -1))),
+        *((2, p, 0, 0) for p in mode2_tail),
+        (0, 7, 0, 0), (0, 6, 0, 0), (255, 255, 0, 0),
+    ]
+    # Rank 152: mode measured, partition inferred. The ANCHOR status rule rejects
+    # every mode-2 reading of every corpus chunk using rank 152 (full 64-partition
+    # scan over the retail ttdb_* pools), so the mode is 3. The partition 21 is
+    # NOT measured: >=10 mode-3
+    # partitions are status-clean and 21 is only the colour-coherence top-1 of
+    # them. It collides with rank 119, which upstream does NOT treat as inferred:
+    # if 119 is ever confirmed at (3, 21), this entry or the mode-3 block order
+    # is wrong. 152 stays in BC7_CONFIG_INFERRED, so strict mode still refuses
+    # chunks that reference it.
+    cfg[152] = (3, 21, 0, 0)
+    return tuple(cfg)
 
 
 BC7_CONFIG = _build_bc7_config()
 
 # Signature ranks whose mode-2 partition assignment is inferred from anchor
 # positions and order only; strict mode refuses chunks that reference them.
+# Exception: 152 is a measured MODE-3 entry whose PARTITION 21 is inferred —
+# see the override comment in _build_bc7_config; it stays here because the
+# partition is still a guess.
 BC7_CONFIG_INFERRED = frozenset((149, 151, 152, 153, 246, 248, 251, 252, 253, 254))
 
 _EMPTY_BC6H_EH = tuple(((0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)) for _ in range(256))
