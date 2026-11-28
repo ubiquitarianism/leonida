@@ -170,6 +170,26 @@ class RunnerTest(unittest.TestCase):
             self.assertIn(tmp, result.stderr)
             self.assertNotIn("Traceback", result.stdout + result.stderr)
 
+    def test_serial_poll_uses_the_remaining_timeout(self):
+        from unittest.mock import Mock, patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"test_short.py": "pass\n"})
+            proc = Mock()
+            proc.wait.side_effect = subprocess.TimeoutExpired("discover", 0.03)
+            clock = Mock()
+            clock.monotonic.side_effect = (100.0, 100.0, 100.031)
+            with (
+                patch.object(r.subprocess, "Popen", return_value=proc),
+                patch.object(r, "time", clock),
+                patch.object(r, "_kill_process_tree") as kill,
+            ):
+                code, _ = run(tmp, "-j", "1", "--timeout", "0.03")
+            self.assertEqual(code, 1)
+            proc.wait.assert_called_once()
+            self.assertAlmostEqual(proc.wait.call_args.kwargs["timeout"], 0.03)
+            kill.assert_called_once_with(proc)
+
     def test_timeout_requires_positive_finite_seconds(self):
         for value in ("0", "-1", "nan", "inf", "-inf"):
             with self.subTest(value=value):

@@ -204,15 +204,20 @@ def run_discover(directory, pattern, verbose, timeout):
         path, env = result_environment(scratch)
         proc = subprocess.Popen([sys.executable, "-c", CHILD_PROGRAM, *args], env=env)
         _register_process(proc)
-        start_time = time.monotonic()
         try:
+            deadline = None if timeout is None else time.monotonic() + timeout
             while True:
+                wait_seconds = 0.2
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(proc.args, timeout)
+                    wait_seconds = min(wait_seconds, remaining)
                 try:
-                    code = proc.wait(timeout=0.2)
+                    code = proc.wait(timeout=wait_seconds)
                     break
                 except subprocess.TimeoutExpired:
-                    if timeout is not None and time.monotonic() - start_time >= timeout:
-                        raise
+                    continue
         except subprocess.TimeoutExpired:
             _kill_process_tree(proc)
             print(f"TIMED OUT after {timeout:g} s: unittest discover in {directory}", file=sys.stderr)
