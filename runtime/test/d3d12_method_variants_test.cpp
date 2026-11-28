@@ -292,13 +292,18 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
     if (queue) static_cast<IUnknown*>(queue)->Release();
 
     // Placed v2 setup.
+    // Tier-1 hosts require separate heaps for buffers, RT/DS textures and other textures.
     D3D12_HEAP_DESC placed_heap_desc{256 * 1024, default_heap, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
-                                     D3D12_HEAP_FLAG_NONE};
+                                     D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES};
     D3D12_HEAP_DESC upload_heap_desc{256 * 1024, upload_heap, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
                                      D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS};
-    Ref<ID3D12Heap> placed_heap, upload_placed_heap;
-    placed_device->CreateHeap(&placed_heap_desc, IID_PPV_ARGS(&placed_heap.p));
-    placed_device->CreateHeap(&upload_heap_desc, IID_PPV_ARGS(&upload_placed_heap.p));
+    Ref<ID3D12Heap> placed_heap, buffer_placed_heap, rt_placed_heap, upload_placed_heap;
+    const HRESULT texture_heap_hr = placed_device->CreateHeap(&placed_heap_desc, IID_PPV_ARGS(&placed_heap.p));
+    placed_heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    const HRESULT buffer_heap_hr = placed_device->CreateHeap(&placed_heap_desc, IID_PPV_ARGS(&buffer_placed_heap.p));
+    placed_heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+    const HRESULT rt_heap_hr = placed_device->CreateHeap(&placed_heap_desc, IID_PPV_ARGS(&rt_placed_heap.p));
+    const HRESULT upload_heap_hr = placed_device->CreateHeap(&upload_heap_desc, IID_PPV_ARGS(&upload_placed_heap.p));
     const auto p2 = [&](ID3D12Heap* heap, UINT64 offset, const D3D12_RESOURCE_DESC1& desc, D3D12_BARRIER_LAYOUT layout,
                         const D3D12_CLEAR_VALUE* clear = nullptr, UINT32 cast_count = 0,
                         const DXGI_FORMAT* cast = nullptr) {
@@ -309,7 +314,8 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
     const auto p2_host_sized = [&](const D3D12_RESOURCE_DESC& base, UINT64 fallback_bytes) {
         const UINT64 bytes = size_host ? size_host->GetResourceAllocationInfo(0, 1, &base).SizeInBytes
                                        : fallback_bytes;
-        D3D12_HEAP_DESC hd{bytes, default_heap, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, D3D12_HEAP_FLAG_NONE};
+        D3D12_HEAP_DESC hd{bytes, default_heap, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+                           D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES};
         Ref<ID3D12Heap> h;
         if (FAILED(placed_device->CreateHeap(&hd, IID_PPV_ARGS(&h.p)))) return E_FAIL;
         return p2(h.p, 0, desc1(base), D3D12_BARRIER_LAYOUT_COMMON);
@@ -338,6 +344,10 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
     };
 
     return {
+        {"CreateHeap, non-RT/DS texture heap", texture_heap_hr, S_OK},
+        {"CreateHeap, buffer heap", buffer_heap_hr, S_OK},
+        {"CreateHeap, RT/DS texture heap", rt_heap_hr, S_OK},
+        {"CreateHeap, upload heap", upload_heap_hr, S_OK},
         {"CreateCommittedResource2, texture with a mip region", v2(default_heap, texture_region), E_INVALIDARG},
         {"CreateCommittedResource2, buffer with a mip region", v2(upload_heap, buffer_region), S_OK},
         {"CreateCommittedResource3, texture with a mip region",
@@ -415,15 +425,15 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
         {"CreatePlacedResource2, buffer in COMMON",
          p2(upload_placed_heap.p, 0, buffer, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
         {"CreatePlacedResource2, buffer with Height=2",
-         p2(placed_heap.p, 0, tall_buffer, D3D12_BARRIER_LAYOUT_UNDEFINED), E_INVALIDARG},
+         p2(buffer_placed_heap.p, 0, tall_buffer, D3D12_BARRIER_LAYOUT_UNDEFINED), E_INVALIDARG},
         {"CreatePlacedResource2, upload buffer with ALLOW_UAV",
          p2(upload_placed_heap.p, 0, uav_buffer, D3D12_BARRIER_LAYOUT_UNDEFINED), E_INVALIDARG},
         {"CreatePlacedResource2, clear value on buffer",
-         p2(placed_heap.p, 0, buffer, D3D12_BARRIER_LAYOUT_UNDEFINED, &cv_rt), E_INVALIDARG},
+         p2(buffer_placed_heap.p, 0, buffer, D3D12_BARRIER_LAYOUT_UNDEFINED, &cv_rt), E_INVALIDARG},
         {"CreatePlacedResource2, clear value on plain texture",
          p2(placed_heap.p, 0, texture, D3D12_BARRIER_LAYOUT_COMMON, &cv_rt), E_INVALIDARG},
         {"CreatePlacedResource2, valid clear value on RT",
-         p2(placed_heap.p, 0, rt_tex, D3D12_BARRIER_LAYOUT_RENDER_TARGET, &cv_rt), S_OK},
+         p2(rt_placed_heap.p, 0, rt_tex, D3D12_BARRIER_LAYOUT_RENDER_TARGET, &cv_rt), S_OK},
         {"CreatePlacedResource2, oversized 1024x1024 texture in 256 KiB heap",
          p2(placed_heap.p, 0, big_tex, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
         {"CreatePlacedResource2, 256x256 at 64 KiB in 256 KiB heap",
@@ -443,7 +453,7 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
         {"CreatePlacedResource2, non-DS texture in DEPTH_STENCIL_WRITE",
          p2(placed_heap.p, 0, texture, D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE), E_INVALIDARG},
         {"CreatePlacedResource2, DS+DENY_SR in DIRECT_QUEUE_SHADER_RESOURCE",
-         p2(placed_heap.p, 0, ds_deny_tex, D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE), E_INVALIDARG},
+         p2(rt_placed_heap.p, 0, ds_deny_tex, D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE), E_INVALIDARG},
         {"CreateReservedResource1, clear value on plain texture",
          r1(res_tex, D3D12_RESOURCE_STATE_COMMON, &cv_rt), E_INVALIDARG},
         {"CreateReservedResource2, buffer in COMMON",
