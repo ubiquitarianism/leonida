@@ -645,7 +645,7 @@ int main() {
         };
 
         std::uint64_t token = 0;
-        const auto present = [&](const char* label, Frame& out) -> bool {
+        const auto present = [&](Frame& out) -> bool {
             clock.advance_us(period);
             if (xbox.WaitFrameEventX(rt::d3d12::xbox_frame_event_origin, 0, 0, &token) != S_OK) return false;
             rt::d3d12::XboxPresentPlaneParameters plane{token, 1, &texture.p, nullptr, 0};
@@ -653,14 +653,14 @@ int main() {
             return xbox.presenter().read_back(out.bytes, &out.extent, &out.format);
         };
 
-        EXPECT(present("first", presented_first));
+        EXPECT(present(presented_first));
         compare_presented(presented_first, decoded_first, "first");
 
         if (has_second) {
             const bool second_round_trip = upload_and_verify(decoded_second, "second");
             check(second_round_trip, "second frame texture round-trip bit-exact");
             if (!second_round_trip) return 1;
-            EXPECT(present("second", presented_second));
+            EXPECT(present(presented_second));
             compare_presented(presented_second, decoded_second, "second");
             if (presented_first.extent.width == presented_second.extent.width &&
                 presented_first.extent.height == presented_second.extent.height &&
