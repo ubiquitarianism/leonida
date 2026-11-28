@@ -1853,9 +1853,22 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// 238), and the queue was refused from the first world frame on. With
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
+///
+/// With `LEONIDA_CARD_ROOM_FOR_TARGETS_SETTLE_MS` set (0, the default: kept
+/// for the run, as before; 20,000 is the value measured), nothing is kept
+/// once the world's targets are made (half of the reserve or more) and have
+/// not grown by 64 MiB for that many ms: at 1440p the targets level off at
+/// 2.1-2.9 GB, and the rest of the 3,072 MB (990 MB at the first world
+/// frame, 160-640 MB in play) stayed reserved for targets that never came
+/// while thousands of textures waited for room (VIctory-NVIDIA's
+/// 2026-11-26 diag run 16:28, 10:59:54: 8,722 MB in use + 836 MB kept for
+/// targets against a line of 9,527 MB). The reserve comes back when the
+/// targets grow by 64 MiB again (a new scene's), for as long again.
+/// Ported from trustno1-coder/VIctory-NVIDIA 21b040da (readmet3xt-lab),
+/// GPL-3.0; there the setting is on at 20,000, here it is off.
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
-    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
         std::env::var("LEONIDA_CARD_ROOM_FOR_TARGETS_MB")
@@ -1863,9 +1876,87 @@ pub(crate) fn targets_room_kept() -> u64 {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
+    static SETTLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let settle = *SETTLE.get_or_init(|| {
+        std::env::var("LEONIDA_CARD_ROOM_FOR_TARGETS_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    if settle == 0 {
+        return targets_kept(most, targets, 0, 0);
+    }
+    // The targets' bytes at their last change of 64 MiB or more, and when
+    // they last grew by that much.
+    static GREW: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let now = crate::host::now_ms();
+    let (last, since) = (GREW[0].load(Relaxed), GREW[1].load(Relaxed));
+    let (last, since) = targets_seen(last, since, targets, now);
+    GREW[0].store(last, Relaxed);
+    GREW[1].store(since, Relaxed);
+    let kept = targets_kept(most, targets, now.saturating_sub(since), settle);
+    // One line each time the reserve is given up or taken back, for a run to
+    // show when and how much (none with the setting at 0).
+    static GIVEN_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let given_up = kept == 0 && targets < most;
+    if GIVEN_UP.swap(given_up, Relaxed) != given_up {
+        tracing::info!("{}", targets_line(given_up, most, targets, now));
+    }
+    kept
+}
+
+/// The line [`targets_room_kept`] writes when the reserve for render
+/// targets is given up (`given_up`) or taken back: the targets' bytes and
+/// what is freed or kept, in MB, and the time of the run in seconds.
+#[cfg(any(windows, test))]
+fn targets_line(given_up: bool, most: u64, targets: u64, now_ms: u64) -> String {
+    let mb = |b: u64| b >> 20;
+    let rest = mb(most.saturating_sub(targets));
+    if given_up {
+        format!(
+            "render-target reserve (LEONIDA_CARD_ROOM_FOR_TARGETS_SETTLE_MS): given up at {:.1} s, targets {} MB, {} MB freed for textures",
+            now_ms as f64 / 1000.0,
+            mb(targets),
+            rest
+        )
+    } else {
+        format!(
+            "render-target reserve (LEONIDA_CARD_ROOM_FOR_TARGETS_SETTLE_MS): taken back at {:.1} s, targets {} MB, {} MB kept",
+            now_ms as f64 / 1000.0,
+            mb(targets),
+            rest
+        )
+    }
+}
+
+/// [`targets_room_kept`]'s record of the targets' bytes (`last`) and of
+/// when they last grew by 64 MiB (`since`, ms), with `targets` now: a fall
+/// of 64 MiB lowers the record (so that growing back counts as growth), a
+/// growth of 64 MiB raises it and restarts the clock.
+#[cfg(any(windows, test))]
+fn targets_seen(last: u64, since: u64, targets: u64, now: u64) -> (u64, u64) {
+    const STEP: u64 = 64 << 20;
+    if targets >= last.saturating_add(STEP) {
+        (targets, now)
+    } else if targets.saturating_add(STEP) <= last {
+        (targets, since)
+    } else {
+        (last, since)
+    }
+}
+
+/// What [`targets_room_kept`] keeps of `most`: what the targets do not
+/// hold yet, or nothing once they hold half of it or more and have not
+/// grown for `settle` ms (`still_ms`; `settle` 0: always kept).
+#[cfg(any(windows, test))]
+fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64) -> u64 {
+    if settle > 0 && targets >= most / 2 && still_ms >= settle {
+        0
+    } else {
+        most.saturating_sub(targets)
+    }
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -5181,6 +5272,42 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    /// The room kept for render targets goes once the world's targets are
+    /// made and have stopped growing, and comes back when they grow again.
+    /// Ported from trustno1-coder/VIctory-NVIDIA 21b040da (readmet3xt-lab).
+    #[test]
+    fn room_for_targets_is_given_up_once_they_settle() {
+        const MIB: u64 = 1 << 20;
+        let most = 3072 * MIB;
+        // Before the world: kept, however long.
+        assert_eq!(targets_kept(most, 652 * MIB, 60_000, 20_000), 2420 * MIB);
+        // The world's first frames: still growing.
+        assert_eq!(targets_kept(most, 2083 * MIB, 5_000, 20_000), 989 * MIB);
+        // Settled: nothing kept.
+        assert_eq!(targets_kept(most, 2432 * MIB, 20_000, 20_000), 0);
+        // Setting 0 (the default): kept as before, however long.
+        assert_eq!(targets_kept(most, 2432 * MIB, 600_000, 0), 640 * MIB);
+
+        // Growth of 64 MiB restarts the clock; less does not.
+        assert_eq!(targets_seen(2000 * MIB, 1_000, 2050 * MIB, 9_000), (2000 * MIB, 1_000));
+        assert_eq!(targets_seen(2000 * MIB, 1_000, 2064 * MIB, 9_000), (2064 * MIB, 9_000));
+        // A fall lowers the record without restarting it, so growing back
+        // counts as growth.
+        let (last, since) = targets_seen(2400 * MIB, 1_000, 1000 * MIB, 9_000);
+        assert_eq!((last, since), (1000 * MIB, 1_000));
+        assert_eq!(targets_seen(last, since, 2400 * MIB, 30_000), (2400 * MIB, 30_000));
+
+        // The run's line says when, and how much is freed or kept again.
+        assert_eq!(
+            targets_line(true, most, 2432 * MIB, 41_300),
+            "render-target reserve (LEONIDA_CARD_ROOM_FOR_TARGETS_SETTLE_MS): given up at 41.3 s, targets 2432 MB, 640 MB freed for textures"
+        );
+        assert_eq!(
+            targets_line(false, most, 2496 * MIB, 95_000),
+            "render-target reserve (LEONIDA_CARD_ROOM_FOR_TARGETS_SETTLE_MS): taken back at 95.0 s, targets 2496 MB, 576 MB kept"
+        );
     }
 
     /// A placed texture viewed from a later level has a host copy of that
