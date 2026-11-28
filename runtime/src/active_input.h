@@ -95,7 +95,8 @@ public:
         const InputEdge edge = edge_between(it->second, now);
         it->second = now;
         if (edge == InputEdge::None || family == tracked_) return InputEdge::None;
-        if (changed_once_ && time_us - changed_at_ < thresholds_.min_switch_us) return InputEdge::None;
+        if (changed_once_ && (time_us < changed_at_ || time_us - changed_at_ < thresholds_.min_switch_us))
+            return InputEdge::None;
         const InputFamily before = active();
         tracked_ = family;
         changed_at_ = time_us;
@@ -125,11 +126,17 @@ private:
     InputEdge edge_between(const InputSample& was, const InputSample& now) const {
         if (now.buttons & ~was.buttons) return InputEdge::Button;
         const float t = thresholds_.trigger;
-        if ((was.left_trigger <= t && now.left_trigger > t) || (was.right_trigger <= t && now.right_trigger > t))
+        const auto trigger_rose = [t](float prev, float cur) {
+            return std::isfinite(prev) && std::isfinite(cur) && prev <= t && cur > t;
+        };
+        if (trigger_rose(was.left_trigger, now.left_trigger) || trigger_rose(was.right_trigger, now.right_trigger))
             return InputEdge::Trigger;
-        const auto out = [this](float x, float y) { return std::hypot(x, y) > thresholds_.stick; };
-        if ((!out(was.left_x, was.left_y) && out(now.left_x, now.left_y)) ||
-            (!out(was.right_x, was.right_y) && out(now.right_x, now.right_y)))
+        const auto stick_left = [this](float px, float py, float cx, float cy) {
+            if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(cx) || !std::isfinite(cy)) return false;
+            return std::hypot(px, py) <= thresholds_.stick && std::hypot(cx, cy) > thresholds_.stick;
+        };
+        if (stick_left(was.left_x, was.left_y, now.left_x, now.left_y) ||
+            stick_left(was.right_x, was.right_y, now.right_x, now.right_y))
             return InputEdge::Stick;
         return InputEdge::None;
     }

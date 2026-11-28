@@ -41,10 +41,17 @@ def run(line, seeds, old=OLD, hi=0x5A5A):
 
 def exact_sqrt_ratio(num, den, k=64):
     """floor(sqrt(num/den) * 2^k) / 2^k as a Fraction: far finer than binary16, and exact when the root is rational."""
+    if isinstance(num, bool) or not isinstance(num, int) or num < 0:
+        raise ValueError(f"num must be a non-negative int, got {num!r}")
+    if isinstance(den, bool) or not isinstance(den, int) or den <= 0:
+        raise ValueError(f"den must be a positive int, got {den!r}")
+    if isinstance(k, bool) or not isinstance(k, int) or k < 0:
+        raise ValueError(f"k must be a non-negative int, got {k!r}")
     return Fraction(math.isqrt((num << (2 * k)) // den), 1 << k) if num else Fraction(0)
 
 
 def ref_rcp(h):
+    h &= 0xFFFF
     if is_nan(h):
         return h | 0x7E00
     if h & 0x7FFF == 0:
@@ -55,6 +62,7 @@ def ref_rcp(h):
 
 
 def ref_sqrt(h):
+    h &= 0xFFFF
     if is_nan(h):
         return h | 0x7E00
     if h & 0x7FFF == 0:
@@ -68,6 +76,7 @@ def ref_sqrt(h):
 
 
 def ref_rsq(h):
+    h &= 0xFFFF
     if is_nan(h):
         return h | 0x7E00
     if h & 0x7FFF == 0:
@@ -82,6 +91,7 @@ def ref_rsq(h):
 
 def ref_fract(h):
     """x - floor(x), rounded once; 1.0 (a tiny negative x) becomes the largest word below 1; fract(+-0) = +0."""
+    h &= 0xFFFF
     if is_nan(h):
         return h | 0x7E00
     if h & 0x7FFF == 0x7C00:
@@ -162,15 +172,15 @@ class UnaryF16:
     def test_output_modifiers_and_clamp(self):
         for a in self.MOD_INPUTS:
             base = self.ref(a)
-            # `clamp` of a NaN result is not modelled (the translator emits FClamp; docs/design.md, float min/max/med3 with
-            # NaN), so a NaN result is only checked with the output multipliers.
+            # `clamp` of a NaN result gives +0 (DX10_CLAMP 1 in the game's MODE; Gen.clamp_mods selects +0 for a NaN
+            # before FClamp, docs/design.md, float min/max/med3 with NaN).
             # #4542, measured on gfx1036: an f16 destination ignores omod (mul:2/mul:4/div:2) under the game's MODE
             # (IEEE=0, f16 denormals kept) and keeps clamp (docs/design.md, f16 output modifiers).
             for suffix, want in ((" mul:2", base), (" mul:4", base),
                                  (" div:2", base), (" clamp", clamp01(base)),
                                  (" mul:2 clamp", clamp01(base))):
                 if is_nan(base) and "clamp" in suffix:
-                    continue
+                    want = 0
                 with self.subTest(a=hex(a), mod=suffix):
                     got = run(self.line("_e64") + suffix, {"v1": a})
                     self.assertEqual(got >> 16, OLD >> 16)

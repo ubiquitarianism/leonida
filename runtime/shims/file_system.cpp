@@ -6,7 +6,8 @@
 // here (docs/runtime_imports.md, "Console paths and the write overlay"; the prefixes come from ivall/xcl,
 // GPL-2.0-only, as facts). The rules:
 //   - "GAME:" (any case, "\\" or "/") maps under --game-dir, "G:\\" is the same folder and "T:\\" a scratch folder in
-//     the overlay (RT-218); any other path is a host path and goes to the host;
+//     the overlay (RT-218), <overlay>\\.gta6rt-temp\\<run>, a new one reserved by every process; any other path is a
+//     host path and goes to the host;
 //   - an open that can write, and DeleteFile, go to the overlay (--overlay, default <game-dir>\\overlay), so the
 //     package stays exactly as installed. A write-open of a package file copies it into the overlay first, so
 //     OPEN_EXISTING keeps its bytes; a delete of a package file leaves an empty marker under
@@ -26,6 +27,7 @@
 #include <intrin.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -41,6 +43,7 @@
 #include "file_system.h"
 #include "shims.h"
 #include "startup_trace.h"
+#include "../src/title_page_watch.h"
 
 namespace rt::fs {
 namespace {
@@ -48,7 +51,7 @@ namespace {
 constexpr wchar_t kGamePrefix[] = L"game:";
 constexpr size_t kGamePrefixLength = 5;
 constexpr wchar_t kDeletedDir[] = L".gta6rt-deleted";
-constexpr wchar_t kScratchDir[] = L".gta6rt-temp";  // what "T:\" names, inside the overlay
+constexpr wchar_t kScratchDir[] = L".gta6rt-temp";  // holds one folder per process; "T:\" names this process's
 // A removed package folder is marked by this file inside its marker folder: the marker folder itself can already
 // exist because files below it were deleted, and that alone does not hide the folder.
 constexpr wchar_t kRemovedDirMarker[] = L".gta6rt-dir";
@@ -166,8 +169,67 @@ std::filesystem::path win32_find_path(const std::filesystem::path& path, const s
 // other console layers map those two drives (RT-218). Only the executable can say which spelling the title uses, so
 // a host drive of the same letter must keep working: a path under --game-dir or the overlay (a package on drive G:,
 // or a path GetModuleFileName handed back) stays a host path, and so does every G:/T: path while no roots are
-// configured. The scratch folder lives in the overlay, as `.gta6rt-temp`.
+// configured. The scratch folder lives in the overlay, as `.gta6rt-temp\<run>`, one per process (scratch_folder()).
 enum class Drive { None, Game, Scratch };
+
+// The stem of this process's T: folder below `.gta6rt-temp`: the process's start time (UTC, to the millisecond) and
+// its id, e.g. "20261123-181502-123-pid4242". On the console T: is the title's own temporary drive, empty at launch
+// and shared with nothing; one folder that every run shared kept the files earlier runs left, so a title that makes a
+// file there with CREATE_NEW (its crash dump and crash log, measured under Wine) got ERROR_FILE_EXISTS. The stem only
+// makes the folder easy to find: a reused process id in the same millisecond gives the same stem, so the folder is
+// reserved by reserve_unique_dir, which never hands out one that already existed.
+const std::wstring& scratch_run() {
+    static const std::wstring name = [] {
+        const DWORD last_error = ::GetLastError();
+        FILETIME created{}, exited{}, kernel{}, user{};
+        SYSTEMTIME t{};
+        if (!::GetProcessTimes(::GetCurrentProcess(), &created, &exited, &kernel, &user) ||
+            !::FileTimeToSystemTime(&created, &t))
+            ::GetSystemTime(&t);
+        wchar_t buffer[64];
+        const unsigned long pid = ::GetCurrentProcessId();
+        std::swprintf(buffer, sizeof(buffer) / sizeof(buffer[0]), L"%04u%02u%02u-%02u%02u%02u-%03u-pid%lu",
+                      unsigned{t.wYear}, unsigned{t.wMonth}, unsigned{t.wDay}, unsigned{t.wHour}, unsigned{t.wMinute},
+                      unsigned{t.wSecond}, unsigned{t.wMilliseconds}, pid);
+        ::SetLastError(last_error);
+        return std::wstring(buffer);
+    }();
+    return name;
+}
+
+// The T: folder this process reserved in each overlay it was given (configure() may name several, as the test does),
+// or the error that stopped the reservation. Decided once per overlay, under the mutex, so concurrent first T: calls
+// get the same folder.
+struct ScratchFolder {
+    std::wstring name;  // empty: the reservation failed with `error`
+    DWORD error = 0;
+};
+std::mutex g_scratch_mutex;
+std::map<std::wstring, ScratchFolder> g_scratch_folders;  // keyed by the overlay path, lowercased
+
+// The name of this process's folder below <overlay>\.gta6rt-temp, reserved on the first call for that overlay; empty
+// when it could not be reserved (logged once). With no overlay configured nothing is made and the stem is the name.
+std::wstring scratch_folder(const std::filesystem::path& overlay) {
+    if (overlay.empty()) return scratch_run();
+    std::lock_guard lock(g_scratch_mutex);
+    ScratchFolder& folder = g_scratch_folders[lower(overlay.native())];
+    if (folder.name.empty() && folder.error == 0) {
+        const DWORD last_error = ::GetLastError();
+        DWORD error = 0;
+        const std::filesystem::path reserved = reserve_unique_dir(overlay / kScratchDir, scratch_run(), error);
+        if (reserved.empty()) {
+            folder.error = error ? error : ERROR_CANNOT_MAKE;
+            std::fprintf(stderr,
+                         "[rt] file_system: no T: folder could be reserved below %ls (Win32 error %lu); T: paths "
+                         "fail with ERROR_INVALID_NAME\n",
+                         (overlay / kScratchDir).c_str(), static_cast<unsigned long>(folder.error));
+        } else {
+            folder.name = reserved.filename().native();
+        }
+        ::SetLastError(last_error);
+    }
+    return folder.name;
+}
 
 Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     if (path.size() >= kGamePrefixLength && lower(path.substr(0, kGamePrefixLength)) == kGamePrefix) {
@@ -190,11 +252,15 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     if (drive == Drive::None) return Parsed::Host;
     parts.clear();
     if (drive == Drive::Scratch) {
-        parts.push_back(kScratchDir);
         const std::filesystem::path overlay = roots().overlay;
+        const std::wstring folder = scratch_folder(overlay);
+        if (folder.empty()) return Parsed::Refused;
+        parts.push_back(kScratchDir);
+        parts.push_back(folder);
+        // The folder is this process's from its reservation on; made again if something removed it since.
         const DWORD last_error = ::GetLastError();
         std::error_code ec;
-        if (!overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir), ec);
+        if (!overlay.empty()) std::filesystem::create_directories(win32_io_path(overlay / kScratchDir / folder), ec);
         ::SetLastError(last_error);
     }
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
@@ -226,7 +292,7 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     if (!flush()) return Parsed::Refused;
     // The overlay's own folders are not part of the title's GAME: tree: hidden from its listings (internal_dir) and
     // refused as an explicit path too, in every spelling the loop above normalises (case, slashes, "." and "..").
-    // T: still names the scratch folder: its first part is pushed above, not parsed from the title's path.
+    // T: still names the scratch folder: its first two parts are pushed above, not parsed from the title's path.
     if (drive == Drive::Game && !parts.empty() && internal_dir(parts.front().c_str())) return Parsed::Refused;
     return Parsed::Console;
 }
@@ -243,12 +309,44 @@ std::filesystem::path disk_path(const std::filesystem::path& root, const std::ve
 
 bool drive_root(const std::wstring& path, const std::vector<std::wstring>& parts) {
     size_t prefix_length = 0;
-    return parts.empty() || (parts.size() == 1 && console_drive(path, prefix_length) == Drive::Scratch);
+    return parts.empty() || (parts.size() == 2 && console_drive(path, prefix_length) == Drive::Scratch);
+}
+
+// A folder's entries change one step at a time, as on the host: RemoveDirectory holds the folder's lock from its
+// emptiness check to its marker, and a GAME: write-open or CreateDirectory holds the lock of the folder it creates in
+// from its "does the folder exist" check, through mirroring that folder into the overlay, to the host call that makes
+// the entry. One of the two goes first: the create fails with ERROR_PATH_NOT_FOUND, or the remove with
+// ERROR_DIR_NOT_EMPTY. Without it both succeeded and the removed folder was back, the new entry in it. The locks are
+// striped by the folder's name, so calls in different folders rarely wait on each other; reads never take one.
+// Namespace scope, not function-local statics: these run on the title's threads. Taken after roots(); nothing holding
+// one takes another of them or calls back into the title (a copy-up's lock may be taken inside one, never around one).
+constexpr size_t kFolderLocks = 64;
+std::mutex g_folder_locks[kFolderLocks];
+
+std::mutex& folder_lock(const std::vector<std::wstring>& folder) {
+    // FNV-1a over the upper-cased components: names compare without case, so every spelling of a folder gets its lock.
+    uint64_t hash = 14695981039346656037ull;
+    const auto mix = [&hash](wchar_t c) {
+        hash ^= static_cast<uint64_t>(c);
+        hash *= 1099511628211ull;
+    };
+    for (const auto& part : folder) {
+        std::wstring upper(part.size(), L'\0');
+        if (part.empty() || LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, part.data(),
+                                          static_cast<int>(part.size()), upper.data(), static_cast<int>(upper.size()),
+                                          nullptr, nullptr, 0) != static_cast<int>(part.size()))
+            upper = part;
+        for (const wchar_t c : upper) mix(c);
+        mix(L'\\');
+    }
+    return g_folder_locks[hash % kFolderLocks];
 }
 
 struct Target {
     std::filesystem::path path;
     DWORD error = 0;  // non-zero: the caller fails with this error and does not touch the host
+    // A write-open's hold on the folder it opens in, until the Target goes after the host open (g_folder_locks).
+    std::unique_lock<std::mutex> folder;
 };
 
 Target fail(DWORD error) {
@@ -355,6 +453,10 @@ std::vector<std::wstring> parent_of(const std::vector<std::wstring>& parts) {
     return parts.empty() ? parts : std::vector<std::wstring>(parts.begin(), parts.end() - 1);
 }
 
+DWORD missing_error(const Roots& r, const std::vector<std::wstring>& parts) {
+    return is_folder(r, parent_of(parts)) ? ERROR_FILE_NOT_FOUND : ERROR_PATH_NOT_FOUND;
+}
+
 // Whether a folder has nothing in the title's view: no overlay entry and no package entry that is not deleted.
 bool empty_in_view(const Roots& r, const std::vector<std::wstring>& parts) {
     std::error_code ec;
@@ -433,10 +535,14 @@ Target write_target(const std::wstring& path, bool copy_up) {
     // below a package file (which then read as a folder) and inside a folder the title had removed. The overlay may
     // still lack a folder only the package has, so it is mirrored here, which the title cannot see.
     // T:'s scratch folder is the exception: it creates its parent folders, as merged with RT-218.
+    // The folder's lock is held from this check to the caller's host open, so a RemoveDirectory of the folder comes
+    // wholly before or after (g_folder_locks).
+    std::unique_lock folder(folder_lock(parent_of(parts)));
     const bool scratch = !parts.empty() && same_name(parts.front().c_str(), kScratchDir);
     if (!scratch && !is_folder(r, parent_of(parts))) return fail(ERROR_PATH_NOT_FOUND);
 
     Target t;
+    t.folder = std::move(folder);
     t.path = disk_path(r.overlay, parts);
 
     std::error_code ec;
@@ -682,6 +788,34 @@ std::filesystem::path overlay_dir() {
     return g_overlay_dir;
 }
 
+std::filesystem::path scratch_dir() {
+    const std::filesystem::path overlay = overlay_dir();
+    if (overlay.empty()) return {};
+    const std::wstring folder = scratch_folder(overlay);
+    return folder.empty() ? std::filesystem::path() : overlay / kScratchDir / folder;
+}
+
+std::wstring scratch_stem() { return scratch_run(); }
+
+std::filesystem::path reserve_unique_dir(const std::filesystem::path& base, const std::wstring& stem, DWORD& error,
+                                         unsigned max_tries) {
+    error = 0;
+    std::error_code ec;
+    std::filesystem::create_directories(win32_io_path(base), ec);
+    for (unsigned n = 1; n <= max_tries; ++n) {
+        const std::filesystem::path candidate = base / (n == 1 ? stem : stem + L"-" + std::to_wstring(n));
+        // Create-only: success means no other process or run had this name, so the folder is new and ours. Through
+        // win32_io_path, as every other create here, so a long overlay root keeps working.
+        if (::CreateDirectoryW(win32_io_path(candidate).c_str(), nullptr)) {
+            error = 0;
+            return candidate;
+        }
+        error = ::GetLastError();
+        if (error != ERROR_ALREADY_EXISTS) return {};  // another name will not get past this error
+    }
+    return {};
+}
+
 // gta6rt --trace FILE: a failed open of a guest path goes to the startup trace as a "file_open_failed" event (the
 // path the title passed, the Win32 error, the caller as module+RVA), so a boot that stops on a missing or refused
 // file names it. Failures only, and at most 256 of them, so a title probing many optional files can't fill the file.
@@ -698,6 +832,24 @@ void note_open_failure(const char* api, LPCWSTR name, DWORD error, const void* c
         "file_open_failed",
         std::string("\"api\":\"") + api + "\",\"path\":" + rt::startup_trace::quote(utf8) +
             ",\"error\":" + std::to_string(error) + ",\"caller\":" +
+            rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
+}
+
+// LOCAL DIAGNOSTIC: gta6rt --trace FILE also records the first 600 successful opens ("file_open": path, access,
+// caller), so the startup trace shows which file the title was working on when it stopped making progress.
+void note_open(const char* api, LPCWSTR name, DWORD access, const void* caller) {
+    if (!rt::startup_trace::enabled()) return;
+    static std::atomic<int> left{600};
+    if (left.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
+    std::string utf8;
+    if (const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr); n > 1) {
+        utf8.resize(static_cast<size_t>(n) - 1);
+        WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8.data(), n, nullptr, nullptr);
+    }
+    rt::startup_trace::event(
+        "file_open",
+        std::string("\"api\":\"") + api + "\",\"path\":" + rt::startup_trace::quote(utf8) + ",\"access\":" +
+            std::to_string(access) + ",\"caller\":" +
             rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
 }
 
@@ -721,21 +873,6 @@ bool touch_pages(void* buffer, DWORD size) {
     return all;
 }
 
-// ReadFile with one retry for a destination the kernel cannot write yet. The retail title reads into title memory
-// that xmem maps from physical pages committed on first touch; the kernel's write raises no user-mode fault, so
-// ReadFile fails with ERROR_NOACCESS (998), and the title's read loop sleeps 1 ms and retries forever (measured on
-// 1.0.2.1, native Windows). Touching the pages from user mode commits them; the read is then retried once.
-BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD size, LPDWORD read, LPOVERLAPPED overlapped) {
-    if (ReadFile(file, buffer, size, read, overlapped)) return TRUE;
-    if (GetLastError() != ERROR_NOACCESS || !buffer || !size) return FALSE;
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true))
-        std::fprintf(stderr, "[rt] fs: ReadFile into uncommitted title memory (ERROR_NOACCESS): committing the "
-                             "destination pages and retrying (logged once)\n");
-    touch_pages(buffer, size);
-    return ReadFile(file, buffer, size, read, overlapped);
-}
-
 HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes,
                             DWORD disposition, DWORD flags, HANDLE template_file) {
     if (!name) {
@@ -753,6 +890,8 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
         const DWORD error = GetLastError();
         note_open_failure("CreateFileW", name, error, _ReturnAddress());
         SetLastError(error);
+    } else {
+        note_open("CreateFileW", name, access, _ReturnAddress());
     }
     return h;
 }
@@ -784,6 +923,8 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         const DWORD error = GetLastError();
         note_open_failure("CreateFile2", name, error, _ReturnAddress());
         SetLastError(error);
+    } else {
+        note_open("CreateFile2", name, access, _ReturnAddress());
     }
     return h;
 }
@@ -1024,10 +1165,7 @@ BOOL WINAPI delete_file_w(LPCWSTR name) {
             removed = true;
         }
     }
-    if (!removed) {
-        SetLastError(ERROR_FILE_NOT_FOUND);
-        return FALSE;
-    }
+    if (!removed) return fail_bool(missing_error(r, parts));
     return TRUE;
 }
 
@@ -1062,6 +1200,8 @@ BOOL create_directory(LPCWSTR template_name, LPCWSTR name, LPSECURITY_ATTRIBUTES
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (view(r, parts).kind != Kind::None) return fail_bool(ERROR_ALREADY_EXISTS);  // "GAME:" included
+    // From the parent's check to the new folder: a RemoveDirectory of the parent comes wholly before or after.
+    std::lock_guard folder(folder_lock(parent_of(parts)));
     if (!is_folder(r, parent_of(parts))) return fail_bool(ERROR_PATH_NOT_FOUND);
 
     const std::filesystem::path target = disk_path(r.overlay, parts);
@@ -1115,8 +1255,10 @@ BOOL WINAPI remove_directory_w(LPCWSTR name) {
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (drive_root(name, parts)) return fail_bool(ERROR_ACCESS_DENIED);  // "GAME:" and "T:" themselves stay
+    // From the emptiness check to the marker: a create in the folder comes wholly before or after (g_folder_locks).
+    std::lock_guard folder(folder_lock(parts));
     const View v = view(r, parts);
-    if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (v.kind == Kind::None) return fail_bool(missing_error(r, parts));
     if (v.kind == Kind::File) return fail_bool(ERROR_DIRECTORY);
     if (!empty_in_view(r, parts)) return fail_bool(ERROR_DIR_NOT_EMPTY);
 
@@ -1153,7 +1295,7 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (drive_root(from, src) || drive_root(to, dst)) return fail_bool(ERROR_ACCESS_DENIED);
     const View from_view = view(r, src);
-    if (from_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (from_view.kind == Kind::None) return fail_bool(missing_error(r, src));
     const std::filesystem::path overlay_from = disk_path(r.overlay, src), overlay_to = disk_path(r.overlay, dst);
     if (same_entry(src, dst)) {
         // The destination is the source, so it is not "already there". The host succeeds at a move onto the same
@@ -1404,7 +1546,7 @@ BOOL WINAPI set_file_attributes_w(LPCWSTR name, DWORD attributes) {
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (parts.empty()) return fail_bool(ERROR_ACCESS_DENIED);
     const View v = view(r, parts);
-    if (v.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    if (v.kind == Kind::None) return fail_bool(missing_error(r, parts));
 
     // The attributes belong to the overlay copy: a package file is copied up and a package folder mirrored first,
     // so the package keeps its own attributes and reads, which prefer the overlay, see the new ones.
@@ -1428,19 +1570,174 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
     return set_file_attributes_w(wide.c_str(), attributes);
 }
 
+BOOL WINAPI get_disk_free_space_ex_w(LPCWSTR directory_name,
+                                     PULARGE_INTEGER free_bytes_available_to_caller,
+                                     PULARGE_INTEGER total_number_of_bytes,
+                                     PULARGE_INTEGER total_number_of_free_bytes) {
+    if (!directory_name) {
+        return ::GetDiskFreeSpaceExW(nullptr, free_bytes_available_to_caller, total_number_of_bytes,
+                                     total_number_of_free_bytes);
+    }
+
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(directory_name, parts);
+    if (parsed == Parsed::Host) {
+        return ::GetDiskFreeSpaceExW(directory_name, free_bytes_available_to_caller, total_number_of_bytes,
+                                     total_number_of_free_bytes);
+    }
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+
+    const Roots r = roots();
+    size_t prefix_length = 0;
+    const Drive drive = console_drive(directory_name, prefix_length);
+
+    if (!r.game.empty() || !r.overlay.empty()) {
+        const View v = view(r, parts);
+        if (v.kind != Kind::Directory) {
+            return fail_bool(ERROR_PATH_NOT_FOUND);
+        }
+        std::filesystem::path host_dir;
+        if (drive == Drive::Scratch || v.in_overlay) {
+            host_dir = disk_path(r.overlay, parts);
+        } else {
+            host_dir = disk_path(r.game, parts);
+        }
+        return ::GetDiskFreeSpaceExW(win32_io_path(host_dir).c_str(), free_bytes_available_to_caller,
+                                     total_number_of_bytes, total_number_of_free_bytes);
+    }
+
+    if (!drive_root(directory_name, parts)) {
+        return fail_bool(ERROR_PATH_NOT_FOUND);
+    }
+
+    constexpr ULONGLONG kDefaultFree = 500ULL * 1024 * 1024 * 1024;
+    constexpr ULONGLONG kDefaultTotal = 1000ULL * 1024 * 1024 * 1024;
+    if (free_bytes_available_to_caller) free_bytes_available_to_caller->QuadPart = kDefaultFree;
+    if (total_number_of_bytes) total_number_of_bytes->QuadPart = kDefaultTotal;
+    if (total_number_of_free_bytes) total_number_of_free_bytes->QuadPart = kDefaultFree;
+    return TRUE;
+}
+
+BOOL WINAPI get_disk_free_space_ex_a(LPCSTR directory_name,
+                                     PULARGE_INTEGER free_bytes_available_to_caller,
+                                     PULARGE_INTEGER total_number_of_bytes,
+                                     PULARGE_INTEGER total_number_of_free_bytes) {
+    if (!directory_name) {
+        return get_disk_free_space_ex_w(nullptr, free_bytes_available_to_caller, total_number_of_bytes,
+                                        total_number_of_free_bytes);
+    }
+    const std::wstring wide = widen_ansi(directory_name);
+    return get_disk_free_space_ex_w(wide.c_str(), free_bytes_available_to_caller, total_number_of_bytes,
+                                    total_number_of_free_bytes);
+}
+
+BOOL WINAPI get_disk_free_space_w(LPCWSTR root_path_name,
+                                  LPDWORD sectors_per_cluster,
+                                  LPDWORD bytes_per_sector,
+                                  LPDWORD number_of_free_clusters,
+                                  LPDWORD total_number_of_clusters) {
+    if (!root_path_name) {
+        return ::GetDiskFreeSpaceW(nullptr, sectors_per_cluster, bytes_per_sector,
+                                   number_of_free_clusters, total_number_of_clusters);
+    }
+
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(root_path_name, parts);
+    if (parsed == Parsed::Host) {
+        return ::GetDiskFreeSpaceW(root_path_name, sectors_per_cluster, bytes_per_sector,
+                                   number_of_free_clusters, total_number_of_clusters);
+    }
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+
+    const Roots r = roots();
+    size_t prefix_length = 0;
+    const Drive drive = console_drive(root_path_name, prefix_length);
+
+    if (!r.game.empty() || !r.overlay.empty()) {
+        const View v = view(r, parts);
+        if (v.kind != Kind::Directory) {
+            return fail_bool(ERROR_PATH_NOT_FOUND);
+        }
+        std::filesystem::path host_dir;
+        if (drive == Drive::Scratch || v.in_overlay) {
+            host_dir = disk_path(r.overlay, parts);
+        } else {
+            host_dir = disk_path(r.game, parts);
+        }
+        std::filesystem::path root_path = host_dir.root_path();
+        if (root_path.empty()) root_path = host_dir;
+        std::wstring root_str = root_path.wstring();
+        if (!root_str.empty() && root_str.back() != L'\\' && root_str.back() != L'/') {
+            root_str += L'\\';
+        }
+        return ::GetDiskFreeSpaceW(win32_io_path(root_str).c_str(), sectors_per_cluster, bytes_per_sector,
+                                   number_of_free_clusters, total_number_of_clusters);
+    }
+
+    if (!drive_root(root_path_name, parts)) {
+        return fail_bool(ERROR_PATH_NOT_FOUND);
+    }
+
+    if (sectors_per_cluster) *sectors_per_cluster = 8;
+    if (bytes_per_sector) *bytes_per_sector = 512;
+    if (number_of_free_clusters) *number_of_free_clusters = 500ULL * 1024 * 1024 / 4;
+    if (total_number_of_clusters) *total_number_of_clusters = 1000ULL * 1024 * 1024 / 4;
+    return TRUE;
+}
+
+BOOL WINAPI get_disk_free_space_a(LPCSTR root_path_name,
+                                  LPDWORD sectors_per_cluster,
+                                  LPDWORD bytes_per_sector,
+                                  LPDWORD number_of_free_clusters,
+                                  LPDWORD total_number_of_clusters) {
+    if (!root_path_name) {
+        return get_disk_free_space_w(nullptr, sectors_per_cluster, bytes_per_sector,
+                                     number_of_free_clusters, total_number_of_clusters);
+    }
+    const std::wstring wide = widen_ansi(root_path_name);
+    return get_disk_free_space_w(wide.c_str(), sectors_per_cluster, bytes_per_sector,
+                                 number_of_free_clusters, total_number_of_clusters);
+}
+
 }  // namespace rt::fs
 
 namespace {
 using namespace rt::fs;
 
+// Reads into title memory. The D3D12 layer keeps some of the title's pages read-only between submissions to see
+// which ones the title writes (slot-133 shadow buffers); the kernel fails a read into such a page with
+// ERROR_NOACCESS instead of faulting, so the destination is pinned and opened first (title_page_watch.h).
+//
+// One more retry for a destination the kernel still cannot write. The retail title reads into title memory that
+// xmem maps from physical pages committed on first touch; the kernel's write raises no user-mode fault, so ReadFile
+// fails with ERROR_NOACCESS (998), and the title's read loop sleeps 1 ms and retries forever (measured on 1.0.2.1,
+// native Windows). Touching the pages from user mode commits them; the read is then retried once.
+BOOL WINAPI read_file(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVERLAPPED overlapped) {
+    if (leonida::kernel_writes::read_file(file, buffer, bytes, read, overlapped)) return TRUE;
+    if (GetLastError() != ERROR_NOACCESS || !buffer || !bytes) return FALSE;
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        std::fprintf(stderr, "[rt] fs: ReadFile into uncommitted title memory (ERROR_NOACCESS): committing the "
+                             "destination pages and retrying (logged once)\n");
+    touch_pages(buffer, bytes);
+    return leonida::kernel_writes::read_file(file, buffer, bytes, read, overlapped);
+}
+BOOL WINAPI read_file_ex(HANDLE file, LPVOID buffer, DWORD bytes, LPOVERLAPPED overlapped,
+                         LPOVERLAPPED_COMPLETION_ROUTINE routine) {
+    return leonida::kernel_writes::read_file_ex(file, buffer, bytes, overlapped, routine);
+}
+BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWORD bytes, LPDWORD reserved,
+                              LPOVERLAPPED overlapped) {
+    return leonida::kernel_writes::read_file_scatter(file, segments, bytes, reserved, overlapped);
+}
+
 // CreateFile, the FindFirstFile family, the attribute queries and DeleteFile arrive through kernel32/kernelbase
 // imports and through the api sets a GDK title is linked against (file-l1-1-0 for the find and attribute calls,
-// file-l1-2-0 and file-l2-1-0 for CreateFile).
+// file-l1-2-0 and file-l2-1-0 for CreateFile; ReadFile and its variants are in file-l1-1-0).
 #define FILE_API(dll)                                                                                    \
     {dll, "CreateFileA", reinterpret_cast<void*>(&create_file_a)},                                       \
         {dll, "CreateFileW", reinterpret_cast<void*>(&create_file_w)},                                   \
         {dll, "CreateFile2", reinterpret_cast<void*>(&create_file2)},                                    \
-        {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
         {dll, "FindFirstFileA", reinterpret_cast<void*>(&find_first_file_a)},                            \
         {dll, "FindFirstFileW", reinterpret_cast<void*>(&find_first_file_w)},                            \
         {dll, "FindFirstFileExA", reinterpret_cast<void*>(&find_first_file_ex_a)},                       \
@@ -1470,7 +1767,14 @@ using namespace rt::fs;
         {dll, "CopyFileExW", reinterpret_cast<void*>(&copy_file_ex_w)},                                  \
         {dll, "CopyFile2", reinterpret_cast<void*>(&copy_file2)},                                        \
         {dll, "SetFileAttributesA", reinterpret_cast<void*>(&set_file_attributes_a)},                    \
-        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)}
+        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)},                    \
+        {dll, "GetDiskFreeSpaceA", reinterpret_cast<void*>(&get_disk_free_space_a)},                      \
+        {dll, "GetDiskFreeSpaceW", reinterpret_cast<void*>(&get_disk_free_space_w)},                      \
+        {dll, "GetDiskFreeSpaceExA", reinterpret_cast<void*>(&get_disk_free_space_ex_a)},                \
+        {dll, "GetDiskFreeSpaceExW", reinterpret_cast<void*>(&get_disk_free_space_ex_w)},                \
+        {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
+        {dll, "ReadFileEx", reinterpret_cast<void*>(&read_file_ex)},                                     \
+        {dll, "ReadFileScatter", reinterpret_cast<void*>(&read_file_scatter)}
 }  // namespace
 
 SHIM_TABLE(file_system,

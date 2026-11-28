@@ -138,5 +138,48 @@ class Wave64VccDataBranchTests(unittest.TestCase):
                 self.assertEqual(run(self.progs[("mask", op)], 0, 0), [taken] * 64)
 
 
+def run_wave32(spv, lo, hi):
+    """The same 64-thread group as `run`, as two 32-lane subgroups: the shader has no 64-bit op, so it is wave32."""
+    pc = VSHARP + [lo & M32, hi & M32, 0, 0] + [0] * 24
+    mem = si.run_workgroup(spv, 64, 32, inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0),
+                                                            "%sg_lane": i % 32}, push_constants=pc, memory={})
+    return [mem[4 * l] for l in range(64)]
+
+
+class Wave32VccDataBranchTests(unittest.TestCase):
+    """Wave32: VCC is vcc_lo alone, so s_cbranch_vccz/vccnz ignore vcc_hi, which is an ordinary SGPR there.
+
+    branch_condition reads %vcc_hi only under wave64 (the class above); the reference model in
+    test_control_flow_vcc.py (eval_vccz) masks VCC to the wave size the same way. A shader that sets vcc_hi and
+    leaves vcc_lo zero must still take s_cbranch_vccz."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.progs = {}
+        for op in ("s_cbranch_vccz", "s_cbranch_vccnz"):
+            suffix = "z" if op.endswith("z") else "nz"
+            cls.progs[("data", op)] = translate_cs("cs_w32_vcc_data_branch_" + suffix, BUILD_DATA + observe(op))
+            for lo, hi in CONST_CASES:
+                cls.progs[("const", lo, hi, op)] = translate_cs(
+                    f"cs_w32_vcc_const_branch_{suffix}_{lo:x}_{hi:x}",
+                    [("s_mov_b32 vcc_lo, " + hex(lo), 4), ("s_mov_b32 vcc_hi, " + hex(hi), 4)] + observe(op))
+
+    def test_vcc_data_branch_reads_vcc_lo_only(self):
+        for lo, hi in CASES:
+            nz = bool(lo & M32)
+            with self.subTest(lo=hex(lo), hi=hex(hi)):
+                self.assertEqual(run_wave32(self.progs[("data", "s_cbranch_vccz")], lo, hi), [9 if nz else 7] * 64)
+                self.assertEqual(run_wave32(self.progs[("data", "s_cbranch_vccnz")], lo, hi), [7 if nz else 9] * 64)
+
+    def test_vcc_constant_writes_read_vcc_lo_only(self):
+        for lo, hi in CONST_CASES:
+            nz = bool(lo & M32)
+            with self.subTest(lo=hex(lo), hi=hex(hi)):
+                self.assertEqual(run_wave32(self.progs[("const", lo, hi, "s_cbranch_vccz")], 0, 0),
+                                 [9 if nz else 7] * 64)
+                self.assertEqual(run_wave32(self.progs[("const", lo, hi, "s_cbranch_vccnz")], 0, 0),
+                                 [7 if nz else 9] * 64)
+
+
 if __name__ == "__main__":
     unittest.main()

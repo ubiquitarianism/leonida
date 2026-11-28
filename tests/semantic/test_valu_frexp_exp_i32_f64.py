@@ -31,6 +31,10 @@ RDNA2 Double-Precision Exponent Extraction Rules:
 
 Standard library Python only; zero third-party dependencies; zero game data.
 Python 3.9+ compatible (from __future__ import annotations).
+
+The translator check at the end of this file (TranslatorMatchesOracle) compares the translated v_frexp_exp_i32_f64
+with this oracle on every class of input, NaNs included: for the exponent it agrees with the hardware measured in the
+game's MODE (docs/design.md, the v_frexp_mant_f64 / v_frexp_exp_i32_f64 row).
 """
 from __future__ import annotations
 
@@ -1204,6 +1208,44 @@ class TestValuFrexpExpI32F64MutationDetection(unittest.TestCase):
         simd.write_lane_reg_u32(0, RegKind.VGPR, 0, 2)
         with self.assertRaises(AssertionError):
             self.assertEqual(simd.read_lane_reg_u32(0, RegKind.VGPR, 0), canary)
+
+
+# ==============================================================================
+# The translator: tools/rdna2spirv.py's output, run in tests/spirv_interp.py, against this file's oracle
+# ==============================================================================
+import os as _os  # noqa: E402
+import sys as _sys  # noqa: E402
+
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import f64_translate as ft  # noqa: E402
+
+def _frexp_inputs():
+    """Normals, subnormals, zeros, infinities and quiet NaNs, both signs."""
+    words = [ft.f64_bits(x) for x in (1.0, 2.0, 3.0, 0.75, 0.1, 123.456, 1e300, 1e-300, 1.7976931348623157e308,
+                                      2.2250738585072014e-308)]
+    words += [0x0000000000000000, 0x0000000000000001, 0x000FFFFFFFFFFFFF, 0x0008000000000000,
+              0x7FF0000000000000, 0x7FF8000000000000, 0x7FF8000012345678]
+    return [w | sign for w in words for sign in (0, 1 << 63)]
+
+
+SNANS = (0x7FF0000000000001, 0xFFF6208167C66911)   # signalling NaNs, both signs
+
+class TranslatorMatchesOracle(unittest.TestCase):
+    """The translated v_frexp_exp_i32_f64 gives this file's oracle word on every input class, NaNs included."""
+
+    def test_matches_the_oracle(self):
+        for word in _frexp_inputs() + list(SNANS):
+            with self.subTest(word=hex(word)):
+                self.assertEqual(hex(ft.run_f64("v_frexp_exp_i32_f64", word, wide=False)),
+                                 hex(ref_frexp_exp_i32_f64(word) & 0xFFFFFFFF))
+
+    def test_source_modifiers(self):
+        for x in (3.0, 0.75, 1e-300, 1.7976931348623157e308):
+            word = ft.f64_bits(-x)
+            for src, kw in (("-v[2:3]", dict(neg=True)), ("|v[2:3]|", dict(abs_val=True))):
+                with self.subTest(word=hex(word), src=src):
+                    self.assertEqual(hex(ft.run_f64("v_frexp_exp_i32_f64", word, src=src, wide=False)),
+                                     hex(ref_frexp_exp_i32_ext(word, **kw) & 0xFFFFFFFF))
 
 
 if __name__ == "__main__":

@@ -2,11 +2,13 @@
 
     python -I scripts/ci_expected_failures.py FAILED_LIST EXIT_STATUS [EXPECTED ...]
 
-FAILED_LIST is a file with one failed test name per line, EXIT_STATUS the test runner's exit status, and each
-EXPECTED argument one or more whitespace-separated test names (so a workflow can pass one quoted list). Exits 1 when a
-test outside EXPECTED failed, the runner failed without naming a test, or the runner was terminated by a signal
-(its failure list can be incomplete); 2 on a usage error. `--help` prints this text. An expected failure absent
-from a completed run gets a GitHub Actions notice so the list in the workflow can shrink.
+FAILED_LIST is a UTF-8 file with one failed test name per line and an optional BOM.
+EXIT_STATUS is the test runner's exit status. Each EXPECTED argument is one or more whitespace-separated
+test names, so a workflow can pass one quoted list.
+
+Exits 1 when an unexpected test failed, the runner failed without naming a test, or a signal terminated the runner.
+Exits 2 on a usage error. `--help` prints this text. An expected failure absent from a completed run gets a GitHub
+Actions notice so the list in the workflow can shrink.
 """
 
 import sys
@@ -22,12 +24,13 @@ def judge(failed: list[str], status: int, expected: list[str]) -> tuple[int, lis
         return 1, lines
     if status != 0 and not failed:
         lines.append(f"::error::the test runner exited with {status} without naming a failed test")
+        return 1, lines
     for name in expected:
         if name in failed:
             lines.append(f"::warning::{name} failed, as expected until its fix is merged")
         else:
             lines.append(f"::notice::{name} passed: drop it from the expected failures")
-    return (1 if unexpected or (status != 0 and not failed) else 0), lines
+    return (1 if unexpected else 0), lines
 
 
 def main(argv: list[str]) -> int:
@@ -43,10 +46,10 @@ def main(argv: list[str]) -> int:
         print(f"ci_expected_failures: EXIT_STATUS {argv[1]!r} is not an integer", file=sys.stderr)
         return 2
     try:
-        with open(argv[0], encoding="utf-8") as f:
+        with open(argv[0], encoding="utf-8-sig") as f:
             failed = [line.strip() for line in f if line.strip()]
-    except OSError as e:
-        print(f"ci_expected_failures: {argv[0]}: {e.strerror or e}", file=sys.stderr)
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"ci_expected_failures: {argv[0]}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
         return 2
     expected = [name for arg in argv[2:] for name in arg.split()]
     code, lines = judge(failed, status, expected)

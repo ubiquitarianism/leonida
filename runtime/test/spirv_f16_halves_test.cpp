@@ -419,6 +419,25 @@ int main() {
         CHECK(vs_w == vs_orig && ps_w == ps_orig);
     }
 
+    // 11. Custom top_location relocates halves into <= top_location.
+    {
+        ShaderEntry vs_e, ps_e;
+        vs_e.f16_halves = {};
+        ps_e.f16_halves = {{0, {28, 29}}};
+        // 10 raw VS outputs (0..9); top_location = 14 leaves slots 10..14 free.
+        auto vs_w = build_vs(0x00010500u, 10, vs_e.f16_halves);
+        auto ps_w = build_ps(0x00010500u, {0}, ps_e.f16_halves);
+        std::string err;
+        CHECK(link_f16_halves(vs_w, vs_e, ps_w, ps_e, &err, 14));
+        std::map<std::uint32_t, std::uint32_t> vs_locs;
+        int unpacks = 0, privs = 0;
+        std::set<std::uint32_t> ep_iface;
+        CHECK(verify_spirv_structure(vs_w, kStorageOutput, vs_locs, unpacks, privs, ep_iface));
+        for (const auto& [loc, var] : vs_locs) {
+            CHECK(loc <= 14);
+        }
+    }
+
     std::printf("spirv_f16_halves_test: all checks passed\n");
     return 0;
 }

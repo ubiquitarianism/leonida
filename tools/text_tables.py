@@ -20,8 +20,8 @@ Conversation data pairs a dialogue key with its line labels as ``<ROOT>AU_<XXXX>
 labels has the audio waves ``<key>_01`` .. ``<key>_<N>`` (the stream names ``awc_names.py`` matches): wave ``_01``
 speaks the first label. Joining a label's hash to the string tables gives each wave its subtitle in every language.
 
-The tables carry no language field. Each table's language is guessed from its script (kana, hangul, CJK, Cyrillic)
-or, for Latin scripts, from distinctive letters and common words, and is ``xx`` when nothing decides it. Spanish and
+The tables carry no language field. Each table's language is guessed from its script (kana, hangul, CJK, Cyrillic,
+Arabic) or, for Latin scripts, from distinctive letters and common words, and is ``xx`` when nothing decides it. Spanish and
 Chinese ship two variants each; markers split them into ``es-ES``/``es-419`` and ``zh-Hant``/``zh-Hans`` (the plain
 code when a table has no marker).
 
@@ -96,7 +96,8 @@ ES_ES = set("vosotros vosotras os vuestro vuestra vuestros vuestras habéis hac�
 ES_419 = set("ustedes carro celular ahorita chamba güey wey platicar chido neta pinche cuate computadora manejar "
              "órale acá chingar chingada pendejo mande güera".split())
 SCRIPTS = (("ja", re.compile(r"[\u3040-\u30ff]")), ("ko", re.compile(r"[\uac00-\ud7af]")),
-           ("zh", re.compile(r"[\u4e00-\u9fff]")), ("ru", re.compile(r"[\u0400-\u04ff]")))
+           ("zh", re.compile(r"[\u4e00-\u9fff]")), ("ru", re.compile(r"[\u0400-\u04ff]")),
+           ("ar", re.compile(r"[\u0600-\u06ff]")))
 LATIN_WORD = re.compile(r"[a-zà-ÿąćęłńóśźż]+")
 UNKNOWN = "xx"
 
@@ -264,6 +265,25 @@ def blobs(source: str):
             if os.path.getsize(path) <= MAX_RESOURCE_BYTES:
                 with open(path, "rb") as fh:
                     yield path, 0, fh.read()
+
+
+def input_under(source: str, address: str):
+    """The input file below directory `source` that a report at `address` would overwrite, or None.
+
+    blobs() reads every file below a plain directory and every carved stream beside an rpf9_carve.py index.json,
+    so checking a report only against the named sources left it free to replace one of those files.
+    """
+    if os.path.isfile(os.path.join(source, "index.json")):
+        import gamedata_index
+        return gamedata_index.carved_stream(address, source)
+    if not os.path.isfile(address):          # a new file is written after the scan, so it was never read
+        return None
+    from report_paths import same_report_path
+    for root, _dirs, names in os.walk(source):   # an unlistable folder fails the scan before anything is written
+        for name in names:
+            if same_report_path(address, os.path.join(root, name)):
+                return os.path.join(root, name)
+    return None
 
 
 def nested_archives(path: str) -> list:
@@ -463,6 +483,11 @@ def main(argv=None) -> int:
         index = os.path.join(source, "index.json")
         if os.path.isdir(source) and os.path.isfile(index) and any(_same_output_path(index, o) for o in outs):
             ap.error(f"an output must not overwrite an input: {index}")
+        if os.path.isdir(source):
+            for flag, path in out_flags:
+                clash = input_under(source, path)
+                if clash:
+                    ap.error(f"{flag} would overwrite the input {clash}")
 
     scan = Scan()
     try:

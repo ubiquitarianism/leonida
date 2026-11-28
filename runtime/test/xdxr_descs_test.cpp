@@ -69,6 +69,19 @@ int stream_lookup() {
     records[1].type = 0;
     CHECK(find_stream_record(stream_of(records, 1), 0) == nullptr);
     CHECK(find_stream_record(stream_of(records, 2), 0) == &records[1]);
+
+    // Trailing bytes shorter than one complete StreamRecord are never read.
+    records[0].type = 0;
+    const size_t small_sizes[] = {1, 4, sizeof(StreamRecord) - 1};
+    for (size_t bytes : small_sizes)
+        CHECK(find_stream_record(StreamDesc{bytes, records}, 0) == nullptr);
+    records[0].type = 1;
+    records[1].type = 0;
+    const size_t partial_second_sizes[] = {sizeof(StreamRecord) + 1, 2 * sizeof(StreamRecord) - 1};
+    for (size_t bytes : partial_second_sizes) {
+        CHECK(find_stream_record(StreamDesc{bytes, records}, 1) == &records[0]);
+        CHECK(find_stream_record(StreamDesc{bytes, records}, 0) == nullptr);
+    }
     return 0;
 }
 

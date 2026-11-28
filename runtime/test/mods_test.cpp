@@ -41,6 +41,9 @@ int main() {
     check(!parse_model_id("0x123456789", id), "a hash wider than 32 bits is refused");
     check(!parse_model_id("0xZZ", id), "a malformed hash is refused");
     check(!parse_model_id("", id), "an empty name is refused");
+    id = 0xCAFEBABEu;
+    check(!parse_model_id("0x", id) && id == 0xCAFEBABEu, "a bare 0x prefix is refused");
+    check(!parse_model_id("0X", id) && id == 0xCAFEBABEu, "a bare 0X prefix is refused");
 
     Mod mod;
     std::string error;
@@ -53,6 +56,8 @@ int main() {
           "a condition the runtime cannot honour yet is refused, not ignored");
     check(!parse_mod(R"({"archetype_swaps":[{"from":"cs_mandy","to":"0xD7C0CDFF"}]})", "m", mod, error),
           "a swap of a model with itself is refused");
+    check(!parse_mod(R"({"archetype_swaps":[{"from":"0x","to":"cs_mandy"}]})", "m", mod, error),
+          "a bare 0x prefix in an archetype swap is refused");
     check(!parse_mod(R"({"enabled":"yes"})", "m", mod, error), "\"enabled\" must be a boolean");
     check(!parse_mod("[1,2]", "m", mod, error), "a manifest that is not an object is refused");
     check(parse_mod("{}", "folder_name", mod, error) && mod.name == "folder_name", "the name defaults to the folder");

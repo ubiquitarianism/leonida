@@ -1,6 +1,6 @@
 // Headless Vulkan test for translated typed image stores and loads (runtime/test/shaders/cs_imgstore.asm and
-// cs_imgload.asm).
-// Usage: vk_store_test cs.spv [load|load-d16|words|signed-zero]
+// cs_imgload*.asm).
+// Usage: vk_store_test cs.spv [load|load-d16|load-mip|words|signed-zero]
 // The shader builds three T#s (word1 FORMAT = 56 rgba8 unorm, 20 r32 uint, 21 r32 sint) and stores to three 8x8
 // images. The translator picks the float / uint / sint view (set 0, bindings 8 / 9 / 10 for 2D) from the FORMAT
 // field, and the bindless index from the descriptor hash table (binding 2). As in the runtime, each image has its
@@ -9,6 +9,10 @@
 // "load" (cs_imgload.asm): the uint and sint images are filled before the dispatch, and the shader loads both
 // texels with image_load and stores their sum into the sint image. The device is made without
 // shaderStorageImageReadWithoutFormat, and a module that declares StorageImageReadWithoutFormat fails (SHADER-151).
+// "load-d16": check integer narrowing for packed image_load (cs_imgload_d16.asm) or image_sample_lz
+// (cs_sample_lz_int_d16.asm), including saturation at the 16-bit boundaries.
+// "load-mip": read level 1 through typed, two-level SRVs with both full-width and D16 fetches; write the checked
+// results to level 0 through single-level storage views. The two mips start with different data.
 // "words" (cs_imgatomic.asm, cs_imgatomic3d.asm, cs_resinfo.asm): the uint and sint images are filled as for "load"
 // and a 4x4x4 r32 uint volume with 200 + i, and nothing is judged here: the 64 words of each are printed after the
 // dispatch (texel (x, y) at i = 8y + x, (x, y, z) at i = 16z + 4y + x) for check.py to compare. Three things are
@@ -16,11 +20,16 @@
 // at binding 7, where 2D and 3D image atomics address their image, and at index 4 of the sampled array a 16x4 rgba8
 // image with all five mip levels (never read, only queried), behind the T# the runtime writes for such an image.
 // "signed-zero" checks three direct float stores and all remaining RGBA32 guard words (SHADER-605).
+// "cube" (cs_imgstore_cube.asm, GPU-CUBE-STORE): the shader stores to three cube images (the same three formats, T#
+// word3 TYPE = SQ_RSRC_IMG_CUBE). As the runtime binds a cube UAV (runtime/src/vulkan_bindless.h), each is a
+// cube-compatible 8x8 image of six layers whose storage view is a six-layer 2D array, at index k + 1 of the 2D-array
+// storage arrays (bindings 11 / 12 / 13 for float / uint / sint). Checks every texel of every layer (the face).
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
 #include "spirv_capability.h"
+#include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <cmath>
@@ -46,7 +55,10 @@ static uint32_t key_hash(const uint32_t k[8]) {     // same FNV-1a as the transl
     return h;
 }
 
-static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32_t index) {
+// `kind` is what the translated modules read next to the index (descriptor_table.h): the arrays this image is
+// bound in, sampled and storage.
+static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32_t index,
+                        uint32_t kind) {
     uint32_t mask = t[0], h = key_hash(key);
     for (uint32_t k = 0; k < 8; k++) {
         uint32_t base = ((h + k) & mask) * 10;
@@ -55,12 +67,16 @@ static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32
         if (used) continue;
         for (int j = 0; j < 8; j++) t[base + 1 + j] = key[j];
         t[base + 9] = index;
+        t[base + 10] = kind;
         return;
     }
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|signed-zero]\n"); return 2; }
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|load-mip|words|signed-zero|cube]\n");
+        return 2;
+    }
     gipa = load_vulkan();
     if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
@@ -121,11 +137,13 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
     // "load" mode (cs_imgload.asm): the sint image receives the sum of the two texels read back with image_load.
+    const bool load_mip = argc > 2 && !std::strcmp(argv[2], "load-mip");
     const bool packed_load = argc > 2 && !std::strcmp(argv[2], "load-d16");
-    const bool load_mode = packed_load || (argc > 2 && !std::strcmp(argv[2], "load"));
+    const bool load_mode = load_mip || packed_load || (argc > 2 && !std::strcmp(argv[2], "load"));
     // "words" mode: the two images filled as for "load"; the shader's results are whatever it leaves in them.
     const bool words_mode = argc > 2 && !std::strcmp(argv[2], "words");
     const bool signed_zero = argc > 2 && !std::strcmp(argv[2], "signed-zero");
+    const bool cube_mode = argc > 2 && !std::strcmp(argv[2], "cube");
     if (signed_zero) {
         LOADI(vkGetPhysicalDeviceProperties2);
         VkPhysicalDeviceFloatControlsProperties controls{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
@@ -223,7 +241,11 @@ int main(int argc, char** argv) {
     for (uint32_t k = 0; k < 3; k++) {
         uint32_t t[8] = {0x1000 * (k + 1), fmts[k] << 20};
         for (int j = 2; j < 8; j++) t[j] = 0x11 * (k + 1);
-        table_insert(table, t, k + 1);     // its index in the 2D arrays; 0 is the fallback, as in the runtime
+        table_insert(table, t, k + 1, leonida::kind_sampled_bit(0) | leonida::kind_storage_bit(0));     // its index in the 2D arrays; 0 is the fallback, as in the runtime
+        if (cube_mode) {   // the cube T# (cs_imgstore_cube.asm): word3 also has TYPE = 0xB, index k + 1 of the 2D arrays
+            t[3] |= 0xB0000000u;
+            table_insert(table, t, k + 1, leonida::kind_sampled_bit(0) | leonida::kind_storage_bit(0));
+        }
     }
     // Index 4: a 16x4 rgba8 image with its whole mip chain (16x4, 8x2, 4x1, 2x1, 1x1) for image_get_resinfo. Its key
     // is the T# of exactly that image (gfx10_descriptors.h), which cs_resinfo.asm builds word for word.
@@ -232,22 +254,25 @@ int main(int argc, char** argv) {
     wide_desc.address = 0x400000; wide_desc.format = fmts[0]; wide_desc.width = WIDE_W; wide_desc.height = WIDE_H;
     wide_desc.mip_count = wide_desc.resource_mips = WIDE_MIPS;
     const leonida::gfx10::ImageWords wide_key = leonida::gfx10::encode(wide_desc);
-    table_insert(table, wide_key.data(), 4);
+    table_insert(table, wide_key.data(), 4, leonida::kind_sampled_bit(0));   // image_get_resinfo reads binding 0
     // The volume of the 3D atomics: index 1 of the 3D arrays, behind a T# of the 2D images' pattern (k = 4).
     const uint32_t VOL = 4;
     {
-        uint32_t t[8] = {0x5000, fmts[1] << 20, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55};
-        table_insert(table, t, 1);
+        // The volume uses the D3D12 layer's whole-mip UAV tag (FirstWSlice=0, WSize=4).
+        uint32_t t[8] = {0x5000, fmts[1] << 20, 0x55, 0x55, 0x80000055, 0x55, 0x55, 0xd7801800};
+        table_insert(table, t, 1, leonida::kind_sampled_bit(2) | leonida::kind_storage_bit(2));
     }
     VkBuffer tb; void* tbp;
     CHECK(make_buffer(table.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tb, &tbp));
     std::memcpy(tbp, table.data(), table.size() * 4);
 
     const uint32_t W = 8;
-    VkImage img[3]; VkImageView view[3];
+    const uint32_t base_width = load_mip ? 2 * W : W, mip_count = load_mip ? 2 : 1;
+    VkImage img[3]; VkImageView view[3], sampled[3];
     for (int k = 0; k < 3; k++) {
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = vkf[k]; ii.extent = {W, W, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = vkf[k]; ii.extent = {base_width, base_width, 1};
+        ii.mipLevels = mip_count; ii.arrayLayers = 1;
         ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
         ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -261,6 +286,14 @@ int main(int argc, char** argv) {
         vi.image = img[k]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = vkf[k];
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         CHECK(vkCreateImageView(dev, &vi, nullptr, &view[k]));
+        sampled[k] = view[k];
+        if (load_mip) {
+            VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+            usage.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+            vi.pNext = &usage;
+            vi.subresourceRange.levelCount = mip_count;
+            CHECK(vkCreateImageView(dev, &vi, nullptr, &sampled[k]));
+        }
     }
     VkImage wide; VkImageView wide_view;
     {
@@ -296,6 +329,26 @@ int main(int argc, char** argv) {
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         CHECK(vkCreateImageView(dev, &vi, nullptr, &vol_view));
     }
+    // Cube mode: three cube-compatible 8x8 images of six layers, each seen through a six-layer 2D-array view.
+    const uint32_t FACES = 6;
+    VkImage cube[3]{}; VkImageView cube_view[3]{};
+    for (int k = 0; cube_mode && k < 3; k++) {
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = vkf[k]; ii.extent = {W, W, 1}; ii.mipLevels = 1;
+        ii.arrayLayers = FACES; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        CHECK(vkCreateImage(dev, &ii, nullptr, &cube[k]));
+        VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, cube[k], &mr);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size; mai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkDeviceMemory m; CHECK(vkAllocateMemory(dev, &mai, nullptr, &m));
+        CHECK(vkBindImageMemory(dev, cube[k], m, 0));
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = cube[k]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY; vi.format = vkf[k];
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, FACES};
+        CHECK(vkCreateImageView(dev, &vi, nullptr, &cube_view[k]));
+    }
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     VkSampler sampler; CHECK(vkCreateSampler(dev, &sci, nullptr, &sampler));
     // Set 0: binding 0 = sampled images, 1 = samplers, 2 = hash table, 8/9/10 = float/uint/sint 2D storage image arrays.
@@ -303,23 +356,27 @@ int main(int argc, char** argv) {
     // index 4. Binding 0 holds each image's view in its own format (typed image_load reads the uint and sint ones
     // through integer aliases); every element of a storage array holds the image of its class, so all of them are
     // valid descriptors. Bindings 4 and 7 = the 2D and 3D r32ui storage images of the image atomics: the uint image
-    // and the volume, in every element.
+    // and the volume, in every element. Cube mode adds 11/12/13 = the float/uint/sint 2D-array storage arrays, which
+    // hold the cube image of their class in every element.
     constexpr uint32_t N = 5;
-    VkDescriptorSetLayoutBinding b[8]{};
+    const uint32_t bindings = cube_mode ? 11 : 8;
+    VkDescriptorSetLayoutBinding b[11]{};
     b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     for (int k = 0; k < 3; k++) b[3 + k] = {uint32_t(8 + k), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[6] = {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[7] = {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    for (int k = 0; k < 3; k++)
+        b[8 + k] = {uint32_t(11 + k), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = 8; dli.pBindings = b;
+    dli.bindingCount = bindings; dli.pBindings = b;
     VkDescriptorSetLayout dsl; CHECK(vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl));
     VkDescriptorPoolSize ps[4] = {
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 * N},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, (bindings - 3) * N},
     };
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 1; dpi.poolSizeCount = 4; dpi.pPoolSizes = ps;
@@ -328,15 +385,15 @@ int main(int argc, char** argv) {
     dai.descriptorPool = dp; dai.descriptorSetCount = 1; dai.pSetLayouts = &dsl;
     VkDescriptorSet ds; CHECK(vkAllocateDescriptorSets(dev, &dai, &ds));
     VkDescriptorBufferInfo tbi{tb, 0, VK_WHOLE_SIZE};
-    VkDescriptorImageInfo sii[N] = {{VK_NULL_HANDLE, view[0], VK_IMAGE_LAYOUT_GENERAL},
-                                    {VK_NULL_HANDLE, view[0], VK_IMAGE_LAYOUT_GENERAL},
-                                    {VK_NULL_HANDLE, view[1], VK_IMAGE_LAYOUT_GENERAL},
-                                    {VK_NULL_HANDLE, view[2], VK_IMAGE_LAYOUT_GENERAL},
+    VkDescriptorImageInfo sii[N] = {{VK_NULL_HANDLE, sampled[0], VK_IMAGE_LAYOUT_GENERAL},
+                                    {VK_NULL_HANDLE, sampled[0], VK_IMAGE_LAYOUT_GENERAL},
+                                    {VK_NULL_HANDLE, sampled[1], VK_IMAGE_LAYOUT_GENERAL},
+                                    {VK_NULL_HANDLE, sampled[2], VK_IMAGE_LAYOUT_GENERAL},
                                     {VK_NULL_HANDLE, wide_view, VK_IMAGE_LAYOUT_GENERAL}};
     VkDescriptorImageInfo smpi{sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     VkDescriptorImageInfo dii[3][N];
-    VkDescriptorImageInfo r32ui[N], r32ui_3d[N];
-    VkWriteDescriptorSet wr[8]{};
+    VkDescriptorImageInfo r32ui[N], r32ui_3d[N], cube_ii[3][N];
+    VkWriteDescriptorSet wr[11]{};
     for (auto& w : wr) { w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w.dstSet = ds; w.descriptorCount = 1; }
     wr[0].dstBinding = 0; wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[0].pImageInfo = sii;
     wr[0].descriptorCount = N;
@@ -353,7 +410,12 @@ int main(int argc, char** argv) {
     for (uint32_t e = 0; e < N; e++) r32ui_3d[e] = {VK_NULL_HANDLE, vol_view, VK_IMAGE_LAYOUT_GENERAL};
     wr[7].dstBinding = 7; wr[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     wr[7].pImageInfo = r32ui_3d; wr[7].descriptorCount = N;
-    vkUpdateDescriptorSets(dev, 8, wr, 0, nullptr);
+    for (int k = 0; cube_mode && k < 3; k++) {
+        for (uint32_t e = 0; e < N; e++) cube_ii[k][e] = {VK_NULL_HANDLE, cube_view[k], VK_IMAGE_LAYOUT_GENERAL};
+        wr[8 + k].dstBinding = 11 + k; wr[8 + k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        wr[8 + k].pImageInfo = cube_ii[k]; wr[8 + k].descriptorCount = N;
+    }
+    vkUpdateDescriptorSets(dev, bindings, wr, 0, nullptr);
 
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
@@ -383,7 +445,15 @@ int main(int argc, char** argv) {
     const uint32_t image_words = W * W * (signed_zero ? 4 : 1);
     VkBuffer rb[3]; void* rbp[3];
     for (int k = 0; k < 3; k++) CHECK(make_buffer(image_words * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &rb[k], &rbp[k]));
-    // Load and words modes: what the uint and sint images hold before the dispatch, texel (x, y) at i = 8y + x.
+    // Cube mode: each cube image's six layers read back one after another, texel (x, y) of face f at 64f + 8y + x.
+    const uint32_t cube_words = W * W * FACES;
+    VkBuffer cube_rb[3]{}; void* cube_rbp[3]{};
+    for (int k = 0; cube_mode && k < 3; k++)
+        CHECK(make_buffer(cube_words * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &cube_rb[k], &cube_rbp[k]));
+    // Mip mode seeds level 0 with a decoy and level 1 with the typed inputs. Signed-zero probes
+    // all four RGBA32 components; the ordinary load and words modes seed integer views only.
+    const int first_fill = signed_zero || load_mip ? 0 : filled ? 1 : 3;
+    const uint32_t mip_offset = load_mip ? base_width * base_width : 0;
     // The last row of the D16 fixture ("load-d16" only) exercises both sides of each 16-bit boundary.
     struct PackedLoad { uint32_t u; int32_t s, sum; };
     constexpr PackedLoad boundary[] = {
@@ -391,18 +461,24 @@ int main(int argc, char** argv) {
         {0, 32768, 32767}, {0, -32768, -32768}, {0, -32769, -32768}, {65536, -32769, 32767},
     };
     static_assert(sizeof(boundary) / sizeof(boundary[0]) == W);
-    // Load/words modes seed the integer images. The signed-zero probe seeds every component of all three images.
-    const int first_fill = signed_zero ? 0 : filled ? 1 : 3;
     VkBuffer fill[3]{};
-    for (int k = first_fill; k < 3; ++k) {
-        void* mapped;
-        CHECK(make_buffer(image_words * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &fill[k], &mapped));
-        auto* words = static_cast<uint32_t*>(mapped);
-        for (uint32_t i = 0; i < image_words; ++i) {
-            const bool edge = packed_load && i / W == W - 1;
-            if (signed_zero) words[i] = 0x39000000u + k * image_words + i;
-            else if (k == 1) words[i] = edge ? boundary[i % W].u : 100 + i;
-            else words[i] = static_cast<uint32_t>(edge ? boundary[i % W].s : -2 * int32_t(i));
+    if (first_fill < 3) {
+        for (int k = first_fill; k < 3; ++k) {
+            void* mapped;
+            const uint32_t count = mip_offset + image_words;
+            CHECK(make_buffer(count * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &fill[k], &mapped));
+            auto* words = static_cast<uint32_t*>(mapped);
+            for (uint32_t i = 0; i < mip_offset; ++i) words[i] = 0x12345678u;
+            for (uint32_t i = 0; i < image_words; ++i) {
+                const bool edge = packed_load && i / W == W - 1;
+                if (signed_zero) words[mip_offset + i] = 0x39000000u + k * image_words + i;
+                else if (k == 0) words[mip_offset + i] =
+                    (i & 1 ? 0xffu : 0u) | (i & W ? 0xff00u : 0u) | 0xff000000u;
+                else if (k == 1) words[mip_offset + i] = edge ? boundary[i % W].u :
+                    (load_mip ? 0x100000u : 0u) + 100u + i;
+                else words[mip_offset + i] = static_cast<uint32_t>(edge ? boundary[i % W].s :
+                    -2 * int32_t(i) - (load_mip ? 0x10000 : 0));
+            }
         }
     }
     // The volume's fill and its read-back, used in words mode.
@@ -426,7 +502,7 @@ int main(int argc, char** argv) {
         ib[k].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib[k].newLayout = VK_IMAGE_LAYOUT_GENERAL;
         ib[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         ib[k].srcQueueFamilyIndex = ib[k].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        ib[k].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        ib[k].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_count, 0, 1};
         if (k >= first_fill) {   // filled by a copy first
             ib[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib[k].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         }
@@ -442,6 +518,7 @@ int main(int argc, char** argv) {
     VkImageMemoryBarrier vol_ib = ib[0];
     vol_ib.image = vol; vol_ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     vol_ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vol_ib.subresourceRange.levelCount = 1;
     const VkImageSubresourceLayers vol_layers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     if (words_mode) {   // filled by a copy first
         vol_ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; vol_ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -460,10 +537,16 @@ int main(int argc, char** argv) {
                              0, nullptr, 1, &vol_ib);
     }
     if (first_fill < 3) {
+        VkBufferImageCopy copies[2]{};
+        for (uint32_t level = 0; level < mip_count; ++level) {
+            auto& copy = copies[level];
+            copy.bufferOffset = level ? mip_offset * 4 : 0;
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+            copy.imageExtent = {base_width >> level, base_width >> level, 1};
+        }
         for (int k = first_fill; k < 3; k++) {
-            VkBufferImageCopy bic{};
-            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; bic.imageExtent = {W, W, 1};
-            vkCmdCopyBufferToImage(cmd, fill[k], img[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+            vkCmdCopyBufferToImage(cmd, fill[k], img[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   mip_count, copies);
             ib[k].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib[k].newLayout = VK_IMAGE_LAYOUT_GENERAL;
             ib[k].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             ib[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -471,6 +554,17 @@ int main(int argc, char** argv) {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
                              nullptr, 0, nullptr, 3 - first_fill, ib + first_fill);
     }
+    VkImageMemoryBarrier cube_ib[3]{};
+    for (int k = 0; cube_mode && k < 3; k++) {
+        cube_ib[k] = ib[0];
+        cube_ib[k].image = cube[k]; cube_ib[k].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        cube_ib[k].newLayout = VK_IMAGE_LAYOUT_GENERAL; cube_ib[k].srcAccessMask = 0;
+        cube_ib[k].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        cube_ib[k].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, FACES};
+    }
+    if (cube_mode)
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                             0, nullptr, 3, cube_ib);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, nullptr);
     uint32_t pc[36] = {};
@@ -485,6 +579,7 @@ int main(int argc, char** argv) {
         ib[k].oldLayout = VK_IMAGE_LAYOUT_GENERAL; ib[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         ib[k].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         ib[k].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        ib[k].subresourceRange.levelCount = 1;
     }
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 3, ib);
@@ -492,6 +587,19 @@ int main(int argc, char** argv) {
         VkBufferImageCopy bic{};
         bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; bic.imageExtent = {W, W, 1};
         vkCmdCopyImageToBuffer(cmd, img[k], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb[k], 1, &bic);
+    }
+    if (cube_mode) {
+        for (int k = 0; k < 3; k++) {
+            cube_ib[k].oldLayout = VK_IMAGE_LAYOUT_GENERAL; cube_ib[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            cube_ib[k].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; cube_ib[k].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        }
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 3, cube_ib);
+        for (int k = 0; k < 3; k++) {
+            VkBufferImageCopy bic{};   // all six layers, tightly packed one after another
+            bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, FACES}; bic.imageExtent = {W, W, 1};
+            vkCmdCopyImageToBuffer(cmd, cube[k], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, cube_rb[k], 1, &bic);
+        }
     }
     if (words_mode) {
         vol_ib.oldLayout = VK_IMAGE_LAYOUT_GENERAL; vol_ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -514,6 +622,30 @@ int main(int argc, char** argv) {
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(q));
 
+    if (cube_mode) {   // every texel of every face, against what cs_imgstore_cube.asm writes there
+        uint32_t bad[3] = {};
+        for (uint32_t face = 0; face < FACES; face++)
+            for (uint32_t y = 0; y < W; y++)
+                for (uint32_t x = 0; x < W; x++) {
+                    const uint32_t i = y * W + x, at = face * W * W + i;
+                    const uint8_t* c = static_cast<const uint8_t*>(cube_rbp[0]) + 4 * at;
+                    const int er = int(std::lround(x / 7.0 * 255)), eg = int(std::lround(y / 7.0 * 255));
+                    const int eb = int(std::lround(face / 5.0 * 255));
+                    if (std::abs(c[0] - er) > 1 || std::abs(c[1] - eg) > 1 || std::abs(c[2] - eb) > 1 || c[3] != 255)
+                        bad[0]++;
+                    if (static_cast<const uint32_t*>(cube_rbp[1])[at] != 100 + 1000 * face + i) bad[1]++;
+                    if (static_cast<const int32_t*>(cube_rbp[2])[at] != -int32_t(1000 * face + i)) bad[2]++;
+                }
+        const uint32_t at = 4 * W * W + 3 * W + 5;   // texel (5, 3) of face 4
+        const uint8_t* c = static_cast<const uint8_t*>(cube_rbp[0]) + 4 * at;
+        std::printf("rgba8 unorm cube (float view): %u bad, face 4 texel(5,3) = %u %u %u %u\n", bad[0], c[0], c[1],
+                    c[2], c[3]);
+        std::printf("r32 uint cube (uint view): %u bad, face 4 texel(5,3) = %u\n", bad[1],
+                    static_cast<const uint32_t*>(cube_rbp[1])[at]);
+        std::printf("r32 sint cube (sint view): %u bad, face 4 texel(5,3) = %d\n", bad[2],
+                    static_cast<const int32_t*>(cube_rbp[2])[at]);
+        return (bad[0] || bad[1] || bad[2]) ? 1 : 0;
+    }
     if (signed_zero) {
         constexpr uint32_t neg = 0x80000000;
         constexpr uint32_t stores[] = {neg, 0, 0, 0, neg, 0x3f800000, 0, 0, neg, neg, 0, 0};
@@ -546,6 +678,18 @@ int main(int argc, char** argv) {
         for (uint32_t x = 0; x < W; x++) {
             uint32_t i = y * W + x;
             const uint8_t* c = static_cast<const uint8_t*>(rbp[0]) + 4 * i;
+            if (load_mip) {
+                const bool red = x & 1, green = y & 1;
+                const uint32_t packed_float = (red ? 0x3c00u : 0) | (green ? 0x3c000000u : 0);
+                const uint32_t u = 0x100000u + 100 + i, s = uint32_t(-2 * int32_t(i) - 0x10000);
+                // D16 saturates red to 65535 (UINT) or -32768 (SINT); the high half holds alpha = 1.
+                const uint32_t want_u = u + 0x0001ffffu + packed_float;
+                const uint32_t want_s = s + 0x00018000u;
+                if (c[0] != (red ? 255 : 0) || c[1] != (green ? 255 : 0) || c[2] || c[3]) bad[0]++;
+                if (static_cast<const uint32_t*>(rbp[1])[i] != want_u) bad[1]++;
+                if (static_cast<const uint32_t*>(rbp[2])[i] != want_s) bad[2]++;
+                continue;
+            }
             int er = int(std::lround(x / 7.0 * 255)), eg = int(std::lround(y / 7.0 * 255));
             if (std::abs(c[0] - er) > 1 || std::abs(c[1] - eg) > 1 || std::abs(c[2] - 128) > 1 || c[3] != 255) bad[0]++;
             const bool edge = packed_load && y == W - 1;

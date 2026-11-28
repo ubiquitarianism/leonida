@@ -30,9 +30,9 @@ The requested command (`python -I tools/rpf9_carve.py <package>/anim.rpf <work>/
 | Bink 2 | 0 streams |
 | elapsed | 141 s |
 
-`rpf9_carve.py` overreads its last stream: it advances a 1 MiB read cursor by 1 MiB even when the final mmap
-slice is shorter. That makes the last `PSIN` stream look 974,742 bytes stored instead of 1,766 and skips 21
-streams at the tail. `tools/anim_index.py` advances by the actual slice length. Its corrected walk finds:
+The earlier `rpf9_carve.py` run above overread its last stream: it used to advance a 1 MiB read cursor by 1 MiB even when the final mmap
+slice was shorter. That made the last `PSIN` stream look 974,742 bytes stored instead of 1,766 and skipped 21
+streams at the tail. Both `tools/rpf9_carve.py` and `tools/anim_index.py` now advance by the actual slice length (`len(chunk)`). The corrected walk finds:
 
 | Measure | corrected walk |
 |---|---:|
@@ -200,14 +200,8 @@ at the next 16-byte boundary after the first. In **1,781/1,781** pairs the u64 a
 In every pair the declared payload lengths fit within page two. The instance blocks referenced by the
 [`+0x38` instance block table](navmesh.md#schema-tables-q28-q30-q38-q40) fit wholly within page one. Schema tables also occupy page two after the auxiliary payloads,
 and none overlaps the auxiliary table or its payloads. The same framing is measured independently for
-[navigation resources](navmesh.md#schema-tables-q28-q30-q38-q40). The meaning of the individual payloads
+[navigation resources](navmesh.md#schema-tables-q28-q30-q38-q40). Entropy across the 1,781 streams is 4.03–7.79 bits/byte, and the meaning of the individual payloads
 in the animation archive remains open.
-The leading u32 is 2 or 3; the next four bytes are constant. Stored 18,168,950 bytes, inflated 32,691,776 bytes.
-1,767 distinct payloads (duplicates up to 10 copies). Entropy 4.03–7.79 bits/byte, so these are packed/quantized
-bitstreams rather than zlib streams. The 24-byte header has five small fields after the type; the measured
-version split and the track side are below. No keyframe values are claimed. Each of these streams is the second
-system page of a `0DRP` resource, the one right after its `0DRP` stream (see [Keyframe
-decoding](#keyframe-decoding)).
 
 ### Partial clip decode
 
@@ -965,89 +959,8 @@ the archetypes reference; the per-bone mapping onto each model's skeleton still 
    55 are referenced by one distinct asset name each. The remaining 104 are shared. Across their local
    animation packs, 63 dictionaries have nonzero rotation or translation bone hashes and 96 have none.
    All 63 fall below the 90% reference-skeleton threshold used above.
-measured. Still open in ASSET-20: the `0DRP` "2/3 packed clip streams" ([above](#packed-clip-streams)) and which
-model or skeleton each non-humanoid clip dictionary drives.
 
-## `MoVE` state-machine containers
-
-`tools/anim_move.py` decodes all 324 `MoVE` (version 19) resources in `anim.rpf` (ASSET-86):
-
-```powershell
-python -I tools/anim_move.py <package>\anim.rpf <work>\anim-move.json
-```
-
-All 324 resources (325 zlib streams, 331,771 stored / 1,494,188 inflated bytes once the 64 KiB stream at
-`0x105a7d000` is joined with its 5,563-byte continuation stream at `0x105a7f9c0`) decode with 0 errors. Unlike clip
-dictionaries and `0DRP` resources, a `MoVE` resource has no virtual `0x50xxxxxx` pointers or RAGE page map: every
-internal cross-reference is a signed 32-bit self-relative byte offset (`target = field_offset + rel_i32`).
-
-### Header and variable preamble
-
-After the fixed 32-byte header (`"MoVE"`, `u32 version = 19`, three zero `u32`s, `u32 network_hash` at `+0x14`,
-`u32 body_size` at `+0x18`, `u32 0` at `+0x1C`), a variable-length preamble starts at `+0x20`:
-
-| Field | Type | Measured across 324 resources |
-|---|---|---|
-| `N_req`, `requests` | `u32`, `N_req × u32` | `0..16` request hashes (`> 0` in 149 resources, 543 entries total) |
-| `N_flag`, `flags` | `u32`, `N_flag × u32` | `0..27` flag hashes (`> 0` in 123 resources, 687 entries total) |
-| `preamble_mode` | `u32` | `0` in 225 resources, `1` in 91, `2` in 8 |
-| `N_desc`, `descriptors_5b` | `u32`, `N_desc × {u32 hash; u8 kind}` | `0` in 184 resources, `1..15` in 140 (272 entries total; `kind` = `0`: 20, `1`: 92, `2`: 74, `4`: 1, `7`: 85) |
-| `tail` | `{u16 sub_flag; u32 ref_hash_0; u32 ref_hash_1}` | 10 zero bytes whenever `preamble_mode` is `0` or `1` (316/316); `sub_flag = 1` with two non-zero reference hashes when `preamble_mode == 2` (8/8) |
-
-The root state container starts immediately after the 10-byte tail at
-`node_start = 48 + 4 * (N_req + N_flag) + 5 * N_desc` (`58..244` bytes). `body_size` at `+0x18` counts the
-request/flag arrays, three `u32` preamble words and the entire state graph (`body_size == 12 + 4 * (N_req + N_flag) +
-graph_bytes`), excluding the 46 fixed/tail bytes and the `5 * N_desc` descriptor table:
-
-$$\text{total\_bytes} = 46 + 5 \cdot N_{\text{desc}} + \text{body\_size}$$
-
-holds exactly for **324 of 324** resources.
-
-### Recursive state containers (`Type 1`, `Type 3`, `Type 22`)
-
-Every node in the graph starts with `{u16 type; u16 index; u32 name_hash}`. Three container types form the recursive
-state-machine and motion-tree hierarchy (**1,616** containers across the 324 resources). All three share a 36-byte
-(`0x24`) common prefix:
-
-```
-+0x00  u16 type                (1 = StateMachine, 3 = InlinedStateMachine, 22 = MotionTree)
-+0x02  u16 index               (0 on root/child states; node index inside an enclosing MotionTree)
-+0x04  u32 name_hash           (joaat32; e.g. joaat32("statemachine") = 0x1997df3c, joaat32("motiontree") = 0x8d398f99)
-+0x08  i32 init_or_root_rel    (target = off + 0x08 + init_or_root_rel)
-+0x0c  u32 flags               (0 or 1)
-+0x10  u8 b10, u8 b11, u8 n_children, u8 n_transitions
-+0x14  four u32 words          (0 in all measured Type 1 and Type 3 headers)
-```
-
-| Container type | Instances | Header & body layout after `+0x24` |
-|---|---:|---|
-| `Type 1` (`StateMachine`) | 230 (63 at file root, 167 nested) | `0x58`-byte header: `+0x24` `i32 transitions_rel` (`off + 0x58 + 8 * n_children` when `n_transitions > 0`, or `0`), `+0x44` `f32 1.0`, `+0x50` `u32 n_default_transitions`, `+0x54` `i32 default_transitions_rel`. At `+0x58`: `n_children` 8-byte child directory entries `{u32 child_hash; i32 child_rel}` (`target = entry + 4 + child_rel`), then `n_transitions` outgoing transitions, `n_default_transitions` default transitions, and the `n_children` child state containers (`Type 1` or `Type 22`). In 230 of 230 instances, `init_target` is in the child directory and every child's `+0x04` hash matches its directory `child_hash`. |
-| `Type 3` (`InlinedStateMachine`) | 132 (all inside a `MotionTree`, 332 child states) | Same header as `Type 1` through `+0x54`, plus `u32 n_inputs` at `+0x58` (`1..2`, 151 inputs total) and `n_inputs × i32 input_rel` at `+0x5c` (`target = (off + 0x5c + 4*i) + input_rel`, pointing to the input pose node in the enclosing `MotionTree`). The `n_children × 8`-byte child directory follows at `off + 0x5c + 4 * n_inputs`, then `n_default_transitions` (114 total) and the `n_children` child states. |
-| `Type 22` (`MotionTree`) | 1,254 (261 at file root, 993 nested) | `0x30`-byte header: `+0x24` `i32 transitions_rel` (always `0x0c`, so transitions start at `off + 0x30`), `+0x28` `i32 param_blocks_rel`, `+0x2c` `u32 n_param_blocks`. Followed by `n_transitions` outgoing transitions, `n_param_blocks` length-prefixed parameter blocks, and the motion-tree node arena (`3,875` declared children; first node has `index == 0`, root expression node is at `off + 0x08 + init_or_root_rel`). |
-
-### Transitions, parameter blocks and motion-tree nodes
-
-- **Outgoing state transitions (1,097 total: 77 on `Type 1`, 1,020 on `Type 22`):** each transition record carries its
-  own byte length as `u32 size` at `+0x10` (`size >= 0x4c`; `76`, `84`, `88`, `92`, `96`, ... bytes), a signed relative
-  offset to the target state at `+0x48`, and (when `size >= 0x50`) a `u32 condition_kind` at `+0x4c` followed by
-  `size - 0x50` bytes of condition hashes and thresholds. Summing `size` across `n_transitions` matches the exact
-  transition block span in **100%** of containers.
-- **Default / any-state transitions (491 total: 377 on `Type 1`, 114 on `Type 3`):** each record starts with
-  `{u16 size; u16 condition_count; i32 target_rel}` (`size >= 16`). Summing `size` across `n_default_transitions`
-  matches `first_child - def_tr_start` in **100%** of containers.
-- **MotionTree parameter blocks (2,104 total across the 1,254 `MotionTree`s):** each block starts with
-  `{u32 block_size; u8 index, b1, b2, b3, b4, b5, b6, b7}` (`b7 == 0` in all 2,104), followed by
-  `(b1 + b2 + b3 + b4)` 16-byte parameter/signal bindings (`3,683` total), `b5` 8-byte output/event bindings (`591`
-  total), and `b6` variable-length curve/expression sub-records (`632` total, each carrying `u16 sub_size` at `+0x04`).
-  The byte identity
-  $$\text{block\_size} = 12 + 16(b_1 + b_2 + b_3 + b_4) + 8b_5 + \sum_{k=1}^{b_6} \text{sub\_size}_k$$
-  holds in **2,104 of 2,104 (100%)** blocks.
-- **MotionTree root expression nodes (1,254 total):** the root node at `init_target` is most commonly `Type 11`
-  (clip leaf, 216), `Type 4` (2-way blend, 193), `Type 3` (`InlinedStateMachine`, 132), `Type 2` (12-byte output leaf,
-  116), `Type 28` (filter/modifier, 94), `Type 9` (directional blend, 83), `Type 1` (nested `StateMachine`, 81),
-  `Type 10` (N-way blend, 72), `Type 12` (parameterized motion, 55), `Type 19` (additive blend, 49), `Type 15`
-  (20-byte unary node, 48), `Type 5` (44-byte blend, 42), and `Type 23` (8-byte identity pose leaf, 20), plus 13
-  rarer operator types (`6, 8, 18, 25, 27, 31, 32, 34, 36, 37, 39, 40, 41`, 53 total).
+Still open in ASSET-20: the meanings of the auxiliary payloads in the 1,781 `0DRP` second-page `clip-stream` entries ([above](#packed-clip-streams)) and the per-bone mapping onto each non-humanoid model's skeleton.
 
 ## `MoVE` state-machine containers
 

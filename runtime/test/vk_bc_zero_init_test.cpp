@@ -380,6 +380,86 @@ int main() {
         VulkanQueue q(ctx, d.queue, d.family);
         EXPECT(q.ok());
         EXPECT(run_d3d220_cases(d, ctx, q, poison_buf, up_buf, up_ptr, rb_buf, rb_ptr, "copy_scratch") == 0);
+
+        // Copy-only queue zero-init of odd-sized 1B (R8_UNORM 3x3 = 9B) and 2B (R16_UNORM 3x1 = 6B) color images
+        // via copy_scratch: must round vkCmdFillBuffer size/offset to 4 bytes (VUID-vkCmdFillBuffer-dstOffset-00024
+        // / -size-00028) and zero all texels on real GPU hardware.
+        {
+            VulkanQueue copy_q(ctx, d.queue, d.family, VulkanQueue::QueueKind::copy);
+            EXPECT(copy_q.ok());
+
+            struct SmallFormatCase {
+                const char* name;
+                VkFormat format;
+                std::uint32_t width, height, bpp;
+            };
+            const SmallFormatCase small_cases[] = {
+                {"R8_UNORM 3x3", VK_FORMAT_R8_UNORM, 3, 3, 1},
+                {"R16_UNORM 3x1", VK_FORMAT_R16_UNORM, 3, 1, 2},
+            };
+            for (const auto& sc : small_cases) {
+                OwnedImage img;
+                EXPECT(create_image(d, sc.format, sc.width, sc.height, 1, poison_buf, img));
+                EXPECT(img.poisoned);
+                ResourceBinding rb{};
+                rb.image = img.image;
+                rb.format = sc.format;
+                rb.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+                rb.width = sc.width; rb.height = sc.height;
+                rb.mip_levels = 1; rb.array_layers = 1; rb.depth = 1; rb.samples = 1;
+                ctx.add_resource(30, rb, VK_IMAGE_LAYOUT_UNDEFINED);
+                std::memset(rb_ptr, 0xCD, 1024);
+
+                CommandList list;
+                EXPECT(list.transition({30, all_subresources, d3d12_state::copy_dest, d3d12_state::copy_source}));
+                const CopyLocation src_loc{30, false, 0, 0, 0, 0, 0, 0};
+                const CopyLocation dst_loc{2, true, 0, 0, sc.width, sc.height, 1, 256};
+                EXPECT(list.copy_texture({dst_loc, 0, 0, 0, src_loc, false, {}}));
+                EXPECT(list.close());
+                const CommandList* ptr = &list;
+                EXPECT(copy_q.execute({&ptr, 1}) == ReplayResult::success);
+                EXPECT(copy_q.idle());
+
+                const auto* out = static_cast<const std::uint8_t*>(rb_ptr);
+                for (std::uint32_t y = 0; y < sc.height; ++y)
+                    for (std::uint32_t x = 0; x < sc.width * sc.bpp; ++x)
+                        EXPECT(out[y * 256 + x] == 0x00);
+                ctx.remove_resource(30);
+                std::printf("copy-queue zero-init (%s via copy_scratch): ok\n", sc.name);
+            }
+        }
+    }
+
+    // Direct ReplayFunctions check: verify vkCmdFillBuffer dstOffset and size are 4-byte aligned even for
+    // odd-sized 1B/2B color images and unaligned scratch offsets (VUID-vkCmdFillBuffer-dstOffset-00024 / -size-00028).
+    {
+        static VkDeviceSize last_fill_off = 1, last_fill_size = 1;
+        static std::uint32_t fill_calls = 0;
+        ReplayFunctions mock{};
+        mock.pipeline_barrier = [](VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+                                   std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*,
+                                   std::uint32_t, const VkImageMemoryBarrier*) {};
+        mock.copy_buffer_to_image = [](VkCommandBuffer, VkBuffer, VkImage, VkImageLayout, std::uint32_t,
+                                       const VkBufferImageCopy*) {};
+        mock.fill_buffer = [](VkCommandBuffer, VkBuffer, VkDeviceSize off, VkDeviceSize size, std::uint32_t) {
+            last_fill_off = off;
+            last_fill_size = size;
+            ++fill_calls;
+        };
+        mock.copy_scratch = [](std::uint64_t, VkBuffer& buf, VkDeviceSize& off) {
+            buf = reinterpret_cast<VkBuffer>(std::uintptr_t(0x1234));
+            off = 2;  // deliberately non-4-byte-aligned
+            return true;
+        };
+        ResourceBinding r8{};
+        r8.image = reinterpret_cast<VkImage>(std::uintptr_t(0x5678));
+        r8.format = VK_FORMAT_R8_UNORM;
+        r8.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+        r8.width = 3; r8.height = 3; r8.mip_levels = 1; r8.array_layers = 1; r8.depth = 1; r8.samples = 1;
+        fill_calls = 0;
+        EXPECT(detail::zero_compressed_image(mock, VK_NULL_HANDLE, r8, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+                                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL));
+        EXPECT(fill_calls == 1 && (last_fill_off % 4) == 0 && (last_fill_size % 4) == 0 && last_fill_size >= 8);
     }
 
     EXPECT(d.validation_errors() == 0);

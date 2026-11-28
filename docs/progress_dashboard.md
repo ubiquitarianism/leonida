@@ -13,6 +13,21 @@ start ..\leonida_progress\progress.html
 The page is one self-contained HTML file: no network, no packages, it opens from disk. The project logo
 (`assets/logo.png`) is embedded in it, and the page follows the system theme until you pick one with its theme button.
 
+Use a CTest JUnit report when the run includes tests configured with `SKIP_RETURN_CODE`. CTest can log those
+skips as `Test Passed.` in `LastTest.log`. `--ctest-junit` replaces the local log with the report, which preserves
+the skipped status. Use `--junit` to add independent runs. A new file name for each run keeps an aborted CTest run
+from reusing an older report.
+
+```powershell
+$report = Join-Path $env:TEMP ("leonida-ctest-{0}.xml" -f [guid]::NewGuid())
+ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure --output-junit $report
+if (Test-Path -LiteralPath $report -PathType Leaf) {
+    python -I tools/progress_dashboard.py --out ..\leonida_progress --ctest-junit $report
+} else {
+    throw "CTest did not produce a JUnit report (exit $LASTEXITCODE)."
+}
+```
+
 ## Sources
 
 Each source is optional. A missing one is listed under "Sources" on the page; it is never counted as zero or as a failure.
@@ -22,7 +37,7 @@ are read directly; there is no need to re-save them as UTF-8.
 | Panel | Source | Unit |
 |---|---|---|
 | Unit tests | `--run-tests` runs `tests/test_*.py` with the selection `ci.yml` uses (standard-library files with a `__main__` block), one process each; the outcome and the commit it ran on are kept in `<out>/unit_results.json`. That is CI's standard-library loop only: `tests/semantic` (the translator suite) and files that need pytest or numpy are not run, so the panel is not the whole test suite; feed those through `--junit` (`python -m pytest tests/semantic --junitxml <file>`) to see them in the runtime-tests panel | test file |
-| Runtime tests | `runtime/build/Testing/Temporary/LastTest.log` and any `--junit` file (CTest `--output-junit` or pytest `--junitxml`). CTest logs and XML reports are age-checked by file modification time | test |
+| Runtime tests | `runtime/build/Testing/Temporary/LastTest.log` and any `--junit` file (CTest `--output-junit` or pytest `--junitxml`). The CTest log and CTest XML reports are age-checked by file modification time; a pytest report is not | test |
 | GPU tests | `--gpu-log <file>[=<GPU, driver, OS>]`: the saved output of `runtime/test/shaders/check.py`, one group per GPU; a log older than the last commit touching `runtime/test/shaders` or `tools/rdna2spirv.py` counts as needing a re-run | test program |
 | Translator contract | the contract table in [design.md](design.md#translator-status-and-runtime-contract), each row classified by how it says it was confirmed | contract row |
 | Runtime imports | the measured tables in [runtime_imports.md](runtime_imports.md) | import |
@@ -34,11 +49,15 @@ are read directly; there is no need to re-save them as UTF-8.
 Every run with `--github` reads the pull requests again, so a merge into `main` shows up on the next run as
 IMPLEMENTED, even before a tracking table (such as the D3D12 tracking issue's PR column) is edited. A pull request closed without merging is
 left out. The page also lists the 30 latest merges, and the trend chart follows the share of pull requests merged and
-of item IDs with a merged pull request. `gh pr list` reads at most 5000 per state; the Sources table says when that
-limit is reached.
+of item IDs with a merged pull request. The chart draws at most eight metrics, the first eight metric IDs of the
+history in alphabetical order, so with every source present `runtime.current`, `tests.current` and `tests.passed`
+are left out of it (they are still in the metrics table). `gh pr list` reads at most 5000 per state; the Sources
+table says when that limit is reached.
 
-With `--github --login <account>` the page also lists that account's claims in the coordination issue (and the issue
-it continues) and its pull requests. Nothing is posted: every `gh` call is a read.
+Every run with `--github` also reads the open coordination issue and shows the size of three of its sections ("Up for
+grabs", "Ready for review or a GPU test", "Needs a rebase on `main`") in the page header. With `--github --login
+<account>` the page also lists that account's claims in the coordination issue (and the issue it continues) and its 50
+latest pull requests. Nothing is posted: every `gh` call is a read.
 
 ## How a status is decided
 
@@ -49,7 +68,7 @@ it continues) and its pull requests. Nothing is posted: every `gh` call is a rea
 | PARTIAL | passed before a change to the test, `make_game.py`, or a Python file under `tools/`, `scripts/` or `runtime/test/shaders/` (CTest: before the last commit touching `runtime/`) | waits for a GPU measurement, or names a GPU check with an item still open | — | open | pull request open |
 | FAILED | failed on its last run | — | — | — | — |
 | MISSING | — | — | unimplemented | — | unclaimed |
-| UNKNOWN | skipped, or git can't tell what changed | states no confirmation method | — | — | claimed, no code yet |
+| UNKNOWN | skipped (a unit-test file whose every case skipped) | states no confirmation method | — | — | claimed, no code yet |
 
 The contract classification reads the row's own words; the matched words are shown in each cell's details, so a
 wrong class is visible and the rule list in the tool (`CONFIRMATION`) can be corrected.

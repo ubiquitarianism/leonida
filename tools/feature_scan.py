@@ -14,8 +14,8 @@ Reads what the shaders stage of make_game.py leaves in <work>/shaders, and print
   accesses (#16): the MTBUF instruction formats, and for MUBUF where V# word 3 (the format) comes from, each checked
   against the translator's typed-buffer table (rdna2spirv.Gen.FORMATS).
 - spirv/index.json (rdna2spirv.py): uses_code_base per stage. A graphics PSO can only need two code bases
-  (§5.2) if two of its stages use one; this gives the per-stage counts. Which stages are paired in one PSO is in
-  the executable, not in shaders.rpf.
+  (§5.2) if two of its stages use one; this gives the per-stage counts. Pairing programs to the stages of a PSO is
+  the pipeline library's job: tools/pso_code_base_pairs.py joins the two and counts whole PSOs.
 
 InnerCoverage metadata is cross-tabulated by stage: SFI0 set/clear/unknown versus ISG1
 present/absent/unknown. Unknown includes missing or truncated parts; unreadable containers
@@ -34,6 +34,7 @@ import sys
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 from shader_carve import parts as dxbc_part_ranges  # noqa: E402
 
 # d3d12shader.h (Windows SDK 10.0.26100.0), D3D_SHADER_REQUIRES_*: the SFI0 part is this 64-bit mask.
@@ -529,18 +530,6 @@ def scan_spirv(spirv_index: str) -> dict:
     return {"translated": dict(total), "uses_code_base": {k: v for k, v in code_base.items() if v}}
 
 
-def same_path(first: str, second: str) -> bool:
-    """True when two paths name the same file, including through a link or a case difference on Windows."""
-    a = os.path.normcase(os.path.abspath(first))
-    b = os.path.normcase(os.path.abspath(second))
-    if a == b:
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def inside_dir(path: str, folder: str) -> bool:
     """True when the path itself or its symlink target is in the folder."""
     for resolve in (os.path.abspath, os.path.realpath):
@@ -570,7 +559,7 @@ def main() -> int:
                   "replace index.json or a .dxbc the scan reads. Give a report path outside it.", file=sys.stderr)
             return 2
         for input_index in (index_path, spirv_index):
-            if same_path(a.out, input_index):
+            if same_report_path(a.out, input_index):
                 print(f"ERROR: --out {a.out} is {input_index}, which the scan reads. Give another report path.",
                       file=sys.stderr)
                 return 2

@@ -6,6 +6,8 @@
 // calls exit() with 0 (42 with `exit-code`) when everything held. Two checks are opt-in, by argument (CTest's
 // run_tiny_game_tls and run_tiny_game_eh): `tls`, thread_local on the game's own threads, which needs the loader's
 // per-thread TLS (gta6rt starts main on a separate thread); and `eh`, a C++ exception caught inside the image.
+// run_tiny_game_ga_tls runs `tls` on tiny_game_ga, this file built with /GA: its thread_local reads then take module
+// TLS index 0 without _tls_index, as a title's executable does, and under gta6rt that index is gta6rt.exe's own.
 // A third, `game-file` (run_tiny_game_dir), reads GAME:\tiny_game_probe.txt after moving the current directory.
 // A fourth, `stack` (run_tiny_game_stack), checks that the entry thread and a thread created with dwStackSize 0
 // both have 8 MB of stack: a driver compiles shaders on the game's threads (BUILD-1457). Only under gta6rt: run
@@ -109,6 +111,18 @@ int main(int argc, char** argv) {
     check(XGameRuntimeInitialize() == S_OK, "XGameRuntimeInitialize is answered by the gta6rt shim (S_OK)");
     check(XSystemGetDeviceType() == 7, "XSystemGetDeviceType is answered by the gta6rt shim (Series X)");
     XGameRuntimeUninitialize();
+
+    if (has_arg(argc, argv, "first-run-ui")) {
+        char value[32]{};
+        const auto configured = [&](const char* name, const char* expected) {
+            const DWORD n = GetEnvironmentVariableA(name, value, sizeof(value));
+            return n && n < sizeof(value) && std::strcmp(value, expected) == 0;
+        };
+        check(configured("LEONIDA_D3D12", "vulkan"), "first-run UI Vulkan backend");
+        check(configured("LEONIDA_PIPELINE_COMPILE", "on-demand"), "first-run UI pipeline profile");
+        check(configured("LEONIDA_KEYBOARD_PAD", "1"), "first-run UI keyboard pad reads keys only with focus");
+        check(configured("LEONIDA_ARENA_MB", "768"), "first-run UI caller override");
+    }
 
     if (has_arg(argc, argv, "tls")) {
         int seen = -1;

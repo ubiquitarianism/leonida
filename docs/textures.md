@@ -33,13 +33,14 @@ stdlib-only BCPack decoder (`tools/bcpack.py`, `tools/bcpack_tables.py`,
 `tools/bcpack_tables_bptc.py`) now decodes the rANS entropy layer and rebuilds BC blocks
 for all six active modes (BC1, BC3, BC4, BC5, BC6H and BC7 — 100% of BCPack codecs in the
 corpus). To inspect or decode one raw BCPack stream from the command line, `tools/bcpack_tool.py`
-wraps the same decoder: `inspect <in.bin> --codec <1..7> --size <uncompressed_bytes> [--json]` prints
-the stream's header, entropy statistics and validation results; `decode <in.bin> <out.bin> --codec <1..7>
---size <uncompressed_bytes> [--provisional]` writes the rebuilt BC blocks; `profile <in.bin> --codec <1..7>
+wraps the same decoder: `inspect <in.bin> --codec <1|3|4|5|6|7> --size <uncompressed_bytes> [--json]` prints
+the stream's header, entropy statistics and validation results; `decode <in.bin> <out.bin> --codec <1|3|4|5|6|7>
+--size <uncompressed_bytes> [--provisional] [--history <path>]` writes the rebuilt BC blocks; `profile <in.bin> --codec <1|3|4|5|6|7>
 --size <uncompressed_bytes>` reports per-symbol frequency statistics. Strict confirmed-history mode is
-the default; `--allow-provisional` enables the
+the default; `--provisional` (`tools/bcpack_tool.py decode`) or `--allow-provisional`
+(`tools/ttpf_mips.py check`/`export`) enables the
 provisional and last-resort history entries, and `--history <path>` supplies locally
-calibrated BC6H/BC7 initial history JSON tables at run time (no fitted BC6H/BC7 history
+calibrated initial history JSON tables at run time (no fitted BC6H/BC7 history
 data is embedded in the repository). `rpf9dump`'s C# `TtpfReader` (submodule pin `e293917`,
 `breadbbbb/rpf9-explorer#7`) now decodes compact 2D mip tails, multi-slice layouts, DXGI 11,
 and BCPack BC1, BC3, BC4 and BC5 chunks in strict mode; BC6H, BC7 and provisional-history
@@ -453,6 +454,44 @@ exceptions. The chunk table's offsets are 256-byte aligned (physical) and 4 KiB 
 (virtual), and the virtual ranges cover every allocation the parser could lay out. The
 12-bit padding on BCPack chunks is zero-filled (see the header section).
 
+### No name streams in the pools
+
+A pool holds no name table and no string data (BUILD-1368). An earlier claim described a
+`nameTable` stream of 64-byte records (65,536 slots) and a `nameData` stream of ASCII strings;
+neither exists in this install. Every byte of a pool falls into one of the regions below
+(`tools/ttpf_mips.py` `Pool`; all 57 pools, counts only):
+
+| Region | Where | What it holds |
+|---|---|---|
+| RDS5 header and chunk table | 0x00 to `0x18 + (count − 1) * 8`, zero-padded to the ETPF index | the fields in the table above |
+| ETPF header | `etpf`, 16 bytes | magic, version, `textures`, `area` |
+| descriptors | `etpf + 0x10`, 16 bytes × `textures` | one texture record each |
+| asset keys | after the descriptors, 8 bytes × `textures` | one u64 per record; unique within each pool (57 / 57), 357,115 keys |
+| trailing metadata | after the keys, to `etpf + 0x10 + area + 32 × textures` | `area + 8 × textures` bytes: 13,973,528 in all |
+| zero padding | to chunk 0's physical offset | 0 non-zero bytes in 57 / 57 pools |
+| texture data | the chunk ranges | one virtual allocation per texture |
+
+- **The virtual space has no room for another stream.** Chunk 0's virtual offset is the
+  4 KiB-aligned metadata size and equals the lowest texture base in 57 / 57 pools. Texture bases
+  rise strictly in record order (0 duplicates, 0 unmapped), each allocation runs to the next base
+  and the last one to the virtual size (`Pool.span`).
+- **The trailing metadata reads as uniform random bytes.** In each of the 52 pools with at least
+  1 KiB of it, it has 7.87–8.00 bits/byte. It holds 54,497 zero bytes against 54,584 for uniform
+  bytes, and 0 repeated aligned 16-byte blocks. Its 3,166 printable ASCII runs of 8 bytes or more
+  (longest 17) match the 3,161 that uniform bytes give. Neither zlib nor raw deflate inflates it
+  from its start, from the end of the descriptors or from the end of `area`.
+  *Hypothesis:* per-texture digests or encrypted data. Under the ground rules it stays unread.
+- **The names occur nowhere else either.** The literal strings `nameTable`, `nameData` and
+  `streamName` occur 0 times in the 57 pool files (raw bytes, 57.94 GiB) and in the inflated
+  streams of `common.rpf` (954 streams), `script.rpf` (1,057) and `data.rpf` (28,509). Only 5 of
+  those streams contain `ttdb` at all: 2 XML content documents in `common.rpf` and 3 `RBF0` UI
+  documents in `data.rpf`. The UI documents use it in a member that holds a texture ID; no stream
+  holds a name table.
+
+What links a texture to the rest of the game is its u64 asset key. Models and materials
+reference textures by that key, and exported textures are named `texture_<index>_<key>`. The
+original texture names are not in the pools, and none of the streams searched above holds them.
+
 ### Codec ids are the BCPack mode
 
 The on-disk codec ids are `0x04, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20`; shifting right by 26
@@ -534,9 +573,12 @@ different levels of confirmation; this example shows the first.)
 
 ### The descriptor `mode` is tiling, not codec
 
-The ETPF descriptor's `mode` field (`b >> 23`) is the mip/tile family: mode 0 uses 64 KiB
-blocks (`SW_64KB_D`), every other observed mode uses 4 KiB blocks (`SW_4KB_S`). It is
-independent of the chunk codec. Formats 71/72 use 8-byte BC1 blocks, 74/75/77/78/83/84/95/96/
+The ETPF descriptor's `mode` field (`b >> 23`) packs a low flag bit and a 4-bit Gfx10 tile
+mode (`(mode >> 1) & 0xF`, `tools/tex_headers.py:gfx10_tile_mode` / `gfx10_tile_bytes`; see
+[The descriptor mode is a flag plus a tile mode](#the-descriptor-mode-is-a-flag-plus-a-tile-mode)
+above): tile mode 0 (modes `0`, `1`, and `32`) uses 64 KiB blocks (`SW_64KB_D`), tile modes
+1–3 use 4 KiB blocks (`SW_4KB_S`), and modes 9–12 are cubemaps. It is independent of the
+chunk codec. Formats 71/72 use 8-byte BC1 blocks, 74/75/77/78/83/84/95/96/
 98/99 use 16-byte blocks, and 80/81 use 8-byte BC4 blocks. No BC2 (codec 2) texture exists in
 this install.
 
@@ -949,10 +991,10 @@ default BC1/BC3/BC4/BC5 rank/history tables (extendable or replaceable via `--hi
 
 | Format | History source | Strict vs. provisional status | Notes |
 |---|---|---|---|
-| BC1 | `tools/bcpack_tables.py` (+ optional `--history`) | 248 confirmed / 7 provisional | Entry 0 unreferenced; provisional entries (6, 9, 67, 68, 71, 74, 122) uncertain by ≤1 green step |
+| BC1 | `tools/bcpack_tables.py` (+ optional `--history`) | 252 confirmed / 3 provisional | Entry 0 unreferenced; entries 9, 67, 68 and 74 confirmed; provisional entries (6, 71, 122) stay below the 99% confirmation bar |
 | BC3 | `tools/bcpack_tables.py` (+ optional `--history`) | 0 confirmed / 35 provisional | All 256 colour-quadrant and 64 alpha-pair rank entries populated |
-| BC4 | `tools/bcpack_tables.py` (+ optional `--history`) | 0 confirmed / 55 provisional | 64 pair entries populated; UI pool chunks reference additional unfitted entries unless supplied via `--history` |
-| BC5 | `tools/bcpack_tables.py` (+ optional `--history`) | 3 confirmed / 211 provisional | 64 pair entries populated |
+| BC4 | `tools/bcpack_tables.py` (+ optional `--history`) | 2 confirmed / 170 provisional | 64 pair entries populated; entries 52 and 190 confirmed; 172 total entries cover the UI pool BC4 chunks in provisional mode (unpopulated entries still require `--history`) |
+| BC5 | `tools/bcpack_tables.py` (+ optional `--history`) | 5 confirmed / 209 provisional | 64 pair entries populated; entries 105, 182, 183, 222 and 255 confirmed |
 | BC6H | external `--history <path>` | Empty by default (`history=None`) | Self-contained chunks decode strictly; external JSON supplies class 1/2/3 entries |
 | BC7 | external `--history <path>` | Empty by default (`history=None`) | Self-contained chunks decode strictly; 286 signature ranks (10 inferred-only refused in strict mode); partial-depth endpoints (`>= 4` bits) mid-range filled in provisional mode |
 

@@ -80,6 +80,36 @@ class SpirvAsmUnitTests(unittest.TestCase):
                 words = _literal_words(f.read(), 7, 1)
             self.assertEqual(struct.pack(f"<{len(words)}I", *words).split(b"\0", 1)[0], literal)
 
+    def test_cli_refuses_output_that_aliases_source(self):
+        for alias in ("same", "dotdot", "hardlink", "symlink"):
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as directory:
+                src = os.path.join(directory, "source.spvasm")
+                original = b"OpNop\n"
+                with open(src, "wb") as f:
+                    f.write(original)
+                if alias == "same":
+                    dst = src
+                elif alias == "dotdot":
+                    os.mkdir(os.path.join(directory, "sub"))
+                    dst = os.path.join(directory, "sub", "..", "source.spvasm")
+                else:
+                    dst = os.path.join(directory, f"{alias}.spv")
+                    try:
+                        if alias == "hardlink":
+                            os.link(src, dst)
+                        else:
+                            os.symlink(src, dst)
+                    except OSError as exc:
+                        self.skipTest(f"{alias} is unavailable: {exc}")
+                result = subprocess.run(
+                    [sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"), src, "-o", dst],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("output must not overwrite the source", result.stderr)
+                with open(src, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
     def test_instruction_boundaries_follow_tokens_across_physical_lines(self):
         canonical = (
             "OpCapability Shader\n"
@@ -853,6 +883,88 @@ class DebugPrintfTests(unittest.TestCase):
         _validate(spv)
         with self.assertRaisesRegex(spirv_asm.SpirvAsmError, "invalid integer literal 'Printf'"):
             spirv_asm.assemble(module("Printf"))
+
+
+class SpirvAsmCliTests(unittest.TestCase):
+    SAMPLE = (
+        "OpCapability Shader\n"
+        "OpMemoryModel Logical GLSL450\n"
+        "OpEntryPoint GLCompute %main \"main\"\n"
+        "OpExecutionMode %main LocalSize 1 1 1\n"
+        "%void = OpTypeVoid\n"
+        "%fn = OpTypeFunction %void\n"
+        "%main = OpFunction %void None %fn\n"
+        "%l = OpLabel\n"
+        "OpReturn\n"
+        "OpFunctionEnd\n"
+    )
+
+    def test_cli_accepts_utf8_bom_and_writes_atomically(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stderr
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "bom.spvasm")
+            out = os.path.join(tmp, "bom.spv")
+            with open(src, "wb") as f:
+                f.write(("\ufeff" + self.SAMPLE).encode("utf-8"))
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = spirv_asm.main([src, "-o", out])
+            self.assertEqual(rc, 0, err.getvalue())
+            self.assertEqual(err.getvalue(), "")
+            with open(out, "rb") as f:
+                data = f.read()
+            self.assertEqual(data, spirv_asm.assemble(self.SAMPLE))
+            self.assertEqual(sorted(os.listdir(tmp)), ["bom.spv", "bom.spvasm"])
+
+    def test_cli_rejects_bad_out_before_assembling(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.spvasm")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write(self.SAMPLE)
+            out_dir = os.path.join(tmp, "existing_dir")
+            os.makedirs(out_dir)
+            missing_parent = os.path.join(tmp, "missing_parent", "out.spv")
+            for bad_out in ("", out_dir, missing_parent):
+                err = io.StringIO()
+                with mock.patch.object(spirv_asm, "assemble", side_effect=AssertionError("assemble should not run")), \
+                        redirect_stderr(err):
+                    rc = spirv_asm.main([src, "-o", bad_out])
+                self.assertEqual(rc, 1)
+                self.assertIn("ERROR:", err.getvalue())
+
+    def test_cli_atomic_write_preserves_existing_spv_on_staging_failure(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.spvasm")
+            out = os.path.join(tmp, "out.spv")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write(self.SAMPLE)
+            with open(out, "wb") as f:
+                f.write(b"OLD-SPV")
+            err = io.StringIO()
+            with mock.patch.object(spirv_asm, "published_mode", side_effect=PermissionError("chmod failed")), \
+                    redirect_stderr(err):
+                rc = spirv_asm.main([src, "-o", out])
+            self.assertEqual(rc, 1)
+            self.assertIn("ERROR:", err.getvalue())
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b"OLD-SPV")
+            self.assertEqual(sorted(os.listdir(tmp)), ["in.spvasm", "out.spv"])
 
 
 if __name__ == "__main__":

@@ -44,7 +44,13 @@ def build(work, name, emulate, llvm_mc):
     r = subprocess.run([sys.executable, "-I", BUILD_PY, out, name], env=env, capture_output=True, text=True)
     if r.returncode:
         sys.exit(r.stdout + r.stderr)
-    return os.path.join(out, "spirv", name + ".spv")
+    spv = os.path.join(out, "spirv", name + ".spv")
+    if not os.path.isfile(spv):
+        mode = "emulated" if emulate else "native"
+        message = f"{name}: {mode} build did not produce a SPIR-V module"
+        reason = (r.stdout + r.stderr).strip()
+        sys.exit(f"{message}\n{reason}" if reason else message)
+    return spv
 
 
 def segments(spv: str) -> tuple[int, int] | None:
@@ -91,7 +97,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"),
                     help="CMake build directory or a configuration directory such as RelWithDebInfo")
-    ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"))
+    # Empty means unset to build.py: mc_command() then finds llvm-mc on PATH or a versioned llvm-mc-<N>.
+    ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", ""))
     # Vulkan guarantees support for at least 65,535 groups along X in one dispatch.
     ap.add_argument("--groups", type=positive_int, default=65535)
     ap.add_argument("--reps", type=positive_int, default=30)

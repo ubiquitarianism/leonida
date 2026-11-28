@@ -92,6 +92,35 @@ class ProgramText(unittest.TestCase):
             leftovers = [p for p in Path(tmp).iterdir() if p.name.startswith("vk_fuzz_")]
             self.assertEqual(leftovers, [])
 
+    def test_read_dump_takes_the_first_wave_of_a_larger_buffer(self):
+        import struct
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            dump = Path(tmp) / "d.bin"
+            # wave32, words=1: vk_compute_test's buffer is at least 64 words, so the dump is 64 words long. Each lane
+            # stores its own value, and the tail holds a sentinel that is not the harness fill, so a read that took
+            # the wrong words, the wrong order or the tail would not match.
+            sentinel = 0xDEADBEEF
+            self.assertNotEqual(sentinel, R.FILL)
+            dump.write_bytes(struct.pack("<64I", *([0x100 + lane for lane in range(32)] + [sentinel] * 32)))
+            lanes = R.read_dump(str(dump), 1, 32)
+            self.assertEqual(lanes, [[0x100 + lane] for lane in range(32)])
+            self.assertNotIn([sentinel], lanes)
+            # wave64, words=1 from a two-group dump (128 words): the buffer is longer than the request the other way
+            # round, and only the first 64 words are the wave's.
+            dump.write_bytes(struct.pack("<128I", *([0x200 + lane for lane in range(64)] + [sentinel] * 64)))
+            self.assertEqual(R.read_dump(str(dump), 1, 64), [[0x200 + lane] for lane in range(64)])
+            # An exact-size dump still reads as before.
+            dump.write_bytes(struct.pack("<128I", *range(128)))
+            lanes = R.read_dump(str(dump), 4, 32)
+            self.assertEqual(len(lanes), 32)
+            self.assertEqual(lanes[0], [0, 1, 2, 3])
+            self.assertEqual(lanes[31], [124, 125, 126, 127])
+            # Too short or missing: no result.
+            dump.write_bytes(struct.pack("<31I", *range(31)))
+            self.assertIsNone(R.read_dump(str(dump), 1, 32))
+            self.assertIsNone(R.read_dump(str(Path(tmp) / "missing.bin"), 1, 32))
+
     def test_judge_counts_skips_and_mismatches(self):
         import unittest.mock as mock
         obs = ["v_mov_b32 v8, v1", "v_mov_b32 v9, v2", "v_mov_b32 v10, v3", "v_mov_b32 v11, v4"]
@@ -167,6 +196,47 @@ class ProgramText(unittest.TestCase):
         self.assertEqual(calls, [0, 1, 2])
         self.assertEqual(got, ["the device can't run 32-lane subgroups (8 lanes)",
                                "vk_compute_test: unsupported: no matching device", [0]])
+
+
+    def test_encoded_listings_skip_llvm_mc_and_follow_the_wave64_emulation_switch(self):
+        listing = "; cs_vkfuzz_0\n; encoding: [0x00,0x00,0x80,0xbf]\ns_endpgm\n"
+        if R.SHADERS not in sys.path:
+            sys.path.insert(0, R.SHADERS)
+        import compute_fixture
+        import mc_command
+
+        for wave, emulate in ((32, ""), (64, ""), (64, "1")):
+            with self.subTest(wave=wave, emulate=emulate), tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / ("vk_compute_test.exe" if os.name == "nt" else "vk_compute_test")).touch()
+                seen = {"translator": None, "gpu": None, "env": None, "listing": None}
+
+                def child(cmd, *, env=None, **_kwargs):
+                    if "--out" in cmd:
+                        out = Path(cmd[cmd.index("--out") + 1])
+                        out.mkdir()
+                        seen["translator"] = list(cmd)
+                        seen["listing"] = (Path(cmd[cmd.index("--out") - 1]) / "cs_vkfuzz_0.s").read_text(
+                            encoding="utf-8")
+                        (out / "index.json").write_text(json.dumps({"cs_vkfuzz_0": {}}), encoding="utf-8",
+                                                        newline="\n")
+                        (out / "cs_vkfuzz_0.spv").write_bytes(b"synthetic")
+                        return subprocess.CompletedProcess(cmd, 0, "", "")
+                    seen["gpu"], seen["env"] = list(cmd), env
+                    Path(env["VKC_DUMP"]).write_bytes(bytes(4 * wave))
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+
+                with mock.patch.object(mc_command, "mc_command", side_effect=AssertionError("llvm-mc was asked")), \
+                     mock.patch.object(mc_command, "run", side_effect=AssertionError("llvm-mc was run")), \
+                     mock.patch.object(compute_fixture, "compute_header", return_value=b"synthetic"), \
+                     mock.patch.object(R.subprocess, "run", side_effect=child), \
+                     mock.patch.dict(os.environ, {"LEONIDA_W64_EMULATE": emulate}):
+                    got = R.run_programs([listing], words=1, wave=wave, build=tmp, work_parent=tmp, encoded=True)
+                self.assertEqual(got, [[0]])
+                self.assertEqual(seen["listing"], "; cs_vkfuzz_0\n" + listing)  # the text, as given
+                emulating = wave == 64 and emulate == "1"
+                self.assertEqual("--wave64-emulate" in seen["translator"], emulating)
+                self.assertEqual("--require-wave64" in seen["gpu"], wave == 64 and not emulating)
+                self.assertEqual(seen["env"].get("VKC_SUBGROUP_SIZE"), None if wave == 64 and not emulating else "32")
 
 
 class Guard(unittest.TestCase):

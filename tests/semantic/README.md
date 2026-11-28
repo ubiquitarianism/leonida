@@ -3,7 +3,7 @@
 Standard library only; no GPU, no LLVM, no SPIRV-Tools, no game files.
 
 ```sh
-python -I scripts/run_semantic_tests.py tests/semantic        # one file per core: 26 s instead of 253 s on 16 cores
+python -I scripts/run_semantic_tests.py tests/semantic        # one file per core: 297 s instead of 2 401 s on 16 cores (Windows 11)
 python -m unittest discover -s tests/semantic -v             # the same tests, one file after another
 python -I scripts/run_semantic_tests.py tests/semantic -j 4 -p 'test_image_*.py'  # a matching subset
 ```
@@ -64,7 +64,7 @@ instruction family per file; the list below describes some of them, not every fi
   whose format differs from the instruction's, or is 0) and asserts the 52 words `check.py` expects, measured natively on a
   Radeon 680M; also the default `BUF_FMT_8_UNORM` byte, a format without an encoder staying `Unsupported`, and the
   store's data VGPRs counting as reads.
-- `test_buffer_formats_all.py` runs `buffer_load_format_xyzw` (through the V# and through tbuffer) and `buffer_store_format_xyzw` of the 33 formats
+- `test_buffer_formats_all.py` runs `buffer_load_format_xyzw` (through the V# and through tbuffer) and `buffer_store_format_xyzw` of the 45 formats
   the SCALED, SINT, 10_11_11 / 11_11_10 FLOAT, 2_10_10_10 and 10_10_10_2 families added, with edge values, NaN, infinity and denormals, against
   `tools/buffer_format_fuzz.py`'s model, which the Radeon 880M reproduced for 1.33 million validated elements (docs/buffer_formats.md). Two stores of
   older formats that differ from the hardware are pinned as expected failures.
@@ -157,6 +157,11 @@ instruction family per file; the list below describes some of them, not every fi
   `ds_read2st64_b32`) and runs 32 lanes in lockstep; the 16 words come from a byte-level LDS model of the ISA rules
   and match what an RTX 4070 SUPER (driver 610.88) wrote. Three SPIR-V sabotages (zero-extending `_i8`/`_i16`, no
   high-half shift for `_d16_hi`, `st64` offset in dwords) must change the result.
+- `test_ds_permute_eager.py` (SHADER-PERMUTE-EAGER) checks that `ds_permute_b32` stores both subgroup shuffles of each
+  source lane before a select reads them, in a wave32 and a wave64 compute shader and a pixel shader, with
+  `test_dpp_eager_subgroup.py`'s model of SPIRV-Cross's single-use forwarding; the module with the stores taken out
+  again has all 64 shuffles in a ternary's arm. It also runs the stored form against `test_ds_permute.py`'s ISA
+  model with EXEC narrowed, sources that are off and a collision.
 - `test_negative_controls.py` sabotages the translated SPIR-V text and requires the result to change.
 - `test_mutations.py` sabotages a temporary copy of `tools/` (13 regressions across SDWA, min3/max3, `v_bfe_i32`,
   `v_pk_fma_f16`, `v_fma_f16 op_sel`, `v_subrev_co_ci_u32`, `v_cmpx_eq_u64`, `v_mul_i32_i24`, `v_ffbh_i32`,
@@ -176,12 +181,24 @@ instruction family per file; the list below describes some of them, not every fi
   modifiers on `v_cvt_f32_ubyte*`/`u32`/`f16` and `v_rcp_iflag_f32`), found by `tools/f32_fuzz.py` (FUZZ-3), and
   tests the interpreter's float operations against GLSL.std.450 (signed zeros, undefined inputs, a single-rounding
   `Fma`).
+- `test_fma_fused_fixture.py` (TEST-FMA-FUSED-F16-RUNTIME) runs the GPU test `cs_fma_fused` in the interpreter with
+  the four operand words of its header and expects the header's eight words, and checks that every register one of
+  its multiply-adds reads comes from `s4..s7`: with three literal operands the f16 one was a compile-time constant,
+  which MoltenVK 1.4.2 gets wrong (`docs/testing.md`, Known problems).
+- `test_valu_div_fixup.py` runs hand-written `v_div_fixup_f32` listings through the translator and asserts the
+  pure-integer lowering's op order, classification constants and NaN priority (`NaN(S2)` above `NaN(S1)` above
+  `0/0`, read off the dataflow) on the emitted SPIR-V, then one word per measured rule through
+  `spirv_mini_interp` (TEST-545: it replaces a hand-written Python model of the fixup that never ran the
+  translator, so it passed whatever the translator did).
 - `test_fixtures.py` checks `tests/semantic/fixtures/disasm/*.s` equals what `regen_fixtures.py` makes from
   `runtime/test/shaders/*.asm` (`python tests/semantic/regen_fixtures.py` rewrites them).
 - `test_dpp_eager_subgroup.py` (SHADER-529) checks that no DPP ballot or shuffle is left where SPIRV-Cross
   (MoltenVK) would inline it into a short-circuiting `&&`/`||` or a ternary's arm, for 11 DPP16/DPP8 forms with
   and without a lane off in EXEC, using a model of SPIRV-Cross's single-use forwarding (its own tests cover the
   model). It also runs the same programs in `spirv_wave_interp.py` against a plain-Python DPP reference.
+- `test_wave_mask_eager.py` (SHADER-WAVEMASK-EAGER) does the same for the whole-wave mask gather: `v_mbcnt`,
+  `s_bcnt1` and `s_ff1` of a compare mask, of VCC and of EXEC, read while EXEC is narrowed, leave no subgroup op in
+  a ternary's arm, in a compute, a vertex and a pixel shader, and `v_mbcnt` counts the lanes that are off.
 
 Limits: single lane (or lanes in lockstep, one instruction per lane per round, that exchange values only through
 `OpGroupNonUniformShuffle`, `Ballot`, `Any`, `All` and `BitwiseOr` Reduce), control flow followed one branch at a time (the fragment-exit discard test, the compute

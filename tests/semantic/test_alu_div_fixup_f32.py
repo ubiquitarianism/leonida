@@ -155,6 +155,39 @@ class TestDivFixupF32(unittest.TestCase):
             with self.subTest(insn=insn, s0=hex(s0), s1=hex(s1), s2=hex(s2)):
                 self.assertEqual(got, want)
 
+    def test_neg_of_negative_operand(self):
+        # VOP3 neg flips the sign bit before classification (section 9), so -x of a negative x must give exactly
+        # the word MEASURED holds for the unmodified row with +x. The rows in section 9 negate only positive
+        # inputs, where an OR with the sign bit gives the same word as the flip; these negate negative ones.
+        # (insn, S0, S1, S2, the unmodified MEASURED row whose word they must reproduce)
+        rows = [
+            ("v_div_fixup_f32 v4, v1, -v2, v3", 0xBF400000, 0xC0000000, 0x40400000,
+             (0xBF400000, 0x40000000, 0x40400000)),   # -(-2.0) denominator: 0.75, not -0.75
+            ("v_div_fixup_f32 v4, v1, v2, -v3", 0xBF400000, 0x40000000, 0xC0400000,
+             (0xBF400000, 0x40000000, 0x40400000)),   # -(-3.0) numerator: 0.75, not -0.75
+            ("v_div_fixup_f32 v4, v1, -v2, v3", 0x3F800000, 0xFFC00011, 0x3F800000,
+             (0x3F800000, 0x7FC00011, 0x3F800000)),   # NaN S1 keeps the flipped sign
+            ("v_div_fixup_f32 v4, v1, v2, -v3", 0x3F800000, 0x3F800000, 0xFFC00022,
+             (0x3F800000, 0x3F800000, 0x7FC00022)),   # NaN S2 keeps the flipped sign
+        ]
+        plain = "v_div_fixup_f32 v4, v1, v2, v3"
+        measured = {(s0, s1, s2): want for insn, s0, s1, s2, want in MEASURED if insn == plain}
+        body = []
+        for k, (insn, s0, s1, s2, base) in enumerate(rows):
+            self.assertIn(base, measured)
+            body += [
+                f"v_mov_b32 v1, {s0:#x}",
+                f"v_mov_b32 v2, {s1:#x}",
+                f"v_mov_b32 v3, {s2:#x}",
+                "v_mov_b32 v4, 0xdeadbeef",
+                insn,
+                f"buffer_store_dword v4, off, s[0:3], 0 offset:{4 * k}",
+            ]
+        _, words = _run_body(body, len(rows))
+        for (insn, s0, s1, s2, base), got in zip(rows, words):
+            with self.subTest(insn=insn, s0=hex(s0), s1=hex(s1), s2=hex(s2)):
+                self.assertEqual(got, measured[base])
+
     def test_operand_forms_and_e64(self):
         body = [
             # SGPR S0, inline float S1/S2, _e64 spelling

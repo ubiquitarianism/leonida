@@ -138,6 +138,63 @@ CONCURRENT_TRACE = (checker.SPARSE_FLAGS + ")\n"
                     "    pQueueFamilyIndices[1]: const uint32_t = 1\n") * 6
 
 
+def make_queue_trace(pdev: str, families: list[tuple[int, int, tuple[int, int, int]]],
+                     created_families: int, buffers: str, *, graphics_family: int = 0) -> str:
+    entries = []
+    for i, (flags, count, (w, h, d)) in enumerate(families):
+        entries.append(
+            f"        pQueueFamilyProperties[{i}]: VkQueueFamilyProperties = 0x{i:x}:\n"
+            f"            queueFlags: VkQueueFlags = {flags}\n"
+            f"            queueCount: uint32_t = {count}\n"
+            f"            minImageTransferGranularity: VkExtent3D = 0:\n"
+            f"                width: uint32_t = {w}\n"
+            f"                height: uint32_t = {h}\n"
+            f"                depth: uint32_t = {d}\n"
+        )
+    return (
+        "vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, pQueueFamilyProperties) returns void:\n"
+        "<before calling into implementation>\n"
+        f"    physicalDevice: VkPhysicalDevice = {pdev}\n"
+        "<after returning from implementation>\n"
+        f"    physicalDevice: VkPhysicalDevice = {pdev}\n"
+        f"    pQueueFamilyPropertyCount: uint32_t* = {len(families)}\n"
+        + "".join(entries)
+        + "vkCreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice) returns VkResult:\n"
+        "<before calling into implementation>\n"
+        f"    physicalDevice: VkPhysicalDevice = {pdev}\n"
+        f"        queueCreateInfoCount: uint32_t = {created_families}\n"
+        "            pQueueCreateInfos[0]: const VkDeviceQueueCreateInfo = 0x1:\n"
+        f"                queueFamilyIndex: uint32_t = {graphics_family}\n"
+        + buffers
+    )
+
+
+SINGLE_FAMILY_TRACE = make_queue_trace(
+    "000002C74B774620",
+    [(15, 1, (1, 1, 1)), (32, 2, (1, 1, 1))],  # graphics+compute+transfer+sparse, plus video-decode only
+    created_families=1,
+    buffers=EXCLUSIVE_TRACE,
+)
+NO_ASYNC_SPARSE_TRACE = make_queue_trace(
+    "000002C74B774620",
+    [(15, 1, (1, 1, 1)), (6, 2, (1, 1, 1)), (4, 1, (1, 1, 1))],  # async compute & copy lack SPARSE_BINDING_BIT (8)
+    created_families=1,
+    buffers=EXCLUSIVE_TRACE,
+)
+MULTI_FAMILY_DROPPED_TRACE = make_queue_trace(
+    "000001C77C556640",
+    [(15, 16, (1, 1, 1)), (12, 2, (1, 1, 1)), (14, 8, (1, 1, 1))],
+    created_families=1,
+    buffers=EXCLUSIVE_TRACE,
+)
+MULTI_FAMILY_OK_TRACE = make_queue_trace(
+    "000001C77C556640",
+    [(15, 16, (1, 1, 1)), (12, 2, (1, 1, 1)), (14, 8, (1, 1, 1))],
+    created_families=3,
+    buffers=CONCURRENT_TRACE,
+)
+
+
 class TraceTest(unittest.TestCase):
     def check(self, text):
         with tempfile.TemporaryDirectory() as td:
@@ -220,6 +277,166 @@ class MainTest(unittest.TestCase):
             self.run_main(fake_run)
         self.assertEqual(len(calls), 2)
         self.assertEqual([c.get("VK_INSTANCE_LAYERS") for c in calls], ["VK_LAYER_LUNARG_api_dump", None])
+
+    def run_main_with_trace(self, trace: str, *, extra_argv: list[str] | None = None,
+                            validation_out: str = PASS_OUT) -> int:
+        def fake_run(argv, cwd, env, **kwargs):
+            if env.get("VK_INSTANCE_LAYERS") == "VK_LAYER_LUNARG_api_dump":
+                (Path(cwd) / "sparse_create_info.log").write_text(trace, encoding="utf-8")
+                return Completed(0, PASS_OUT)
+            return Completed(0, validation_out)
+
+        with tempfile.TemporaryDirectory() as td:
+            exe = Path(td) / "t.exe"
+            exe.write_bytes(b"")
+            with mock.patch.object(checker.subprocess, "run", side_effect=fake_run), \
+                 mock.patch.object(sys, "argv", ["check", str(exe), *(extra_argv or [])]), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                return checker.main()
+
+    def test_single_sparse_family_device_skips_with_77(self) -> None:
+        self.assertEqual(self.run_main_with_trace(SINGLE_FAMILY_TRACE), 77)
+        self.assertEqual(self.run_main_with_trace(NO_ASYNC_SPARSE_TRACE), 77)
+
+    def test_single_sparse_family_baseline_mode_skips_with_77(self) -> None:
+        self.assertEqual(self.run_main_with_trace(SINGLE_FAMILY_TRACE, extra_argv=["--expect-baseline-exclusive"]), 77)
+
+    def test_multi_sparse_family_device_creating_one_family_still_fails(self) -> None:
+        with self.assertRaises(AssertionError):
+            self.run_main_with_trace(MULTI_FAMILY_DROPPED_TRACE)
+
+    def test_single_family_device_with_concurrent_buffers_fails(self) -> None:
+        bad = make_queue_trace("000002C74B774620", [(15, 1, (1, 1, 1))], created_families=1, buffers=CONCURRENT_TRACE)
+        with self.assertRaises(AssertionError):
+            self.run_main_with_trace(bad)
+
+    def test_single_family_device_validation_error_still_fails(self) -> None:
+        with self.assertRaises(AssertionError):
+            self.run_main_with_trace(
+                SINGLE_FAMILY_TRACE,
+                validation_out=PASS_OUT + "Validation Error: [ VUID-vkCmdDraw-None-02699 ] synthetic\n",
+            )
+
+    def test_multi_family_device_passes_concurrent_contract(self) -> None:
+        self.assertEqual(self.run_main_with_trace(MULTI_FAMILY_OK_TRACE), 0)
+
+    def test_non_sparse_async_compute_ahead_of_sparse_compute_skips_with_77(self) -> None:
+        # Mirrors queue_families.h: pick_queue_families chooses the first async compute family ([1]) and
+        # sparse_capable_queue_families falls back to graphics ([0]) when [1] lacks SPARSE_BINDING_BIT.
+        trace = make_queue_trace(
+            "000002C74B774620",
+            [(15, 1, (1, 1, 1)), (6, 2, (1, 1, 1)), (14, 2, (1, 1, 1))],
+            created_families=1,
+            buffers=EXCLUSIVE_TRACE,
+        )
+        self.assertEqual(self.run_main_with_trace(trace), 77)
+        # Zero-count non-sparse compute is skipped by pick_queue_families, so [2] is selected and 1 family must fail.
+        zero_count = make_queue_trace(
+            "000002C74B774620",
+            [(15, 1, (1, 1, 1)), (6, 0, (1, 1, 1)), (14, 2, (1, 1, 1))],
+            created_families=1,
+            buffers=EXCLUSIVE_TRACE,
+        )
+        with self.assertRaises(AssertionError):
+            self.run_main_with_trace(zero_count)
+
+    def test_non_sparse_dma_ahead_of_sparse_dma_skips_with_77(self) -> None:
+        # Mirrors queue_families.h: pick_queue_families chooses the first fine-grained DMA family ([1]) and
+        # sparse_capable_queue_families falls back to graphics ([0]) when [1] lacks SPARSE_BINDING_BIT.
+        trace = make_queue_trace(
+            "000002C74B774620",
+            [(15, 1, (1, 1, 1)), (4, 1, (1, 1, 1)), (12, 1, (1, 1, 1))],
+            created_families=1,
+            buffers=EXCLUSIVE_TRACE,
+        )
+        self.assertEqual(self.run_main_with_trace(trace), 77)
+        # Coarse-grained non-sparse DMA ([1]) is not chosen, so fine-grained sparse DMA ([2]) is picked -> must fail.
+        coarse_first = make_queue_trace(
+            "000002C74B774620",
+            [(15, 1, (1, 1, 1)), (4, 1, (2, 2, 1)), (12, 1, (1, 1, 1))],
+            created_families=1,
+            buffers=EXCLUSIVE_TRACE,
+        )
+        with self.assertRaises(AssertionError):
+            self.run_main_with_trace(coarse_first)
+        # Non-sparse compute ([1]) + fine-grained sparse DMA ([2]) still leaves copy=[2] -> must fail.
+        mixed = make_queue_trace(
+            "000002C74B774620",
+            [(15, 1, (1, 1, 1)), (6, 2, (1, 1, 1)), (12, 1, (1, 1, 1))],
+            created_families=1,
+            buffers=EXCLUSIVE_TRACE,
+        )
+        with self.assertRaises(AssertionError):
+            self.run_main_with_trace(mixed)
+
+    def test_incomplete_queue_family_dump_fails(self) -> None:
+        two_family = make_queue_trace(
+            "000002C74B774620",
+            [(15, 1, (1, 1, 1)), (14, 2, (1, 1, 1))],
+            created_families=1,
+            buffers=EXCLUSIVE_TRACE,
+        )
+        head, tail = two_family.split("        pQueueFamilyProperties[1]:", 1)
+        tail_entry, rest = tail.split("vkCreateDevice(", 1)
+        count_query = (
+            "vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pQueueFamilyPropertyCount, pQueueFamilyProperties) returns void:\n"
+            "<before calling into implementation>\n"
+            "    physicalDevice: VkPhysicalDevice = 000002C74B774620\n"
+            "<after returning from implementation>\n"
+            "    physicalDevice: VkPhysicalDevice = 000002C74B774620\n"
+            "    pQueueFamilyPropertyCount: uint32_t* = 2\n"
+            "    pQueueFamilyProperties: VkQueueFamilyProperties* = NULL\n"
+        )
+        one_family_trace = make_queue_trace(
+            "000002C74B774620",
+            [(15, 1, (1, 1, 1))],
+            created_families=1,
+            buffers=EXCLUSIVE_TRACE,
+        )
+        broken = {
+            "missing extent fields on entry 1": (
+                head + "        pQueueFamilyProperties[1]:"
+                + tail_entry.split("            minImageTransferGranularity:", 1)[0]
+                + "vkCreateDevice(" + rest
+            ),
+            "entry 1 dropped while count=2": head + "vkCreateDevice(" + rest,
+            "duplicate index 0 instead of 1": two_family.replace("pQueueFamilyProperties[1]:", "pQueueFamilyProperties[0]:", 1),
+            "out-of-range index 2": two_family.replace("pQueueFamilyProperties[1]:", "pQueueFamilyProperties[2]:", 1),
+            "missing pQueueFamilyPropertyCount": SINGLE_FAMILY_TRACE.replace(
+                "    pQueueFamilyPropertyCount: uint32_t* = 2\n", "", 1
+            ),
+            "partial dump smaller than count query": count_query + one_family_trace,
+        }
+        for name, trace in broken.items():
+            with self.subTest(name), self.assertRaises(AssertionError):
+                self.run_main_with_trace(trace)
+
+    def test_main_accepts_argv_writes_lf_settings_reads_bom_and_handles_oserror(self) -> None:
+        settings_bytes = []
+
+        def fake_run(argv, cwd, env, **kwargs):
+            settings_bytes.append((Path(cwd) / "vk_layer_settings.txt").read_bytes())
+            if env.get("VK_INSTANCE_LAYERS") == "VK_LAYER_LUNARG_api_dump":
+                # Emit sorted trace with UTF-8 BOM on disk.
+                (Path(cwd) / "sparse_create_info.log.0").write_bytes(
+                    b"\xef\xbb\xbf" + MULTI_FAMILY_OK_TRACE.encode("utf-8")
+                )
+                return Completed(0, PASS_OUT)
+            return Completed(0, PASS_OUT)
+
+        with tempfile.TemporaryDirectory() as td:
+            exe = Path(td) / "t.exe"
+            exe.write_bytes(b"")
+            with mock.patch.object(checker.subprocess, "run", side_effect=fake_run), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = checker.main([str(exe)])
+        self.assertEqual(rc, 0)
+        self.assertTrue(settings_bytes)
+        self.assertNotIn(b"\r\n", settings_bytes[0])
+
+        with self.assertRaises(AssertionError):
+            with mock.patch.object(checker.subprocess, "run", side_effect=FileNotFoundError("no binary")):
+                checker.run_pass(Path("missing.exe"), {}, Path("."))
 
 
 if __name__ == "__main__":

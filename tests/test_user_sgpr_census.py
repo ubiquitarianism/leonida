@@ -28,6 +28,7 @@ INDEX = {
     "d.cs": {"stage": "cs", "user_sgpr_reads": reads((4, "ptr32_lo"), (5, "const32"))},
     "e.gs": {"stage": "gs", "user_sgpr_reads": reads((2, "const32"), (8, "ptr64_lo"), (9, "ptr64_hi"))},
     "f.vs": {"stage": "vs", "user_sgpr_reads": []},
+    "g.ms": {"stage": "ms", "user_sgpr_reads": reads((16, "ptr32_lo"), (17, "const32"))},
 }
 
 
@@ -40,6 +41,8 @@ def test_lowest_pointer_per_stage():
     assert s["cs"]["most_common_lowest_pointer_sgpr"] == 4
     assert s["gs"]["lowest_pointer_kind"] == {"ptr64_lo": 1}
     assert s["vs"]["most_common_lowest_pointer_sgpr"] is None
+    assert s["ms"]["most_common_lowest_pointer_sgpr"] == 16
+    assert s["ms"]["lowest_pointer_kind"] == {"ptr32_lo": 1}
 
 
 def test_tie_most_common_prefers_smaller_sgpr_regardless_of_insertion_order(tmp_path, capsys):
@@ -122,15 +125,19 @@ def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
 
     # same_report_path resolves each path once and calls the private helpers since #6268, so a case-folded volume is
     # simulated by patching those: the public path_key / same_name_on_folding_volume are no longer on its path.
+    # realpath is patched too: on Windows it returns an existing file's name as stored, so INDEX.JSON would resolve to
+    # index.json and match before the probe is asked (as in tests/test_wave64_graphics_scan.py).
     probe = mock.Mock(return_value=True)
+    folding = output_kind == "folding-volume-case"
     ctx = (mock.patch.multiple(report_paths, _resolved_key=mock.Mock(side_effect=str),
                                _same_resolved_name=probe)
-           if output_kind == "folding-volume-case" else contextlib.nullcontext())
+           if folding else contextlib.nullcontext())
     with ctx, (mock.patch.object(os.path, "samefile", side_effect=OSError("not same"))
-               if output_kind == "folding-volume-case" else contextlib.nullcontext()):
+               if folding else contextlib.nullcontext()),             (mock.patch.object(report_paths.os.path, "realpath", side_effect=os.path.abspath)
+             if folding else contextlib.nullcontext()):
         with pytest.raises(SystemExit) as exc:
             usc.main([str(index), "--json", str(output)])
-    if output_kind == "folding-volume-case":
+    if folding:
         probe.assert_called_once()
 
     assert exc.value.code == 2
@@ -151,7 +158,7 @@ def test_json_report_accepts_a_separate_output(tmp_path):
 def test_expect_passes_and_fails(tmp_path, capsys):
     p = tmp_path / "index.json"
     p.write_text(json.dumps(INDEX), encoding="utf-8")
-    assert usc.main([str(p), "--expect", "ps=8", "cs=4"]) == 0
+    assert usc.main([str(p), "--expect", "ps=8", "cs=4", "ms=16"]) == 0
     assert usc.main([str(p), "--expect", "ps=0"]) == 1
     assert "expected s0, got s8" in capsys.readouterr().err
 
@@ -317,6 +324,9 @@ def test_technique_names():
     assert usc.technique("PS_Water", "ps") == "Water"
     assert usc.technique("!VS_Water_0123abcd_Wrapped", "ps") is None   # the token must match the stage
     assert usc.technique("standard_0123abcd_Wrapped", "vs") is None
+    assert usc.technique("MS_Terrain", "ms") == "Terrain"
+    assert usc.technique("!MS_Terrain_0123abcd_Wrapped", "ms") == "Terrain"
+    assert usc.technique("!MS_Terrain_0123abcd_Wrapped", "vs") is None
 
 
 def root_block(params, stage, omit_invisible):
@@ -396,3 +406,25 @@ def test_pairs_cli_writes_the_report_and_no_names():
         assert "VS/PS pairs: 1 techniques with both stages" in result.stdout
         assert "Fog" not in result.stdout
         assert json.loads(report.read_text(encoding="utf-8"))["vs_ps_pairs"]["shared_different_kind"] == 0
+
+
+def test_mesh_shader_pair_census_and_cli(tmp_path, capsys):
+    index = {
+        "!MS_Terrain_0123abcd_Wrapped": {"stage": "ms", "user_sgpr_reads": reads((16, "ptr32_lo"), (17, "const32"))},
+        "#PS_Terrain_89abcdef_Wrapped": {"stage": "ps", "user_sgpr_reads": reads((8, "ptr32_lo"), (16, "ptr32_lo"), (17, "const32"))},
+    }
+    pc = usc.pair_census(index, stages=("ms", "ps"))
+    assert pc["techniques_with_ms_and_ps"] == 1
+    assert pc["combinations"] == 1
+    assert pc["shared_same_kind"] == 2
+    assert pc["shared_different_kind"] == 0
+
+    p = tmp_path / "index.json"
+    p.write_text(json.dumps(index), encoding="utf-8")
+    rep = tmp_path / "report.json"
+    assert usc.main([str(p), "--pairs", "--json", str(rep)]) == 0
+    out = capsys.readouterr().out
+    assert "MS/PS pairs: 1 techniques with both stages" in out
+    data = json.loads(rep.read_text(encoding="utf-8"))
+    assert "ms_ps_pairs" in data
+    assert data["ms_ps_pairs"]["techniques_with_ms_and_ps"] == 1

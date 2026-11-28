@@ -4,6 +4,7 @@
 #include "../src/active_input.h"
 
 #include <cstdio>
+#include <limits>
 #include <iterator>
 #include <string_view>
 
@@ -201,6 +202,41 @@ int test_forced() {
     return 0;
 }
 
+int test_out_of_order_timestamp_and_non_finite_axes() {
+    ActiveInputTracker t(InputFamily::Xbox);
+    EXPECT(t.observe(1, InputFamily::PlayStation5, InputSample{}, 1000000) == InputEdge::None);
+    EXPECT(t.observe(2, InputFamily::Keyboard, InputSample{}, 1000000) == InputEdge::None);
+
+    InputSample press;
+    press.buttons = 1;
+    EXPECT(t.observe(1, InputFamily::PlayStation5, press, 2000000) == InputEdge::Button);
+    EXPECT(t.active() == InputFamily::PlayStation5 && t.generation() == 1);
+
+    // An earlier timestamp must not underflow (time_us - changed_at_) and bypass min_switch_us.
+    EXPECT(t.observe(2, InputFamily::Keyboard, press, 1999000) == InputEdge::None);
+    EXPECT(t.active() == InputFamily::PlayStation5 && t.generation() == 1);
+
+    // Non-finite stick/trigger samples (NaN baseline or Inf deflection) must not trigger a family switch.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    ActiveInputTracker t2(InputFamily::Xbox);
+    InputSample nan_stick;
+    nan_stick.left_x = nan;
+    EXPECT(t2.observe(3, InputFamily::PlayStation5, nan_stick, 1000000) == InputEdge::None);
+    InputSample deflected;
+    deflected.left_x = 0.9f;
+    EXPECT(t2.observe(3, InputFamily::PlayStation5, deflected, 2000000) == InputEdge::None);
+    EXPECT(t2.active() == InputFamily::Xbox && t2.generation() == 0);
+
+    ActiveInputTracker t3(InputFamily::Xbox);
+    EXPECT(t3.observe(4, InputFamily::PlayStation5, InputSample{}, 1000000) == InputEdge::None);
+    InputSample inf_trig;
+    inf_trig.left_trigger = inf;
+    EXPECT(t3.observe(4, InputFamily::PlayStation5, inf_trig, 2000000) == InputEdge::None);
+    EXPECT(t3.active() == InputFamily::Xbox && t3.generation() == 0);
+    return 0;
+}
+
 int test_names() {
     EXPECT(std::string_view(input_family_name(InputFamily::PlayStation5)) == "PlayStation 5");
     EXPECT(std::string_view(input_family_name(InputFamily::Keyboard)) == "keyboard and mouse");
@@ -222,6 +258,7 @@ int main() {
         {"one family, held input", test_same_family_and_holds},
         {"reconnect", test_reconnect},
         {"forced family", test_forced},
+        {"out-of-order timestamp and non-finite axes", test_out_of_order_timestamp_and_non_finite_axes},
         {"names", test_names},
     };
     int failures = 0;

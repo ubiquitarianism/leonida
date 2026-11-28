@@ -22,14 +22,17 @@ import json
 import os
 import struct
 import sys
+import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing sibling helpers.
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
+from file_mode import published_mode  # noqa: E402
 import gamedata_index as gi  # noqa: E402
 import gamedata_maps as gm  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 HEADER_BYTES = 40
@@ -400,13 +403,15 @@ def parse_qtable(blob: bytes, *, root_hash: int | None = None, type_hash: int | 
         matching_arrays = [r for r in records if r["kind"] == "array" and r["element_type_hash"] == type_hash]
         matching_structs = [r for r in records if r["kind"] == "struct" and r["struct_type_hash"] == type_hash]
         owner_roots = {tree_owner[r["index"]] for r in matching_arrays + matching_structs if tree_owner[r["index"]] >= 0}
+        tq_strides = Counter(r["stride"] for r in matching_arrays)
+        tq_sizes = Counter(r["bytes"] for r in matching_structs)
         result["type_query"] = {
             "hash": f"{type_hash:#010x}",
             "array_matches": len(matching_arrays),
             "struct_matches": len(matching_structs),
             "distinct_trees": len(owner_roots),
-            "array_strides": dict(sorted(Counter(str(r["stride"]) for r in matching_arrays).items())),
-            "struct_sizes": dict(sorted(Counter(str(r["bytes"]) for r in matching_structs).items())),
+            "array_strides": {str(k): tq_strides[k] for k in sorted(tq_strides)},
+            "struct_sizes": {str(k): tq_sizes[k] for k in sorted(tq_sizes)},
         }
 
     return result
@@ -465,20 +470,30 @@ def _join_qtable_from_source(source) -> tuple[bytes, dict]:
 
 
 class _BinFolderSource:
-    """Minimal sorted *.bin reader when a test/carve directory has no index.json."""
+    """Minimal offset-ordered *.bin reader when a test/carve directory has no index.json."""
 
     def __init__(self, directory: str):
-        names = sorted(n for n in os.listdir(directory) if n.lower().endswith(".bin"))
         self.directory = directory
-        self.rows = []
-        for idx, name in enumerate(names):
+        hex_rows = []
+        other_rows = []
+        for name in sorted(os.listdir(directory)):
+            if not name.lower().endswith(".bin"):
+                continue
             full = os.path.join(directory, name)
+            if not os.path.isfile(full):
+                continue
             sz = os.path.getsize(full)
-            try:
-                off = int(os.path.splitext(name)[0], 16)
-            except ValueError:
-                off = idx * 0x10000
-            self.rows.append({"off": off, "stored": sz, "size": sz, "_name": name})
+            stem = os.path.splitext(name)[0]
+            if stem and all(c in "0123456789abcdefABCDEF" for c in stem):
+                hex_rows.append((int(stem, 16), name, sz))
+            else:
+                other_rows.append((name, sz))
+        hex_rows.sort(key=lambda item: (item[0], item[1]))
+        next_off = (hex_rows[-1][0] + 0x10000) if hex_rows else 0
+        self.rows = [{"off": off, "stored": sz, "size": sz, "_name": name} for off, name, sz in hex_rows]
+        for name, sz in other_rows:
+            self.rows.append({"off": next_off, "stored": sz, "size": sz, "_name": name})
+            next_off += 0x10000
 
     def read(self, row: dict) -> bytes:
         with open(os.path.join(self.directory, row["_name"]), "rb") as f:
@@ -521,6 +536,10 @@ def load_qtable_payload(target: str) -> tuple[bytes, dict]:
 
 def check_report_path(out_path: str, target: str, rows: list[dict] | None = None) -> None:
     """Refuse a --json destination that is a directory or collides with any input."""
+    if not out_path.strip():
+        raise UsageError("--json path must not be empty")
+    if out_path.endswith(("/", "\\")) or (os.sep and out_path.endswith(os.sep)):
+        raise UsageError(f"--json is a directory path: {out_path}")
     if os.path.isdir(out_path):
         raise UsageError(f"--json is a directory: {out_path}")
     if os.path.isdir(target):
@@ -533,7 +552,8 @@ def check_report_path(out_path: str, target: str, rows: list[dict] | None = None
             raise UsageError(f"--json would overwrite the input {target}")
         else:
             for name in os.listdir(target):
-                if name.lower().endswith(".bin") and same_report_path(out_path, os.path.join(target, name)):
+                full = os.path.join(target, name)
+                if name.lower().endswith(".bin") and os.path.isfile(full) and same_report_path(out_path, full):
                     raise UsageError(f"--json would overwrite the input {name}")
     elif same_report_path(out_path, target):
         raise UsageError(f"--json would overwrite the input {target}")
@@ -575,6 +595,36 @@ def _print_summary(report: dict) -> None:
         )
 
 
+def _write_json_atomic(path: str, payload: dict) -> None:
+    dest = os.path.realpath(path)
+    parent = os.path.dirname(dest) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".tmp-", suffix=".json")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f, indent=1)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, published_mode(dest))
+        replace_retry(tmp, dest)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="carved script directory, script.rpf archive, or joined .bin file")
@@ -586,7 +636,7 @@ def main(argv=None) -> int:
     try:
         root_h = _parse_hex_u32(a.root_hash) if a.root_hash is not None else None
         type_h = _parse_hex_u32(a.type_hash) if a.type_hash is not None else None
-        if a.json:
+        if a.json is not None:
             rows = gm._read_index_rows(a.target) if os.path.isdir(a.target) and os.path.isfile(os.path.join(a.target, "index.json")) else None
             check_report_path(a.json, a.target, rows=rows)
         blob, meta = load_qtable_payload(a.target)
@@ -607,11 +657,9 @@ def main(argv=None) -> int:
     out = {"location": meta, **report}
     _print_summary(out)
 
-    if a.json:
+    if a.json is not None:
         try:
-            gm._make_parent(a.json)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(out, f, indent=1)
+            _write_json_atomic(a.json, out)
         except OSError as e:
             print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2

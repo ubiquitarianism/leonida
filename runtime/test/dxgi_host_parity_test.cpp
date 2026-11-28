@@ -7,9 +7,11 @@
 // output is S_OK with a null output; on ResizeBuffers NONPREROTATED, FULLSCREEN_VIDEO and every bit from 0x4000 up are
 // DXGI_ERROR_INVALID_CALL, and FOREGROUND_LAYER, YUV_VIDEO and 0x2000 on a chain created without them E_INVALIDARG;
 // a null out-pointer is DXGI_ERROR_INVALID_CALL on GetBuffer, GetHwnd, GetLastPresentCount and GetRestrictToOutput.
-// Exits 77 without an interactive window station, a Vulkan device or a host D3D12 device.
+// Exits 77 without an interactive window station, a Vulkan device or a host D3D12 device, and under Wine, whose DXGI
+// is not that reference (host_wine.h; its wined3d faults on the null GetBuffer out-pointer).
 #include "vk_test_device.h"
 #include "host_adapter.h"
+#include "host_wine.h"
 #include "window_station.h"
 #include "../shims/d3d12_com.h"
 
@@ -226,6 +228,7 @@ int main() {
         std::printf("SKIP: the process has no interactive window station\n");
         return 77;
     }
+    if (hostwine::host_is_wine()) return 77;  // every row is compared with the host
     vktest::Device vk;
     if (!vk.create(true)) {
         std::printf("SKIP: no Vulkan device\n");

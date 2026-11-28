@@ -1,8 +1,9 @@
 // Exercise checkpoint replacement and real filesystem errors without a Vulkan device.
-#include "pipeline_cache_file.h"
+#include "../src/pipeline_cache_file.h"
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -10,6 +11,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include "../shims/d3d12_pipeline_checkpoint.h"
 #else
 #include <csignal>
 #include <sys/resource.h>
@@ -44,7 +46,40 @@ static int test_checkpoint(const fs::path& dir) {
     CHECK(write_pipeline_cache_file(directory, "next", 4));
     CHECK(fs::is_directory(directory));
 
+    // Guard against empty path and null buffer with positive size
+    CHECK(write_pipeline_cache_file("", "data", 4) == std::make_error_code(std::errc::invalid_argument));
+    CHECK(write_pipeline_cache_file(cache, nullptr, 16) == std::make_error_code(std::errc::invalid_argument));
+    // Zero size with null pointer safely succeeds and writes empty file
+    const auto empty_file = dir / "empty.bin";
+    CHECK(!write_pipeline_cache_file(empty_file, nullptr, 0));
+    CHECK(contents(empty_file).empty());
+    fs::remove(empty_file);
+
 #ifdef _WIN32
+    {
+        using namespace rt::d3d12;
+        CHECK(cache_temp_suffix(L"123.0") && !cache_temp_suffix(L".2") && !cache_temp_suffix(L"1.2.3"));
+        CacheStagingFile next(cache, 128);
+        CHECK(next.data);
+        std::memcpy(next.data, "short", 5);
+        CHECK(next.publish(cache, 5) && contents(cache) == "short");
+        { CacheStagingFile aborted(cache, 16); CHECK(aborted.data); }
+        CHECK(contents(cache) == "short");
+        CHECK(!write_pipeline_cache_file(cache, saved.data(), saved.size()));
+        const auto orphan = dir / "cache.bin.tmp.140.0", fresh = dir / "cache.bin.tmp.141.0";
+        const auto held = dir / "cache.bin.tmp.142.0";
+        for (const auto& path : {orphan, fresh, held}) std::ofstream(path) << "partial";
+        auto old = fs::file_time_type::clock::now() - std::chrono::hours(1);
+        fs::last_write_time(orphan, old);
+        fs::last_write_time(held, old);
+        HANDLE live = CreateFileW(held.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        CHECK(live != INVALID_HANDLE_VALUE);
+        clean_stale_cache_files(cache);
+        CHECK(!fs::exists(orphan) && fs::exists(fresh) && fs::exists(held) && contents(cache) == saved);
+        CloseHandle(live);
+        fs::remove(fresh);
+        fs::remove(held);
+    }
     // A reader that did not share DELETE access prevents replacement.
     HANDLE held = CreateFileW(cache.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);

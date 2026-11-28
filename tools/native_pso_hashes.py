@@ -16,6 +16,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode
 from shader_carve import parts
 
 HEADER = "# native_pso_hashes 1"
@@ -45,7 +46,7 @@ def build(dxbc: str, spirv: str) -> dict:
     workspace = os.path.dirname(os.path.realpath(spirv))
     if os.path.commonpath((workspace, os.path.realpath(dxbc))) != workspace:
         raise ValueError("the carved folder must be inside the same shader workspace as the translation")
-    with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+    with open(os.path.join(spirv, "index.json"), encoding="utf-8-sig") as f:
         index = json.load(f)
     if not isinstance(index, dict):
         raise ValueError("index.json is not an object")
@@ -88,14 +89,22 @@ def write(spirv: str, table: dict) -> str:
             for key in sorted(table):
                 stage, path = table[key]
                 tmp.write(f"{key}\t{stage}\t{path}\n")
+        os.chmod(tmp.name, published_mode(out))
         os.replace(tmp.name, out)
     finally:
         if os.path.exists(tmp.name):
+            try:
+                os.chmod(tmp.name, 0o600)
+            except OSError:
+                pass
             os.unlink(tmp.name)
     return out
 
 
 def main(argv) -> int:
+    if argv[1:] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
     if len(argv) != 3:
         print(__doc__.strip().splitlines()[0], file=sys.stderr)
         print("usage: native_pso_hashes.py <dxbc dir> <spirv dir>", file=sys.stderr)
@@ -112,4 +121,8 @@ def main(argv) -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main(sys.argv))

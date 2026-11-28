@@ -37,12 +37,13 @@ struct Depth24Bias {
     int constant = 0;     // D3D12_RASTERIZER_DESC::DepthBias
     float slope = 0.0f;   // SlopeScaledDepthBias
     float clamp = 0.0f;   // DepthBiasClamp: > 0 caps the bias, < 0 floors it, 0 leaves it
+    float levels = 16777215.0f;
     bool any() const { return constant != 0 || slope != 0.0f; }
 };
 
 // D3D's constant term in float: (float)DepthBias * r, with r the float nearest 1 / (2^24 - 1).
-inline float depth24_bias_constant(int bias) {
-    return float(bias) * float(1.0 / 16777215.0);
+inline float depth24_bias_constant(int bias, float levels=16777215.0f) {
+    return float(bias) * float(1.0 / double(levels));
 }
 
 namespace spirv24 {
@@ -54,7 +55,8 @@ enum : std::uint32_t {
     op_function = 54, op_function_end = 56, op_variable = 59, op_load = 61, op_store = 62, op_decorate = 71,
     op_composite_extract = 81, op_convert_f_to_u = 109, op_convert_u_to_f = 112, op_bitcast = 124, op_i_add = 128,
     op_f_add = 129, op_i_sub = 130, op_f_mul = 133, op_select = 169, op_i_equal = 170, op_u_greater_than = 172,
-    op_u_greater_than_equal = 174, op_shift_left_logical = 196, op_dpdx = 207, op_dpdy = 208, op_label = 248,
+    op_u_greater_than_equal = 174, op_shift_right_logical = 194, op_shift_left_logical = 196, op_dpdx = 207,
+    op_dpdy = 208, op_label = 248,
     op_return = 253, op_no_line = 317, op_execution_mode_id = 331,
 };
 enum : std::uint32_t { storage_input = 1, storage_output = 3 };
@@ -141,7 +143,7 @@ private:
 // The edit, on a parsed module. Globals are collected first and spliced in at their section's end.
 class Patch {
 public:
-    Patch(Module& m, std::uint32_t entry) : m_(m), entry_(entry) {
+    Patch(Module& m, std::uint32_t entry, float levels) : m_(m), entry_(entry), levels_(levels) {
         // Copies: apply() moves the module's instructions while the code at returns still looks types up.
         for (const Inst& i : m.insts()) {
             if (opcode(i) == op_function) break;
@@ -181,12 +183,18 @@ public:
         constants_.push_back({t, value, id});
         return id;
     }
+    bool is_depth16() const { return levels_ == 65535.0f; }
+
     // Declares what quantise() uses, so it can run inside apply() (at returns) without adding globals.
     void prime_quantise() {
         t_bool();
         glsl();
-        for (float f : {16777215.0f, 0.0f}) f32(f);
-        for (std::uint32_t u : {0x3f800000u, 0xffffffu, 0x7f800000u, 0u, 23u, 1u, 80u}) u32(u);
+        for (float f : {levels_, 0.0f}) f32(f);
+        if (is_depth16()) {
+            for (std::uint32_t u : {0x3f800000u, 0xffffu, 0x7f800000u, 0u, 15u, 8u, 128u, 88u, 23u}) u32(u);
+        } else {
+            for (std::uint32_t u : {0x3f800000u, 0xffffffu, 0x7f800000u, 0u, 23u, 1u, 80u}) u32(u);
+        }
     }
     std::uint32_t f32(float f) { return constant(t_float(), bits(f)); }
     std::uint32_t u32(std::uint32_t u) { return constant(t_uint(), u); }
@@ -244,28 +252,49 @@ public:
         return id;
     }
 
-    // depth24_to_float(depth24_from_bits(z)) of depth24_convert.comp, branch-free.
+    // Quantise z to D24 (levels_ == 16777215.0f) or D16 (levels_ == 65535.0f) and reconstruct the nearest float
+    // to d / levels_ without floating-point division (SPIR-V OpFDiv only guarantees 2.5 ULP), branch-free.
     std::uint32_t quantise(std::vector<Inst>& code, std::uint32_t z) {
         const std::uint32_t tf = t_float(), tu = t_uint(), tb = t_bool();
+        const std::uint32_t max_code = is_depth16() ? 0xffffu : 0xffffffu;
         const std::uint32_t b = emit(code, op_bitcast, tu, {z});
-        const std::uint32_t product = emit(code, op_f_mul, tf, {z, f32(16777215.0f)});
+        const std::uint32_t product = emit(code, op_f_mul, tf, {z, f32(levels_)});
         const std::uint32_t rounded = ext(code, tf, glsl_round_even, {product});
         // Clamped before the conversion so an out-of-range float never reaches OpConvertFToU (undefined there).
         const std::uint32_t safe = ext(code, tf, glsl_fmin, {ext(code, tf, glsl_fmax, {rounded, f32(0.0f)}),
-                                                            f32(16777215.0f)});
+                                                            f32(levels_)});
         const std::uint32_t code_mid = emit(code, op_convert_f_to_u, tu, {safe});
         const std::uint32_t at_least_one = emit(code, op_u_greater_than_equal, tb, {b, u32(0x3f800000u)});
-        const std::uint32_t code_hi = emit(code, op_select, tu, {at_least_one, u32(0xffffffu), code_mid});
+        const std::uint32_t code_hi = emit(code, op_select, tu, {at_least_one, u32(max_code), code_mid});
         const std::uint32_t negative_or_nan = emit(code, op_u_greater_than, tb, {b, u32(0x7f800000u)});
         const std::uint32_t d = emit(code, op_select, tu, {negative_or_nan, u32(0), code_hi});
-        // float(m + 1) * 2^(e - 47) with e = findMSB(d) and m = d << (23 - e); d == 0 gives 0.
         const std::uint32_t e = ext(code, tu, glsl_find_umsb, {d});
-        const std::uint32_t m = emit(code, op_shift_left_logical, tu, {d, emit(code, op_i_sub, tu, {u32(23), e})});
-        const std::uint32_t mf = emit(code, op_convert_u_to_f, tf, {emit(code, op_i_add, tu, {m, u32(1)})});
-        const std::uint32_t exponent = emit(code, op_shift_left_logical, tu, {emit(code, op_i_add, tu, {e, u32(80)}),
-                                                                            u32(23)});
-        const std::uint32_t scale = emit(code, op_bitcast, tf, {exponent});
-        const std::uint32_t value = emit(code, op_f_mul, tf, {mf, scale});
+        std::uint32_t value = 0;
+        if (is_depth16()) {
+            // Nearest float to d / (2^16 - 1) for d in 1..65535:
+            // n = d << (15 - e) puts d's MSB at bit 15; repeating n in binary gives (n << 8) | (n >> 8) as the
+            // top 24 bits, and the tail below bit 8 is strictly > 0.5 iff bit 7 of n is set (never a tie), so
+            // m = (n << 8) + ((n + 128) >> 8) is the exact rounded 24-bit mantissa (0x1000000 for d == 65535).
+            // Multiplying float(m) by 2^(e - 39) (biased exponent e + 88) matches float(double(d) / 65535.0)
+            // for every 16-bit code, and for d == 0 (e == 0xffffffff) shifts stay < 32 and zero selects 0.0f.
+            const std::uint32_t n = emit(code, op_shift_left_logical, tu, {d, emit(code, op_i_sub, tu, {u32(15), e})});
+            const std::uint32_t n_hi = emit(code, op_shift_left_logical, tu, {n, u32(8)});
+            const std::uint32_t n_lo =
+                emit(code, op_shift_right_logical, tu, {emit(code, op_i_add, tu, {n, u32(128)}), u32(8)});
+            const std::uint32_t mf = emit(code, op_convert_u_to_f, tf, {emit(code, op_i_add, tu, {n_hi, n_lo})});
+            const std::uint32_t exponent =
+                emit(code, op_shift_left_logical, tu, {emit(code, op_i_add, tu, {e, u32(88)}), u32(23)});
+            const std::uint32_t scale = emit(code, op_bitcast, tf, {exponent});
+            value = emit(code, op_f_mul, tf, {mf, scale});
+        } else {
+            // float(m + 1) * 2^(e - 47) with e = findMSB(d) and m = d << (23 - e); d == 0 gives 0.
+            const std::uint32_t m = emit(code, op_shift_left_logical, tu, {d, emit(code, op_i_sub, tu, {u32(23), e})});
+            const std::uint32_t mf = emit(code, op_convert_u_to_f, tf, {emit(code, op_i_add, tu, {m, u32(1)})});
+            const std::uint32_t exponent = emit(code, op_shift_left_logical, tu, {emit(code, op_i_add, tu, {e, u32(80)}),
+                                                                                u32(23)});
+            const std::uint32_t scale = emit(code, op_bitcast, tf, {exponent});
+            value = emit(code, op_f_mul, tf, {mf, scale});
+        }
         const std::uint32_t zero = emit(code, op_i_equal, tb, {d, u32(0)});
         return emit(code, op_select, tf, {zero, f32(0.0f), value});
     }
@@ -329,6 +358,7 @@ public:
 private:
     Module& m_;
     std::uint32_t entry_;
+    float levels_;
     std::vector<Inst> existing_;
     std::vector<Inst> globals_, decorations_, modes_;
     Inst import_;
@@ -344,6 +374,10 @@ private:
 inline std::vector<std::uint32_t> depth24_patch_fragment(const std::vector<std::uint32_t>& words,
                                                          const Depth24Bias& bias, std::string& why) {
     using namespace spirv24;
+    if (bias.levels != 16777215.0f && bias.levels != 65535.0f) {
+        why = "unsupported depth quantisation level count";
+        return {};
+    }
     Module m;
     if (!m.parse(words, why)) return {};
     std::uint32_t entry = 0;
@@ -369,7 +403,7 @@ inline std::vector<std::uint32_t> depth24_patch_fragment(const std::vector<std::
         if (opcode(i) == op_function) break;
     }
 
-    Patch p(m, entry);
+    Patch p(m, entry, bias.levels);
     const std::uint32_t tf = p.t_float();
     p.prime_quantise();
     std::uint32_t frag_depth = p.builtin_variable(builtin_frag_depth);
@@ -396,7 +430,7 @@ inline std::vector<std::uint32_t> depth24_patch_fragment(const std::vector<std::
             const std::uint32_t dy = p.ext(entry_code, tf, glsl_fabs, {p.emit(entry_code, op_dpdy, tf, {z})});
             const std::uint32_t max_slope = p.ext(entry_code, tf, glsl_fmax, {dx, dy});
             std::uint32_t amount = p.emit(entry_code, op_f_mul, tf, {p.f32(bias.slope), max_slope});
-            amount = p.emit(entry_code, op_f_add, tf, {amount, p.f32(depth24_bias_constant(bias.constant))});
+            amount = p.emit(entry_code, op_f_add, tf, {amount, p.f32(depth24_bias_constant(bias.constant,bias.levels))});
             if (bias.clamp > 0.0f) amount = p.ext(entry_code, tf, glsl_fmin, {amount, p.f32(bias.clamp)});
             if (bias.clamp < 0.0f) amount = p.ext(entry_code, tf, glsl_fmax, {amount, p.f32(bias.clamp)});
             z = p.emit(entry_code, op_f_add, tf, {z, amount});

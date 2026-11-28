@@ -10,6 +10,8 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -21,6 +23,7 @@
 
 namespace rt::shims {
 long xgameruntime_gamesave_open_handles();
+void xgameruntime_gamesave_trace_for_test(void (*sink)(const char* line));
 }
 
 namespace {
@@ -115,6 +118,26 @@ bool CALLBACK on_blob(const BlobInfo* info, void* context) {
     seen->names.emplace_back(info->name);
     seen->sizes.push_back(info->size);
     return true;
+}
+
+// The LEONIDA_TRACE_XGAMESAVE lines, collected from whichever thread the shim logs on.
+std::mutex g_trace_mutex;
+std::vector<std::string> g_trace;
+void on_trace(const char* line) {
+    std::lock_guard<std::mutex> lock(g_trace_mutex);
+    g_trace.emplace_back(line);
+}
+std::vector<std::string> trace_lines() {
+    std::lock_guard<std::mutex> lock(g_trace_mutex);
+    return g_trace;
+}
+// The index of the first line holding every one of `parts`, -1 for none.
+int trace_index(const std::vector<std::string>& lines, const char* a, const char* b = "", const char* c = "") {
+    for (size_t i = 0; i < lines.size(); ++i)
+        if (lines[i].find(a) != std::string::npos && lines[i].find(b) != std::string::npos &&
+            lines[i].find(c) != std::string::npos)
+            return static_cast<int>(i);
+    return -1;
 }
 
 }  // namespace
@@ -227,6 +250,20 @@ int main() {
               std::strcmp(out[1].info.name, "profile/main") == 0 &&
               std::memcmp(out[1].data, profile.data(), profile.size()) == 0,
           "ReadBlobData returns both blobs, byte for byte, pointing into the buffer");
+    // A title sizes the buffer as sizeof(XGameSaveBlob) + data + name and its NUL per blob, with no padding: such a
+    // buffer is enough, the blobs packed back to back.
+    const char* one[] = {"story"};
+    count = 1;
+    std::vector<uint8_t> exact(sizeof(Blob) + story.size() + std::strlen("story") + 1);
+    auto* tight = reinterpret_cast<Blob*>(exact.data());
+    check(at<Read>(save, 20)(save, container, one, &count, exact.size(), tight) == S_OK && count == 1 &&
+              std::strcmp(tight[0].info.name, "story") == 0 && tight[0].info.size == story.size() &&
+              std::memcmp(tight[0].data, story.data(), story.size()) == 0 &&
+              tight[0].info.name + std::strlen("story") + 1 <= reinterpret_cast<const char*>(exact.data() + exact.size()),
+          "ReadBlobData into a buffer of the unpadded size returns the blob");
+    count = 1;
+    check(at<Read>(save, 20)(save, container, one, &count, exact.size() - 1, tight) == E_GS_PROVIDED_BUFFER_TOO_SMALL,
+          "one byte less than the unpadded size is too small");
     const char* absent[] = {"nope"};
     count = 1;
     check(at<Read>(save, 20)(save, container, absent, &count, buffer.size() * 8, out) == E_GS_BLOB_NOT_FOUND,
@@ -360,6 +397,173 @@ int main() {
         if (manual) XTaskQueueCloseHandle(manual);
         std::filesystem::remove_all(root / L"local-user" / L"first", ec);
         std::filesystem::remove_all(root / L"local-user" / L"second", ec);
+    }
+
+    // ---- a failed commit leaves the container as it was ----
+    // Another process holds blob "b" open without FILE_SHARE_DELETE, so replacing it fails in the middle of the
+    // update, after "a" was already replaced. The update must fail, undo what it already did, and leave no temporary
+    // or backup files. Closing the handle makes the same update succeed.
+    {
+        const HRESULT out_of_local = static_cast<HRESULT>(0x80830003);   // E_GS_OUT_OF_LOCAL_STORAGE
+        struct Edit {
+            const char* name;
+            const char* data;   // nullptr: delete
+        };
+        auto submit = [&](Handle container, std::vector<Edit> edits) -> HRESULT {
+            Handle u = nullptr;
+            HRESULT hr = at<Create>(save, 23)(save, container, nullptr, &u);
+            for (const Edit& e : edits) {
+                if (FAILED(hr)) break;
+                hr = e.data ? at<Write>(save, 25)(save, u, e.name, reinterpret_cast<const uint8_t*>(e.data),
+                                              std::strlen(e.data))
+                            : at<ByName>(save, 26)(save, u, e.name);
+            }
+            if (SUCCEEDED(hr)) hr = at<Submit>(save, 27)(save, u);
+            at<Close>(save, 24)(save, u);
+            return hr;
+        };
+        auto read_blob = [&](const std::filesystem::path& dir, const wchar_t* file) {
+            std::ifstream f(dir / file, std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        };
+        auto file_count = [](const std::filesystem::path& dir) {
+            std::error_code count_ec;
+            int n = 0;
+            for (const auto& e : std::filesystem::directory_iterator(dir, count_ec)) {
+                (void)e;
+                ++n;
+            }
+            return n;
+        };
+
+        Handle rc = nullptr;
+        check(at<Create>(save, 16)(save, provider, "rollback", &rc) == S_OK && rc, "CreateContainer for the rollback checks");
+        const std::filesystem::path rollback_dir = root / L"local-user" / L"rollback";
+
+        // Case A: a write whose rename is blocked after an earlier write was applied.
+        check(submit(rc, {{"a", "OLD_A"}, {"b", "OLD_B"}}) == S_OK, "seed blobs a and b");
+        HANDLE hold = CreateFileW((rollback_dir / L"b").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                  OPEN_EXISTING, 0, nullptr);
+        check(hold != INVALID_HANDLE_VALUE, "another handle holds blob b open");
+        check(submit(rc, {{"a", "NEW_A"}, {"b", "NEW_B"}}) == out_of_local, "an update whose rename of b is blocked fails");
+        check(read_blob(rollback_dir, L"a") == "OLD_A" && read_blob(rollback_dir, L"b") == "OLD_B",
+              "a failed update leaves a and b with their old contents");
+        check(file_count(rollback_dir) == 2, "a failed update leaves no temporary or backup files");
+        CloseHandle(hold);
+        check(submit(rc, {{"a", "NEW_A"}, {"b", "NEW_B"}}) == S_OK, "the same update succeeds once b is free");
+        check(read_blob(rollback_dir, L"a") == "NEW_A" && read_blob(rollback_dir, L"b") == "NEW_B" && file_count(rollback_dir) == 2,
+              "the successful update leaves only the new contents");
+
+        // Case B: a delete that sorts before a blocked write must not be applied.
+        check(submit(rc, {{"a", "OLD_A"}, {"b", "OLD_B"}}) == S_OK, "reseed blobs a and b");
+        hold = CreateFileW((rollback_dir / L"b").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           0, nullptr);
+        check(hold != INVALID_HANDLE_VALUE, "another handle holds blob b open again");
+        check(submit(rc, {{"a", nullptr}, {"b", "NEW_B"}}) == out_of_local, "a mixed update with a blocked write fails");
+        check(std::filesystem::exists(rollback_dir / L"a") && read_blob(rollback_dir, L"a") == "OLD_A" && read_blob(rollback_dir, L"b") == "OLD_B",
+              "the delete of a is not applied when the write of b fails");
+        check(file_count(rollback_dir) == 2, "the mixed failed update leaves no temporary or backup files");
+        CloseHandle(hold);
+
+        // Case C: the plain success path, a write and a delete.
+        check(submit(rc, {{"a", "FINAL_A"}, {"b", nullptr}}) == S_OK, "a write and a delete succeed together");
+        check(read_blob(rollback_dir, L"a") == "FINAL_A" && !std::filesystem::exists(rollback_dir / L"b") && file_count(rollback_dir) == 1,
+              "the successful write and delete leave only the written blob");
+
+        // Case D: scratch files of a commit that died midway. A temporary is dropped; a backup may be the only copy of
+        // a blob's old contents, so neither an update of another blob nor a failed update of two rollback_dir removes it.
+        std::ofstream(rollback_dir / L"b~", std::ios::binary) << "HALF_B";
+        std::ofstream(rollback_dir / L"b~b~", std::ios::binary) << "KEPT_B";
+        check(submit(rc, {{"a", "NEXT_A"}}) == S_OK, "an update of a with scratch files of b present");
+        check(!std::filesystem::exists(rollback_dir / L"b~") && read_blob(rollback_dir, L"b~b~") == "KEPT_B",
+              "a stale temporary is removed and a kept backup is not");
+        hold = CreateFileW((rollback_dir / L"a").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           0, nullptr);
+        check(hold != INVALID_HANDLE_VALUE, "another handle holds blob a open");
+        check(submit(rc, {{"a", "X"}, {"b", "Y"}}) == out_of_local, "an update that fails at a, before b is reached");
+        CloseHandle(hold);
+        check(read_blob(rollback_dir, L"b~b~") == "KEPT_B", "the failed update keeps the backup it did not write");
+
+        at<Close>(save, 17)(save, rc);
+    }
+
+    // ---- LEONIDA_TRACE_XGAMESAVE: one line per call, async jobs from schedule to result, never blob contents ----
+    {
+        rt::shims::xgameruntime_gamesave_trace_for_test(on_trace);
+        std::string content;
+        while (content.size() < 300) content += "TRACE-CONTENT-MARKER ";
+        content.resize(300);
+        Handle tc = nullptr, tu = nullptr;
+        at<Create>(save, 16)(save, provider, "traced", &tc);
+        at<Create>(save, 23)(save, tc, "Traced", &tu);
+        at<Write>(save, 25)(save, tu, "slot", reinterpret_cast<const uint8_t*>(content.data()), content.size());
+        XAsyncBlock tsubmit{};
+        const bool submitted = at<WithAsync>(save, 28)(save, tu, &tsubmit) == S_OK && finished(&tsubmit) &&
+                               at<AsyncOnly>(save, 29)(save, &tsubmit) == S_OK;
+        const char* tnames[] = {"slot"};
+        uint32_t tcount = 1;
+        std::vector<uint64_t> tbuf(1024);
+        const bool read_sync = at<Read>(save, 20)(save, tc, tnames, &tcount, tbuf.size() * 8,
+                                                  reinterpret_cast<Blob*>(tbuf.data())) == S_OK;
+        XAsyncBlock tread{};
+        uint32_t tacount = 0;
+        const bool read_async = at<ReadAsync>(save, 21)(save, tc, tnames, 1, &tread) == S_OK && finished(&tread) &&
+                                at<ReadResult>(save, 22)(save, &tread, tbuf.size() * 8,
+                                                         reinterpret_cast<Blob*>(tbuf.data()), &tacount) == S_OK &&
+                                tacount == 1;
+        at<Close>(save, 24)(save, tu);
+        at<Close>(save, 17)(save, tc);
+        at<ByName>(save, 10)(save, provider, "traced");
+        rt::shims::xgameruntime_gamesave_trace_for_test(nullptr);
+        const size_t traced_lines = trace_lines().size();
+        int64_t untraced = 0;
+        at<Quota>(save, 7)(save, provider, &untraced);
+        const std::vector<std::string> lines = trace_lines();
+        for (const std::string& l : lines) std::printf("  %s", l.c_str());
+
+        check(submitted && read_sync && read_async, "a traced write and read through the offline provider succeed");
+        bool formed = !lines.empty(), contents = false;
+        for (const std::string& l : lines) {
+            formed = formed && l.rfind("[rt] xgamesave: t=", 0) == 0 && l.find("ms tid=") != std::string::npos &&
+                     !l.empty() && l.back() == '\n';
+            contents = contents || l.find("TRACE-CONTENT") != std::string::npos;
+        }
+        check(formed, "every trace line is \"[rt] xgamesave: t=<ms>ms tid=<thread> ...\"");
+        check(!contents, "no trace line holds blob contents");
+        check(trace_index(lines, "XGameSaveCreateContainer provider=", "container=\"traced\" handle=", "hr=0x00000000") >= 0,
+              "CreateContainer is traced with the container name, its handle and the HRESULT");
+        check(trace_index(lines, "XGameSaveCreateUpdate handle=", "container=\"traced\" display=\"Traced\"", "hr=0x00000000") >= 0,
+              "CreateUpdate is traced with the container and display name");
+        check(trace_index(lines, "XGameSaveSubmitBlobWrite update=", "blob=\"slot\" size=300", "hr=0x00000000") >= 0,
+              "SubmitBlobWrite is traced with the blob name and size");
+        const int scheduled = trace_index(lines, "XGameSaveSubmitUpdateAsync schedule async=", "container=\"traced\" ops=1 bytes=300");
+        const int ran = trace_index(lines, "XGameSaveSubmitUpdateAsync run async=", "waited=");
+        const int completed = trace_index(lines, "XGameSaveSubmitUpdateAsync complete async=", "hr=0x00000000", "work=");
+        const int collected = trace_index(lines, "XGameSaveSubmitUpdateResult async=", "hr=0x00000000");
+        check(trace_index(lines, "XGameSaveSubmitUpdateAsync async=", "hr=0x00000000") >= 0,
+              "SubmitUpdateAsync's own HRESULT is traced");
+        check(scheduled >= 0 && ran > scheduled && completed > ran && collected > completed,
+              "SubmitUpdateAsync is traced when scheduled, when its work runs, when it completes and when collected");
+        char block[48];
+        std::snprintf(block, sizeof(block), "async=%p ", static_cast<void*>(&tsubmit));
+        check(scheduled >= 0 && ran >= 0 && completed >= 0 && collected >= 0 &&
+                  lines[scheduled].find(block) != std::string::npos && lines[ran].find(block) != std::string::npos &&
+                  lines[completed].find(block) != std::string::npos && lines[collected].find(block) != std::string::npos,
+              "the four lines of one async job name the title's XAsyncBlock");
+        check(trace_index(lines, "XGameSaveReadBlobData handle=", "names=\"slot\"", "read=\"slot\":300 hr=0x00000000") >= 0,
+              "ReadBlobData is traced with the names asked for and the blob sizes read");
+        const int rscheduled = trace_index(lines, "XGameSaveReadBlobDataAsync schedule async=", "names=\"slot\"");
+        const int rran = trace_index(lines, "XGameSaveReadBlobDataAsync run async=", "waited=");
+        const int rcompleted = trace_index(lines, "XGameSaveReadBlobDataAsync complete async=", "hr=0x00000000");
+        const int rcollected = trace_index(lines, "XGameSaveReadBlobDataResult async=", "read=\"slot\":300", "hr=0x00000000");
+        check(rscheduled >= 0 && rran > rscheduled && rcompleted > rran && rcollected > rcompleted,
+              "ReadBlobDataAsync is traced from schedule to the Result call, which names the blob and its size");
+        check(trace_index(lines, "XGameSaveCloseUpdate update=") >= 0 &&
+                  trace_index(lines, "XGameSaveCloseContainer handle=", "container=\"traced\"") >= 0 &&
+                  trace_index(lines, "XGameSaveDeleteContainer provider=", "container=\"traced\"", "hr=0x00000000") >= 0,
+              "the closes and the container delete are traced");
+        check(lines.size() == traced_lines && trace_index(lines, "XGameSaveGetRemainingQuota ") < 0,
+              "with the trace off again, a call logs nothing");
     }
 
     at<Close>(save, 6)(save, provider);

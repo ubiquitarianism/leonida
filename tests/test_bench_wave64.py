@@ -1,10 +1,10 @@
-"""bench_wave64.py: a configuration that fails after its first process is a failure, not a configuration that ran.
-The builds and GPU runs are replaced by stubs, so this needs no GPU, LLVM or Vulkan SDK."""
+"""Exercise benchmark setup and comparison without a GPU, LLVM or Vulkan SDK."""
 import contextlib
 import fnmatch
 import io
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -109,6 +109,19 @@ class EmulatedOnly(unittest.TestCase):
 
 
 class HarnessError(unittest.TestCase):
+    def test_skipped_shader_reports_builder_reason_without_a_traceback(self):
+        for flags, mode in (((), "native"), (("--emulated-only",), "emulated")):
+            with self.subTest(mode=mode):
+                run = subprocess.run(
+                    [sys.executable, "-I", bench_wave64.__file__, "--shader", "ms_tri", *flags],
+                    env={**os.environ, "LEONIDA_BARY_FALLBACK": "0"},
+                    capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+                self.assertIn(f"ms_tri: {mode} build did not produce a SPIR-V module", run.stderr)
+                self.assertIn("not built (need a DXBC container with signatures): ms_tri", run.stderr)
+                self.assertNotIn("Traceback", run.stderr)
+
     def test_harness_is_found_in_a_cmake_configuration_subdirectory(self):
         executable = "vk_compute_test.exe" if os.name == "nt" else "vk_compute_test"
         output = "bench ms: median=1.0 min=0.9 max=1.1\nbench out fnv1a: abc\n4 groups x 64: 0 mismatches\n"

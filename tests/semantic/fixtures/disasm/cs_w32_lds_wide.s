@@ -8,6 +8,7 @@
 	v_mov_b32_e32 v35, 0xdeadc0de
 	v_mov_b32_e32 v4, 0x12345678
 	v_mov_b32_e32 v5, 0x9abcdef0
+	v_cmpx_eq_u32_e32 0, v0
 	ds_write_b128 v2, v[30:33] offset:16
 	ds_write_b32 v2, v2 offset:60
 	s_waitcnt lgkmcnt(0)
@@ -22,7 +23,6 @@
 	ds_read_b64 v[48:49], v2 offset:64
 	ds_read2st64_b32 v[50:51], v2 offset1:1
 	s_waitcnt lgkmcnt(0)
-	v_cmpx_eq_u32_e32 0, v0
 	v_mov_b32_e32 v21, 0
 	buffer_store_dword v40, v21, s[0:3], 0 offen
 	v_mov_b32_e32 v21, 4

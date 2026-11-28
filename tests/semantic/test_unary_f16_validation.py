@@ -39,9 +39,20 @@ def h2f(h):
     return struct.unpack("<e", struct.pack("<H", h & 0xFFFF))[0]
 
 
-def validate_spirv(spv_text):
+def _require_or_skip_spirv_tools(test_case: unittest.TestCase) -> tuple[str, str]:
     spirv_as = shutil.which("spirv-as")
     spirv_val = shutil.which("spirv-val")
+    if spirv_as and spirv_val:
+        return spirv_as, spirv_val
+    msg = "spirv-as / spirv-val not found on PATH"
+    if os.environ.get("LEONIDA_REQUIRE_SPIRV_TOOLS") == "1":
+        test_case.fail(msg)
+    test_case.skipTest(msg)
+
+
+def validate_spirv(spv_text, spirv_as=None, spirv_val=None):
+    spirv_as = spirv_as or shutil.which("spirv-as")
+    spirv_val = spirv_val or shutil.which("spirv-val")
     if not spirv_as or not spirv_val:
         raise AssertionError("spirv-as / spirv-val not found on PATH")
     with tempfile.TemporaryDirectory() as d:
@@ -67,8 +78,82 @@ def validate_spirv(spv_text):
 
 def run_ps(lines, name="ps_unary_f16_val"):
     spv = translate_lines(name, lines)
-    validate_spirv(spv)
     return mrt0_words(spv)
+
+
+def _combo_opsel_shaders():
+    v1_val = (f2h(0.25) << 16) | f2h(0.0)
+    old = 0xBEEF1234
+    combos = ((0, 0), (1, 0), (0, 1), (1, 1))
+    shaders = []
+    for op in ("v_sin_f16", "v_cos_f16"):
+        for suffix in ("_e64", ""):
+            lines = [f"v_mov_b32 v4, {v1_val:#x}"]
+            for idx, (shi, dhi) in enumerate(combos):
+                lines.append(f"v_mov_b32 v{idx}, {old:#x}")
+                lines.append(f"{op}{suffix} v{idx}, v4 op_sel:[{shi},{dhi}]")
+            lines.append("exp mrt0 v0, v1, v2, v3 done vm")
+            lines.append("s_endpgm")
+            shaders.append((op, suffix, f"ps_{op}_{suffix or 'bare'}_opsel", lines))
+    return combos, old, shaders
+
+
+def _nontrivial_opsel_shader():
+    # lo = 0.125 turns (45 deg): sin ~= 0.707, cos ~= 0.707
+    # hi = 0.75  turns (270 deg): sin = -1.0,  cos = 0.0
+    v1_val = (f2h(0.75) << 16) | f2h(0.125)
+    old = 0xCAFE5678
+    lines = [
+        f"v_mov_b32 v4, {v1_val:#x}",
+        f"v_mov_b32 v0, {old:#x}",
+        "v_sin_f16_e64 v0, v4 op_sel:[1,1]",            # hi = sin(0.75) = -1.0, lo preserved
+        f"v_mov_b32 v1, {old:#x}",
+        "v_sin_f16_e64 v1, -v4 op_sel:[1,0]",           # lo = sin(-0.75) = +1.0, hi preserved
+        f"v_mov_b32 v2, {old:#x}",
+        "v_sin_f16_e64 v2, v4 op_sel:[1,1] clamp",      # hi = clamp(-1.0) = 0.0, lo preserved
+        f"v_mov_b32 v3, {old:#x}",
+        "v_cos_f16_e64 v3, |v4| op_sel:[0,1]",          # hi = cos(0.125) ~= sqrt(2)/2, lo preserved
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    return old, "ps_sincos_opsel_mods", lines
+
+
+def _inplace_sdwa_shader():
+    # In-place op_sel:[1,0] reads hi before overwriting lo; SDWA reads WORD_1 and writes WORD_1.
+    v0_init = (f2h(0.25) << 16) | f2h(0.0)
+    old = 0x0000BEEF
+    lines = [
+        f"v_mov_b32 v0, {v0_init:#x}",
+        "v_sin_f16_e64 v0, v0 op_sel:[1,0]",            # lo = sin(0.25) = 1.0, hi stays 0.25
+        f"v_mov_b32 v1, {v0_init:#x}",
+        "v_cos_f16_e64 v1, v1 op_sel:[0,1]",            # hi = cos(0.0) = 1.0, lo stays 0.0
+        f"v_mov_b32 v4, {v0_init:#x}",
+        f"v_mov_b32 v2, {old:#x}",
+        "v_sin_f16_sdwa v2, v4 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
+        f"v_mov_b32 v3, {old:#x}",
+        "v_cos_f16_sdwa v3, v4 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    return old, "ps_sincos_inplace_sdwa", lines
+
+
+def _positive_control_lines(op):
+    valid_forms = [
+        f"{op} v0, v1",
+        f"{op}_e32 v0, v1",
+        f"{op}_e64 v0, -|v1| op_sel:[1,1] clamp mul:2",
+        f"{op} v0, |v1| op_sel:[1,0] div:2 clamp",
+        f"{op}_sdwa v0, -v1 clamp mul:2 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
+    ]
+    return [
+        "v_mov_b32 v0, 0xaaaa3c00",
+        "v_mov_b32 v1, 0x40003800",
+        *valid_forms,
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
 
 
 def translate_single(inst_line):
@@ -89,14 +174,7 @@ class SinCosF16OpSelTests(unittest.TestCase):
     """Verify v_sin_f16 / v_cos_f16 honor op_sel:[shi, dhi] and preserve the other half."""
 
     def test_sin_cos_opsel_all_four_combinations(self):
-        # Pack two distinct turn angles into v1:
-        #   lo = 0.0   -> sin(0.0)  = 0.0,  cos(0.0)  = 1.0
-        #   hi = 0.25  -> sin(0.25) = 1.0,  cos(0.25) = 0.0
-        h_lo = f2h(0.0)
-        h_hi = f2h(0.25)
-        v1_val = (h_hi << 16) | h_lo
-        old = 0xBEEF1234
-
+        combos, old, shaders = _combo_opsel_shaders()
         expected = {
             ("v_sin_f16", 0, 0): (old & 0xFFFF0000) | f2h(0.0),
             ("v_sin_f16", 1, 0): (old & 0xFFFF0000) | f2h(1.0),
@@ -107,42 +185,15 @@ class SinCosF16OpSelTests(unittest.TestCase):
             ("v_cos_f16", 0, 1): (f2h(1.0) << 16) | (old & 0xFFFF),
             ("v_cos_f16", 1, 1): (f2h(0.0) << 16) | (old & 0xFFFF),
         }
-
-        for op in ("v_sin_f16", "v_cos_f16"):
-            for suffix in ("_e64", ""):
-                lines = [f"v_mov_b32 v4, {v1_val:#x}"]
-                combos = ((0, 0), (1, 0), (0, 1), (1, 1))
-                for idx, (shi, dhi) in enumerate(combos):
-                    lines.append(f"v_mov_b32 v{idx}, {old:#x}")
-                    lines.append(f"{op}{suffix} v{idx}, v4 op_sel:[{shi},{dhi}]")
-                lines.append("exp mrt0 v0, v1, v2, v3 done vm")
-                lines.append("s_endpgm")
-                words = run_ps(lines, f"ps_{op}_{suffix or 'bare'}_opsel")
-                for idx, (shi, dhi) in enumerate(combos):
-                    with self.subTest(op=op, suffix=suffix or "bare", shi=shi, dhi=dhi):
-                        self.assertEqual(words[idx], expected[(op, shi, dhi)])
+        for op, suffix, name, lines in shaders:
+            words = run_ps(lines, name)
+            for idx, (shi, dhi) in enumerate(combos):
+                with self.subTest(op=op, suffix=suffix or "bare", shi=shi, dhi=dhi):
+                    self.assertEqual(words[idx], expected[(op, shi, dhi)])
 
     def test_sin_cos_opsel_nontrivial_angles_and_mods(self):
-        # lo = 0.125 turns (45 deg): sin ~= 0.707, cos ~= 0.707
-        # hi = 0.75  turns (270 deg): sin = -1.0,  cos = 0.0
-        h_lo = f2h(0.125)
-        h_hi = f2h(0.75)
-        v1_val = (h_hi << 16) | h_lo
-        old = 0xCAFE5678
-
-        words = run_ps([
-            f"v_mov_b32 v4, {v1_val:#x}",
-            f"v_mov_b32 v0, {old:#x}",
-            "v_sin_f16_e64 v0, v4 op_sel:[1,1]",            # hi = sin(0.75) = -1.0, lo preserved
-            f"v_mov_b32 v1, {old:#x}",
-            "v_sin_f16_e64 v1, -v4 op_sel:[1,0]",           # lo = sin(-0.75) = +1.0, hi preserved
-            f"v_mov_b32 v2, {old:#x}",
-            "v_sin_f16_e64 v2, v4 op_sel:[1,1] clamp",      # hi = clamp(-1.0) = 0.0, lo preserved
-            f"v_mov_b32 v3, {old:#x}",
-            "v_cos_f16_e64 v3, |v4| op_sel:[0,1]",          # hi = cos(0.125) ~= sqrt(2)/2, lo preserved
-            "exp mrt0 v0, v1, v2, v3 done vm",
-            "s_endpgm",
-        ], "ps_sincos_opsel_mods")
+        old, name, lines = _nontrivial_opsel_shader()
+        words = run_ps(lines, name)
 
         self.assertEqual(words[0], (f2h(-1.0) << 16) | (old & 0xFFFF))
         self.assertEqual(words[1], (old & 0xFFFF0000) | f2h(1.0))
@@ -151,27 +202,24 @@ class SinCosF16OpSelTests(unittest.TestCase):
         self.assertAlmostEqual(h2f(words[3] >> 16), math.cos(2.0 * math.pi * 0.125), delta=2e-3)
 
     def test_sin_cos_opsel_inplace_and_sdwa(self):
-        # In-place op_sel:[1,0] reads hi before overwriting lo; SDWA reads WORD_1 and writes WORD_1.
-        v0_init = (f2h(0.25) << 16) | f2h(0.0)
-        old = 0x0000BEEF
-        words = run_ps([
-            f"v_mov_b32 v0, {v0_init:#x}",
-            "v_sin_f16_e64 v0, v0 op_sel:[1,0]",            # lo = sin(0.25) = 1.0, hi stays 0.25
-            f"v_mov_b32 v1, {v0_init:#x}",
-            "v_cos_f16_e64 v1, v1 op_sel:[0,1]",            # hi = cos(0.0) = 1.0, lo stays 0.0
-            f"v_mov_b32 v4, {v0_init:#x}",
-            f"v_mov_b32 v2, {old:#x}",
-            "v_sin_f16_sdwa v2, v4 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
-            f"v_mov_b32 v3, {old:#x}",
-            "v_cos_f16_sdwa v3, v4 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
-            "exp mrt0 v0, v1, v2, v3 done vm",
-            "s_endpgm",
-        ], "ps_sincos_inplace_sdwa")
+        old, name, lines = _inplace_sdwa_shader()
+        words = run_ps(lines, name)
 
         self.assertEqual(words[0], (f2h(0.25) << 16) | f2h(1.0))
         self.assertEqual(words[1], (f2h(1.0) << 16) | f2h(0.0))
         self.assertEqual(words[2], (f2h(1.0) << 16) | (old & 0xFFFF))
         self.assertEqual(words[3], (f2h(1.0) << 16) | (old & 0xFFFF))
+
+    def test_sin_cos_opsel_spirv_val(self):
+        spirv_as, spirv_val = _require_or_skip_spirv_tools(self)
+        _, _, shaders = _combo_opsel_shaders()
+        cases = [(name, lines) for _, _, name, lines in shaders]
+        for helper in (_nontrivial_opsel_shader, _inplace_sdwa_shader):
+            _, name, lines = helper()
+            cases.append((name, lines))
+        for name, lines in cases:
+            with self.subTest(shader=name):
+                validate_spirv(translate_lines(name, lines), spirv_as, spirv_val)
 
 
 class UnaryF16ValidationTests(unittest.TestCase):
@@ -179,23 +227,16 @@ class UnaryF16ValidationTests(unittest.TestCase):
 
     def test_positive_controls_all_12_ops(self):
         for op in UNARY_F16_OPS:
-            valid_forms = [
-                f"{op} v0, v1",
-                f"{op}_e32 v0, v1",
-                f"{op}_e64 v0, -|v1| op_sel:[1,1] clamp mul:2",
-                f"{op} v0, |v1| op_sel:[1,0] div:2 clamp",
-                f"{op}_sdwa v0, -v1 clamp mul:2 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1",
-            ]
-            lines = [
-                "v_mov_b32 v0, 0xaaaa3c00",
-                "v_mov_b32 v1, 0x40003800",
-                *valid_forms,
-                "exp mrt0 v0, v0, v0, v0 done vm",
-                "s_endpgm",
-            ]
             with self.subTest(op=op):
-                spv = translate_lines(f"ps_pos_{op}", lines)
-                validate_spirv(spv)
+                spv = translate_lines(f"ps_pos_{op}", _positive_control_lines(op))
+                self.assertIn("OpEntryPoint", spv)
+
+    def test_positive_controls_all_12_ops_spirv_val(self):
+        spirv_as, spirv_val = _require_or_skip_spirv_tools(self)
+        for op in UNARY_F16_OPS:
+            with self.subTest(op=op):
+                spv = translate_lines(f"ps_pos_{op}", _positive_control_lines(op))
+                validate_spirv(spv, spirv_as, spirv_val)
 
     def test_negative_validation_all_12_ops(self):
         invalid_templates = [

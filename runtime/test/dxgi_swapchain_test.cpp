@@ -8,6 +8,7 @@
 
 #include "../shims/d3d12_com.h"
 #include "../shims/dxgi_com.h"
+#include "host_wine.h"
 #include "vulkan_loader.h"
 #include "window_station.h"
 #include "../src/vulkan_device_filter.h"
@@ -156,8 +157,9 @@ HRESULT create_guarded(IDXGIFactory4* factory, IUnknown* queue, HWND hwnd, const
 
 // CreateSwapChainForHwnd with descriptions D3D12 refuses (and the valid ones next to them), against the host runtime's
 // DXGI: each case gets its own window on each side, and the HRESULTs must match. Returns the number of mismatches,
-// or -1 without a host D3D12 device.
+// or -1 without a host D3D12 device, or under Wine, whose DXGI is not that reference (host_wine.h).
 int compare_swap_chain_arguments(IDXGIFactory4* ours, ID3D12Device* our_device, ID3D12CommandQueue* our_queue) {
+    if (hostwine::host_is_wine()) return -1;
     using CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
     using CreateFactory2 = HRESULT(WINAPI*)(UINT, REFIID, void**);
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -312,8 +314,9 @@ int compare_swap_chain_arguments(IDXGIFactory4* ours, ID3D12Device* our_device, 
 // GetBuffer and Present are DXGI_ERROR_INVALID_CALL, and the next ResizeBuffers to a valid size brings it all back.
 // A refused call (a back buffer still held) changes nothing. WARP differs (it takes 16385 and fails at 32768 with
 // E_OUTOFMEMORY), so this compares with the host's default adapter. Returns the number of mismatches, or -1 without
-// a host D3D12 device.
+// a host D3D12 device or under Wine (host_wine.h).
 int compare_failed_resize(IDXGIFactory4* ours, ID3D12CommandQueue* our_queue) {
+    if (hostwine::host_is_wine()) return -1;
     using CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
     using CreateFactory2 = HRESULT(WINAPI*)(UINT, REFIID, void**);
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -638,11 +641,15 @@ int main() {
     cl->Close();
 
     // Before the test's own swap chain: the host comparison creates and releases its own windows and chains.
+    // Why a comparison was left out: under Wine there is a host device, and it is not the reference (host_wine.h).
+    const char* const not_compared = hostwine::host_is_wine()
+                                         ? "the host's DXGI is Wine's, not compared with it"
+                                         : "no host D3D12 device to compare with, skipped";
     const int argument_mismatches = compare_swap_chain_arguments(factory, dev, queue);
-    if (argument_mismatches < 0) std::printf("CreateSwapChainForHwnd: no host D3D12 device to compare with, skipped\n");
+    if (argument_mismatches < 0) std::printf("CreateSwapChainForHwnd: %s\n", not_compared);
     if (argument_mismatches > 0) return fail("CreateSwapChainForHwnd answers differ from the host runtime");
     const int resize_mismatches = compare_failed_resize(factory, queue);
-    if (resize_mismatches < 0) std::printf("failed ResizeBuffers: no host D3D12 device to compare with, skipped\n");
+    if (resize_mismatches < 0) std::printf("failed ResizeBuffers: %s\n", not_compared);
     if (resize_mismatches > 0) return fail("a failed ResizeBuffers differs from the host runtime");
 
     DXGI_SWAP_CHAIN_DESC1 scd{};
@@ -1256,8 +1263,9 @@ int main() {
                 return fail("Adapter CheckInterfaceSupport(IDXGIDevice) failed");
             IDXGIFactory4* host_factory = nullptr;
             IDXGIAdapter1* host_adapter = nullptr;
-            // The host dxgi.dll, loaded at run time: this test doesn't link it, and a Wine run without it skips.
-            HMODULE host_dxgi = LoadLibraryW(L"dxgi.dll");
+            // The host dxgi.dll, loaded at run time: this test doesn't link it. Not under Wine, whose DXGI makes up a
+            // version of its own for the adapter (host_wine.h).
+            HMODULE host_dxgi = hostwine::host_is_wine() ? nullptr : LoadLibraryW(L"dxgi.dll");
             const auto create_factory = host_dxgi ? reinterpret_cast<decltype(&CreateDXGIFactory1)>(
                 GetProcAddress(host_dxgi, "CreateDXGIFactory1")) : nullptr;
             if (create_factory && SUCCEEDED(create_factory(IID_PPV_ARGS(&host_factory))) && host_factory &&

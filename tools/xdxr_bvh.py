@@ -26,6 +26,7 @@ Usage: `python -I tools/xdxr_bvh.py --help` lists the options.
 """
 import argparse
 import math
+import os
 import random
 import struct
 import sys
@@ -74,8 +75,10 @@ def f32(x):
 
 def ptr(offset, kind):
     """Node pointer for a record at byte ``offset`` from the BVH start: 64-byte unit index << 3 | type."""
-    if offset % UNIT:
-        raise ValueError(f"node offset {offset:#x} is not 64-byte aligned")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or offset % UNIT:
+        raise ValueError(f"node offset {offset!r} must be a non-negative multiple of {UNIT}")
+    if isinstance(kind, bool) or not isinstance(kind, int) or not 0 <= kind <= 7:
+        raise ValueError(f"node type {kind!r} must be in 0..7")
     p = (offset // UNIT) << 3 | kind
     if p >= INVALID:
         raise ValueError("BVH too large for 32-bit node pointers")
@@ -144,6 +147,20 @@ def encode_box16(lo, hi):
 
 
 # ---- geometry helpers ----
+def _empty_box():
+    return [INF, INF, INF], [-INF, -INF, -INF]
+
+
+def _box_empty(box):
+    lo, hi = box
+    return not all(lo[c] <= hi[c] for c in range(3))
+
+
+def _tri_inactive(tri):
+    """Treat a NaN in any vertex component as inactive (matches runtime/src/xdxr_build.comp for static builds)."""
+    return any(math.isnan(c) for p in tri for c in p)
+
+
 def _bounds(points):
     lo = [min(p[c] for p in points) for c in range(3)]
     hi = [max(p[c] for p in points) for c in range(3)]
@@ -151,8 +168,11 @@ def _bounds(points):
 
 
 def _union(boxes):
-    lo = [min(b[0][c] for b in boxes) for c in range(3)]
-    hi = [max(b[1][c] for b in boxes) for c in range(3)]
+    live = [b for b in boxes if not _box_empty(b)]
+    if not live:
+        return _empty_box()
+    lo = [min(b[0][c] for b in live) for c in range(3)]
+    hi = [max(b[1][c] for b in live) for c in range(3)]
     return lo, hi
 
 
@@ -170,8 +190,8 @@ def invert_affine(m):
     det = (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
            - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]))
-    if det == 0:
-        raise ValueError("singular instance transform")
+    if det == 0 or not math.isfinite(det):
+        raise ValueError("singular or non-finite instance transform")
     inv = [[0.0] * 3 for _ in range(3)]
     for r in range(3):
         for c in range(3):
@@ -179,20 +199,31 @@ def invert_affine(m):
             c1, c2 = (r + 1) % 3, (r + 2) % 3
             inv[r][c] = (a[r1][c1] * a[r2][c2] - a[r1][c2] * a[r2][c1]) / det
     t = [row[3] for row in m]
-    return [inv[r] + [-(inv[r][0] * t[0] + inv[r][1] * t[1] + inv[r][2] * t[2])] for r in range(3)]
+    out = [inv[r] + [-(inv[r][0] * t[0] + inv[r][1] * t[1] + inv[r][2] * t[2])] for r in range(3)]
+    if any(not math.isfinite(x) for row in out for x in row):
+        raise ValueError("singular or non-finite instance transform")
+    return out
 
 
 # ---- tree construction (ASSUMPTION: the heuristic is ours; any valid BVH4 traverses the same) ----
 def _split4(items, centre):
-    """Split items into up to four groups by two median cuts along the widest centroid axes."""
+    """Split items into up to four groups by two median cuts along the widest centroid axes.
+    Items with an empty box (``centre(i) is None``) sort last, matching xdxr_build.comp MODE_MORTON."""
     def cut(group):
         if len(group) < 2:
             return [group]
-        lo, hi = _bounds([centre(i) for i in group])
-        axis = max(range(3), key=lambda c: hi[c] - lo[c])
-        group = sorted(group, key=lambda i: centre(i)[axis])
-        mid = len(group) // 2
-        return [group[:mid], group[mid:]]
+        live = [i for i in group if centre(i) is not None]
+        if not live:
+            mid = len(group) // 2
+            return [group[:mid], group[mid:]]
+        empty = [i for i in group if centre(i) is None]
+        if len(live) >= 2:
+            lo, hi = _bounds([centre(i) for i in live])
+            axis = max(range(3), key=lambda c: hi[c] - lo[c])
+            live = sorted(live, key=lambda i: centre(i)[axis])
+        ordered = live + empty
+        mid = len(ordered) // 2
+        return [ordered[:mid], ordered[mid:]]
     out = []
     for half in cut(items):
         out.extend(g for g in cut(half) if g)
@@ -275,36 +306,38 @@ def _write_header(buf, flags, end, n_elements, bounds, nodes_off, root, elements
                      nodes_off, 0, root, elements_off, parents_off, 0)
 
 
-def _remap_for(tri, order):
-    """Remap byte that returns D3D's barycentrics (the weights of the triangle's own vertices 1 and 2) when the
-    node reads the vertices in ``order``: the edge function of slot s weighs order[s]."""
-    order = [tuple(p) for p in order]
-    return order.index(tuple(tri[1])) | order.index(tuple(tri[2])) << 2
-
-
 def _pair_triangles(tris):
-    """Greedy pairing of triangles that share an edge into one leaf (TRI0 = v0 v1 v2, TRI1 = v1 v3 v2). Returns a
-    list of leaves, each a list of (slots, remap, prim) entries plus the five vertex slots."""
+    """Greedy pairing of active triangles that share an edge into one leaf (TRI0 = v0 v1 v2, TRI1 = v1 v3 v2).
+    Inactive (NaN) triangles and zero-length edges are never paired, matching runtime/src/xdxr_build.comp. Returns a
+    list of leaves, each a list of (slots, remap, prim) entries plus the four vertex slots."""
     leaves = []
     used = [False] * len(tris)
+    inactive = [_tri_inactive(t) for t in tris]
     edges = {}
     for i, t in enumerate(tris):
+        if inactive[i]:
+            continue
         for k in range(3):
             a, b = tuple(t[k]), tuple(t[(k + 1) % 3])
+            if a == b:
+                continue
             edges.setdefault((b, a), []).append((i, k))     # an opposite-winding neighbour has edge (b, a)
     for i, t in enumerate(tris):
         if used[i]:
             continue
         used[i] = True
         mate = None
-        for k in range(3):
-            a, b = tuple(t[k]), tuple(t[(k + 1) % 3])
-            for j, kj in edges.get((a, b), []):
-                if not used[j]:
-                    mate = (k, j, kj)
+        if not inactive[i]:
+            for k in range(3):
+                a, b = tuple(t[k]), tuple(t[(k + 1) % 3])
+                if a == b:
+                    continue
+                for j, kj in edges.get((a, b), []):
+                    if not used[j]:
+                        mate = (k, j, kj)
+                        break
+                if mate:
                     break
-            if mate:
-                break
         if not mate:
             v = [list(t[0]), list(t[1]), list(t[2]), list(t[2])]
             leaves.append((v, [(TRI0, REMAP_IDENTITY, i)]))
@@ -316,7 +349,11 @@ def _pair_triangles(tris):
         q = tris[j]
         p3 = q[(kj + 2) % 3]                                  # the mate's vertex off the shared edge
         v = [list(p0), list(p1), list(p2), list(p3)]
-        leaves.append((v, [(TRI0, _remap_for(t, (p0, p1, p2)), i), (TRI1, _remap_for(q, (p1, p3, p2)), j)]))
+        # TRI0 reads (p0, p1, p2): vertex m of t is in slot (m + 4 - k) % 3.
+        # TRI1 reads (p1, p3, p2): vertex m of q is in slot (m + 5 - kj) % 3.
+        remap0 = ((5 - k) % 3) | (((6 - k) % 3) << 2)
+        remap1 = ((6 - kj) % 3) | (((7 - kj) % 3) << 2)
+        leaves.append((v, [(TRI0, remap0, i), (TRI1, remap1, j)]))
     return leaves
 
 
@@ -335,10 +372,11 @@ def build_blas(triangles, geometry_index=0, flags=0, box16=False, pair=False, op
         leaves = [([list(t[0]), list(t[1]), list(t[2]), list(t[2])], [(TRI0, REMAP_IDENTITY, i)])
                   for i, t in enumerate(tris)]
     # the tree's leaves are triangle references (leaf record, node type): a paired record is reached through two
-    # pointers, each with its own triangle's box
+    # pointers, each with its own triangle's box. Inactive (NaN) triangles get an empty box (+inf, -inf).
     refs = [(h, kind, prim) for h, (_, entries) in enumerate(leaves) for kind, _, prim in entries]
-    ref_box = {r: _bounds(tris[r[2]]) for r in refs}
-    centre = lambda r: [(ref_box[r][0][c] + ref_box[r][1][c]) * 0.5 for c in range(3)]
+    ref_box = {r: _empty_box() if _tri_inactive(tris[r[2]]) else _bounds(tris[r[2]]) for r in refs}
+    centre = lambda r: (None if _box_empty(ref_box[r])
+                        else [(ref_box[r][0][c] + ref_box[r][1][c]) * 0.5 for c in range(3)])
     root = _build_tree(refs, centre, lambda r: ref_box[r])
     inner = _inner_nodes(root)
     parents_off, elements_off, nodes_off, end, node_size = _layout(len(leaves), LEAF_SIZE, inner, box16)
@@ -386,9 +424,13 @@ class Instance:
 
 
 def _world_box(inst):
+    if inst.blas_va == 0 or (inst.mask & 0xFF) == 0 or _box_empty(inst.blas_bounds):
+        return _empty_box()
     lo, hi = inst.blas_bounds
     corners = [[(lo, hi)[(i >> c) & 1][c] for c in range(3)] for i in range(8)]
     pts = [_transform_point(inst.transform, p) for p in corners]
+    if any(math.isnan(c) for p in pts for c in p):
+        return _empty_box()
     return _bounds(pts)
 
 
@@ -397,11 +439,24 @@ def build_tlas(instances, box16=False):
     if not instances:
         raise ValueError("a TLAS needs at least one instance")
     for inst in instances:
-        if inst.blas_va % AS_ALIGNMENT:
-            raise ValueError("BLAS addresses must be 256-byte aligned")
-    boxes = {i: _world_box(inst) for i, inst in enumerate(instances)}
+        if (isinstance(inst.blas_va, bool) or not isinstance(inst.blas_va, int)
+                or not 0 <= inst.blas_va < (1 << 40) or inst.blas_va % AS_ALIGNMENT):
+            raise ValueError("BLAS addresses must be 256-byte aligned and in 0..2^40-1")
+    invs = {}
+    boxes = {}
+    for i, inst in enumerate(instances):
+        try:
+            invs[i] = invert_affine(inst.transform)
+        except ValueError:
+            # Matches xdxr_build.comp / docs/bvh.md 7a: a singular or non-finite transform gets a zero inverse
+            # and an empty box so the instance is inactive.
+            invs[i] = [[0.0] * 4 for _ in range(3)]
+            boxes[i] = _empty_box()
+        else:
+            boxes[i] = _world_box(inst)
     handles = list(range(len(instances)))
-    centre = lambda h: [(boxes[h][0][c] + boxes[h][1][c]) * 0.5 for c in range(3)]
+    centre = lambda h: (None if _box_empty(boxes[h])
+                        else [(boxes[h][0][c] + boxes[h][1][c]) * 0.5 for c in range(3)])
     root = _build_tree(handles, centre, lambda h: boxes[h])
     inner = _inner_nodes(root)
     parents_off, elements_off, nodes_off, end, node_size = _layout(len(instances), INSTANCE_SIZE, inner, box16)
@@ -409,9 +464,10 @@ def build_tlas(instances, box16=False):
     inst_ptrs = {}
     for h, inst in enumerate(instances):
         off = elements_off + h * INSTANCE_SIZE
-        inv = invert_affine(inst.transform)
+        inv = invs[h]
         identity_rot = all(inst.transform[r][c] == (1.0 if r == c else 0.0) for r in range(3) for c in range(3))
-        internal = (inst.blas_root & ~INST_FLAGS_MASK) | (INST_IDENTITY_ROTATION if identity_rot else 0)
+        inst_root = INVALID if inst.blas_va == 0 else inst.blas_root
+        internal = (inst_root & ~INST_FLAGS_MASK) | (INST_IDENTITY_ROTATION if identity_rot else 0)
         struct.pack_into("<12f", buf, off, *[x for row in inst.transform for x in row])
         struct.pack_into("<4I", buf, off + 48, (inst.instance_id & 0xFFFFFF) | (inst.mask & 0xFF) << 24,
                          (inst.contribution & 0xFFFFFF) | (inst.flags & 0xFF) << 24, internal,
@@ -461,7 +517,7 @@ class Memory:
 
 def _box_test(extent, org, d, inv, lo, hi):
     """Entry distance of the ray into the box, or inf on a miss (TestXboxBvh4Node / RayBoxTest)."""
-    if any(lo[c] > hi[c] for c in range(3)):
+    if not all(lo[c] <= hi[c] for c in range(3)):
         return INF
     tnear, tfar = 0.0, extent
     for c in range(3):
@@ -566,10 +622,14 @@ def _inverse_dir(d):
 def _trace_blas(mem, bvh_va, org, d, tmax, hit, inst, stats=None):
     inv = _inverse_dir(d)
     stack = [mem.u32(bvh_va + 48)[0]]
+    visited = set()
     while stack:
         p = stack.pop()
         if p == INVALID:
             continue
+        if p in visited:
+            raise ValueError(f"cycle in BVH at node {p:#x}")
+        visited.add(p)
         if stats is not None:
             stats["steps"] += 1
         r = intersect_node(mem, bvh_va, p, org, d, inv, hit["t"] if hit else tmax)
@@ -602,10 +662,14 @@ def trace(mem, bvh_va, org, d, tmax=INF, mask=0xFF, bias=0, stats=None):
     hit = None
     inv = _inverse_dir(d)
     stack = [mem.u32(bvh_va + 48)[0]]
+    visited = set()
     while stack:
         p = stack.pop()
         if p == INVALID:
             continue
+        if p in visited:
+            raise ValueError(f"cycle in BVH at node {p:#x}")
+        visited.add(p)
         if ptr_type(p) == INSTANCE:
             rec = bvh_va + ptr_offset(p)
             id_mask, _, internal, blas = mem.u32(rec + 48, 4)
@@ -635,12 +699,15 @@ def brute_force(scene, org, d, tmax=INF, mask=0xFF):
     ``scene`` is a list of (transform or None, mask, triangles); the result names the scene index as instance."""
     best = None
     for idx, (m, imask, tris) in enumerate(scene):
-        if m is not None and not imask & mask:
+        if not tris or (m is not None and not imask & mask):
             continue
         if m is None:
             lo, ld = org, d
         else:
-            inv = invert_affine(m)
+            try:
+                inv = invert_affine(m)
+            except ValueError:
+                continue                                        # singular or non-finite transform: inactive instance
             lo, ld = _transform_point(inv, org), _transform_dir(inv, d)
         for prim, t in enumerate(tris):
             v = [[f32(c) for c in p] for p in t]
@@ -676,6 +743,8 @@ def validate(data, expect_bottom=None):
     for name, off in (("offsetToNodes", nodes_off), ("offsetToElements", elements_off)):
         if off % UNIT or off > len(data):
             errs.append(f"{name} {off:#x} is unaligned or past the end")
+    if parents_off % 4:
+        errs.append(f"offsetToParents {parents_off:#x} is not 4-byte aligned")
     if errs:
         return errs
     seen_leaves = 0
@@ -735,7 +804,9 @@ def validate(data, expect_bottom=None):
                     lo, hi = b[:3], b[3:]
                 if k == INVALID:
                     continue
-                if box and not all(box[0][c] <= lo[c] and hi[c] <= box[1][c] for c in range(3)):
+                if any(math.isnan(c) for c in (*lo, *hi)):
+                    errs.append(f"child box {i} of {p:#x} contains NaN")
+                elif box and not all(box[0][c] <= lo[c] and hi[c] <= box[1][c] for c in range(3)):
                     errs.append(f"child box {i} of {p:#x} is not inside its parent's box")
                 stack.append((k, (lo, hi), p))
         else:
@@ -745,35 +816,56 @@ def validate(data, expect_bottom=None):
     return errs
 
 
+def _node_size(kind):
+    return NODE32_SIZE if kind == BOX32 else INSTANCE_SIZE if kind == INSTANCE else UNIT
+
+
 def box16_rounding(data):
     """Checks that every BOX16 child box of a bottom-level BVH holds exactly encode_box16 of the exact box of the
     triangles under that child: the bits, not just containment. The exact box comes from the leaves' own vertices, so
     this needs nothing but the buffer. A triangle with a NaN vertex has an empty box, as in the builder. Returns a list
     of problems (empty = every BOX16 word matches)."""
+    if len(data) < HEADER_SIZE:
+        return ["buffer shorter than the 64-byte header"]
     errs = []
     root = struct.unpack_from("<I", data, 48)[0]
     empty = ([INF] * 3, [-INF] * 3)
     memo = {}
+    visiting = set()
 
     def exact(p):
         if p in memo:
             return memo[p]
+        if p in visiting:
+            errs.append(f"cycle at node {p:#x}")
+            return empty
         kind, off = ptr_type(p), ptr_offset(p)
-        if kind <= TRI3:
-            pts = [struct.unpack_from("<3f", data, off + 12 * s) for s in TRI_VERTS[kind]]
-            box = empty if any(math.isnan(c) for q in pts for c in q) else _bounds(pts)
-        else:
-            kids = struct.unpack_from("<4I", data, off)
-            boxes = [exact(k) for k in kids if k != INVALID]
-            boxes = [b for b in boxes if all(b[0][c] <= b[1][c] for c in range(3))]
-            box = _union(boxes) if boxes else empty
-            if kind == BOX16:
-                for i, k in enumerate(kids):
-                    want = encode_box16(*(exact(k) if k != INVALID else empty))
-                    got = struct.unpack_from("<3I", data, off + 16 + 12 * i)
-                    if tuple(got) != tuple(want):
-                        errs.append(f"BOX16 {p:#x} child {i}: {[hex(w) for w in got]}, expected "
-                                    f"{[hex(w) for w in want]}")
+        size = _node_size(kind)
+        if off < HEADER_SIZE or off + size > len(data):
+            errs.append(f"node {p:#x} outside the buffer")
+            return empty
+        visiting.add(p)
+        try:
+            if kind <= TRI3:
+                pts = [struct.unpack_from("<3f", data, off + 12 * s) for s in TRI_VERTS[kind]]
+                box = empty if any(math.isnan(c) for q in pts for c in q) else _bounds(pts)
+            elif kind in (BOX16, BOX32):
+                kids = struct.unpack_from("<4I", data, off)
+                child_boxes = [exact(k) if k != INVALID else empty for k in kids]
+                boxes = [b for b in child_boxes if all(b[0][c] <= b[1][c] for c in range(3))]
+                box = _union(boxes) if boxes else empty
+                if kind == BOX16:
+                    for i, k in enumerate(kids):
+                        want = encode_box16(*child_boxes[i])
+                        got = struct.unpack_from("<3I", data, off + 16 + 12 * i)
+                        if tuple(got) != tuple(want):
+                            errs.append(f"BOX16 {p:#x} child {i}: {[hex(w) for w in got]}, expected "
+                                        f"{[hex(w) for w in want]}")
+            else:
+                errs.append(f"unexpected node type {kind} at {p:#x} in bottom-level BOX16 check")
+                box = empty
+        finally:
+            visiting.discard(p)
         memo[p] = box
         return box
 
@@ -784,34 +876,48 @@ def box16_rounding(data):
 
 def node_census(data):
     """Reachable pointers of a valid BVH by node type: {type: count}, the root included."""
+    if len(data) < HEADER_SIZE:
+        return {}
     count = {}
+    visited = set()
     stack = [struct.unpack_from("<I", data, 48)[0]]
     while stack:
         p = stack.pop()
-        if p == INVALID:
+        if p == INVALID or p in visited:
             continue
-        kind = ptr_type(p)
+        kind, off = ptr_type(p), ptr_offset(p)
+        size = _node_size(kind)
+        if off < HEADER_SIZE or off + size > len(data):
+            continue
+        visited.add(p)
         count[kind] = count.get(kind, 0) + 1
         if kind in (BOX16, BOX32):
-            stack.extend(struct.unpack_from("<4I", data, ptr_offset(p)))
+            stack.extend(struct.unpack_from("<4I", data, off))
     return count
 
 
 def pair_rotations(data):
     """The (TRI0 remap byte, TRI1 remap byte) of every paired leaf reachable in a valid bottom-level BVH: which of
     the three rotations each triangle of a pair was stored in."""
+    if len(data) < HEADER_SIZE:
+        return set()
     seen = set()
+    visited = set()
     stack = [struct.unpack_from("<I", data, 48)[0]]
     while stack:
         p = stack.pop()
-        if p == INVALID:
+        if p == INVALID or p in visited:
             continue
-        kind = ptr_type(p)
+        kind, off = ptr_type(p), ptr_offset(p)
+        size = _node_size(kind)
+        if off < HEADER_SIZE or off + size > len(data):
+            continue
+        visited.add(p)
         if kind == TRI1:
-            remap = struct.unpack_from("<I", data, ptr_offset(p) + 60)[0]
+            remap = struct.unpack_from("<I", data, off + 60)[0]
             seen.add((remap & 0xFF, (remap >> 8) & 0xFF))
         elif kind in (BOX16, BOX32):
-            stack.extend(struct.unpack_from("<4I", data, ptr_offset(p)))
+            stack.extend(struct.unpack_from("<4I", data, off))
     return seen
 
 
@@ -824,7 +930,6 @@ def count_pairs(data):
 def _case_names(directory):
     """Find cases using a literal directory and the usual JSON filename pattern."""
     import glob
-    import os
     pattern = os.path.join(glob.escape(os.fspath(directory)), "*.json")
     return sorted(os.path.splitext(os.path.basename(path))[0] for path in glob.glob(pattern))
 
@@ -833,21 +938,50 @@ class CaseError(Exception):
     """A <case>.json / <case>.bin pair that is missing, unreadable or not a case description."""
 
 
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _load_case(directory, name):
     """desc, data for one <name>.json and <name>.bin pair. CaseError names the .json at fault: any *.json in the
     directory counts as a case (check-build is run on a build folder that may hold other reports), so a stray or
     half-written file there must say which one it is, not end in a traceback."""
     import json
-    js = f"{directory}/{name}.json"
+    js = os.path.join(directory, f"{name}.json")
+    bin_path = os.path.join(directory, f"{name}.bin")
     fix = lambda x: math.nan if x == "nan" else x                                   # noqa: E731
     try:
-        with open(js, encoding="utf-8") as fh:
+        with open(js, encoding="utf-8-sig") as fh:
             desc = json.load(fh)
-        with open(f"{directory}/{name}.bin", "rb") as fh:
+        with open(bin_path, "rb") as fh:
             data = fh.read()
+        if not isinstance(desc, dict):
+            raise CaseError(f"{js}: case is not a JSON object")
         kind = desc["kind"]
         if kind == "blas":
-            desc["triangles"] = [[[fix(c) for c in v] for v in t[:3]] + t[3:] for t in desc["triangles"]]
+            raw_tris = desc["triangles"]
+            if not isinstance(raw_tris, list):
+                raise CaseError(f"{js}: 'triangles' is not a list")
+            tris = []
+            for ti, t in enumerate(raw_tris):
+                if not isinstance(t, list) or len(t) < 5:
+                    raise CaseError(f"{js}: triangle {ti} must be [v0, v1, v2, geometry, primitive]")
+                verts = []
+                for v in t[:3]:
+                    if not isinstance(v, list) or len(v) != 3:
+                        raise CaseError(f"{js}: triangle {ti} has a non-vec3 vertex")
+                    coords = [fix(c) for c in v]
+                    if not all(_is_number(c) for c in coords):
+                        raise CaseError(f"{js}: triangle {ti} has a non-numeric vertex coordinate")
+                    verts.append(coords)
+                if not _is_int(t[3]) or not _is_int(t[4]):
+                    raise CaseError(f"{js}: triangle {ti} geometry/primitive ids must be integers")
+                tris.append(verts + t[3:])
+            desc["triangles"] = tris
         elif kind != "tlas":
             raise CaseError(f"{js}: kind {kind!r} is neither 'blas' nor 'tlas'")
         # Check the keys check_build needs while the filename is still in scope: a KeyError there would name only the
@@ -855,6 +989,12 @@ def _load_case(directory, name):
         for key in ("address",) + (("blas", "instances") if kind == "tlas" else ()):
             if key not in desc:
                 raise CaseError(f"{js}: the case has no {key!r} key")
+        if not _is_int(desc["address"]) or desc["address"] < 0:
+            raise CaseError(f"{js}: 'address' must be a non-negative integer")
+        if "bias" in desc and not _is_int(desc["bias"]):
+            raise CaseError(f"{js}: 'bias' must be an integer")
+        if "rays" in desc and (not _is_int(desc["rays"]) or desc["rays"] < 1):
+            raise CaseError(f"{js}: 'rays' must be a positive integer")
         if kind == "tlas":
             if not isinstance(desc["blas"], list) or not all(isinstance(b, str) and b for b in desc["blas"]):
                 raise CaseError(f"{js}: 'blas' is not a list of case names")
@@ -866,6 +1006,17 @@ def _load_case(directory, name):
                 for key in ("transform", "blas", "mask"):
                     if key not in inst:
                         raise CaseError(f"{js}: instance {i} has no {key!r} key")
+                raw_xform = inst["transform"]
+                if not isinstance(raw_xform, list) or len(raw_xform) != 12:
+                    raise CaseError(f"{js}: instance {i} 'transform' must be a 12-element list")
+                xform = [fix(c) for c in raw_xform]
+                if not all(_is_number(c) for c in xform):
+                    raise CaseError(f"{js}: instance {i} 'transform' has a non-numeric entry")
+                inst["transform"] = xform
+                if not _is_int(inst["mask"]):
+                    raise CaseError(f"{js}: instance {i} 'mask' must be an integer")
+    except CaseError:
+        raise
     except KeyError as error:
         raise CaseError(f"{js}: the case has no {error} key") from None
     except (OSError, ValueError, TypeError, IndexError) as error:
@@ -875,6 +1026,8 @@ def _load_case(directory, name):
 
 def check_build(directory, rays=300, seed=1):
     """Validate every <case>.bin of a GPU build and trace rays against brute force. Returns a list of problems."""
+    if not _is_int(rays) or rays < 1:
+        raise ValueError("rays must be a positive integer")
     names = _case_names(directory)
     if not names:
         return [f"no cases in {directory}"]
@@ -883,7 +1036,7 @@ def check_build(directory, rays=300, seed=1):
     for n, (desc, _) in cases.items():
         if desc["kind"] != "tlas":
             continue
-        js = f"{directory}/{n}.json"
+        js = os.path.join(directory, f"{n}.json")
         for b in desc["blas"]:
             if b not in cases:
                 raise CaseError(f"{js}: BLAS {b!r} is not a case in this folder")
@@ -892,7 +1045,7 @@ def check_build(directory, rays=300, seed=1):
         for i, inst in enumerate(desc["instances"]):
             index = inst["blas"]
             # -1 is an instance with no BLAS (vk_xdxr_build_test's "no BLAS" case), which the model skips
-            if not isinstance(index, int) or not -1 <= index < len(desc["blas"]):
+            if not _is_int(index) or not -1 <= index < len(desc["blas"]):
                 raise CaseError(f"{js}: instance {i} names BLAS index {index!r}, not -1..{len(desc['blas']) - 1}")
     rng = random.Random(seed)
     for n, (desc, data) in cases.items():
@@ -939,37 +1092,46 @@ def check_build(directory, rays=300, seed=1):
         stats = {"steps": 0}
         bad = hits = 0
         case_rays = min(rays, desc.get("rays", rays))      # a large case may ask for fewer (brute force is slow)
-        for _ in range(case_rays):
-            o = [rng.uniform(-12, 12) for _ in range(3)]
-            target = [rng.uniform(-6, 6) for _ in range(3)]
-            d = [target[c] - o[c] for c in range(3)]
-            got = trace(mem, desc["address"], o, d, bias=desc.get("bias", 0), stats=stats)
-            want = brute_force(scene, o, d)
-            hits += got is not None
-            if (got is None) != (want is None):
-                bad += 1
-                continue
-            if got is None:
-                continue
-            if ids is not None:
-                same = (got["geometry"], got["primitive"]) == ids[want["primitive"]]
-                same = same and math.isclose(got["t"], want["t"], rel_tol=1e-6, abs_tol=1e-9)
-                # D3D12's barycentrics: a paired (TRI1) or rotated TRI0 triangle must still return them through its
-                # remap byte, not its slot order
-                same = same and all(math.isclose(g, w, rel_tol=1e-5, abs_tol=1e-6)
-                                    for g, w in zip(got["bary"], want["bary"]))
-            else:
-                # the instance's world-to-object matrix is a float32 inverse; allow for its rounding in t
-                want_id = inst_ids[want["instance"]][want["primitive"]]
-                same = (got["instance"], (got["geometry"], got["primitive"])) == (want["instance"], want_id)
-                same = same and math.isclose(got["t"], want["t"], rel_tol=1e-4)
-            bad += not same
+        trace_failed = len(data) < HEADER_SIZE
+        if not trace_failed:
+            for _ in range(case_rays):
+                o = [rng.uniform(-12, 12) for _ in range(3)]
+                target = [rng.uniform(-6, 6) for _ in range(3)]
+                d = [target[c] - o[c] for c in range(3)]
+                try:
+                    got = trace(mem, desc["address"], o, d, bias=desc.get("bias", 0), stats=stats)
+                except (IndexError, ValueError) as exc:
+                    msg = f"traversal failed: {exc}"
+                    errs.append(msg)
+                    problems.append(f"{n}: {msg}")
+                    trace_failed = True
+                    break
+                want = brute_force(scene, o, d)
+                hits += got is not None
+                if (got is None) != (want is None):
+                    bad += 1
+                    continue
+                if got is None:
+                    continue
+                if ids is not None:
+                    same = (got["geometry"], got["primitive"]) == ids[want["primitive"]]
+                    same = same and math.isclose(got["t"], want["t"], rel_tol=1e-6, abs_tol=1e-9)
+                    # D3D12's barycentrics: a paired (TRI1) or rotated TRI0 triangle must still return them through its
+                    # remap byte, not its slot order
+                    same = same and all(math.isclose(g, w, rel_tol=1e-5, abs_tol=1e-6)
+                                        for g, w in zip(got["bary"], want["bary"]))
+                else:
+                    # the instance's world-to-object matrix is a float32 inverse; allow for its rounding in t
+                    want_id = inst_ids[want["instance"]][want["primitive"]]
+                    same = (got["instance"], (got["geometry"], got["primitive"])) == (want["instance"], want_id)
+                    same = same and math.isclose(got["t"], want["t"], rel_tol=1e-4)
+                bad += not same
         paired = f", {pairs} TRI1" if pairs else ""
         print(f"{n}: {len(data)} bytes{paired}, {len(errs)} validation errors, {bad}/{case_rays} rays differ "
               f"({hits} hits), {stats['steps'] / max(case_rays, 1):.1f} steps per ray")
         if bad:
             problems.append(f"{n}: {bad} of {case_rays} rays differ from brute force")
-        if desc["kind"] == "blas" and len(desc["triangles"]) > 4 and hits == 0:
+        if not trace_failed and desc["kind"] == "blas" and len(desc["triangles"]) > 4 and hits == 0:
             problems.append(f"{n}: no ray hit anything; the check proves nothing")
     return problems
 

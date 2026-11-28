@@ -67,7 +67,18 @@ def _run_insn_line(line: str) -> rdna2spirv.Gen:
     return g
 
 
-def _translate_and_validate_cs(name: str, asm_lines: list[str], threads: int = 64) -> str:
+def _require_or_skip_spirv_tools(test_case: unittest.TestCase) -> tuple[str, str]:
+    spirv_as = shutil.which("spirv-as")
+    spirv_val = shutil.which("spirv-val")
+    if spirv_as and spirv_val:
+        return spirv_as, spirv_val
+    msg = "spirv-as and spirv-val must be on PATH"
+    if os.environ.get("LEONIDA_REQUIRE_SPIRV_TOOLS") == "1":
+        test_case.fail(msg)
+    test_case.skipTest(msg)
+
+
+def _translate_cs(name: str, asm_lines: list[str], threads: int = 64) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         os.mkdir(os.path.join(tmp, "disasm"))
         os.mkdir(os.path.join(tmp, "fssm"))
@@ -84,9 +95,11 @@ def _translate_and_validate_cs(name: str, asm_lines: list[str], threads: int = 6
             warnings.simplefilter("ignore", ResourceWarning)
             spv = rdna2spirv.translate(s_path)
             gc.collect()
-        spirv_as = shutil.which("spirv-as")
-        spirv_val = shutil.which("spirv-val")
-        assert spirv_as and spirv_val, "spirv-as and spirv-val must be on PATH"
+        return spv
+
+
+def _validate_spirv(name: str, spv: str, spirv_as: str, spirv_val: str) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
         spvasm = os.path.join(tmp, f"{name}.spvasm")
         spvbin = os.path.join(tmp, f"{name}.spv")
         with open(spvasm, "w", encoding="utf-8", newline="\n") as f:
@@ -101,7 +114,6 @@ def _translate_and_validate_cs(name: str, asm_lines: list[str], threads: int = 6
             capture_output=True, text=True,
         )
         assert r2.returncode == 0, f"spirv-val failed:\n{r2.stderr}"
-        return spv
 
 
 def _store_scc(slot: int) -> list[str]:
@@ -246,66 +258,71 @@ class TestSopcNegativeValidation(unittest.TestCase):
                         _run_insn_line(f"{op} s[4:5], {bad}")
 
 
+def _positive_control_program() -> tuple[list[str], list[tuple[str, int]]]:
+    asm: list[str] = [
+        "s_mov_b32 m0, 0x00000005",
+        "s_mov_b32 s8, -1",
+        "s_mov_b32 s9, 0x3f800000",   # 1.0f bits (bit 29 is 1, bit 30 is 0)
+        "s_mov_b32 s10, 0xbf800000",  # -1.0f bits
+        "s_mov_b32 s12, 0x00000010",  # bit 4 set
+        "s_mov_b32 s13, 0x00000100",  # bit 40 set in s[12:13]
+        "s_mov_b32 vcc_lo, s12",
+        "s_mov_b32 vcc_hi, s13",
+    ]
+    expected: list[tuple[str, int]] = []
+
+    def add_case(label: str, insn: str, want: int):
+        slot = len(expected)
+        asm.append(insn)
+        asm.extend(_store_scc(slot))
+        expected.append((label, want))
+
+    # 12 32-bit scalar compares covering sgpr, null, m0, vcc_lo/hi, exec_lo/hi, scc/src_scc,
+    # plain negative integer immediates, positive immediates, and float immediates.
+    add_case("s_cmp_eq_i32 sgpr/neg_imm", "s_cmp_eq_i32 s8, -1", 1)
+    add_case("s_cmp_lg_i32 sgpr/neg_imm", "s_cmp_lg_i32 s8, -16", 1)
+    add_case("s_cmp_gt_i32 null/neg_imm", "s_cmp_gt_i32 null, -1", 1)
+    add_case("s_cmp_ge_i32 m0/imm", "s_cmp_ge_i32 m0, 5", 1)
+    add_case("s_cmp_lt_i32 neg_imm/null", "s_cmp_lt_i32 -1, null", 1)
+    add_case("s_cmp_le_i32 scc/imm", "s_cmp_le_i32 scc, 1", 1)
+    add_case("s_cmp_eq_u32 sgpr/fimm", "s_cmp_eq_u32 s9, 1.0", 1)
+    add_case("s_cmp_eq_u32 sgpr/neg_fimm", "s_cmp_eq_u32 s10, -1.0", 1)
+    add_case("s_cmp_lg_u32 vcc_lo/null", "s_cmp_lg_u32 vcc_lo, null", 1)
+    add_case("s_cmp_gt_u32 vcc_hi/m0", "s_cmp_gt_u32 vcc_hi, m0", 1)
+    add_case("s_cmp_ge_u32 exec_lo/exec_hi", "s_cmp_ge_u32 exec_lo, exec_hi", 1)
+    add_case("s_cmp_lt_u32 src_scc/m0", "s_cmp_lt_u32 src_scc, m0", 1)
+    add_case("s_cmp_le_u32 m0/vcc_lo", "s_cmp_le_u32 m0, vcc_lo", 1)
+
+    # 2 64-bit scalar compares covering s[a:b], vcc, exec, null, 0, -1, hex imm.
+    add_case("s_cmp_eq_u64 pair/vcc", "s_cmp_eq_u64 s[12:13], vcc", 1)
+    add_case("s_cmp_lg_u64 pair/null", "s_cmp_lg_u64 s[12:13], null", 1)
+    add_case("s_cmp_eq_u64 null/0", "s_cmp_eq_u64 null, 0", 1)
+    add_case("s_cmp_eq_u64 exec/-1", "s_cmp_eq_u64 exec, -1", 1)
+    add_case("s_cmp_lg_u64 exec/0", "s_cmp_lg_u64 exec, 0", 1)
+
+    # 4 bit-test ops covering b32 and b64 with valid scalar operands.
+    add_case("s_bitcmp1_b32 s12/4", "s_bitcmp1_b32 s12, 4", 1)
+    add_case("s_bitcmp0_b32 m0/1", "s_bitcmp0_b32 m0, 1", 1)
+    add_case("s_bitcmp1_b32 fimm/29", "s_bitcmp1_b32 1.0, 29", 1)
+    add_case("s_bitcmp0_b32 fimm/30", "s_bitcmp0_b32 1.0, 30", 1)
+    add_case("s_bitcmp0_b32 null/0", "s_bitcmp0_b32 null, 0", 1)
+    add_case("s_bitcmp1_b32 exec_lo/0", "s_bitcmp1_b32 exec_lo, 0", 1)
+    add_case("s_bitcmp1_b64 pair/40", "s_bitcmp1_b64 s[12:13], 40", 1)
+    add_case("s_bitcmp0_b64 pair/41", "s_bitcmp0_b64 s[12:13], 41", 1)
+    add_case("s_bitcmp1_b64 vcc/40", "s_bitcmp1_b64 vcc, 40", 1)
+    add_case("s_bitcmp1_b64 exec/63", "s_bitcmp1_b64 exec, 63", 1)
+    add_case("s_bitcmp0_b64 null/35", "s_bitcmp0_b64 null, 35", 1)
+    add_case("s_bitcmp1_b64 neg_imm/63", "s_bitcmp1_b64 -1, 63", 1)
+    add_case("s_bitcmp1_b64 pair/m0", "s_bitcmp1_b64 s[12:13], m0", 0)
+
+    asm.append("s_endpgm")
+    return asm, expected
+
+
 class TestSopcPositiveControls(unittest.TestCase):
-    def test_all_18_ops_and_valid_scalar_operands_spirv_val_and_interp(self):
-        asm: list[str] = [
-            "s_mov_b32 m0, 0x00000005",
-            "s_mov_b32 s8, -1",
-            "s_mov_b32 s9, 0x3f800000",   # 1.0f bits (bit 29 is 1, bit 30 is 0)
-            "s_mov_b32 s10, 0xbf800000",  # -1.0f bits
-            "s_mov_b32 s12, 0x00000010",  # bit 4 set
-            "s_mov_b32 s13, 0x00000100",  # bit 40 set in s[12:13]
-            "s_mov_b32 vcc_lo, s12",
-            "s_mov_b32 vcc_hi, s13",
-        ]
-        expected: list[tuple[str, int]] = []
-
-        def add_case(label: str, insn: str, want: int):
-            slot = len(expected)
-            asm.append(insn)
-            asm.extend(_store_scc(slot))
-            expected.append((label, want))
-
-        # 12 32-bit scalar compares covering sgpr, null, m0, vcc_lo/hi, exec_lo/hi, scc/src_scc,
-        # plain negative integer immediates, positive immediates, and float immediates.
-        add_case("s_cmp_eq_i32 sgpr/neg_imm", "s_cmp_eq_i32 s8, -1", 1)
-        add_case("s_cmp_lg_i32 sgpr/neg_imm", "s_cmp_lg_i32 s8, -16", 1)
-        add_case("s_cmp_gt_i32 null/neg_imm", "s_cmp_gt_i32 null, -1", 1)
-        add_case("s_cmp_ge_i32 m0/imm", "s_cmp_ge_i32 m0, 5", 1)
-        add_case("s_cmp_lt_i32 neg_imm/null", "s_cmp_lt_i32 -1, null", 1)
-        add_case("s_cmp_le_i32 scc/imm", "s_cmp_le_i32 scc, 1", 1)
-        add_case("s_cmp_eq_u32 sgpr/fimm", "s_cmp_eq_u32 s9, 1.0", 1)
-        add_case("s_cmp_eq_u32 sgpr/neg_fimm", "s_cmp_eq_u32 s10, -1.0", 1)
-        add_case("s_cmp_lg_u32 vcc_lo/null", "s_cmp_lg_u32 vcc_lo, null", 1)
-        add_case("s_cmp_gt_u32 vcc_hi/m0", "s_cmp_gt_u32 vcc_hi, m0", 1)
-        add_case("s_cmp_ge_u32 exec_lo/exec_hi", "s_cmp_ge_u32 exec_lo, exec_hi", 1)
-        add_case("s_cmp_lt_u32 src_scc/m0", "s_cmp_lt_u32 src_scc, m0", 1)
-        add_case("s_cmp_le_u32 m0/vcc_lo", "s_cmp_le_u32 m0, vcc_lo", 1)
-
-        # 2 64-bit scalar compares covering s[a:b], vcc, exec, null, 0, -1, hex imm.
-        add_case("s_cmp_eq_u64 pair/vcc", "s_cmp_eq_u64 s[12:13], vcc", 1)
-        add_case("s_cmp_lg_u64 pair/null", "s_cmp_lg_u64 s[12:13], null", 1)
-        add_case("s_cmp_eq_u64 null/0", "s_cmp_eq_u64 null, 0", 1)
-        add_case("s_cmp_eq_u64 exec/-1", "s_cmp_eq_u64 exec, -1", 1)
-        add_case("s_cmp_lg_u64 exec/0", "s_cmp_lg_u64 exec, 0", 1)
-
-        # 4 bit-test ops covering b32 and b64 with valid scalar operands.
-        add_case("s_bitcmp1_b32 s12/4", "s_bitcmp1_b32 s12, 4", 1)
-        add_case("s_bitcmp0_b32 m0/1", "s_bitcmp0_b32 m0, 1", 1)
-        add_case("s_bitcmp1_b32 fimm/29", "s_bitcmp1_b32 1.0, 29", 1)
-        add_case("s_bitcmp0_b32 fimm/30", "s_bitcmp0_b32 1.0, 30", 1)
-        add_case("s_bitcmp0_b32 null/0", "s_bitcmp0_b32 null, 0", 1)
-        add_case("s_bitcmp1_b32 exec_lo/0", "s_bitcmp1_b32 exec_lo, 0", 1)
-        add_case("s_bitcmp1_b64 pair/40", "s_bitcmp1_b64 s[12:13], 40", 1)
-        add_case("s_bitcmp0_b64 pair/41", "s_bitcmp0_b64 s[12:13], 41", 1)
-        add_case("s_bitcmp1_b64 vcc/40", "s_bitcmp1_b64 vcc, 40", 1)
-        add_case("s_bitcmp1_b64 exec/63", "s_bitcmp1_b64 exec, 63", 1)
-        add_case("s_bitcmp0_b64 null/35", "s_bitcmp0_b64 null, 35", 1)
-        add_case("s_bitcmp1_b64 neg_imm/63", "s_bitcmp1_b64 -1, 63", 1)
-        add_case("s_bitcmp1_b64 pair/m0", "s_bitcmp1_b64 s[12:13], m0", 0)
-
-        asm.append("s_endpgm")
-        spv = _translate_and_validate_cs("cs_sopc_pos", asm, threads=64)
+    def test_all_18_ops_and_valid_scalar_operands_interp(self):
+        asm, expected = _positive_control_program()
+        spv = _translate_cs("cs_sopc_pos", asm, threads=64)
         mem = si.run_workgroup(
             spv, 64, 64,
             inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
@@ -315,6 +332,12 @@ class TestSopcPositiveControls(unittest.TestCase):
         for slot, (label, want) in enumerate(expected):
             with self.subTest(case=label):
                 self.assertEqual(mem[slot * 4], want, label)
+
+    def test_all_18_ops_and_valid_scalar_operands_spirv_val(self):
+        spirv_as, spirv_val = _require_or_skip_spirv_tools(self)
+        asm, _ = _positive_control_program()
+        spv = _translate_cs("cs_sopc_pos", asm, threads=64)
+        _validate_spirv("cs_sopc_pos", spv, spirv_as, spirv_val)
 
 
 if __name__ == "__main__":

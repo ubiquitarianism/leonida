@@ -66,6 +66,7 @@ CAUGHT = [
     ("heightmap2.dat", b"MHIU" + bytes(12), "MHIU heightmap"),
     ("presets.dat", b"SPS1" + bytes(12), "SPS1 shader-preset table"),
     ("effects.dat", b"SGD5" + bytes(12), "SGD5 effects database"),
+    ("profile.dat", b"BCPHIST1" + bytes(8), "local BCPack predictor profile"),
     ("texcontainer.dat", b"RDS5" + bytes(12), "RDS5 texture container"),
     ("bank2.json", b"AWC\x00" + bytes(12), "AWC audio bank"),
     ("script.lol", b"YSC\x00" + bytes(12), "YSC compiled script"),
@@ -125,6 +126,24 @@ def tarred(members):
     return buf.getvalue()
 
 
+def v7_tarred(members):
+    """Hand-built legacy tar headers, without the later ustar marker or extension fields."""
+    buf = io.BytesIO()
+    for name, data in members.items():
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        info.type = tarfile.AREGTYPE
+        header = bytearray(info.tobuf(format=tarfile.USTAR_FORMAT))
+        header[257:] = bytes(tarfile.BLOCKSIZE - 257)
+        header[148:156] = b"        "
+        header[148:156] = ("%06o\0 " % sum(header)).encode("ascii")
+        buf.write(header)
+        buf.write(data)
+        buf.write(bytes(-len(data) % tarfile.BLOCKSIZE))
+    buf.write(bytes(2 * tarfile.BLOCKSIZE))
+    return buf.getvalue()
+
+
 def corrupt_deflate(archive):
     """`archive` (one deflated zip member) with the first byte of its deflate data made an invalid block type."""
     data = bytearray(archive)
@@ -181,8 +200,8 @@ PASSED_ARCHIVES = [
 ]
 
 
-def run(args, cwd=None):
-    return subprocess.run([sys.executable, "-I", SCRIPT, *args], cwd=cwd, capture_output=True, text=True)
+def run(args, cwd=None, env=None):
+    return subprocess.run([sys.executable, "-I", SCRIPT, *args], cwd=cwd, env=env, capture_output=True, text=True)
 
 
 class CheckNoGameData(unittest.TestCase):
@@ -209,6 +228,52 @@ class CheckNoGameData(unittest.TestCase):
                 result = run([self.write(name, data)])
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn(f"{name}: {line}", result.stdout)
+
+    def test_v7_tar_members_are_checked_without_a_ustar_marker(self):
+        data = v7_tarred({"readme.txt": b"plain text\n", "synthetic.bin": DDS})
+        self.assertEqual(data[257:263], bytes(6))
+        # Confirm this is a readable archive, rather than depending on our scanner's interpretation.
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            self.assertEqual(archive.getnames(), ["readme.txt", "synthetic.bin"])
+            with archive.extractfile("synthetic.bin") as member:
+                self.assertEqual(member.read(), DDS)
+        expected = "DDS texture in tar archive (synthetic.bin)"
+        cases = [
+            ("legacy.bin", data, expected),
+            ("legacy_gzip.bin", gzip.compress(data), expected + " in gzip stream"),
+            ("legacy_bzip2.bin", bz2.compress(data), expected + " in bzip2 stream"),
+            ("legacy_xz.bin", lzma.compress(data), expected + " in xz stream"),
+            ("nested.bin", zipped({"inner.bin": data}), expected + " in zip archive (inner.bin)"),
+        ]
+        for name, payload, line in cases:
+            with self.subTest(name=name):
+                result = run([self.write(name, payload)])
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"{name}: {line}", result.stdout)
+
+    def test_v7_tar_containing_only_text_passes(self):
+        data = v7_tarred({"readme.txt": b"plain text\n", "empty.txt": b""})
+        paths = [self.write("legacy.bin", data), self.write("legacy_gzip.bin", gzip.compress(data)),
+                 self.write("nested.bin", zipped({"inner.bin": data}))]
+        result = run(paths)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_v7_header_probe_does_not_reject_non_archives(self):
+        bad_checksum = bytearray(v7_tarred({"readme.txt": b"plain text\n"}))
+        bad_checksum[0] ^= 1
+        cases = [("bad_checksum.bin", bad_checksum), ("short.bin", bad_checksum[:511]),
+                 ("zeros.bin", bytes(1024)), ("text.txt", b"# ordinary text\n" * 40)]
+        result = run([self.write(name, data) for name, data in cases])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_broken_ustar_is_still_reported_as_unchecked(self):
+        data = bytearray(tarred({"readme.txt": b"plain text\n"}))
+        data[0] ^= 1
+        result = run([self.write("broken.bin", data)])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("tar archive that can't be opened (contents can't be checked)", result.stdout)
 
     def test_decompression_is_bounded(self):
         # A gzip of 65 MiB of zeros (about 64 KiB on disk) holding a zip: past the 64 MiB budget, reported, not read
@@ -250,10 +315,90 @@ class CheckNoGameData(unittest.TestCase):
         self.assertEqual(len(result.stdout.splitlines()), 2, result.stdout)
         self.assertIn("2 file(s)", result.stderr)
 
-    def test_directories_and_missing_paths_are_skipped(self):
-        os.mkdir(os.path.join(self.dir, "sub"))
-        result = run([os.path.join(self.dir, "sub"), os.path.join(self.dir, "missing.bin")])
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    def test_explicit_directory_and_missing_file_are_errors(self):
+        directory = os.path.join(self.dir, "sub")
+        missing = os.path.join(self.dir, "missing.bin")
+        os.mkdir(directory)
+        result = run([directory, missing])
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 2, result.stderr)
+        self.assertIn("sub:", result.stderr)
+        self.assertIn("missing.bin:", result.stderr)
+        self.assertIn("not a regular file", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_explicit_path_error_does_not_hide_a_match(self):
+        missing = os.path.join(self.dir, "missing.bin")
+        bad = self.write("bad.txt", b"DDS " + bytes(12))
+        clean = self.write("clean.txt", b"plain text\n")
+        for paths in ([missing, clean, bad], [bad, clean, missing]):
+            with self.subTest(paths=paths):
+                result = run(paths)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("bad.txt: DDS texture", result.stdout)
+                self.assertIn("cannot read", result.stderr)
+                self.assertIn("missing.bin:", result.stderr)
+                self.assertIn("1 file(s) start like game data", result.stderr)
+
+    def test_explicit_symlinks_are_errors_without_reading_targets(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlinks unavailable")
+        target = self.write("target.txt", b"DDS " + bytes(12))
+        links = [os.path.join(self.dir, "link.txt"), os.path.join(self.dir, "broken.txt")]
+        try:
+            os.symlink(target, links[0])
+            os.symlink(os.path.join(self.dir, "absent"), links[1])
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"cannot create symlinks: {e}")
+        result = run(links)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")  # do not follow even a link to a magic-bearing target
+        self.assertEqual(len(result.stderr.splitlines()), 2, result.stderr)
+        self.assertEqual(result.stderr.count("not a regular file"), 2, result.stderr)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs unavailable")
+    def test_explicit_fifo_is_rejected_without_blocking(self):
+        fifo = os.path.join(self.dir, "fifo")
+        os.mkfifo(fifo)
+        result = subprocess.run([sys.executable, "-I", SCRIPT, fifo], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("not a regular file", result.stderr)
+
+    def test_default_scan_still_skips_non_regular_and_deleted_entries(self):
+        spec = importlib.util.spec_from_file_location("check_no_game_data_under_test", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        # Git lists submodule directories and files deleted from the working tree. Default mode must tolerate both.
+        paths = [self.dir, os.path.join(self.dir, "deleted.txt")]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(module, "tracked_files", return_value=paths), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(module.main([]), 0)
+        self.assertEqual(out.getvalue() + err.getvalue(), "")
+
+    def test_explicit_missing_path_with_newline_has_one_diagnostic(self):
+        if os.name == "nt":
+            self.skipTest("Windows file names cannot contain newlines")
+        result = run([os.path.join(self.dir, "missing\nfile.txt")])
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn(r"missing\nfile.txt", result.stderr)
+
+    def test_explicit_stat_failure_is_reported_without_opening(self):
+        spec = importlib.util.spec_from_file_location("check_no_game_data_under_test", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(module.os, "lstat", side_effect=PermissionError(errno.EACCES, "Permission denied")), \
+                mock.patch.object(module, "classify_file") as classify, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(module.main(["locked.txt"]), 2)
+        classify.assert_not_called()
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue().splitlines(), [
+            "check_no_game_data: cannot read locked.txt: Permission denied"])
 
     def run_with_unreadable(self, locked, paths):
         """main() in this process with open() refusing `locked`; (exit status, stdout, stderr)."""
@@ -303,6 +448,35 @@ class CheckNoGameData(unittest.TestCase):
         rc, out, err = self.run_with_unreadable(locked, [locked, pe])
         self.assertEqual(rc, 1, out + err)
         self.assertIn("PE executable", out)
+
+    def test_git_missing_is_one_stderr_line_and_exit_2(self):
+        # PATH holds no git: the default mode cannot list the tracked files, and that is not "game data found" (1)
+        empty = os.path.join(self.dir, "empty-bin")
+        os.mkdir(empty)
+        self.write("notes.txt", b"plain text\n")
+        result = run([], cwd=self.dir, env=dict(os.environ, PATH=empty))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertTrue(result.stderr.startswith("check_no_game_data: cannot list the tracked files with git: "),
+                        result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_outside_a_repository_is_one_stderr_line_and_exit_2(self):
+        # GIT_CEILING_DIRECTORIES stops git from finding a repository above the temporary directory, and LC_ALL=C
+        # keeps git's message in English; a GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE of the caller would point git at a
+        # repository anyway (a git hook sets them), so they are removed
+        self.write("notes.txt", b"plain text\n")
+        env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+        env.update(GIT_CEILING_DIRECTORIES=os.path.dirname(self.dir), LC_ALL="C")
+        result = run([], cwd=self.dir, env=env)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertTrue(result.stderr.startswith("check_no_game_data: cannot list the tracked files with git: "),
+                        result.stderr)
+        self.assertIn("not a git repository", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     @unittest.skipUnless(shutil.which("git"), "git not installed")
     def test_default_mode_reads_tracked_files_only(self):

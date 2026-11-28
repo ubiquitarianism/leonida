@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -36,7 +37,7 @@ class Judge(unittest.TestCase):
     def test_runner_failure_without_names_fails(self):
         code, lines = cef.judge([], 2, ["ps_ssharp"])
         self.assertEqual(code, 1)
-        self.assertIn("::error::the test runner exited with 2 without naming a failed test", lines)
+        self.assertEqual(lines, ["::error::the test runner exited with 2 without naming a failed test"])
 
     def test_interrupted_run_cannot_pass_on_a_partial_failure_list(self):
         for status in (-15, 143):
@@ -65,6 +66,9 @@ class Main(unittest.TestCase):
         self.assertEqual(self.run_main("\nxdxr_build_check\n\n", "8", "xdxr_build_check"), 0)
         self.assertEqual(self.run_main("a\nb\n", "8", "a"), 1)
 
+    def test_a_utf8_bom_is_not_part_of_the_first_failure_name(self):
+        self.assertEqual(self.run_main("\ufeffknown\n", "8", "known"), 0)
+
     def test_an_expected_argument_can_hold_several_names(self):
         self.assertEqual(self.run_main("a\nb\n", "8", " a  b\n"), 0)
         self.assertEqual(self.run_main("a\nb\n", "8", ""), 1)
@@ -87,6 +91,19 @@ class Main(unittest.TestCase):
                 self.assertEqual(cef.main([str(missing), "8"]), 2)
         self.assertEqual(err.getvalue().count("\n"), 1)
         self.assertIn(str(missing), err.getvalue())
+
+    def test_an_invalid_utf8_list_is_one_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "failed.txt"
+            path.write_bytes(b"\xffknown\n")
+            result = subprocess.run(
+                [sys.executable, "-I", str(SCRIPTS / "ci_expected_failures.py"), str(path), "8"],
+                capture_output=True, text=True, errors="replace", timeout=10,
+            )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stderr.count("\n"), 1)
+        self.assertIn(path.name, result.stderr)
+        self.assertIn("utf-8", result.stderr.lower())
 
     def test_a_non_integer_status_is_one_error_line(self):
         with tempfile.TemporaryDirectory() as tmp:

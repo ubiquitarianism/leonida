@@ -187,6 +187,48 @@ class ImportFailFastTest(unittest.TestCase):
             self.assertEqual((code, out), (2, ""))
             self.assertTrue(err)
 
+    def test_cli_dll_all_json_matches_documented_invocation(self):
+        """Verify `--dll ... --all --json` reports all DLL imports including zero-call entries."""
+        data = build_image([(TEXT_RVA + 0x100, 0xE8, THUNK_FOO)])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(data)
+            code, out, err = run_cli(path, "--dll", "xmem.dll", "--all", "--json")
+            other_code, other_out, other_err = run_cli(path, "--dll", "other.dll", "--all", "--json")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            json.loads(out),
+            {
+                "image_base": "0x140000000",
+                "imports": {
+                    FOO: {"calls": 1, "fatal": []},
+                    BAR: {"calls": 0, "fatal": []},
+                    ORD: {"calls": 0, "fatal": []},
+                },
+            },
+        )
+        self.assertEqual((other_code, other_err), (0, ""))
+        self.assertEqual(json.loads(other_out), {"image_base": "0x140000000", "imports": {}})
+
+    def test_additional_result_copy_width_and_mask_encodings(self):
+        """Exercise 0x89 reg copies, 0xF7 masks, 16-bit 0x66 ax tests, and 0x3D imm32 compares."""
+        at = TEXT_RVA + 0x100
+        call = b"\xe8" + rel32(at + 5, THUNK_FOO)
+        cases = (
+            ("0x89 reg copy to ebx", b"\x89\xc3\x31\xc0\x85\xdb\x75\x01\xcc\xc3", "eax == 0"),
+            ("0xF7 test eax, imm32 mask", b"\xf7\xc0\x00\x00\x00\x80\x75\x01\xc3\xcc", "(eax & 0x80000000) != 0"),
+            ("0x66 16-bit test ax, ax", b"\x66\x85\xc0\x75\x01\xcc\xc3", "ax == 0"),
+            ("0x3D cmp eax, imm32", b"\x3d\x34\x12\x00\x00\x75\x01\xc3\xcc", "eax != 0x1234"),
+        )
+        for label, body, want in cases:
+            with self.subTest(label):
+                buf = bytearray(build_image([]))
+                code = call + body
+                buf[at:at + len(code)] = code
+                fatal = import_fail_fast.fail_fast(bytes(buf))["imports"][FOO]["fatal"]
+                self.assertEqual(fatal, [{"rva": at, "condition": want}])
+
 
 if __name__ == "__main__":
     unittest.main()

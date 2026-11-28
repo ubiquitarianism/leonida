@@ -29,7 +29,10 @@ int request_without_limits() {
     CHECK(decide_arena_size("1", none).bytes == 16 * MiB);
     CHECK(decide_arena_size("0", none).bytes == 16 * MiB);
     CHECK(decide_arena_size("lots", none).bytes == 16 * MiB);
+    CHECK(decide_arena_size("-5", none).bytes == 16 * MiB);
+    CHECK(decide_arena_size("-99999999999999999999", none).bytes == 16 * MiB);
     CHECK(decide_arena_size("99999", none).bytes == 4095 * MiB);
+    CHECK(decide_arena_size("99999999999999999999", none).bytes == 4095 * MiB);
     const ArenaSize s = decide_arena_size("3000", none);
     CHECK(s.bytes == 3000 * MiB && s.requested == 3000 * MiB && s.capped == arena_cap_none);
     return 0;
@@ -103,11 +106,45 @@ int floor_and_limits() {
     return 0;
 }
 
+// A driver that leaves Resizable BAR memory out of a large buffer's memoryTypeBits (RTX 5070 Ti, NVIDIA 617.42:
+// above about 4,091 MiB): the arena shrinks in 16 MiB steps to the largest size that still may use it, by at most an
+// eighth, and stays as asked when it already fits or when nothing in reach does.
+int resizable_bar_fit() {
+    const auto under = [](VkDeviceSize limit) { return [limit](VkDeviceSize bytes) { return bytes <= limit; }; };
+    CHECK(device_local_arena_bytes(4095 * MiB, under(4091 * MiB)) == 4080 * MiB);
+    CHECK(device_local_arena_bytes(4095 * MiB, under(5000 * MiB)) == 4095 * MiB);   // fits: unchanged
+    CHECK(device_local_arena_bytes(256 * MiB, under(4091 * MiB)) == 256 * MiB);
+    CHECK(device_local_arena_bytes(4095 * MiB, under(1 * GiB)) == 4095 * MiB);      // past an eighth: unchanged
+    CHECK(device_local_arena_bytes(4095 * MiB, [](VkDeviceSize) { return false; }) == 4095 * MiB);
+    unsigned calls = 0;
+    CHECK(device_local_arena_bytes(4095 * MiB, [&](VkDeviceSize bytes) { ++calls; return bytes <= 4064 * MiB; }) ==
+          4064 * MiB);
+    CHECK(calls == 3);   // 4095 (as asked), then 4080 and 4064 MiB: one buffer probe per step tried
+
+    VkPhysicalDeviceMemoryProperties memory{};
+    memory.memoryHeapCount = 2;
+    memory.memoryHeaps[0] = {8 * GiB, 0};
+    memory.memoryHeaps[1] = {4070 * MiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    memory.memoryTypeCount = 2;
+    memory.memoryTypes[0] = {kArenaRequiredMemory, 0};
+    memory.memoryTypes[1] = {kArenaRequiredMemory | kArenaPreferredMemory, 1};
+    CHECK(device_local_arena_bytes(4095 * MiB, [&](VkDeviceSize bytes) {
+        const std::uint32_t bits = bytes > 4080 * MiB ? 0b01 : 0b11;
+        const VkMemoryRequirements requirements{bytes, 4096, bits};
+        return device_local_arena_fits(memory, requirements);
+    }) == 4064 * MiB);
+    const VkMemoryRequirements padded{4071 * MiB, 4096, 0b11};
+    CHECK(!device_local_arena_fits(memory, padded));
+    CHECK(std::string_view(arena_cap_name(arena_cap_bar | arena_cap_buffer)).find("Resizable BAR") == 0);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
-    for (const auto test : {request_without_limits, each_limit, unknown_limits, allocation_overhead, floor_and_limits})
+    for (const auto test : {request_without_limits, each_limit, unknown_limits, allocation_overhead, floor_and_limits,
+                            resizable_bar_fit})
         if (test()) return 1;
-    std::printf("arena_size: request clamp, each device limit, unknown limits, allocation overhead and the floor\n");
+    std::printf("arena_size: request clamp, each device limit, unknown limits, allocation overhead, the floor and the Resizable BAR fit\n");
     return 0;
 }

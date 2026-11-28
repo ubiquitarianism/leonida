@@ -997,12 +997,12 @@ function renderTexturesGrid() {
     card.className = 'tex-card';
     card.innerHTML = `
       <div class="tex-preview">
-        <img src="${t.preview}" alt="${escapeHtml(t.name)}" loading="lazy" onerror="this.onerror=null; this.src=''; this.alt='DDS / Pre-converted'">
+        <img src="${escapeHtml(t.preview)}" alt="${escapeHtml(t.name)}" loading="lazy" onerror="this.onerror=null; this.src=''; this.alt='DDS / Pre-converted'">
       </div>
       <div class="tex-info">
         <div class="tex-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
         <div class="tex-meta">
-          <span>${t.format}</span>
+          <span>${escapeHtml(t.format)}</span>
           <span>${formatBytes(t.size)}</span>
         </div>
       </div>
@@ -1024,12 +1024,12 @@ function renderTexturesGrid() {
         card.className = 'tex-card';
         card.innerHTML = `
           <div class="tex-preview">
-            <img src="${t.preview}" alt="${escapeHtml(t.name)}" loading="lazy" onerror="this.onerror=null; this.src=''; this.alt='DDS / Pre-converted'">
+            <img src="${escapeHtml(t.preview)}" alt="${escapeHtml(t.name)}" loading="lazy" onerror="this.onerror=null; this.src=''; this.alt='DDS / Pre-converted'">
           </div>
           <div class="tex-info">
             <div class="tex-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</div>
             <div class="tex-meta">
-              <span>${t.format}</span>
+              <span>${escapeHtml(t.format)}</span>
               <span>${formatBytes(t.size)}</span>
             </div>
           </div>

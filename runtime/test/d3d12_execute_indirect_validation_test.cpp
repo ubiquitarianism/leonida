@@ -125,8 +125,12 @@ struct Env {
 
 struct Case {
     const char* name;
-    bool expected_ok;  // Measured on Windows 11 WARP and RTX 5090 HW D3D12
+    bool expected_ok;  // What the layer answers. Outside host_varies it is also what every measured host answers.
     std::function<void(Env&)> record;
+    // PC D3D12 runtimes disagree on this case, so a live host may answer either way and only the layer is judged.
+    // Measured: WARP and an RTX 5060 refuse all five such cases (e1ec785b2); WARP and an RTX 3080 Ti on D3D12Core
+    // 10.0.26100.9818 accept all five. The layer accepts them (d3d12_com.cpp, ExecuteIndirect, says why).
+    bool host_varies = false;
 };
 
 bool run_case(Env& env, const Case& c, HRESULT& out_hr) {
@@ -212,12 +216,12 @@ std::vector<Case> parity_cases() {
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, 260, nullptr, 0); }},
         {"arg_offset=256 ==width (max=0 no-op)", true,
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 256, nullptr, 0); }},
-        {"arg_offset=260 >width (max=0 no-op)", false,
-         [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 260, nullptr, 0); }},
+        {"arg_offset=260 >width (max=0 no-op)", true,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 260, nullptr, 0); }, true},
         {"arg_offset=U64MAX-3 wrap (max=1)", false,
          [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, kU64Max - 3, nullptr, 0); }},
-        {"arg_offset=U64MAX-3 aligned (max=0 no-op)", false,
-         [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, kU64Max - 3, nullptr, 0); }},
+        {"arg_offset=U64MAX-3 aligned (max=0 no-op)", true,
+         [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, kU64Max - 3, nullptr, 0); }, true},
         {"arg_offset=U64MAX unaligned+wrap (max=1)", false,
          [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, kU64Max, nullptr, 0); }},
         {"arg_offset=240 max=2 cnt=null (OOB)", false,
@@ -233,17 +237,23 @@ std::vector<Case> parity_cases() {
         {"arg_buf width=3 (max=1 OOB)", false,
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf3.p, 0, nullptr, 0); }},
 
-        // Padded stride: the host bounds max_count * stride, not (max_count - 1) * stride + record_size, so a
-        // record that fits at the end of the buffer while its stride runs past it is refused
-        {"draw stride=20 off=240 max=1 (240+20>256)", false,
-         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 1, e.buf256.p, 240, nullptr, 0); }},
-        {"draw stride=20 off=220 max=2 (220+40>256)", false,
-         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 2, e.buf256.p, 220, nullptr, 0); }},
-        {"dispatch stride=20 off=244 max=1 (244+20>256)", false,
+        // Padded stride: the last record fits at the end of the buffer while its stride runs past it. A runtime
+        // that bounds max_count * stride refuses these; one that bounds (max_count - 1) * stride + record_size
+        // accepts them, and so does the layer.
+        {"draw stride=20 off=240 max=1 (240+16==256)", true,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 1, e.buf256.p, 240, nullptr, 0); }, true},
+        {"draw stride=20 off=220 max=2 (220+20+16==256)", true,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 2, e.buf256.p, 220, nullptr, 0); }, true},
+        {"dispatch stride=20 off=244 max=1 (244+12==256)", true,
          [](Env& e) {
              e.bind_compute_if_available();
              e.list->ExecuteIndirect(e.dispatch20.p, 1, e.buf256.p, 244, nullptr, 0);
-         }},
+         }, true},
+        // One byte group further and the record itself no longer fits: refused under either rule.
+        {"draw stride=20 off=244 max=1 (244+16>256)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 1, e.buf256.p, 244, nullptr, 0); }},
+        {"draw stride=20 off=224 max=2 (224+20+16>256)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 2, e.buf256.p, 224, nullptr, 0); }},
         {"draw_indexed stride=24 off=240 max=1 (OOB)", false,
          [](Env& e) { e.list->ExecuteIndirect(e.draw_indexed24.p, 1, e.buf256.p, 240, nullptr, 0); }},
 
@@ -304,6 +314,11 @@ bool run_positive_gpu_dispatch(Env& env) {
     // Exact-fit indirect dispatch (244 + 12 == 256) plus max_command_count == 0 no-op at the buffer's end.
     list->ExecuteIndirect(env.dispatch12.p, 1, args.p, 244, nullptr, 0);
     list->ExecuteIndirect(env.dispatch12.p, 0, args.p, 256, nullptr, 0);
+    // The two shapes PC runtimes split on, which the layer accepts: the same record read through a padded stride
+    // that runs past the buffer, and a zero count at an offset outside it. Replayed with validation on, so a rule
+    // that let Vulkan read past the buffer would show up as a validation error below.
+    list->ExecuteIndirect(env.dispatch20.p, 1, args.p, 244, nullptr, 0);
+    list->ExecuteIndirect(env.dispatch12.p, 0, args.p, 260, nullptr, 0);
     CHECK(SUCCEEDED(list->Close()));
 
     ID3D12CommandList* lists[] = {list.p};
@@ -430,6 +445,7 @@ int main() {
     std::filesystem::remove_all(fixture, ec);
 
     unsigned failures = 0;
+    unsigned varied_accepted = 0, varied_refused = 0;   // live host answers on the host_varies cases
     std::printf("%-48s | %-10s | %-10s | %-10s\n", "case", "layer", "WARP", hw_ran ? hw_name.c_str() : "HW");
     for (std::size_t i = 0; i < table.size(); ++i) {
         const bool layer_ok = SUCCEEDED(layer_hr[i]);
@@ -440,12 +456,26 @@ int main() {
                     static_cast<unsigned long>(layer_hr[i]),
                     warp_ran ? (SUCCEEDED(warp_hr[i]) ? "S_OK" : "FAIL") : (warp_ok ? "(S_OK)" : "(FAIL)"),
                     hw_ran ? (SUCCEEDED(hw_hr[i]) ? "S_OK" : "FAIL") : (hw_ok ? "(S_OK)" : "(FAIL)"));
+        if (table[i].host_varies) {
+            // Runtimes split on this case: the hosts are reported, the layer alone has to answer as expected.
+            if (warp_ran) ++(warp_ok ? varied_accepted : varied_refused);
+            if (hw_ran) ++(hw_ok ? varied_accepted : varied_refused);
+            if (layer_ok != table[i].expected_ok) {
+                std::fprintf(stderr, "FAIL %s: layer=%d expected=%d (hosts differ by D3D12 runtime: warp=%d hw=%d)\n",
+                             table[i].name, int(layer_ok), int(table[i].expected_ok), int(warp_ok), int(hw_ok));
+                ++failures;
+            }
+            continue;
+        }
         if (layer_ok != warp_ok || layer_ok != hw_ok || layer_ok != table[i].expected_ok) {
             std::fprintf(stderr, "FAIL %s: layer=%d warp=%d hw=%d expected=%d\n",
                          table[i].name, int(layer_ok), int(warp_ok), int(hw_ok), int(table[i].expected_ok));
             ++failures;
         }
     }
+    if (varied_accepted || varied_refused)
+        std::printf("runtime-dependent cases: the live hosts accepted %u and refused %u answers; the layer accepts "
+                    "all of them\n", varied_accepted, varied_refused);
 
     const unsigned validation_errors = vk.validation_errors() - errors_before;
     if (validation_errors) {

@@ -131,5 +131,61 @@ class EdgeTests(unittest.TestCase):
             os.unlink(path)
 
 
+class WrongInputTests(unittest.TestCase):
+    """A wrong input is one ERROR line and exit 2, not a traceback."""
+
+    def run_main(self, argv):
+        import contextlib
+        import io
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            code = rc.main(argv)
+        return code, err.getvalue(), out.getvalue()
+
+    def assert_error_line(self, code, err):
+        self.assertEqual(code, 2)
+        self.assertTrue(err.startswith("ERROR: "), err)
+        self.assertEqual(err.count("\n"), 1, err)
+        self.assertNotIn("Traceback", err)
+
+    def test_missing_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, err, _ = self.run_main([os.path.join(tmp, "missing.exe"), "--out", tmp])
+            self.assert_error_line(code, err)
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_folder_as_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "image")
+            os.mkdir(folder)
+            code, err, _ = self.run_main([folder, "--out", tmp])
+            self.assert_error_line(code, err)
+            self.assertEqual(os.listdir(tmp), ["image"])
+
+    def test_out_is_a_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = os.path.join(tmp, "good.exe")
+            with open(image, "wb") as f:
+                f.write(build_pe())
+            out = os.path.join(tmp, "out")
+            with open(out, "wb") as f:
+                f.write(b"keep")
+            code, err, _ = self.run_main([image, "--out", out])
+            self.assert_error_line(code, err)
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b"keep")
+
+    def test_good_image_still_writes_both_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = os.path.join(tmp, "good.exe")
+            with open(image, "wb") as f:
+                f.write(build_pe())
+            out = os.path.join(tmp, "out")
+            code, err, stdout = self.run_main([image, "--out", out])
+            self.assertEqual(code, 0, err)
+            self.assertEqual(sorted(os.listdir(out)), ["good.exe.recomp.json", "good.exe.recomp.md"])
+            self.assertIn("3 fns", stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

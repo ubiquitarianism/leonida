@@ -45,7 +45,8 @@ stop and report the blocker; do not substitute llvmpipe. The ICD file on this bo
 - Run one process per card, keep logs per card, and aggregate counts afterwards.
 - Each PR verification used a clean worktree at the PR head and, where a base was named, a second worktree at that
   base with its own freshly built programs. Mixing a script from one commit with binaries from another produces
-  false failures (see "Known problems" in [testing.md](testing.md)).
+  false failures (see "Rebuild the test programs after pulling" under [Run them](testing.md#run-them) in
+  testing.md).
 - When a shard fails, rerun the *same* shard on two or three other cards. Failing everywhere points to a driver or
   corpus issue; failing on one card points to that card. Re-run single failing tests in isolation before calling a
   result reproducible.
@@ -66,7 +67,10 @@ page. No game-derived data was used for any of them.
 
 Two failures recur on these cards at the tested commits and were confirmed on clean base worktrees, so they are
 driver-version limitations rather than regressions from the PRs tested here: `cs_w32_salu64` (wrong high word of
-an `s_bfe_i64` field) and `cs_signed_zero_nan`. The latter is the signed-zero class tracked in #1203. A real
+an `s_bfe_i64` field) and `cs_signed_zero_nan`. Both are Mesa bugs recorded under "Known problems" in
+[testing.md](testing.md#known-problems): ACO's `combine_add_sub_b2i` for the first and NIR's range analysis
+(`fmul_is_a_number`) folding the `x != x` check for the second; RADV from Mesa 26.3.1 passes both on a gfx1151
+(not measured on these cards). A real
 regression was found on PR #2715: two wave64 pixel fixtures returned the clear value on all three cards tested while
 the PR's base passed them.
 

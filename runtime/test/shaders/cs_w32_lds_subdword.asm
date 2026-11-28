@@ -12,23 +12,27 @@
 ;   out[2] ds_read_i8   offset:2 -> 0xFFFFFFB2   out[3] ds_read_u8   offset:2 -> 0x000000B2
 ;   out[4] ds_read_i8   offset:3 -> 0x00000011   out[5] ds_read_i16  offset:6 -> 0xFFFFA1B2
 ;   out[6] ds_read_u16  offset:6 -> 0x0000A1B2   out[7] ds_read_i16  offset:4 -> 0xFFFFC3D4
-; Every lane writes the same bytes, so the result does not depend on lane order.
+; Only lane zero accesses LDS and writes the results, avoiding concurrent writes to the same word.
+; Workgroup barriers separate the initial stores, narrow writes, and reads of the same words.
 ; group: 32,1,1
 ; Run: vk_compute_test cs_w32_lds_subdword.spv 1 dump
 ;   -> out[0..7] = 0x11B2D444 0xA1B2C3D4 0xFFFFFFB2 0x000000B2 0x00000011 0xFFFFA1B2 0x0000A1B2 0xFFFFC3D4
 ; mattr: +wavefrontsize32,-wavefrontsize64
+v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v2, 0
 v_mov_b32_e32 v4, 0x11223344
 v_mov_b32_e32 v5, 0x55667788
 ds_write_b32 v2, v4
 ds_write_b32 v2, v5 offset:4
 s_waitcnt lgkmcnt(0)
+s_barrier
 v_mov_b32_e32 v3, 0xa1b2c3d4
 ds_write_b8 v2, v3 offset:1
 ds_write_b8_d16_hi v2, v3 offset:2
 ds_write_b16 v2, v3 offset:4
 ds_write_b16_d16_hi v2, v3 offset:6
 s_waitcnt lgkmcnt(0)
+s_barrier
 ds_read_b32 v10, v2
 ds_read_b32 v11, v2 offset:4
 ds_read_i8 v12, v2 offset:2
@@ -38,7 +42,6 @@ ds_read_i16 v15, v2 offset:6
 ds_read_u16 v16, v2 offset:6
 ds_read_i16 v17, v2 offset:4
 s_waitcnt lgkmcnt(0)
-v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v21, 0
 buffer_store_dword v10, v21, s[0:3], 0 offen
 v_mov_b32_e32 v21, 4

@@ -67,9 +67,13 @@ map-definition metadata.
 The unread bytes are mostly small alignment and metadata gaps between streams. The gap audit found
 **23** `0DRP` signatures in unread ranges, but none resolved to a map or metadata resource
 (`raw_maps = 0`, `raw_meta = 0`), so the census is not missing a map class. No unaligned zlib stream
-that inflates to a `0DRP` header was found in a gap (`missed_zlib_meta = 0`). The 906 rejected
-candidates are zlib streams that do not form a complete `0x7a` resource; they are ordinary archive
-payload, not counted maps.
+that inflates to a `0DRP` header was found in a gap (`missed_zlib_meta = 0`). The 840 rejected
+candidates are 16-byte-aligned zlib headers that do not inflate to a stream ending inside the archive
+(`scan_shard`: `assemble` raises an inflate error (zlib, struct or index) or returns `None`); they are
+ordinary archive payload, not counted maps. A stream that inflates without the `0DRPz` prefix of a `0x7a`
+resource is ordinary payload and accepted. One with that prefix that does not come out whole (truncated,
+not parsing, or still short of a page) is `incomplete`; `invalid` is a second parse check behind it. Both
+are 0 here.
 
 ## Other archives
 
@@ -161,7 +165,8 @@ do not depend on that fix.
 `summary.json` sets `census_exact` only when all of these hold:
 
 - `complete` is true and every expected shard was written;
-- `maps_exact == maps` and `entities_exact == entities`;
+- `maps_exact == maps`, which also makes `entities_exact == entities`, since `entities_exact` sums the
+  exact rows;
 - `entity_gfx == 0` and `entity_unresolved == 0`;
 - `incomplete == 0` and `invalid == 0`;
 - `raw_maps == 0` and `missed_zlib_meta == 0`.
@@ -196,7 +201,7 @@ python -I tools\world_census.py <levels.rpf> --out work\world\census --merge-onl
 python -I tests\test_world_census.py
 ```
 
-The default shard size is 2 GiB, the default job count is half the logical CPUs, and the scan is
+The default shard size is 2 GiB, the default job count is half the logical CPUs (at most 12), and the scan is
 bounded by `--start` / `--limit` when a partial pass is wanted. `--jobs 1` runs the shards in-process
 instead of a process pool, which is useful for small synthetic archives and tests.
 

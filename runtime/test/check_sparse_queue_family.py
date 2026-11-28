@@ -29,6 +29,19 @@ SPARSE_FLAGS = "VkBufferCreateFlags = 7 (VK_BUFFER_CREATE_SPARSE_BINDING_BIT"
 MODE = re.compile(r"sharingMode:\s+VkSharingMode = (VK_SHARING_MODE_\w+)")
 COUNT = re.compile(r"queueFamilyIndexCount:\s+uint32_t = (\d+)")
 INDICES = re.compile(r"pQueueFamilyIndices\[(\d+)\]:\s+const uint32_t = (\d+)")
+CREATE_DEVICE = re.compile(r"^vkCreateDevice\(.*?(?=^vk\w+\(|\Z)", re.M | re.S)
+QUEUE_FAMILY_PROPS = re.compile(r"^vkGetPhysicalDeviceQueueFamilyProperties\(.*?(?=^vk\w+\(|\Z)", re.M | re.S)
+PHYS_DEVICE = re.compile(r"physicalDevice:\s+VkPhysicalDevice\s*=\s*([0-9a-fA-Fx]+)")
+QUEUE_CREATE_COUNT = re.compile(r"queueCreateInfoCount:\s+uint32_t\s*=\s*(\d+)")
+QUEUE_FAMILY_INDEX = re.compile(
+    r"pQueueCreateInfos\[0\]:(?:(?!pQueueCreateInfos\[|enabledLayerCount).)*?queueFamilyIndex:\s+uint32_t\s*=\s*(\d+)",
+    re.S,
+)
+QUEUE_FAMILY_PROP_COUNT = re.compile(r"pQueueFamilyPropertyCount:\s+uint32_t\*\s*=\s*(\d+)")
+VK_QUEUE_GRAPHICS_BIT = 0x1
+VK_QUEUE_COMPUTE_BIT = 0x2
+VK_QUEUE_TRANSFER_BIT = 0x4
+VK_QUEUE_SPARSE_BINDING_BIT = 0x8
 # Each of the two runs gets 30 s, so both together stay inside the CTest TIMEOUT of 65 s (runtime/CMakeLists.txt).
 RUN_TIMEOUT = 30
 ACCESS_VIOLATION = 0xC0000005   # STATUS_ACCESS_VIOLATION, as Windows reports it in the exit code
@@ -38,8 +51,119 @@ CALL_HEAD = re.compile(r"^(vk\w+)\(", re.M)
 CASE = re.compile(r"^RESULT (LAYER_MAP_(?:DIRECT|COPY|COMPUTE)_COPY_COMPUTE) PASS mapped_mismatch=0/65536 unmapped_nonzero=0/65536$", re.M)
 
 
-def check_trace(path: Path, expect_exclusive: bool) -> tuple[int, int]:
-    rows = path.read_text(encoding="utf-8", errors="replace").splitlines()
+def _pick_sparse_queue_families(families: list[tuple[int, int, int, int, int]],
+                                graphics: int) -> tuple[int, int, int]:
+    """Mirror runtime/src/queue_families.h (pick_queue_families + sparse_capable_queue_families)."""
+    def fine_grained(family: tuple[int, int, int, int, int]) -> bool:
+        return family[2:] == (1, 1, 1)
+
+    compute = copy = graphics
+    have_compute = have_copy = False
+    for i, family in enumerate(families):
+        flags, count = family[0], family[1]
+        if count == 0:
+            continue
+        if not have_compute and (flags & VK_QUEUE_COMPUTE_BIT) and not (flags & VK_QUEUE_GRAPHICS_BIT):
+            compute = i
+            have_compute = True
+        if (not have_copy and (flags & VK_QUEUE_TRANSFER_BIT)
+                and not (flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) and fine_grained(family)):
+            copy = i
+            have_copy = True
+    if not have_copy and have_compute and fine_grained(families[compute]):
+        copy = compute
+    if not (families[compute][0] & VK_QUEUE_SPARSE_BINDING_BIT):
+        compute = graphics
+    if not (families[copy][0] & VK_QUEUE_SPARSE_BINDING_BIT):
+        copy = graphics
+    return graphics, compute, copy
+
+
+def single_sparse_queue_family(path: Path) -> bool:
+    """True when vkCreateDevice uses 1 queue family and the physical device yields only 1 sparse-capable family.
+
+    Mirrors runtime/src/queue_families.h (pick_queue_families + sparse_capable_queue_families): Leonida picks the
+    first non-graphics async compute or fine-grained (1x1x1) DMA transfer family, then falls back to graphics if the
+    chosen family lacks SPARSE_BINDING. On single-family GPUs (e.g. Intel Xe-LP iGPUs), VK_SHARING_MODE_CONCURRENT
+    is illegal (VUID-00914).
+    """
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    devices = CREATE_DEVICE.findall(text)
+    if len(devices) != 1:
+        return False
+    pdev_m = PHYS_DEVICE.search(devices[0])
+    qci_m = QUEUE_CREATE_COUNT.search(devices[0])
+    if not pdev_m or not qci_m or int(qci_m.group(1)) != 1:
+        return False
+    pdev = pdev_m.group(1)
+    created_graphics: int | None = None
+    if "pQueueCreateInfos[" in devices[0]:
+        qfi_m = QUEUE_FAMILY_INDEX.search(devices[0])
+        if not qfi_m:
+            return False
+        created_graphics = int(qfi_m.group(1))
+
+    families: list[tuple[int, int, int, int, int]] | None = None
+    max_expected = 0
+    for call in QUEUE_FAMILY_PROPS.findall(text):
+        after = call.split("<after returning from implementation>", 1)
+        if "<before calling into implementation>" in call and len(after) != 2:
+            pm = PHYS_DEVICE.search(call)
+            if pm and pm.group(1) == pdev:
+                return False
+            continue
+        body = after[1] if len(after) == 2 else call
+        pm = PHYS_DEVICE.search(body)
+        if not pm or pm.group(1) != pdev:
+            continue
+        cnt_m = QUEUE_FAMILY_PROP_COUNT.search(body)
+        if cnt_m:
+            max_expected = max(max_expected, int(cnt_m.group(1)))
+        if "pQueueFamilyProperties[" not in body:
+            continue
+        if not cnt_m:
+            return False
+        expected = int(cnt_m.group(1))
+        if expected <= 0:
+            return False
+        chunks = re.split(r"(?=pQueueFamilyProperties\[\d+\]:)", body)[1:]
+        if len(chunks) != expected:
+            return False
+        parsed: dict[int, tuple[int, int, int, int, int]] = {}
+        for chunk in chunks:
+            im = re.match(r"pQueueFamilyProperties\[(\d+)\]:", chunk)
+            fm = re.search(r"queueFlags:\s+VkQueueFlags\s*=\s*(\d+)", chunk)
+            cm = re.search(r"queueCount:\s+uint32_t\s*=\s*(\d+)", chunk)
+            wm = re.search(r"width:\s+uint32_t\s*=\s*(\d+)", chunk)
+            hm = re.search(r"height:\s+uint32_t\s*=\s*(\d+)", chunk)
+            dm = re.search(r"depth:\s+uint32_t\s*=\s*(\d+)", chunk)
+            if not (im and fm and cm and wm and hm and dm):
+                return False
+            idx = int(im.group(1))
+            if idx >= expected or idx in parsed:
+                return False
+            parsed[idx] = (int(fm.group(1)), int(cm.group(1)), int(wm.group(1)), int(hm.group(1)), int(dm.group(1)))
+        if len(parsed) != expected:
+            return False
+        families = [parsed[i] for i in range(expected)]
+    if not families or len(families) != max_expected:
+        return False
+
+    graphics = (created_graphics if created_graphics is not None
+                else next((i for i, (flags, count, *_) in enumerate(families)
+                           if count > 0 and (flags & VK_QUEUE_GRAPHICS_BIT)), None))
+    if graphics is None or graphics >= len(families):
+        return False
+    g_flags, g_count = families[graphics][0], families[graphics][1]
+    if g_count == 0 or not (g_flags & VK_QUEUE_GRAPHICS_BIT) or not (g_flags & VK_QUEUE_SPARSE_BINDING_BIT):
+        return False
+
+    direct, compute, copy = _pick_sparse_queue_families(families, graphics)
+    return compute == direct and copy == direct
+
+
+def check_trace(path: Path, expect_exclusive: bool, *, single_family: bool = False) -> tuple[int, int]:
+    rows = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
     records = 0
     for i, line in enumerate(rows):
         if SPARSE_FLAGS not in line:
@@ -53,8 +177,11 @@ def check_trace(path: Path, expect_exclusive: bool) -> tuple[int, int]:
             raise AssertionError(f"incomplete API dump sparse VkBuffer at line {i+1}")
         sharing, n = mode.group(1), int(count.group(1))
         indices = [(int(slot), int(family)) for slot, family in INDICES.findall(tail)]
-        if expect_exclusive:
+        if expect_exclusive or single_family:
             if sharing != "VK_SHARING_MODE_EXCLUSIVE" or n != 0 or indices:
+                if single_family and not expect_exclusive:
+                    raise AssertionError(f"invalid sparse buffer on single-family device at line {i+1}: "
+                                         f"{sharing}, count={n}, indices={indices}")
                 raise AssertionError(f"baseline negative control not reproduced at line {i+1}")
         elif (sharing != "VK_SHARING_MODE_CONCURRENT" or n < 2 or len(indices) != n
               or len({slot for slot, _ in indices if slot < n}) != n
@@ -67,12 +194,14 @@ def check_trace(path: Path, expect_exclusive: bool) -> tuple[int, int]:
     return records // 2, records
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("executable", type=Path, help="Compiled Leonida d3d12_sparse_queue_family_test binary")
     parser.add_argument("--expect-baseline-exclusive", action="store_true",
                         help="negative-control mode: prove buggy EXCLUSIVE create infos instead of requiring fix")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if not str(args.executable).strip():
+        parser.error("executable path must not be empty")
     exe = args.executable.resolve()
     if not exe.is_file():
         print(f"ERROR: missing executable {exe}", file=sys.stderr)
@@ -87,6 +216,7 @@ def main() -> int:
             "lunarg_api_dump.pre_dump = true\n"
             "lunarg_api_dump.detailed = true\n",
             encoding="utf-8",
+            newline="\n",
         )
         dump_env, validation_env = pass_envs(os.environ, path)
         # Two runs, one layer each. SDK 1.4.363's api_dump reads the VkDevice's dispatch key after the call down the
@@ -97,17 +227,22 @@ def main() -> int:
         if skip:
             return skip
         # Check the trace before the validation run: a skip there must not hide a contract the trace has broken.
-        candidates = list(path.glob("sparse_create_info.log*"))
+        candidates = sorted(path.glob("sparse_create_info.log*"))
         if not candidates:
             print("SKIP 77: Vulkan SDK VK_LAYER_LUNARG_api_dump unavailable or did not write trace")
             return 77
-        calls, infos = check_trace(candidates[0], args.expect_baseline_exclusive)
+        single_family = single_sparse_queue_family(candidates[0])
+        calls, infos = check_trace(candidates[0], args.expect_baseline_exclusive, single_family=single_family)
         validation_out, skip = run_pass(exe, validation_env, path)
         if skip:
             return skip
         errors = [line for line in validation_out.splitlines() if "Validation Error" in line or "VUID-" in line]
         if errors:
             raise AssertionError(f"Khronos validation reported {len(errors)} error line(s); first: {errors[0][:300]}")
+        if single_family:
+            print(f"SKIP 77: GPU exposes only 1 sparse-capable queue family; cross-family CONCURRENT sparse buffer "
+                  f"contract requires 2+ families ({calls} EXCLUSIVE sparse VkBuffer creations and Khronos validation passed)")
+            return 77
         kinds = sorted(CASE.findall(dump_out))
         print(f"GPU PASS: {len(kinds)} COPY/COMPUTE sparse queue cases, mapped 65,536 bytes exact, unmapped 65,536 zeros")
         print(f"VK API CONTRACT PASS: {calls} sparse VkBuffer creations / {infos} create-info records = "
@@ -135,10 +270,10 @@ def died_in_vk_destroy_device(trace_dir: Path) -> bool:
     The trace can't tell api_dump's own read of the freed device from a driver crash in the same call. The validation
     run can: it destroys the device without api_dump and has to exit 0.
     """
-    traces = list(trace_dir.glob("sparse_create_info.log*"))
+    traces = sorted(trace_dir.glob("sparse_create_info.log*"))
     if len(traces) != 1:
         return False
-    calls = CALL_HEAD.findall(traces[0].read_text(encoding="utf-8", errors="replace"))
+    calls = CALL_HEAD.findall(traces[0].read_text(encoding="utf-8-sig", errors="replace"))
     return bool(calls) and calls[-1] == "vkDestroyDevice"
 
 
@@ -147,8 +282,11 @@ def run_pass(exe: Path, env: Mapping[str, str], cwd: Path, trace_dir: Path | Non
 
     trace_dir (the api_dump run only) allows an access violation in vkDestroyDevice, once every result is printed.
     """
-    run = subprocess.run([str(exe)], cwd=cwd, env=dict(env), capture_output=True,
-                         text=True, encoding="utf-8", errors="replace", timeout=RUN_TIMEOUT)
+    try:
+        run = subprocess.run([str(exe)], cwd=cwd, env=dict(env), capture_output=True,
+                             text=True, encoding="utf-8", errors="replace", timeout=RUN_TIMEOUT)
+    except OSError as exc:
+        raise AssertionError(f"failed to start {exe}: {exc}") from exc
     out = run.stdout + "\n" + run.stderr
     if run.returncode == 77:
         print("SKIP 77: Leonida Vulkan device / sparse features unavailable")

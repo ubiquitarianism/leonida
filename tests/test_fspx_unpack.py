@@ -144,6 +144,33 @@ class Kind0AndCode(unittest.TestCase):
         self.assertEqual(fspx_unpack.code_range(program(with_prologue=False)), (0, 12 + 4))
         self.assertEqual(fspx_unpack.code_range(program(endpgm=False))[1], None)
 
+    def test_short_prologue(self):
+        # The 24-byte prologue of some pipeline-library programs: hash carriers at words 0 and 3 only, each a VOP3
+        # opcode-0x180 word with a literal in the form tools/fspx_prologue_probe.py checks, then the code at word 6.
+        carrier = struct.pack("<III", 0xD5800000, 0x03FE0100, 0x12345678)
+        code = carrier * 2 + V_MOV * 3 + ENDPGM
+        self.assertEqual(fspx_unpack.code_range(code), (24, 24 + 12 + 4))
+        # Only word 0 is a carrier: no prologue.
+        self.assertEqual(fspx_unpack.code_range(carrier + V_MOV * 6 + ENDPGM)[0], 0)
+        # Opcode-0x180 words whose second dword is not the literal form: no short prologue.
+        loose = struct.pack("<III", 0xD5800000, 0x03FF0000, 0x12345678)
+        self.assertEqual(fspx_unpack.code_range(loose * 2 + V_MOV * 3 + ENDPGM)[0], 0)
+        # The 36-byte form still wins when word 6 is a prologue word too.
+        self.assertEqual(fspx_unpack.code_range(program())[0], 36)
+
+    def test_code_range_last(self):
+        code = prologue() + V_MOV * 3 + ENDPGM + V_MOV + ENDPGM + S_NOP
+        self.assertEqual(fspx_unpack.code_range(code), (36, 36 + 12 + 4))
+        self.assertEqual(fspx_unpack.code_range_last(code), (36, 36 + 12 + 4 + 4 + 4))
+
+    def test_branch_targets_inside(self):
+        enc = "; encoding: [0x00,0x00,0x00,0x00]"
+        listing = f"\ts_cbranch_execz 1 {enc}\n\ts_nop 0 {enc}\n\ts_endpgm {enc}\n"
+        self.assertTrue(fspx_unpack.branch_targets_inside(listing, 12))   # 0 + 4 + 4 = 8: inside
+        self.assertFalse(fspx_unpack.branch_targets_inside(listing, 8))   # 8 is past an 8-byte range
+        back = f"\ts_nop 0 {enc}\n\ts_branch 65534 {enc}\n"               # -2: 4 + 4 - 8 = 0
+        self.assertTrue(fspx_unpack.branch_targets_inside(back, 8))
+
     def test_unaligned_endpgm_bytes_are_not_the_end(self):
         code = prologue() + b"\0\0" + ENDPGM + b"\0\0" + V_MOV + ENDPGM
         start, end = fspx_unpack.code_range(code)
@@ -214,7 +241,9 @@ class Cli(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
         self.assertEqual(os.listdir(os.path.join(out, "fspx")), [])
 
-    def test_disassembly_with_invalid_words_keeps_listing(self):
+    def test_disassembly_with_invalid_words_takes_the_decoder_listing(self):
+        # llvm-mc reports an invalid word in a program tools/rdna2_decode.py decodes whole: the compute fallback of
+        # shader_disasm.disasm takes the decoder's listing (fewer invalid words), without llvm-mc's messages.
         result, out = self.disassemble("import sys\n"
                                        "print('\\ts_endpgm')\n"
                                        "sys.stderr.write('warning: invalid instruction encoding\\n')\n")
@@ -222,9 +251,10 @@ class Cli(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         with open(os.path.join(out, "disasm", "one.s"), encoding="utf-8") as f:
             listing = f.read()
-        self.assertIn("1 invalid words", listing)
-        self.assertIn("\ts_endpgm", listing)
-        self.assertIn("warning: invalid instruction encoding", listing)
+        self.assertIn("0 invalid words", listing)
+        self.assertIn("v_mov_b32", listing)
+        self.assertIn("s_endpgm", listing)
+        self.assertNotIn("warning: invalid instruction encoding", listing)
 
     def test_clean_disassembly_keeps_listing(self):
         result, out = self.disassemble("print('\\ts_endpgm')\n")

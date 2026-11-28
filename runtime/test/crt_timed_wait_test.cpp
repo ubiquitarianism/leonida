@@ -2,6 +2,16 @@
 // statically linked timed wait kept the mutex for the whole timeout, so a thread setting the predicate waited until
 // the wait timed out. Also checks the other definitions that file takes over: std::shared_mutex and
 // this_thread::sleep_for. No game files, no GPU.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -111,6 +121,63 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         check(ms_since(start) >= 90, "this_thread::sleep_for sleeps");
     }
+
+    {
+        // Repeated short unnotified waits must not return cv_status::no_timeout early before their deadline.
+        bool no_early_no_timeout = true;
+        bool all_reached_target = true;
+        std::unique_lock<std::mutex> lock(mutex);
+        for (int i = 0; i < 25; ++i) {
+            const auto target = Clock::now() + std::chrono::milliseconds(10);
+            const std::cv_status status = cv.wait_for(lock, std::chrono::milliseconds(10));
+            const auto finished = Clock::now();
+            if (finished < target) {
+                all_reached_target = false;
+                if (status == std::cv_status::no_timeout) no_early_no_timeout = false;
+            }
+        }
+        check(no_early_no_timeout, "25 short unnotified wait_for calls never return no_timeout before target");
+        check(all_reached_target, "25 short unnotified wait_for calls reach steady_clock target");
+    }
+
+#ifdef _WIN32
+    {
+        // A pre-existing ERROR_TIMEOUT must not misclassify a real notification as a timeout and must be preserved.
+        bool flag = false;
+        std::thread setter([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            { std::lock_guard<std::mutex> lock(mutex); flag = true; }
+            cv.notify_one();
+        });
+        SetLastError(ERROR_TIMEOUT);
+        std::cv_status status = std::cv_status::timeout;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            while (!flag) {
+                status = cv.wait_for(lock, std::chrono::seconds(5));
+                if (status == std::cv_status::timeout) break;
+            }
+        }
+        const DWORD last_error = GetLastError();
+        setter.join();
+        check(flag && status == std::cv_status::no_timeout, "pre-existing ERROR_TIMEOUT does not mask notification");
+        check(last_error == ERROR_TIMEOUT, "pre-existing ERROR_TIMEOUT is preserved across wait_for");
+    }
+
+    {
+        // Caller LastError is preserved across a timed-out wait_for.
+        SetLastError(ERROR_INVALID_DATA);
+        std::unique_lock<std::mutex> lock(mutex);
+        const auto target = Clock::now() + std::chrono::milliseconds(15);
+        const std::cv_status status = cv.wait_for(lock, std::chrono::milliseconds(15));
+        const auto finished = Clock::now();
+        const DWORD last_error = GetLastError();
+        check(status == std::cv_status::timeout || finished >= target,
+              "unnotified wait_for with preset LastError does not return no_timeout before target");
+        check(finished >= target, "unnotified wait_for with preset LastError reaches steady_clock target");
+        check(last_error == ERROR_INVALID_DATA, "caller LastError is preserved across timed-out wait_for");
+    }
+#endif
 
     if (failures) {
         std::printf("RESULT: FAIL (%d failures)\n", failures);

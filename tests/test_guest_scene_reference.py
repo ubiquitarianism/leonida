@@ -1,6 +1,8 @@
 """Fixed reference points for the synthetic guest's renderer and input trace (no GPU)."""
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import struct
@@ -87,9 +89,10 @@ class GuestSceneReferenceTest(unittest.TestCase):
             (root / "spirv").mkdir()
             placeholder = root / "placeholder.txt"
             placeholder.write_bytes(b"synthetic input")
-            out = placeholder / "output"
+            out = placeholder / "output-\u00f8"
             result = subprocess.run(
-                [sys.executable, "-I", str(path), "--wine", sys.executable,
+                # UTF-8 mode: a piped stderr is the ANSI code page on Windows, and the error names the path.
+                [sys.executable, "-I", "-X", "utf8", str(path), "--wine", sys.executable,
                  "--loader", str(placeholder), "--guest", str(placeholder),
                  "--shaders", str(root), "--out", str(out)],
                 capture_output=True, encoding="utf-8", errors="replace", timeout=20,
@@ -99,6 +102,29 @@ class GuestSceneReferenceTest(unittest.TestCase):
             self.assertNotIn("Traceback", result.stderr)
             self.assertEqual(result.stdout, "")
             self.assertEqual(placeholder.read_bytes(), b"synthetic input")
+
+    def test_run_leaves_a_competing_runs_output_untouched(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            loader = root / "loader.txt"
+            loader.write_bytes(b"synthetic input")
+            shaders = root / "shaders"
+            shaders.mkdir()
+            args = argparse.Namespace(wine=None, loader=loader, guest=loader, shaders=shaders, play_audio=False)
+            out = root / "output"
+            logs = out / "logs"
+            # The other run claimed this directory after our argument check.
+            logs.mkdir(parents=True)
+            first_run_log = logs / "full.stdout.log"
+            first_run_log.write_bytes(b"first run")
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                self.assertEqual(runner.execute(args, out, temporary=False), 1)
+
+            self.assertEqual(list(out.iterdir()), [logs])
+            self.assertEqual(first_run_log.read_bytes(), b"first run")
+            self.assertIn(f"could not create output directory {out}", stderr.getvalue())
 
     def test_launch_failure_preserves_run_record_and_logs(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -112,7 +138,9 @@ class GuestSceneReferenceTest(unittest.TestCase):
                    "--shaders", str(root), "--out", str(out)]
             if sys.platform != "win32":
                 cmd += ["--wine", str(bad_loader), "--wine-arg=-a", "--wine-arg=path with spaces/wine"]
-            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", timeout=20)
+            # The runner's "could not launch" line carries the OS error text, which Windows localizes and the child
+            # prints in the ANSI code page (cp1251 on a Russian host): a strict UTF-8 decode would leave stdout None.
+            result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=20)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             report = json.loads((out / "report.json").read_text(encoding="utf-8"))
             self.assertIn("could not launch", report["error"])

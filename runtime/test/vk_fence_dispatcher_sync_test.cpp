@@ -6,6 +6,7 @@
 //   3. mark_device_lost() wakes a blocked vkWaitSemaphores() so pending waits complete and cancel()/stop() never hang.
 //   4. vkGetSemaphoreCounterValue() returning VK_ERROR_DEVICE_LOST drains pending waits and marks device_lost_ instead
 //      of spinning forever.
+//   3 and 4 also check that a loss is said once per device (set_device_lost), whichever path sees it first.
 //   5. cancel() blocks until a callback already dispatched for that semaphore has stopped using it.
 //   6. A re-entrant cancel() for a later callback in the same ready batch skips that callback.
 // Skips with exit code 77 when no Vulkan 1.3 device is available. No game data.
@@ -198,8 +199,13 @@ int main() {
             });
             if (!wait_until_in_vk_wait()) std::_Exit(1);
 
+            const unsigned reports_before = leonida::device_lost_reports.load();
             lost_ctx.mark_device_lost();
+            lost_ctx.mark_device_lost("a second report of the same loss");
+            // Said once per device: the second call and the dispatcher waking on the same flag add nothing.
+            if (leonida::device_lost_reports.load() != reports_before + 1) std::_Exit(1);
             if (!wait_flag(mu, cv, callback_fired)) std::_Exit(1);
+            if (leonida::device_lost_reports.load() != reports_before + 1) std::_Exit(1);
 
             // cancel() and ~VulkanContext() -> stop() must return promptly even after device_lost_ is set.
             lost_ctx.cancel_fence_waits(stuck.semaphore());
@@ -215,7 +221,8 @@ int main() {
         EXPECT(ok_lost);
         joiner.join();
         EXPECT(callback_fired);
-        std::printf("fence dispatcher: mark_device_lost() wakes blocked wait and teardown completes ok\n");
+        std::printf("fence dispatcher: mark_device_lost() wakes blocked wait, is reported once, and teardown completes "
+                    "ok\n");
     }
 
     // 4. vkGetSemaphoreCounterValue() returning VK_ERROR_DEVICE_LOST drains pending waits instead of spinning forever.
@@ -230,6 +237,8 @@ int main() {
         bool done = false;
         bool marked_lost = false;
         std::uint32_t observed_calls = 0;
+        unsigned reports_by_dispatcher = 0, reports_after_mark = 0;
+        const unsigned reports_before = leonida::device_lost_reports.load();
 
         std::thread err_test([&] {
             VulkanContext err_ctx(driver::get_device, d.device, true);
@@ -250,6 +259,9 @@ int main() {
 
             marked_lost = err_ctx.is_device_lost();
             observed_calls = driver::counter_calls.load(std::memory_order_acquire);
+            reports_by_dispatcher = leonida::device_lost_reports.load() - reports_before;
+            err_ctx.mark_device_lost();  // the device is already lost: nothing more is said
+            reports_after_mark = leonida::device_lost_reports.load() - reports_before;
             err_ctx.cancel_fence_waits(sem.semaphore());
         });
 
@@ -266,7 +278,9 @@ int main() {
         EXPECT(drained);
         EXPECT(marked_lost);
         EXPECT(observed_calls >= 1 && observed_calls <= 4);
-        std::printf("fence dispatcher: vkGetSemaphoreCounterValue DEVICE_LOST drains without spin (%u calls) ok\n",
+        EXPECT(reports_by_dispatcher == 1 && reports_after_mark == 1);
+        std::printf("fence dispatcher: vkGetSemaphoreCounterValue DEVICE_LOST drains without spin (%u calls) and is "
+                    "reported once ok\n",
                     observed_calls);
     }
 

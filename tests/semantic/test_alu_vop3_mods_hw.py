@@ -12,7 +12,8 @@ operand triples each. Only the form is taken from the game; every word here is s
 sample, up to three per form with distinct results. The measured cases not listed match too, except for differences
 already on record: an omod turning a -0 result into +0 (docs/design.md, Output modifiers rows; #1281), f32 denormal
 operands or intermediate results (SHADER-377), NaN sign/payload, 1-ulp differences in v_rcp/v_log/v_sin, and cases
-whose translation is undefined in SPIR-V (FClamp of a NaN, the root or log of a negative or zero).
+whose translation is undefined in SPIR-V (FClamp of a NaN, the root or log of a negative or zero). The f32/f16 clamp of a
+NaN gives +0 since 2026-11-24 (test_vop3_clamp_nan.py); those rows are not replayed here.
 """
 import os
 import struct

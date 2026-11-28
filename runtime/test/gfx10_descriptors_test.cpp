@@ -114,6 +114,25 @@ int main() {
         CHECK(is_image(words) && decode(words, out) && out == in);
     }
 
+    ImageWords volume_words = encode(Image{.type = ImageType::image_3d, .depth = 16,
+                                          .first_mip = 1, .mip_count = 2, .resource_mips = 4});
+    volume_words[4] |= 37u << 16;
+    CHECK(decode(volume_words, image) && image.first_layer == 37 && image.depth == 16);
+    CHECK(!has_hardware_volume_uav_slice_offset(volume_words, image));
+    const auto volume_range = vulkan_subresource_range(image, VK_IMAGE_ASPECT_COLOR_BIT);
+    CHECK(volume_range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT);
+    CHECK(volume_range.baseMipLevel == 1 && volume_range.levelCount == 2);
+    CHECK(volume_range.baseArrayLayer == 0 && volume_range.layerCount == 1);
+    volume_words = encode(Image{.type = ImageType::image_3d, .depth = 7, .first_mip = 1, .resource_mips = 4});
+    volume_words[4] |= 2u << 16;
+    volume_words[5] |= 1u;
+    CHECK(decode(volume_words, image) && has_hardware_volume_uav_slice_offset(volume_words, image));
+    volume_words[4] &= 0xffffu;
+    CHECK(decode(volume_words, image) && !has_hardware_volume_uav_slice_offset(volume_words, image));
+
+    const auto array_range = vulkan_subresource_range(images[2], VK_IMAGE_ASPECT_COLOR_BIT);
+    CHECK(array_range.baseArrayLayer == 3 && array_range.layerCount == 7);
+
     // Bits this header does not encode are ignored: SW_MODE and BC_SWIZZLE (word 3), PITCH_MSB (word 4), PERF_MOD
     // and the rest of word 5, the compression and metadata fields of words 6 and 7, RESOURCE_LEVEL (word 2 bit 31).
     ImageWords busy = encode(images[3]);
@@ -167,7 +186,15 @@ int main() {
     for (const FormatRow& row : format_table) {
         CHECK(row.gfx10 >= previous && row.gfx10 > 0 && row.gfx10 < 512);
         CHECK(seen.insert(row.vulkan).second);
-        CHECK(valid_swizzle(row.channels) && row.channels[0] != select_zero && row.channels[0] != select_one);
+        // Every format reads its first channel as red, but A8 (an A8_UNORM render target), whose only channel is alpha.
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        const bool alpha_only = row.vulkan == VK_FORMAT_A8_UNORM_KHR;
+#else
+        const bool alpha_only = false;
+#endif
+        CHECK(valid_swizzle(row.channels) &&
+              (alpha_only ? row.channels == channels_a
+                          : row.channels[0] != select_zero && row.channels[0] != select_one));
         CHECK(format_from_vulkan(row.vulkan) == row.gfx10);
         CHECK(format_swizzle(row.vulkan) == row.channels);
         if (row.gfx10 != previous) {
@@ -176,6 +203,17 @@ int main() {
         }
         previous = row.gfx10;
     }
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    // An A8 render target shares 8_UNORM with R8: an A8 image keeps its own view format, and the T#'s X is its alpha.
+    CHECK(format_from_vulkan(VK_FORMAT_A8_UNORM_KHR) == 1 && vulkan_format(1) == VK_FORMAT_R8_UNORM);
+    CHECK(vulkan_view_format(VK_FORMAT_A8_UNORM_KHR, 1) == VK_FORMAT_A8_UNORM_KHR);
+    {
+        const VkComponentMapping a8 = vulkan_swizzle(Swizzle{select_zero, select_zero, select_zero, select_x},
+                                                     VK_FORMAT_A8_UNORM_KHR);
+        CHECK(a8.r == VK_COMPONENT_SWIZZLE_ZERO && a8.g == VK_COMPONENT_SWIZZLE_ZERO &&
+              a8.b == VK_COMPONENT_SWIZZLE_ZERO && a8.a == VK_COMPONENT_SWIZZLE_A);
+    }
+#endif
     CHECK(vulkan_format(56) == VK_FORMAT_R8G8B8A8_UNORM && vulkan_format(130) == VK_FORMAT_R8G8B8A8_SRGB);
     CHECK(vulkan_format(22) == VK_FORMAT_R32_SFLOAT && format_from_vulkan(VK_FORMAT_D32_SFLOAT) == 22);
     CHECK(vulkan_format(7) == VK_FORMAT_R16_UNORM && format_from_vulkan(VK_FORMAT_D16_UNORM) == 7);
@@ -359,18 +397,21 @@ int main() {
     CHECK(info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && info.mipLodBias == -0.75f);
     CHECK(info.minLod == 0.5f && info.maxLod == 4.25f);
     info = vulkan_sampler({.mag_filter = Filter::aniso_point, .mip_filter = MipFilter::linear, .max_anisotropy = 8,
-                           .compare = CompareFunction::greater, .max_lod = 9.0f, .unnormalized = true});
+                           .compare = CompareFunction::greater, .min_lod = 1.5f, .max_lod = 9.0f,
+                           .lod_bias = 2.5f, .unnormalized = true});
     CHECK(info.unnormalizedCoordinates == VK_TRUE && info.mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST);
-    CHECK(info.maxLod == 0.0f && info.anisotropyEnable == VK_FALSE && info.compareEnable == VK_FALSE);
+    CHECK(info.minLod == 0.0f && info.maxLod == 0.0f && info.mipLodBias == 0.0f);
+    CHECK(info.anisotropyEnable == VK_FALSE && info.compareEnable == VK_FALSE);
     // Unnormalised: U and V clamp (wrap, the default S# mode, would be invalid: VUID ...-01075), border stays border,
-    // W is free; min and mag filter agree (VUID ...-01072).
+    // W is free; min and mag filter agree (VUID ...-01072); mipLodBias is zero (VUID ...-01074).
     CHECK(info.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE &&
           info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE &&
           info.addressModeW == VK_SAMPLER_ADDRESS_MODE_REPEAT && info.minFilter == info.magFilter);
     info = vulkan_sampler({.address_u = AddressMode::clamp_border, .address_v = AddressMode::mirror,
-                           .min_filter = Filter::bilinear, .unnormalized = true});
+                           .min_filter = Filter::bilinear, .lod_bias = -3.25f, .unnormalized = true});
     CHECK(info.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER &&
-          info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && info.minFilter == VK_FILTER_NEAREST);
+          info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && info.minFilter == VK_FILTER_NEAREST &&
+          info.mipLodBias == 0.0f);
     CHECK(vulkan_address_mode(AddressMode::mirror) == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT);
     CHECK(vulkan_address_mode(AddressMode::mirror_once_last_texel) == VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE);
     CHECK(vulkan_address_mode(AddressMode::clamp_half_border) == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);

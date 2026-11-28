@@ -64,6 +64,33 @@ VKAPI_ATTR VkResult VKAPI_CALL stalling_wait_semaphores(VkDevice device, const V
     return real_wait_semaphores(device, info, timeout);
 }
 
+// Each submission's command buffer starts with a full memory barrier (D3D12's ExecuteCommandLists boundary): counts
+// the command buffers begun and those whose first barrier is that one.
+PFN_vkBeginCommandBuffer real_begin = nullptr;
+PFN_vkCmdPipelineBarrier real_barrier = nullptr;
+std::uint32_t begun = 0, led_by_full_barrier = 0;
+bool awaiting_first_barrier = false;
+
+VKAPI_ATTR VkResult VKAPI_CALL counting_begin(VkCommandBuffer cb, const VkCommandBufferBeginInfo* info) {
+    ++begun;
+    awaiting_first_barrier = true;
+    return real_begin(cb, info);
+}
+
+VKAPI_ATTR void VKAPI_CALL watching_barrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst,
+                                            VkDependencyFlags flags, std::uint32_t memory_count,
+                                            const VkMemoryBarrier* memory, std::uint32_t buffer_count,
+                                            const VkBufferMemoryBarrier* buffers, std::uint32_t image_count,
+                                            const VkImageMemoryBarrier* images) {
+    if (awaiting_first_barrier) {
+        awaiting_first_barrier = false;
+        if (src == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && dst == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT &&
+            memory_count == 1 && (memory[0].srcAccessMask & VK_ACCESS_MEMORY_WRITE_BIT))
+            ++led_by_full_barrier;
+    }
+    real_barrier(cb, src, dst, flags, memory_count, memory, buffer_count, buffers, image_count, images);
+}
+
 const char* flags_text(VkQueueFlags f) {
     static char buf[32];
     std::snprintf(buf, sizeof buf, "%s%s%s", f & VK_QUEUE_GRAPHICS_BIT ? "G" : "", f & VK_QUEUE_COMPUTE_BIT ? "C" : "",
@@ -184,6 +211,16 @@ std::uint8_t pattern(std::uint32_t i, std::uint8_t seed) { return std::uint8_t(i
 
 int main() {
     if (check_picker() || check_queue_slots()) return 1;
+
+    // Even with a capable dedicated family, the graphics fallback must be usable. With only a caller-owned
+    // graphics queue, its actual family index (which need not be zero) determines support.
+    constexpr std::array<std::uint32_t, 2> copy_only_timestamps{64, 0};
+    constexpr std::array<std::uint32_t, 2> both_timestamps{64, 32};
+    static_assert(!copy_queue_timestamp_families_supported(copy_only_timestamps, 1, 0));
+    static_assert(!copy_queue_timestamp_families_supported(copy_only_timestamps, 1, std::nullopt));
+    static_assert(!copy_queue_timestamp_families_supported(copy_only_timestamps, 0, 1));
+    static_assert(copy_queue_timestamp_families_supported(both_timestamps, 1, 0));
+    static_assert(copy_queue_timestamp_families_supported(both_timestamps, 1, std::nullopt));
 
     vktest::Device d;
     d.all_queue_types = true;
@@ -346,6 +383,38 @@ int main() {
     EXPECT(copy.execute(clear_lists) == ReplayResult::unsupported);
     EXPECT(compute.execute(clear_lists) == ReplayResult::unsupported);
     std::printf("copy and compute queues refuse a render-target clear\n");
+
+    // 4b. Two ExecuteCommandLists copying into the same buffer, with no barrier in either list: D3D12 orders them (each
+    // ends with its work done and visible), so each submission's command buffer must start with a full memory barrier.
+    // Before, none did, and synchronization validation reported WRITE_AFTER_WRITE between them (in 5 below).
+    {
+        void* map = nullptr;
+        VkBuffer twice_src = d.buffer(4096, usage, &map);
+        VkBuffer twice_dst = d.buffer(4096, usage, &map);
+        EXPECT(twice_src && twice_dst);
+        add_buffer(9, twice_src, 4096);
+        add_buffer(10, twice_dst, 4096);
+        CommandList twice;
+        EXPECT(twice.copy_buffer({10, 0, 9, 0, 4096}));
+        EXPECT(twice.close());
+        const CommandList* twice_lists[] = {&twice};
+        real_begin = context.vk.vkBeginCommandBuffer;
+        real_barrier = context.vk.vkCmdPipelineBarrier;
+        context.vk.vkBeginCommandBuffer = counting_begin;
+        context.vk.vkCmdPipelineBarrier = watching_barrier;
+        begun = led_by_full_barrier = 0;
+        for (Kind kind : {Kind::direct, Kind::copy}) {
+            VulkanQueue& q = kind == Kind::direct ? direct : copy;
+            EXPECT(q.execute(twice_lists) == ReplayResult::success);
+            EXPECT(q.execute(twice_lists) == ReplayResult::success);
+            EXPECT(q.idle());
+        }
+        context.vk.vkBeginCommandBuffer = real_begin;
+        context.vk.vkCmdPipelineBarrier = real_barrier;
+        std::printf("ExecuteCommandLists boundary: %u of %u submissions start with a full memory barrier\n",
+                    led_by_full_barrier, begun);
+        EXPECT(begun >= 4 && led_by_full_barrier == begun);
+    }
 
     // 5. A caller that submits faster than the GPU finishes must not grow the queue's command buffers without bound:
     // at the cap it waits for the oldest one. Big host-visible copies keep the GPU behind the submitting loop. The first

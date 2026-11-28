@@ -100,7 +100,8 @@ class XboxPresentation {
 public:
     // `clock` null: real time (a steady high-resolution timer). Tests pass a leonida::ManualFrameClock, which must
     // outlive this object. `presenter` is what create_window_presenter returned.
-    explicit XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock = nullptr);
+    explicit XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock = nullptr,
+                              std::shared_ptr<leonida::FrameTokenSource> tokens = nullptr, bool current_origin_poll = false);
     ~XboxPresentation();
     XboxPresentation(const XboxPresentation&) = delete;
     XboxPresentation& operator=(const XboxPresentation&) = delete;
@@ -171,6 +172,9 @@ public:
     std::uint64_t presents() const { return presents_; }
     // Frames shown mid-scan because of ImmediateThresholdPercent.
     std::uint64_t immediate_presents() const { return pacer_.immediate_presents(); }
+    // Frame-time percentiles, mean drift against target interval, and origin-to-present latency (BL-6).
+    leonida::FramePacingSummary pacing_summary() const { return pacer_.pacing_summary(); }
+    void log_pacing_summary() const;
 
 private:
     // PresentX without its `[d3d12-trace]` line.

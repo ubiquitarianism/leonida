@@ -100,14 +100,17 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 COMPUTE += [("cs_bvh32", "1", "bvh")]   # TEST-184: image_bvh_intersect_ray, the 32-bit node pointer; same scene and words
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800, 0x40ff8000, 0x3ff00000]
+CS_SMEM_VCC = list(range(0x7210, 0x7218))
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 # -0, and NaN checks that need SignedZeroInfNanPreserve (cs_signed_zero_nan.asm); 0 in out[4..7] means it's missing
 SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007c00]
+CVT_F16_MODS_WORDS = [0xFFC4A000, 0x33800000, 0x36800000, 0xAAAA0001, 0xAAAA03FF, 0xAAAA0000, 0xAAAA0000, 0xAAAA0001]
 WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
+                "cs_w32_cvt_f16_mods",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
                 "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
-                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec",
+                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_w32_andn2_exec",
                 "cs_mask_vgpr_exec", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi",
                 "cs_w32_exec_computed")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
@@ -116,7 +119,8 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
 # otherwise pick a narrower size and return different words (#774).
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const",
-                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec", "cs_mask_vgpr_exec", "cs_w32_permlane_fi",
+                     "cs_w32_cvt_f16_mods",
+                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_w32_andn2_exec", "cs_mask_vgpr_exec", "cs_w32_permlane_fi",
                      "cs_w32_exec_computed")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
@@ -125,10 +129,15 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_ops", [100, 10, 11, 12, 13, 14, 15, 16]),
           ("cs_dpp_bound", [10, 10, 11, 12, 13, 14, 15, 16]),
           ("cs_dpp_bank", [0xffffffff, 0xfffffffe, 0xfffffffd, 0xfffffffc, 7, 7, 7, 7]),
-          ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777])]
+          ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777]),
+          # a VOPC compare with a DPP src0: 1 for the pair compare, 2 for the dpp8 one (cs_dpp_cmp.asm header)
+          ("cs_dpp_cmp", [3, 2, 3, 2, 1, 0, 1, 0]),
+          # v_cmpx with a DPP src0: 1 where the plain compare keeps the lane, 2 for the negated one (cs_dpp_cmpx.asm)
+          ("cs_dpp_cmpx", [1, 1, 0, 0, 3, 3, 2, 2])]
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
 WAVE32_LANE_DUMPS += tuple(n for n, _ in CS_DPP)
-CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
+CS_DUMPS = [*CS_DPP, ("cs_smem_vcc_base", CS_SMEM_VCC), ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
+            ("cs_w32_cvt_f16_mods", CVT_F16_MODS_WORDS),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
             # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
@@ -161,6 +170,12 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # ds_wrxchg*_rtn_b64, ds_or_rtn_b64, ds_min_f32, ds_max_rtn_f32 (cs_lds_xchg64_ext.asm header)
             ("cs_lds_xchg64_ext", [0x11110003, 0x33333333, 0xF00FF000, 0x04030201,
                                0x40302010, 0x70500705, 0x3FC00000, 0x80000000]),
+            # ds_wrxchg2_rtn_b32's pair cases and ds_wrxchg2st64_rtn_b32
+            # (cs_w32_wrxchg2_ext.asm / cs_w32_wrxchg2st64.asm headers)
+            ("cs_w32_wrxchg2_ext", [0x77777777, 0x88880008, 0x99990009, 0xDEADBEEF,
+                                    0xAAAAAAAA, 0xBBBBBBBB, 0x12341234, 0x56785678]),
+            ("cs_w32_wrxchg2st64", [0x33333333, 0x44444444, 0x55550005, 0x66660006,
+                                    0xB0B00084, 0xB0B00088, 0xB0B00140, 0xB0B002C0]),
             # ds_mskor, ds_and/xor_b64, ds_add_rtn_f32, ds_inc/dec/rsub_u32 (cs_lds_atomics_ext.asm header)
             ("cs_lds_atomics_ext", [0xF0F11234, 0xAB34CD78, 0x12345678, 0xF0F00F0F,
                                     0xA5A55A5A, 0x00AA00AA, 0x7FB00000, 0xFE090700]),
@@ -385,10 +400,341 @@ def shift64_test(tools, spirv, env=None):
         return dump_test(tools, spirv, "cs_w32_shift64", expected, len(expected), child)
 
 
+# cs_w32_cmp_f64.asm: the 16 binary64 compare predicates in opcode order (bit n of a result word is predicate n), and
+# the operand values every pair is drawn from, in ascending order and then two NaNs.
+CMP_F64_PREDICATES = ("f", "lt", "eq", "le", "gt", "lg", "ge", "o",
+                      "u", "nge", "nlg", "ngt", "nle", "neq", "nlt", "tru")
+CMP_F64_VALUES = (
+    0xFFF0000000000000,   # -inf
+    0xFFEFFFFFFFFFFFFF,   # -max
+    0xBFF0000000000001,   # -1 - 1 ulp
+    0xBFF0000000000000,   # -1
+    0xBFEFFFFFFFFFFFFF,   # the value above -1: its high dword is the smaller one, its low dword all ones
+    0x8000000000000001,   # the negative smallest subnormal
+    0x8000000000000000,   # -0
+    0x0000000000000000,   # +0
+    0x0000000000000001,   # the smallest subnormal
+    0x0010000000000000,   # the smallest normal
+    0x3FF0000000000000,   # 1
+    0x3FF0000000000001,   # 1 + 1 ulp
+    0x7FEFFFFFFFFFFFFF,   # +max
+    0x7FF0000000000000,   # +inf
+    0x7FF0000000000001,   # a NaN whose payload is only in the low dword: its high dword is +inf's
+    0xFFF8000000000000)   # a negative quiet NaN
+CMP_F64_SIGN = 1 << 63
+
+
+def cmp_f64_predicates(a_bits, b_bits):
+    """The 16 results of comparing two binary64 bit patterns, as a mask with bit n for CMP_F64_PREDICATES[n].
+    IEEE-754 through Python floats: a pair with a NaN is unordered, so lt, eq and gt are all false for it and every
+    negated predicate is true; -0 equals +0 and a subnormal is not zero."""
+    a, b = (struct.unpack("<d", struct.pack("<Q", bits))[0] for bits in (a_bits, b_bits))
+    unordered = a != a or b != b
+    lt, eq, gt = a < b, a == b, a > b
+    results = (False, lt, eq, lt or eq, gt, lt or gt, gt or eq, not unordered,
+               unordered, not (gt or eq), not (lt or gt), not gt, not (lt or eq), not eq, not lt, True)
+    return sum(1 << bit for bit, result in enumerate(results) if result)
+
+
+def cmp_f64_words():
+    """cs_w32_cmp_f64: the input heap and the full expected readback, with Python floats as the oracle. Record
+    16 * ia + ib compares value ia with value ib. Thread i handles records i and i + 128, so a record's thread has
+    the record's parity."""
+    inputs, results = [], []
+    for record, (a, b) in enumerate((a, b) for a in CMP_F64_VALUES for b in CMP_F64_VALUES):
+        inputs.extend((a & 0xFFFFFFFF, a >> 32, b & 0xFFFFFFFF, b >> 32))
+        word = cmp_f64_predicates(a, b)
+        word |= (record % 2 == 0) << 16     # tru with the odd threads turned off first
+        word |= (cmp_f64_predicates(a & ~CMP_F64_SIGN, b ^ CMP_F64_SIGN) >> 1 & 1) << 17    # lt of |a| and -b
+        word |= (cmp_f64_predicates(a ^ CMP_F64_SIGN, b & ~CMP_F64_SIGN) >> 9 & 1) << 18    # nge of -a and |b|
+        results.extend((word, word))        # the v_cmp_ word (VCC), then the v_cmpx_ word (EXEC)
+    return [0xEEEEEEEE] * len(results) + inputs, results + inputs
+
+
+def cmp_f64_test(tools, spirv, env=None):
+    """Verify the 32 binary64 compares on 256 memory-fed operand pairs, including the untouched input records."""
+    initial, expected = cmp_f64_words()
+    with tempfile.TemporaryDirectory(prefix="leonida-cmp-f64-") as tmp:
+        path = Path(tmp) / "input.bin"
+        path.write_bytes(struct.pack(f"<{len(initial)}I", *initial))
+        child = dict(os.environ if env is None else env, VKC_HEAP_INIT=str(path))
+        child.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_w32_cmp_f64") or 32))
+        return dump_test(tools, spirv, "cs_w32_cmp_f64", expected, len(expected), child)
+
+
+# cs_w32_round_f64.asm: the binary64 input of each thread, a value and its negative side by side.
+ROUND_F64_VALUES = (
+    0x0000000000000000, 0x8000000000000000,   # +0, -0
+    0x0000000000000001, 0x8000000000000001,   # the smallest subnormal and its negative
+    0x3FD0000000000000, 0xBFD0000000000000,   # +-0.25
+    0x3FDFFFFFFFFFFFFF, 0xBFDFFFFFFFFFFFFF,   # +-the largest value below 0.5: x + 0.5 already rounds to 1
+    0x3FE0000000000000, 0xBFE0000000000000,   # +-0.5, a tie that goes to 0
+    0x3FE0000000000001, 0xBFE0000000000001,   # +-the value just above 0.5
+    0x3FE8000000000000, 0xBFE8000000000000,   # +-0.75
+    0x3FEFFFFFFFFFFFFF, 0xBFEFFFFFFFFFFFFF,   # +-the value just below 1
+    0x3FF0000000000000, 0xBFF0000000000000,   # +-1
+    0x3FF0000000000001, 0xBFF0000000000001,   # +-the value just above 1
+    0x3FF8000000000000, 0xBFF8000000000000,   # +-1.5, a tie that goes to 2
+    0x4004000000000000, 0xC004000000000000,   # +-2.5, a tie that goes to 2
+    0x400C000000000000, 0xC00C000000000000,   # +-3.5, a tie that goes to 4
+    0x4003FFFFFFFFFFFF, 0xC004000000000001,   # just below 2.5, and just beyond -2.5
+    0x4320000000000001, 0xC320000000000001,   # +-(2^51 + 0.5), a tie that goes to 2^51
+    0x4320000000000003, 0xC320000000000003,   # +-(2^51 + 1.5), a tie that goes to 2^51 + 2
+    0x432FFFFFFFFFFFFF, 0xC32FFFFFFFFFFFFF,   # +-(2^52 - 0.5), the largest value with a fraction; a tie to 2^52
+    0x4330000000000000, 0x4330000000000001,   # 2^52, and the odd integer 2^52 + 1
+    0xC330000000000001, 0x433FFFFFFFFFFFFF,   # -(2^52 + 1), and 2^53 - 1
+    0x4340000000000000, 0x43E0000000000000,   # 2^53, and 2^63
+    0xC3E0000000000000, 0x7E37E43C8800759C,   # -2^63, and 1e300
+    0xFE37E43C8800759C, 0x7FEFFFFFFFFFFFFF,   # -1e300, and the largest finite value
+    0xFFEFFFFFFFFFFFFF, 0x7FF0000000000000,   # its negative, and +inf
+    0xFFF0000000000000, 0x7FF8000000000000,   # -inf, and a quiet NaN
+    0xFFF8000000000000, 0x7FF0000000000001,   # a negative quiet NaN, and a signalling NaN (payload in the low dword)
+    0xFFF0000080000000, 0x7FF8DEADBEEF1234,   # a negative signalling NaN, and a quiet NaN with a payload
+    0x419D6F3454400000, 0xC19D6F3457000000,   # 123456789.0625, and -123456789.75
+    0x3FB999999999999A, 0xBFB999999999999A,   # +-0.1
+    0x4012000000000000, 0xC012000000000000,   # +-4.5, a tie that goes to 4
+    0x4016000000000000, 0xC016000000000000,   # +-5.5, a tie that goes to 6
+    0x0010000000000000, 0x8010000000000000,   # +-the smallest normal
+    0x41E0000000100000, 0xC1E0000000100000)   # +-(2^31 + 0.5), a tie that goes to 2^31
+ROUND_F64_SIGN = 1 << 63
+ROUND_F64_KEPT = 0xCAFEF00DDEADBEEF   # the pair an inactive lane keeps: 0xdeadbeef low, 0xcafef00d high
+
+
+def round_f64(op, bits):
+    """The binary64 pattern RDNA2 gives for `bits` rounded to an integral value by "trunc", "ceil", "rndne" or
+    "floor" (docs/design.md): exact IEEE-754, a tie of rndne going to the even integer, the result keeping the
+    sign of the source even when it is zero, and an infinity or a NaN coming back unchanged."""
+    x = struct.unpack("<d", struct.pack("<Q", bits))[0]
+    if x != x or x in (math.inf, -math.inf):
+        return bits
+    whole = {"trunc": math.trunc, "ceil": math.ceil, "rndne": round, "floor": math.floor}[op](x)
+    return struct.unpack("<Q", struct.pack("<d", math.copysign(float(whole), x)))[0]
+
+
+def round_f64_results():
+    """cs_w32_round_f64: for each thread its eight results in store order, as (op, source bits). The source has the
+    VOP3 modifier applied. The last result of an odd thread is (None, the pair it keeps): the lane was off."""
+    threads = []
+    for thread, x in enumerate(ROUND_F64_VALUES):
+        threads.append([("trunc", x), ("ceil", x), ("rndne", x), ("floor", x), ("trunc", x ^ ROUND_F64_SIGN),
+                        ("ceil", x & ~ROUND_F64_SIGN), ("floor", x),
+                        ("rndne", x) if thread % 2 == 0 else (None, ROUND_F64_KEPT)])
+    return threads
+
+
+def round_f64_words():
+    """cs_w32_round_f64: the input heap and the readback RDNA2's rules give, low dword first, with Python floats as
+    the oracle."""
+    results, inputs = [], []
+    for thread in round_f64_results():
+        for op, source in thread:
+            value = source if op is None else round_f64(op, source)
+            results.extend((value & 0xFFFFFFFF, value >> 32))
+    for x in ROUND_F64_VALUES:
+        inputs.extend((x & 0xFFFFFFFF, x >> 32))
+    return [0xEEEEEEEE] * len(results) + inputs, results + inputs
+
+
+# Drivers that round a binary64 with code written for a binary32, by the first word of the device name on
+# vk_compute_test's "device: ..." line (as UNJUDGED_WORDS is keyed), and the ops they do it for.
+# - Mesa llvmpipe: Trunc and RoundEven of a double take its float fallback whenever the CPU has no vector extension
+#   as wide as its double vectors, which are twice its native width: 512 bits at the usual 256, so every CPU without
+#   AVX-512. There a magnitude above 2^24 comes back unchanged (trunc of 123456789.0625 is 123456789.0625), and
+#   RoundEven of a smaller one can be the other neighbouring integer (1 for 1.5, 0 for the value just above 0.5).
+#   Floor and Ceil are exact on that path. Measured with Mesa 25.2.8 (LLVM 20.1.2) on the CI's runners, where the
+#   CPU decides from run to run, and with Mesa 26.2.6 (LLVM 23.1.4) under GALLIUM_OVERRIDE_CPU_CAPS=avx: 48 of the
+#   512 results. With AVX-512, or with AVX at LP_NATIVE_VECTOR_WIDTH=128, all four ops are exact.
+ROUND_F64_FLOAT_PATH = {"llvmpipe": ("trunc", "rndne")}
+
+
+def round_f64_float_path(op, source, value):
+    """Whether `value` is what a driver in ROUND_F64_FLOAT_PATH may give for the rounding of the finite `source`
+    instead of round_f64's word: the source itself when its magnitude is above 2^24, else one of its two
+    neighbouring integers, with the source's sign. Nothing below 0.5, a subnormal included: Trunc and RoundEven
+    give the zero of the source's sign there on either path."""
+    x = struct.unpack("<d", struct.pack("<Q", source))[0]
+    if x != x or x in (math.inf, -math.inf) or abs(x) < 0.5:
+        return False
+    if abs(x) > 1 << 24:
+        return value == source
+    return value in (round_f64("floor", source), round_f64("ceil", source))
+
+
+def round_f64_problem(got, out=""):
+    """Judge a readback of cs_w32_round_f64: "" or the first word that is wrong, named by its op and source. `out` is
+    vk_compute_test's output, for its "device: ..." line. Every word is exact, the results of a NaN and of a
+    subnormal included: the translated code rounds those two itself and does not leave them to the driver's
+    double-precision functions (docs/design.md). On a device in ROUND_F64_FLOAT_PATH the ops named there are held
+    to round_f64_float_path instead."""
+    _, expected = round_f64_words()
+    results = [result for thread in round_f64_results() for result in thread]
+    device = re.search(r"^device: (\S+)", out, re.MULTILINE)
+    float_path = ROUND_F64_FLOAT_PATH.get(device.group(1), ()) if device else ()
+    for index, (op, source) in enumerate(results):
+        value = got[2 * index] | got[2 * index + 1] << 32
+        want = expected[2 * index] | expected[2 * index + 1] << 32
+        if value == want or op in float_path and round_f64_float_path(op, source, value):
+            continue
+        what = "the pair an inactive lane keeps" if op is None else f"{op} of {source:#018x}"
+        return f"word {2 * index} (thread {index // 8}): {what} gave {value:#018x}, expected {want:#018x}"
+    for index in range(2 * len(results), len(expected)):
+        if got[index] != expected[index]:
+            return f"word {index}: an input changed, expected {expected[index]:#010x}, got {got[index]:#010x}"
+    return ""
+
+
+def round_f64_test(tools, spirv, env=None):
+    """Verify the four binary64 roundings on 64 memory-fed inputs, including the untouched input records."""
+    initial, expected = round_f64_words()
+    with tempfile.TemporaryDirectory(prefix="leonida-round-f64-") as tmp:
+        path = Path(tmp) / "input.bin"
+        path.write_bytes(struct.pack(f"<{len(initial)}I", *initial))
+        child = dict(os.environ if env is None else env, VKC_HEAP_INIT=str(path))
+        child.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_w32_round_f64") or 32))
+        return dump_test(tools, spirv, "cs_w32_round_f64", expected, len(expected), child, judge=round_f64_problem)
+
+
+# cs_w32_frexp_ldexp.asm: per thread a binary32 word with the exponent v_ldexp_f32 adds to it (a 32-bit word, signed),
+# and a binary64 pattern.
+FREXP_LDEXP_F32 = (
+    (0x3F800000, 0), (0x3F800000, 1), (0x3F800000, 0xFFFFFFFF), (0x3FC00000, 10),               # 1 and 1.5
+    (0xBFC00000, 0xFFFFFFF6), (0x3F7FFFFF, 127), (0x3EAAAAAB, 3), (0xBF400000, 4),              # -1.5 by 2^-10, ...
+    (0x47F12065, 0xFFFFFFEC), (0xC0490FDB, 100), (0x42F6E979, 0xFFFFFF7E), (0x3F000000, 0),     # 123456.79 by 2^-20
+    (0x3F800000, 127), (0x3F800000, 128), (0x3F800000, 0xFFFFFF82), (0x3F800000, 0xFFFFFF81),   # 1 by 2^127 .. 2^-127
+    (0x00800000, 0xFFFFFFFF), (0x00800000, 1), (0x00800000, 253), (0x00800000, 254),            # the smallest normal
+    (0x00800001, 0xFFFFFFFF), (0x7F7FFFFF, 1), (0x7F7FFFFF, 0xFFFFFFFF), (0x7F7FFFFF, 0),       # the largest finite
+    (0x7F7FFFFF, 0xFFFFFF03), (0x7F7FFFFF, 0xFFFFFF02), (0xFF7FFFFF, 2), (0x7F000000, 1),       # ... by 2^-253, 2^-254
+    (0x40000000, 512), (0x40000000, 0xFFFFFE00), (0x40000000, 513), (0x40000000, 0xFFFFFDFF),   # the clamp at +-512
+    (0x3F800000, 0x7FFFFFFF), (0xBF800000, 0x80000000), (0x00800000, 0x7FFFFFFF), (0x7F7FFFFF, 0x80000000),
+    (0x3F000000, 0xFFFFFF83), (0x3F000000, 0xFFFFFF82), (0x7F000000, 0), (0x00FFFFFF, 0xFFFFFFFF),
+    (0x00000000, 5), (0x80000000, 0xFFFFFFFB), (0x00000000, 0x7FFFFFFF), (0x80000000, 0x80000000),   # zeros
+    (0x00000001, 10), (0x807FFFFF, 300), (0x007FFFFF, 0), (0x00400000, 1),                      # denormals
+    (0x7F800000, 0xFFFFFFFB), (0xFF800000, 500), (0x7F800000, 0x80000000), (0xFF800000, 0),     # infinities
+    (0x7FC00000, 3), (0x7F800001, 0xFFFFFFFD), (0xFFC12345, 1000), (0xFF800001, 0xFFFFFC18),    # NaNs
+    (0x3F800001, 23), (0xBF7FFFFF, 0xFFFFFFE9), (0x41200000, 0xFFFFFF80), (0x3DCCCCCD, 130),
+    (0x4B800000, 0xFFFFFF6A), (0x33800000, 150), (0x7EFFFFFF, 1), (0x01000000, 0xFFFFFFFE))
+FREXP_F64 = (
+    0x3FF0000000000000, 0xBFF0000000000000, 0x3FE8000000000000, 0x4008000000000000,   # 1, -1, 0.75, 3
+    0x7E37E43C8800759C, 0x01A56E1FC2F8F359, 0x7FEFFFFFFFFFFFFF, 0xFFEFFFFFFFFFFFFF,   # 1e300, 1e-300, +-max
+    0x0010000000000000, 0x8010000000000000, 0x3FF0000000000001, 0x400921FB54442D18,   # +-min normal, 1 + ulp, pi
+    0x3FB999999999999A, 0xBFB999999999999A, 0x4330000000000000, 0x0170000000000000,   # +-0.1, 2^52, 2^-1000
+    0x0000000000000001, 0x8000000000000001, 0x000FFFFFFFFFFFFF, 0x800FFFFFFFFFFFFF,   # subnormals: the smallest, largest
+    0x0000000080000000, 0x0000000100000000, 0x0008000000000000, 0x00000001FFFFFFFF,   # bit 31, bit 32, bit 51, 33 bits
+    0x0000000180000000, 0x000000000000FFFF, 0x8000000100000001, 0x0004000000000001,   # bits on both sides of the dwords
+    0x0000000000000002, 0x0000000000008000, 0x0000000000010000, 0x0000000040000000,   # single bits 1, 15, 16, 30
+    0x0000000200000000, 0x0000800000000000, 0x0001000000000000, 0x0004000000000000,   # single bits 33, 47, 48, 50
+    0x800000000000ABCD, 0x80000000FFFFFFFF, 0x8000FFFF00000000, 0x000ABCDEF0123456,
+    0x0000000000000000, 0x8000000000000000, 0x7FF0000000000000, 0xFFF0000000000000,   # zeros and infinities
+    0x7FF8000000000000, 0x7FF0000000000001, 0xFFF8000012345678, 0xFFF0000080000000,   # NaNs
+    0x3FE0000000000000, 0xBFE0000000000000, 0x7FE0000000000000, 0x0020000000000000,   # +-0.5, 2^1023, 2^-1021
+    0x4059000000000000, 0xC08F400000000000, 0x3F50624DD2F1A9FC, 0x41DFFFFFFFC00000,   # 100, -1000, 0.001, 2^31 - 1
+    0x3FEFFFFFFFFFFFFF, 0xBFEFFFFFFFFFFFFF, 0x001FFFFFFFFFFFFF, 0x801FFFFFFFFFFFFF,
+    0x43E0000000000000, 0xC3E0000000000000, 0x3CA0000000000000, 0x7FD0000000000001)
+FREXP_LDEXP_KEPT = 0xDEADBEEF   # the word an inactive lane keeps
+
+
+def frexp_mant_f32(x):
+    """v_frexp_mant_f32 on a binary32 word (docs/design.md): a normal keeps its sign and fraction and gets the
+    exponent field 126; a zero or a denormal, read as zero, gives a zero of its sign; an infinity or a NaN comes
+    back unchanged."""
+    exponent = x >> 23 & 0xFF
+    if exponent == 0:
+        return x & 0x80000000
+    return x if exponent == 255 else x & 0x807FFFFF | 126 << 23
+
+
+def frexp_exp_i32_f32(x):
+    """v_frexp_exp_i32_f32: the exponent field minus 126 for a normal, as a 32-bit word; 0 for everything else."""
+    exponent = x >> 23 & 0xFF
+    return (exponent - 126) & 0xFFFFFFFF if 0 < exponent < 255 else 0
+
+
+def ldexp_f32(x, n):
+    """v_ldexp_f32: the 32-bit word n, read as signed and clamped to [-512, 512], is added to the exponent field of
+    a normal x. A field above 254 gives an infinity of x's sign and one of 0 or below a zero of its sign (there are
+    no denormal results). A zero or a denormal gives a zero of its sign, and an infinity or a NaN comes back."""
+    exponent, sign = x >> 23 & 0xFF, x & 0x80000000
+    if exponent == 0:
+        return sign
+    if exponent == 255:
+        return x
+    exponent += max(-512, min(512, n - (1 << 32) if n & 0x80000000 else n))
+    if exponent > 254:
+        return sign | 0x7F800000
+    return sign if exponent <= 0 else x & 0x807FFFFF | exponent << 23
+
+
+def frexp_f64(bits):
+    """(v_frexp_mant_f64, v_frexp_exp_i32_f64) of a binary64 pattern, the exponent as a 32-bit word. A normal gets
+    the exponent field 1022 and gives its field minus 1022. A subnormal is normalized: its top fraction bit, at
+    position p, becomes the implicit one, and the exponent is p - 1073. A zero keeps its sign and an infinity or a
+    NaN comes back unchanged, all three with exponent 0."""
+    exponent, fraction, sign = bits >> 52 & 0x7FF, bits & ((1 << 52) - 1), bits & (1 << 63)
+    if exponent == 0x7FF:
+        return bits, 0
+    if exponent:
+        return sign | 1022 << 52 | fraction, (exponent - 1022) & 0xFFFFFFFF
+    if not fraction:
+        return sign, 0
+    top = fraction.bit_length() - 1
+    return sign | 1022 << 52 | (fraction << (52 - top)) & ((1 << 52) - 1), (top - 1073) & 0xFFFFFFFF
+
+
+def frexp_ldexp_words():
+    """cs_w32_frexp_ldexp: the input heap and the full expected readback, eight result words per thread and then
+    the records {x, n, d.lo, d.hi}."""
+    results, inputs = [], []
+    for thread, ((x, n), d) in enumerate(zip(FREXP_LDEXP_F32, FREXP_F64)):
+        mantissa, exponent = frexp_f64(d)
+        results.extend((frexp_mant_f32(x), frexp_exp_i32_f32(x), ldexp_f32(x, n), frexp_mant_f32(x ^ 0x80000000),
+                        mantissa & 0xFFFFFFFF, mantissa >> 32, exponent,
+                        ldexp_f32(x & 0x7FFFFFFF, n) if thread % 2 == 0 else FREXP_LDEXP_KEPT))
+        inputs.extend((x, n, d & 0xFFFFFFFF, d >> 32))
+    return [0xEEEEEEEE] * len(results) + inputs, results + inputs
+
+
+def frexp_ldexp_test(tools, spirv, env=None):
+    """Verify the five frexp and ldexp ops on 64 memory-fed records, including the untouched input records."""
+    initial, expected = frexp_ldexp_words()
+    with tempfile.TemporaryDirectory(prefix="leonida-frexp-ldexp-") as tmp:
+        path = Path(tmp) / "input.bin"
+        path.write_bytes(struct.pack(f"<{len(initial)}I", *initial))
+        child = dict(os.environ if env is None else env, VKC_HEAP_INIT=str(path))
+        child.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_w32_frexp_ldexp") or 32))
+        return dump_test(tools, spirv, "cs_w32_frexp_ldexp", expected, len(expected), child)
+
+
 # cs_user_sgprs.asm: vk_compute_test puts these words in s4..s7 and the shader stores them back.
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
 USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
+# cs_w32_salu_ext.asm: the sixteen operand words vk_compute_test puts in s4..s19, and the 73 words the shader stores
+# (each derived in its header; tests/test_gpu_salu_ext.py recomputes them with the reference of tools/salu_diff.py).
+SALU_EXT_SGPRS = [0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x00000001, 0x12345678, 0xDEADBEEF, 0x0000FF80, 0x00000025,
+                  0x00000040, 0x00000000, 0x00000001, 0x80000001, 0xFFFF0000, 0xFFFFFFFF, 0x00000000, 0x00000047]
+SALU_EXT_WORDS = [
+    0xFFFFFFFF, 0x12345677, 0xCC89A887, 0x00000000, 0x33765778, 0x00000000, 0xCC99E897, 0x00000000,
+    0xFC000000, 0x00000000, 0x00000000, 0x12345680, 0x01F3266F, 0x00000011, 0x80000000, 0x00000001,
+    0x00000000, 0x12345678, 0x00000008, 0x00000000, 0x80000000, 0x1233D678, 0x7FFFFFFF, 0x0FD5BDEE,
+    0xBEEF5678, 0xDEAD1234, 0x1E6A2C48, 0x00000001, 0xFFFFFFFF, 0x0000001F, 0x00000010, 0xFFFFFFFF,
+    0x00000000, 0xFFFFFF80, 0x00000078, 0xFFFFFFDF, 0x00000020, 0xC962FC98, 0x12345678, 0xFFFF8000,
+    0x00000040, 0x00000000, 0x00000001, 0x80000001, 0xFFFF0000, 0xFFFFFFDF, 0xFFFFFF7F, 0xFFFFFFFF,
+    0x00000000, 0x00000020, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x02000000, 0xFF000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000020, 0x00000080, 0x00000080, 0x00000000, 0x00000000, 0x07FFFFFF,
+    0x00000000, 0x00000000, 0x00000000, 0x00000010, 0x00000000, 0x0056D555, 0x000D5555, 0x00555555,
+    0x0000015B]
+SALU_EXT_HEAP_WORDS = 80   # the 73 results, then words that must keep the harness's fill
+
+
+def salu_ext_test(tools, spirv, env=None):
+    """cs_w32_salu_ext: 38 scalar ALU ops on the operands of SALU_EXT_SGPRS, every destination and SCC stored. The
+    whole 80-word heap is compared: the 73 results and the untouched fill after them."""
+    child = dict(os.environ if env is None else env, VKC_SGPRS=",".join(f"{w:#x}" for w in SALU_EXT_SGPRS))
+    child.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_w32_salu_ext") or 32))
+    expected = SALU_EXT_WORDS + [0xEEEEEEEE] * (SALU_EXT_HEAP_WORDS - len(SALU_EXT_WORDS))
+    return dump_test(tools, spirv, "cs_w32_salu_ext", expected, SALU_EXT_HEAP_WORDS, child)
+
+
 # cs_fma_fused.asm: single-rounded f32 multiply-adds (and one f16). The operands arrive in s4..s7 so no driver can fold
 # them; FMA_FUSED are the exact single-rounded words and FMA_SPLIT are the exact split-rounded words (derivations in
 # the .asm header; out[7] is f16 round-to-odd, never GLSL Fma, so it is always 0x7351). Under --fma khr
@@ -409,6 +755,9 @@ CVT_F32_SAT_CASES = (
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
 # v_pk_mul_lo_u16 with a constant operand (cs_pk_mul_lo_const.asm), measured natively on RDNA2 (gfx1036); lanes 0 and 1.
 PK_MUL_LO_WORDS = [0x00009E88, 0x03675433, 0x00230000, 0x00077F6C] * 2
+# Its 32 lanes store 16 bytes each, 128 words: more than the 64 vk_compute_test gives one group by default, so lanes
+# 16-31 wrote past the buffer through its device address (VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819, GPU-AV).
+PK_MUL_LO_ENV = {"VKC_OUT_WORDS": "128"}
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
 # on narrower subgroups. cs_dpp_w64 is not cross-half, but its lane id needs both halves.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
@@ -437,10 +786,13 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               # s_andn2_saveexec_b64 / s_andn2_wrexec_b64: EXEC = S0 & ~EXEC over both halves, D old / new EXEC, SCC
               ("cs_w64x_andn2_exec", [1, 16, 32, 4144, 2052, 3, 8, 1544]),
               # s_and/s_or_saveexec_b64 (VCC and SGPR-pair sources), s_andn2_saveexec/wrexec_b64 (SGPR pair): D, EXEC, SCC
-              ("cs_w64x_saveexec_b64", [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171])]
+              ("cs_w64x_saveexec_b64", [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171]),
+              # SHADER-W64-SDST-PAIR: v_cmp_* / carry-out SGPR destinations printed as one register (no mattr line)
+              ("cs_w64x_cmp_sdst", [10240, 6144, 2053, 8224, 7714, 6184, 4144, 5])]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
-                ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
+                ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0]),
+                ("cs_w64x_partial_swizzle", [508, 523, 0, 0, 528, 0, 531, 0])]
 PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               # exp mrt0 done (no vm) with every lane on, EXEC off afterwards: written (.asm header, measured on gfx1036)
               "ps_exp_color_mask": (0x40000000, 0x40800000, 0x40000000, 0x40800000),
@@ -454,6 +806,7 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_ops7": (0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003),
               "ps_ops8": (0x80000000, 0xbfffffff, 0x000f100e, 0x0f0f0f1f),
               "ps_f32_mods": (0xc0256a01, 0x3f800000, 0x41e00000, 0x3fc00000),
+              "ps_exp_f32_denorm": (0x01000000, 0x00800000, 0x00000000, 0x00000000),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xbffefff2, 0x3c003344, 0xbff70000),
               # 16-bit SDWA results with dst_sel:DWORD zero the high half (.asm header, measured on gfx1036)
               "ps_sdwa_dword_hi": (0x00004000, 0x00000003, 0x00004700, 0x0000c000),
@@ -467,7 +820,7 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_scc_logic32": (0x0fff0fff, 0x000f000f, 0xf00ff00f, 0x36),
               "ps_scc_logic64": (0x0fff0fff, 0xff000000, 0xff0000ff, 0x16),
               "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
-              "ps_f64_mods": (0x40040000, 0x3ff00000, 0x3fe40000, 0x3ff00000),
+              "ps_f64_mods": (0x3ff40000, 0x3ff00000, 0x3ff00000, 0x3fd00000),
               "ps_f64_round": (0xc12af665, 0x3fe7ffff, 0xbfffffff, 0xc12af666),
               "ps_outmods_f16": (0xaaaa3c00, 0xaaaa3e00, 0x7c000000, 0x3c000000),
               # f16 op_sel, partial writes, inline constants: words measured on RDNA2 hardware (.asm headers)
@@ -624,6 +977,17 @@ STORE_WORDS = {
     # 3D image atomics: the data register afterwards (sint image) and the six texels afterwards (volume)
     "cs_imgatomic3d": ({}, dict(enumerate([0x101, 0xDB, 0xF4, 0xCE, 0xE6, 0xFF])),
                        {57: 0x111, 19: 3, 44: 0xF4, 6: 0xD00D, 30: 0xE6, 39: 0x10}),
+    # GPU-IMG-ATOMIC-EXT: swap, inc, dec, fmin, fmax and fcmpswap. The 2D cases' texels afterwards (uint image, with the
+    # four that all 64 threads hit at 40..43), the data registers afterwards (sint image: 2D cases at 0..20, 3D cases
+    # at 32..37) and the 3D cases' texels afterwards (volume)
+    "cs_imgatomic_ext": ({0: 0x12345678, 1: 0xABCDEF01, 2: 0, 3: 0x68, 4: 0, 5: 0x68, 6: 0x32, 7: 9, 8: 0x6D,
+                          9: 0x3FC00000, 10: 0xC0400000, 11: 0x40200000, 12: 0x3FC00000, 13: 0x3FC00000,
+                          14: 0x3FC00000, 15: 0x40490FDB, 16: 0x3FC00000, 17: 0x3F800000, 18: 0x7FC00000,
+                          19: 0x78, 20: 0x77, 40: 0xCC, 41: 0x4D, 42: 0x427C0000, 43: 0xC27C0000},
+                         {0: 0x64, 1: 0xABCDEF01, 2: 0x66, 3: 0x67, 4: 0x68, 5: 0x69, 6: 0x6A, 7: 0, 8: 0x1F4,
+                          **dict.fromkeys(range(9, 17), 0x3FC00000), 17: 0, 18: 0x7FC00000, 19: 0x77, 20: 0x78,
+                          32: 0x101, 33: 0xDB, 34: 0xF4, 35: 0x3FC00000, 36: 0x3FC00000, 37: 0x3FC00000},
+                         {6: 0xC0400000, 19: 0xDC, 30: 0x40200000, 39: 0x40490FDB, 44: 0x64, 57: 0x0BADF00D}),
     # image_get_resinfo on a 16x4 image with five levels: (width, height, depth, levels) of levels 0, 1 and 3, then
     # width and height of level 2 and an untouched register, height and levels of level 1, the levels alone, and
     # level 5, past the last (2D depth 0 and the past-the-end zeros measured on RDNA2, SHADER-388)
@@ -728,9 +1092,10 @@ def failure(code, output, lines):
     return f"exit {code}: {details or 'no test output'}"
 
 
-def dump_test(tools, spirv, name, want, words, env=None):
+def dump_test(tools, spirv, name, want, words, env=None, judge=None):
     """Run one group with a heap of `words` words and compare the first len(want) words of the whole dump. The
-    console dump stops at word 7."""
+    console dump stops at word 7. With `judge`, the whole dump goes to it instead, as a tuple of words, with the
+    test program's output (it names the device), and its answer ("" for a pass) is returned."""
     with tempfile.TemporaryDirectory(prefix="leonida-fmt-") as tmp:
         dump = Path(tmp) / "out.bin"
         # VKC_OUT_WORDS sets a minimum. Pin this dispatch to exactly `words` words.
@@ -746,6 +1111,8 @@ def dump_test(tools, spirv, name, want, words, env=None):
         data = dump.read_bytes()
     if len(data) != 4 * words:
         return f"expected {4 * words} dump bytes, got {len(data)}"
+    if judge:
+        return judge(struct.unpack(f"<{words}I", data), out)
     for i, (expected, got) in enumerate(zip(want, struct.unpack(f"<{words}I", data))):
         if got != expected:
             return f"word {i}: expected {expected:#010x}, got {got:#010x}"
@@ -766,7 +1133,7 @@ def fmt_sint32_test(tools, spirv, env=None):
 
 
 def fmt_all_test(tools, spirv, env=None):
-    """cs_fmt_all: 28 loads, the inputs, 15 stores, and the untouched words between (316 words in all). Wave32, one
+    """cs_fmt_all: 32 loads, the inputs, 20 stores, and the untouched words between (336 words in all). Wave32, one
     thread: the translator recorded 32 for it, so the run is pinned to a 32-wide subgroup like compute_test does."""
     env = dict(os.environ if env is None else env)
     env.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_fmt_all") or 32))
@@ -992,7 +1359,7 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
             return Skip(f"SKIP ({out.strip() or 'unsupported device'})")
         if code == 0 and (skip := wave32_lane_skip(out)):
             return skip
-    if sg and (skip := unpinned_subgroup_skip(out)):
+    if code == 0 and sg and (skip := unpinned_subgroup_skip(out)):
         return skip
     if code != 0:
         return failure(code, out, 2)
@@ -1688,6 +2055,20 @@ def mandelbrot_counts(w):
     return counts
 
 
+def exp_f32_denorm_problem(px):
+    if len(px) != 4096:
+        return f"expected 4096 pixels, got {len(px)}"
+    for i, pixel in enumerate(px):
+        x = i % 64
+        result = (0x01000000, 0x00800000)[x] if x < 2 else 0
+        exponent = struct.unpack('<I', struct.pack('<f', -125.0 - x))[0]
+        column = struct.unpack('<I', struct.pack('<f', float(x)))[0]
+        expected = (result, exponent, column, result)
+        if tuple(pixel) != expected:
+            return f"pixel {i}: got {pixel}, expected {expected}"
+    return ''
+
+
 def mandelbrot_problem(px):
     """ps_mandelbrot: channel 3 is the lane's iteration count. A lane that leaves EXEC too early or late, or a loop
     that ends on the wrong branch, changes counts; the colour channels are only for looking at the frame."""
@@ -1801,6 +2182,8 @@ def pixel_test(tools, spirv, name):
         c = collections.Counter((a, b) for a, b, _, _ in px)
         fine = c[(8, 1)] and c[(8, 0)] and c[(7, 0)] and set(c) <= {(8, 1), (8, 0), (7, 0)}
         return "" if fine else f"(s5, bit) counts {dict(c)}"
+    if name == "ps_exp_f32_denorm_rt":
+        return exp_f32_denorm_problem(px)
     if name == "ps_mandelbrot":
         return mandelbrot_problem(px)
     return "no check written for this shader"
@@ -1832,6 +2215,32 @@ def clip_test(tools, spirv, name):
             if wrong:
                 return f"x={clip_x} y={clip_y}: {wrong} of 4096 pixels differ"
     return ""
+
+
+def texture_uav_test(tools, spv):
+    """The Windows D3D12 test compares every texel itself, through both Vulkan and WARP."""
+    if os.name != "nt":
+        return Skip("SKIP (needs the Windows D3D12 runtime)")
+    exe = os.path.join(tools, "d3d12_texture_uav_test" + EXE)
+    if not os.path.isfile(exe):
+        return f"missing {exe}"
+    code, out = run(exe, spv)
+    if code == UNSUPPORTED:
+        reason = next((line for line in out.splitlines() if line.startswith("SKIP:")), "unsupported device")
+        return Skip(reason)
+    return "" if code == 0 else failure(code, out, 8)
+
+
+IMAGE_STORE_CASES = {
+    "cs_imgstore": (),
+    "cs_imgstore_cube": ("cube",),   # GPU-CUBE-STORE: six-layer 2D-array views at bindings 11/12/13
+    "cs_imgload": ("load",),
+    "cs_imgload_tfe": ("load",),
+    "cs_imgload_d16": ("load-d16",),
+    "cs_imgload_d16_tfe": ("load-d16",),
+    "cs_sample_lz_int_d16": ("load-d16",),
+    "cs_imgload_mip": ("load-mip",),
+}
 
 
 def main():
@@ -1867,15 +2276,19 @@ def main():
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
+    results.append(("cs_w32_salu_ext", salu_ext_test(tools, spirv)))
     results.append(("cs_heap_init", compute_test(tools, spirv, "cs_heap_init", "1", "dump",
                                                  expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
     results.append(("cs_w32_shift64", shift64_test(tools, spirv)))
+    results.append(("cs_w32_cmp_f64", cmp_f64_test(tools, spirv)))
+    results.append(("cs_w32_round_f64", round_f64_test(tools, spirv)))
+    results.append(("cs_w32_frexp_ldexp", frexp_ldexp_test(tools, spirv)))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
                                                  expected_words=CVT_PK_U8_WORDS)))
     results.append(("cs_pk_mul_lo_const", compute_test(tools, spirv, "cs_pk_mul_lo_const", "1", "dump",
-                                                       expected_words=PK_MUL_LO_WORDS)))
+                                                       expected_words=PK_MUL_LO_WORDS, env=PK_MUL_LO_ENV)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
@@ -1885,9 +2298,7 @@ def main():
     results.append(("ms_wave_info_s3", mesh_w64x_test(tools, spirv, "ms_wave_info_s3")))
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
-    for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"]), ("cs_imgload_tfe", ["load"]),
-                       ("cs_imgload_d16", ["load-d16"]), ("cs_imgload_d16_tfe", ["load-d16"]),
-                       ("cs_sample_lz_int_d16", ["load-d16"])):
+    for name, args in IMAGE_STORE_CASES.items():
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs
             m = re.search(r"unsupported: .*", out)
@@ -1895,6 +2306,9 @@ def main():
             continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
+    texture_uav_spv = os.path.join(spirv, "cs_texture_uav.spv")
+    if os.path.isfile(texture_uav_spv):
+        results.append(("cs_texture_uav", texture_uav_test(tools, texture_uav_spv)))
     for name in STORE_WORDS:   # TEST-184: image atomics and image_get_resinfo
         results.append((name, store_words_test(tools, spirv, name)))
     for name in GET_LOD_TESTS:   # TEST-184: image_get_lod, 2D and 2D array

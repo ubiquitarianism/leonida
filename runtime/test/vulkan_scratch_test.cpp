@@ -1,5 +1,6 @@
 // Unit tests for ScratchBuffers (runtime/src/vulkan_scratch.h). CPU-only, no Vulkan instance and no GPU:
-// synthetic device procs exercise alignment, minimum chunk size, failure cleanup, retire/collect/forget, and spare cap.
+// synthetic device procs exercise alignment, minimum chunk size, failure cleanup, retire/collect/forget, spare cap,
+// and the usage a chunk is created with.
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -37,6 +39,9 @@ struct FakeVulkan {
     int free_memory_calls = 0;
     int wait_idle_calls = 0;
     int get_counter_calls = 0;
+    VkBufferUsageFlags last_usage = 0;  // of the last chunk created
+    VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
+    std::vector<std::uint32_t> families;
 
     VkResult create_buffer_result = VK_SUCCESS;
     VkResult bind_result = VK_SUCCESS;
@@ -52,9 +57,13 @@ const VkDevice k_device = make_handle<VkDevice>(0x100);
 VKAPI_ATTR VkResult VKAPI_CALL fake_create_buffer(
     VkDevice, const VkBufferCreateInfo* info, const VkAllocationCallbacks*, VkBuffer* out) {
     ++g_vk->create_buffer_calls;
+    g_vk->sharing_mode = info->sharingMode;
+    if (info->queueFamilyIndexCount)
+        g_vk->families.assign(info->pQueueFamilyIndices, info->pQueueFamilyIndices + info->queueFamilyIndexCount);
     if (g_vk->create_buffer_result != VK_SUCCESS) return g_vk->create_buffer_result;
     const std::uintptr_t id = g_vk->next_buffer++;
     g_vk->live_buffers[id] = info->size;
+    g_vk->last_usage = info->usage;
     *out = make_handle<VkBuffer>(id);
     return VK_SUCCESS;
 }
@@ -148,7 +157,7 @@ int main() {
         g_vk = &vk;
         constexpr VkDeviceSize k_4mib = 4u << 20;
         {
-            ScratchBuffers scratch(fake_get_device_proc, k_device, fake_allocate);
+            ScratchBuffers scratch(fake_get_device_proc, k_device, fake_allocate, 0, {2, 5});
             EXPECT(scratch.loaded());
 
             VkBuffer buf = VK_NULL_HANDLE;
@@ -157,6 +166,7 @@ int main() {
             EXPECT(vk.create_buffer_calls == 0);
 
             EXPECT(scratch.get(100, buf, off));
+            EXPECT(vk.sharing_mode == VK_SHARING_MODE_CONCURRENT && vk.families == std::vector<std::uint32_t>({2, 5}));
             const VkBuffer chunk1 = buf;
             EXPECT(chunk1 != VK_NULL_HANDLE && off == 0);
             EXPECT(vk.live_buffers[reinterpret_cast<std::uintptr_t>(chunk1)] == k_4mib);
@@ -285,6 +295,47 @@ int main() {
             scratch.forget(sem_b);
             EXPECT(vk.live_buffers.find(reinterpret_cast<std::uintptr_t>(big_buf)) == vk.live_buffers.end());
             EXPECT(vk.live_buffers.size() == 5);
+        }
+        EXPECT(vk.live_buffers.empty() && vk.live_memory.empty());
+    }
+
+    // A chunk is a transfer source and destination, plus whatever usage the owner asks for (the expanded indices of
+    // quad lists are an index buffer written through its device address).
+    {
+        FakeVulkan vk;
+        g_vk = &vk;
+        constexpr VkBufferUsageFlags transfer = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        constexpr VkBufferUsageFlags extra =
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceSize off = 0;
+        {
+            ScratchBuffers scratch(fake_get_device_proc, k_device, fake_allocate);
+            EXPECT(scratch.get(256, buf, off) && vk.last_usage == transfer);
+        }
+        {
+            ScratchBuffers scratch(fake_get_device_proc, k_device, fake_allocate, extra);
+            EXPECT(scratch.get(256, buf, off) && vk.last_usage == (transfer | extra));
+        }
+        EXPECT(vk.live_buffers.empty() && vk.live_memory.empty());
+    }
+
+    // A chunk whose used byte count is within 255 bytes of UINT64_MAX must not wrap alignment back to offset 0.
+    {
+        FakeVulkan vk;
+        g_vk = &vk;
+        {
+            ScratchBuffers scratch(fake_get_device_proc, k_device, fake_allocate);
+            VkBuffer buf1 = VK_NULL_HANDLE, buf2 = VK_NULL_HANDLE;
+            VkDeviceSize off1 = 1, off2 = 1;
+            const std::uint64_t near_max = std::numeric_limits<std::uint64_t>::max() - 100u;
+            EXPECT(scratch.get(near_max, buf1, off1));
+            EXPECT(buf1 != VK_NULL_HANDLE && off1 == 0 && vk.create_buffer_calls == 1);
+
+            EXPECT(scratch.get(16, buf2, off2));
+            EXPECT(buf2 != VK_NULL_HANDLE && buf2 != buf1 && off2 == 0);
+            EXPECT(vk.create_buffer_calls == 2 && vk.allocate_calls == 2);
+            EXPECT(vk.live_buffers.size() == 2 && vk.live_memory.size() == 2);
         }
         EXPECT(vk.live_buffers.empty() && vk.live_memory.empty());
     }

@@ -147,6 +147,19 @@ class LoadsMatchTheModel(unittest.TestCase):
 
 
 class StoresMatchTheModel(unittest.TestCase):
+    def test_dynamic_format_switch_and_unknown_codes(self):
+        with open(os.path.join(HERE, "fixtures", "store_dynamic_vsharp.asm"), encoding="utf-8") as f:
+            spv = support.translate_lines("cs_dynamic_format", f.read().splitlines(), fssm=tv.CS_BOUNDS_FSSM)
+        words = [0x3f800000, 0x40000000, 0x40400000, 0x40800000]
+        for code, count in ((0, 0), (20, 1), (22, 1), (77, 4), (78, 0), (127, 0)):
+            with self.subTest(code=code):
+                memory = {OUT_BASE + i * 4: SENTINEL for i in range(5)}
+                support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                                     push_constants=[OUT_BASE, 0, 16, 0x30000000 | code << 12 | DST_XYZW],
+                                     memory=memory)
+                self.assertEqual([memory[OUT_BASE + i * 4] for i in range(5)],
+                                 words[:count] + [SENTINEL] * (5 - count))
+
     def test_stores_through_the_v_sharp(self):
         for code in ADDED:
             name = model.GFX10_NAMES[code]

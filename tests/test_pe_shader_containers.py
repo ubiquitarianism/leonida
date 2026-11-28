@@ -14,6 +14,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -75,6 +76,26 @@ def ildn(name: str) -> bytes:
 
 
 class ContainerTests(unittest.TestCase):
+    def test_packed_native_programs_keep_plain_indices_and_extract_inflated_bytes(self):
+        def pack(dxbc, trailing=b""):
+            compressor = zlib.compressobj(wbits=-15)
+            payload = compressor.compress(dxbc) + compressor.flush() + trailing
+            stored = 12 + len(payload)
+            return struct.pack("<IIII", stored, 0xDDCE7, stored, len(dxbc)) + payload
+
+        native = container([(b"DXIL", dxil_payload("packed"))])
+        plain = container([(b"SFI0", bytes(8))])
+        packed = pack(native)
+        image = packed + plain + pack(plain) + pack(native, b"junk") + packed[:-1]
+        records, _ = psc.inspect(image, "synthetic.exe")
+        self.assertEqual([r["offset"] for r in records], [len(packed), 4])
+        self.assertEqual(records[1]["stored_size"], len(packed) - 4)
+        with tempfile.TemporaryDirectory() as tmp:
+            entries = psc.extract(image, records, tmp)
+            for entry, expected in zip(entries, (plain, native)):
+                with open(os.path.join(tmp, entry["file"]), "rb") as f:
+                    self.assertEqual(f.read(), expected)
+
     def test_scan_reads_one_container(self):
         data = container(
             [

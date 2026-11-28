@@ -1,11 +1,17 @@
 // Typeless depth-stencil textures without ALLOW_DEPTH_STENCIL (R24G8_TYPELESS, R32G8X24_TYPELESS), as an application
 // makes to keep a copy of its depth buffer for sampling: clear a depth buffer of the family, CopyResource it into
-// the plain texture, read both planes back and compare with Windows D3D12/WARP. No game data or shaders.
+// the plain texture, read both planes back, check that they hold the cleared values and compare with Windows
+// D3D12/WARP. No game data or shaders. Under Wine the reference would be vkd3d (host_wine.h), which reads both planes
+// back as zeros: there the comparison is left out, and the layer's readback is checked against the cleared values
+// alone.
 // LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <vector>
 
 #define CHECK(condition) do { \
@@ -155,6 +161,46 @@ bool copy_and_read(ID3D12Device* device, const Family& family, std::vector<unsig
     return true;
 }
 
+// Whether a readback of copy_and_read holds what clear() wrote, texel by texel: depth 0.25 and stencil 0x5a, and
+// depth 0.75 and stencil 0x3c inside the rectangle (1,1)-(5,3). This needs no reference device, so it is checked on
+// every host and is the whole check where there is none to compare with (Wine). The depth plane is four bytes a
+// texel: a float for R32G8X24, and for R24G8 a 24-bit UNORM in the low three bytes (the fourth is not depth, and a
+// device that keeps D24 as a float may round by one step either way). The stencil plane is one byte a texel.
+bool holds_cleared_values(const Family& family, const std::vector<unsigned char>& data) {
+    const size_t texels = size_t(width) * height;
+    if (data.size() != texels * 5) {
+        std::fprintf(stderr, "%s: the readback is %zu bytes, %zu expected (4 of depth and 1 of stencil a texel)\n",
+                     family.name, data.size(), texels * 5);
+        return false;
+    }
+    for (UINT y = 0; y < height; ++y) {
+        for (UINT x = 0; x < width; ++x) {
+            const bool inside = x >= 1 && x < 5 && y >= 1 && y < 3;
+            const float depth = inside ? 0.75f : 0.25f;
+            const unsigned char stencil = inside ? 0x3c : 0x5a;
+            const size_t texel = size_t(y) * width + x;
+            std::uint32_t word = 0;
+            std::memcpy(&word, data.data() + texel * 4, sizeof(word));
+            bool depth_ok = false;
+            if (family.typeless == DXGI_FORMAT_R24G8_TYPELESS) {
+                const auto want = static_cast<std::int64_t>(double(depth) * 16777215.0 + 0.5);
+                const auto got = static_cast<std::int64_t>(word & 0x00ffffffu);
+                depth_ok = got >= want - 1 && got <= want + 1;
+            } else {
+                std::uint32_t want = 0;
+                std::memcpy(&want, &depth, sizeof(want));
+                depth_ok = word == want;
+            }
+            const unsigned char got_stencil = data[texels * 4 + texel];
+            if (depth_ok && got_stencil == stencil) continue;
+            std::fprintf(stderr, "%s: texel (%u,%u) holds depth word 0x%08x and stencil 0x%02x, cleared to depth %g "
+                         "and stencil 0x%02x\n", family.name, x, y, word, got_stencil, double(depth), stencil);
+            return false;
+        }
+    }
+    return true;
+}
+
 // The first byte where the two readbacks differ, or -1.
 long first_difference(const std::vector<unsigned char>& a, const std::vector<unsigned char>& b) {
     if (a.size() != b.size()) return long(std::min(a.size(), b.size()));
@@ -169,6 +215,9 @@ int main() {
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;
     if (device_status != vktest::DeviceStatus::ready) return 1;
+    // Under Wine the reference would be vkd3d, which reads both planes back as zeros: no comparison there, and the
+    // layer's readback is still checked against the values it was cleared to.
+    const bool compare_with_host = !hostwine::host_is_wine();
     unsigned failures = 0;
     {
         Ref<ID3D12Device> ours;
@@ -184,15 +233,16 @@ int main() {
         Ref<IDXGIFactory4> factory;
         Ref<IDXGIAdapter> adapter;
         Ref<ID3D12Device> warp;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
-            FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p))) ||
-            FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&warp.p)))) {
+        if (compare_with_host &&
+            (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
+             FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter.p))) ||
+             FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&warp.p))))) {
             std::fprintf(stderr, "no WARP device, skipped\n");
             return 77;
         }
         for (const Family& family : families) {
             std::vector<unsigned char> expected, actual;
-            if (!copy_and_read(warp.p, family, expected)) {
+            if (compare_with_host && !copy_and_read(warp.p, family, expected)) {
                 std::fprintf(stderr, "%s: WARP could not run the copy\n", family.name);
                 ++failures;
                 continue;
@@ -200,6 +250,16 @@ int main() {
             if (!copy_and_read(ours.p, family, actual)) {
                 std::fprintf(stderr, "%s: the layer could not run the copy\n", family.name);
                 ++failures;
+                continue;
+            }
+            if (!holds_cleared_values(family, actual)) {
+                ++failures;
+                continue;
+            }
+            if (!compare_with_host) {
+                std::printf("%s without ALLOW_DEPTH_STENCIL: copy of a cleared depth buffer holds the cleared depth "
+                            "and stencil at every texel (%zu bytes; not compared with the host)\n",
+                            family.name, actual.size());
                 continue;
             }
             const long at = first_difference(actual, expected);

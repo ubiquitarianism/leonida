@@ -11,7 +11,8 @@ Usage:
 
 ``--game-dir`` defaults to ``LEONIDA_GAME_DIR``. Naming the streams takes about half a minute, so the name table
 (names, offsets and frame sizes only, no movie data) is kept in ``%LOCALAPPDATA%\\Leonida\\bink_names.csv`` and rebuilt
-when the archive or mount source changes, or the cached table cannot be parsed. ``--no-cache`` skips it.
+when the archive or mount source changes, or the cached table cannot be parsed. ``--no-cache`` skips it and
+keeps its temporary report in the system temporary directory instead of the persistent cache directory.
 The names are a local work product: don't commit or post them.
 """
 import argparse
@@ -62,15 +63,18 @@ def _read_cache(cache, key):
 
 def load_names(archive, mount, use_cache=True):
     """[(path, offset, width, height, frames)] for the streams of ``archive``, named from ``mount``."""
-    cache = cache_path()
-    key = stamp(archive) + "|" + stamp(mount)  # the names come from the mount lists too
-    if use_cache and cache.is_file():
-        rows = _read_cache(cache, key)
-        if rows is not None:
-            return rows
-    cache.parent.mkdir(parents=True, exist_ok=True)
+    report_dir = None
+    if use_cache:
+        cache = cache_path()
+        key = stamp(archive) + "|" + stamp(mount)  # the names come from the mount lists too
+        if cache.is_file():
+            rows = _read_cache(cache, key)
+            if rows is not None:
+                return rows
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        report_dir = cache.parent
     # Each lookup gets its own report and staging file: two runs at once must not remove or replace each other's.
-    fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".tmp.csv", dir=cache.parent)
+    fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".tmp.csv", dir=report_dir)
     os.close(fd)
     tmp = Path(name)
     try:
@@ -85,7 +89,12 @@ def load_names(archive, mount, use_cache=True):
     if use_cache:
         fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".part", dir=cache.parent)
         try:
-            with open(fd, "w", encoding="utf-8", newline="") as f:
+            try:
+                out = open(fd, "w", encoding="utf-8", newline="")
+            except BaseException:
+                os.close(fd)
+                raise
+            with out as f:
                 f.write("# " + key + "\n")
                 w = csv.writer(f, lineterminator="\n")
                 w.writerow(CACHE_FIELDS)
@@ -93,6 +102,10 @@ def load_names(archive, mount, use_cache=True):
                     w.writerow([r["path"], r["offset"], r["width"], r["height"], r["frames"]])
             os.replace(name, cache)
         finally:
+            try:
+                os.chmod(name, 0o600)
+            except OSError:
+                pass
             Path(name).unlink(missing_ok=True)
     return [(r["path"], int(r["offset"]), r["width"], r["height"], r["frames"]) for r in rows]
 
@@ -114,10 +127,11 @@ def pick(names, wanted):
 def find_exe(explicit):
     if explicit:
         return Path(explicit)
-    root = HERE.parent
-    for c in (root / "runtime" / "build" / "bink_play.exe", root / "runtime" / "build" / "Release" / "bink_play.exe"):
-        if c.is_file():
-            return c
+    build = HERE.parent / "runtime" / "build"
+    for config in ("", "Release", "RelWithDebInfo", "Debug", "MinSizeRel"):
+        player = build / config / "bink_play.exe"
+        if player.is_file():
+            return player
     raise SystemExit("bink_play.exe not found; build the runtime (runtime/build) or pass --exe")
 
 

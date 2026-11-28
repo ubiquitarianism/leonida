@@ -12,7 +12,6 @@ These tests verify:
 """
 import os
 import re
-import shlex
 import shutil
 import struct
 import subprocess
@@ -20,6 +19,8 @@ import tempfile
 import unittest
 
 import support
+
+import mc_command  # noqa: E402  (support puts tools/ on sys.path)
 import rdna2spirv
 
 PS_EPILOGUE = ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"]
@@ -50,9 +51,16 @@ def vdata_reg(dmask, d16=False):
 
 
 def llvm_mc_cmd():
+    """llvm-mc's argv, or None when there is none.
+
+    LLVM_MC is one executable path or a whole command line (`wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc` on
+    Windows, whose official LLVM build has no AMDGPU target). POSIX shlex.split eats the backslashes of a Windows
+    path (H:\\GTA6\\...\\llvm-mc.exe becomes H:GTA6...), so the split is the shared one in tools/mc_command.py that
+    the tools use: a value that is one existing file path stays one argv element, and a command line is still split.
+    """
     env = os.environ.get("LLVM_MC")
     if env:
-        return shlex.split(env)
+        return mc_command.split_command(env)
     exe = shutil.which("llvm-mc")
     return [exe] if exe else None
 

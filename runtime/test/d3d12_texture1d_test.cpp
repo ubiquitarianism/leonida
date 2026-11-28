@@ -116,7 +116,7 @@ int main() {
     uav1d.Texture1D.MipSlice = 1;
     dev->CreateUnorderedAccessView(tex1d, nullptr, &uav1d, {cbv_cpu.ptr + cbv_inc * 5});
 
-    // Default (nullptr) SRV and UAV on a 1D array must write a null descriptor (set 0 has no 1D-array binding).
+    // Set 0 has storage-only 1D-array bindings: a default SRV is null, but a default UAV covers the whole array.
     std::memset(reinterpret_cast<void*>(cbv_cpu.ptr + cbv_inc * 6), 0x77, cbv_inc * 2);
     dev->CreateShaderResourceView(tex1d, nullptr, {cbv_cpu.ptr + cbv_inc * 6});
     dev->CreateUnorderedAccessView(tex1d, nullptr, nullptr, {cbv_cpu.ptr + cbv_inc * 7});
@@ -147,11 +147,12 @@ int main() {
     if (!decode_and_lookup(5, img) || img.type != g::ImageType::image_1d || img.first_mip != 1 || img.mip_count != 1 ||
         img.layer_count != 1)
         return fail("explicit 1D UAV on array T# or bindless lookup mismatch");
-    for (UINT slot = 6; slot < 8; ++slot) {
-        const auto* bytes = reinterpret_cast<const std::uint8_t*>(cbv_cpu.ptr + cbv_inc * slot);
-        for (UINT b = 0; b < 32; ++b)
-            if (bytes[b] != 0) return fail("default 1DArray view should write a null descriptor");
-    }
+    const auto* srv_bytes = reinterpret_cast<const std::uint8_t*>(cbv_cpu.ptr + cbv_inc * 6);
+    for (UINT b = 0; b < 32; ++b)
+        if (srv_bytes[b] != 0) return fail("default 1DArray SRV should write a null descriptor");
+    if (!decode_and_lookup(7, img) || img.type != g::ImageType::image_1d_array || img.first_mip != 0 ||
+        img.mip_count != 1 || img.first_layer != 0 || img.layer_count != tex1d_desc.DepthOrArraySize)
+        return fail("default 1DArray UAV T# or bindless lookup mismatch");
 
     // RTV / DSV 1D bounds validation (out-of-bounds mip/slice must write a null TargetView)
     D3D12_RENDER_TARGET_VIEW_DESC bad_rtv{};
@@ -267,6 +268,6 @@ int main() {
     cbv_heap->Release();
     dev->Release();
 
-    std::printf("PASS: d3d12_texture1d_test (1D/1DArray SRV, UAV + CopyTextureRegion round-trip)\n");
+    std::printf("PASS: d3d12_texture1d_test (1D views, 1DArray UAV + CopyTextureRegion round-trip)\n");
     return 0;
 }

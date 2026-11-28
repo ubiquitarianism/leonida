@@ -19,6 +19,104 @@
 
 using namespace leonida;
 
+// The shared contract vectors (the translator's desc_probe and this table must agree on both kinds): 512 slots, mask
+// 511. Each row is a key -> the bare FNV-1a hash (slot 345 and friends) and the fnv1a_fmix32 hash (spread).
+struct HashVector {
+    DescriptorKey key;
+    std::uint32_t fnv1a;
+    std::uint32_t fnv1a_slot;
+    std::uint32_t fnv1a_fmix32;
+    std::uint32_t fnv1a_fmix32_slot;
+};
+
+constexpr std::array<HashVector, 8> kHashVectors{{
+    {{0x00100000u, 0x00000000u, 0x90500FACu, 0x00000000u, 0u, 0u, 0u, 0u}, 0x1CD4CD59u, 345, 0x7CE036C5u, 197},
+    {{0x10100000u, 0x00000000u, 0x90500FACu, 0x00000000u, 0u, 0u, 0u, 0u}, 0x0CD4CD59u, 345, 0x646B8915u, 277},
+    {{0x20100000u, 0x00000000u, 0x90500FACu, 0x00000000u, 0u, 0u, 0u, 0u}, 0x3CD4CD59u, 345, 0xC2E843B6u, 438},
+    {{0x30100000u, 0x00000000u, 0x90500FACu, 0x00000000u, 0u, 0u, 0u, 0u}, 0x2CD4CD59u, 345, 0xE11420E3u, 227},
+    {{0x12345678u, 0x9ABCDEF0u, 0x0FEDCBA9u, 0x87654321u, 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u},
+     0xBD4A977Fu, 383, 0x3AE592B1u, 177},
+    {{0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u}, 0x9BE17165u, 357, 0xBB10DC19u, 25},
+    {{0x00010001u, 0x00400040u, 0x10014FACu, 0x00000000u, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu},
+     0x814225E4u, 484, 0xD5398A35u, 53},
+    {{0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu},
+     0xB0E4285Du, 93, 0x98A3F73Au, 314},
+}};
+
+int test_shared_hash_vectors() {
+    for (const HashVector& v : kHashVectors) {
+        EXPECT(hash_descriptor_key(v.key, DescriptorHashKind::fnv1a) == v.fnv1a);
+        EXPECT(hash_descriptor_key(v.key, DescriptorHashKind::fnv1a_fmix32) == v.fnv1a_fmix32);
+        EXPECT((v.fnv1a & 511u) == v.fnv1a_slot);
+        EXPECT((v.fnv1a_fmix32 & 511u) == v.fnv1a_fmix32_slot);
+        // fnv1a_fmix32 is the same FNV loop plus the finalizer, and the old default overload is still bare FNV-1a.
+        EXPECT(hash_descriptor_key_fnv1a(v.key.data()) == v.fnv1a);
+        EXPECT(finalize_descriptor_hash(v.fnv1a) == v.fnv1a_fmix32);
+        EXPECT(hash_descriptor_key(v.key) == v.fnv1a);
+    }
+    return 0;
+}
+
+// The clustering the fmix32 finalizer removes: T#s that differ only in the top nibble of dword 0 share slot 345 under
+// bare FNV-1a (four keys in one probe run), and land in four different home slots under fnv1a_fmix32.
+int test_fmix32_spreads_the_clustered_keys() {
+    constexpr std::uint32_t mask = 511;
+    std::array<std::uint32_t, 4> fnv1a_slots{}, fmix32_slots{};
+    for (std::size_t i = 0; i < fnv1a_slots.size(); ++i) {
+        fnv1a_slots[i] = hash_descriptor_key(kHashVectors[i].key, DescriptorHashKind::fnv1a) & mask;
+        fmix32_slots[i] = hash_descriptor_key(kHashVectors[i].key, DescriptorHashKind::fnv1a_fmix32) & mask;
+        EXPECT(fnv1a_slots[i] == 345u);
+    }
+    for (std::size_t i = 0; i < fmix32_slots.size(); ++i)
+        for (std::size_t j = i + 1; j < fmix32_slots.size(); ++j) EXPECT(fmix32_slots[i] != fmix32_slots[j]);
+    return 0;
+}
+
+// A table finds every key it holds with the kind it was built with, at that kind's home slot and probe window; a table
+// built with the other kind does not answer them (the minority of a mixed library misses to index 0).
+int test_table_uses_the_kind_it_was_built_with() {
+    constexpr std::uint32_t slots = 512;
+    constexpr std::uint32_t mask = slots - 1;
+    for (const DescriptorHashKind kind : {DescriptorHashKind::fnv1a, DescriptorHashKind::fnv1a_fmix32}) {
+        DescriptorTable table(slots, kind);
+        EXPECT(table.capacity() == slots && table.mask() == mask && table.hash_kind() == kind);
+        for (std::size_t i = 0; i < kHashVectors.size(); ++i) EXPECT(table.insert(kHashVectors[i].key, i + 1));
+        EXPECT(table.size() == kHashVectors.size());
+        for (std::size_t i = 0; i < kHashVectors.size(); ++i) {
+            EXPECT(table.lookup(kHashVectors[i].key) == i + 1);
+            EXPECT(table.contains(kHashVectors[i].key));
+            // The key is in its own kind's probe window, with its index and the occupied marker.
+            const std::uint32_t home = hash_descriptor_key(kHashVectors[i].key, kind) & mask;
+            bool found = false;
+            for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
+                std::uint32_t words[10] = {};
+                EXPECT(table.read_slot((home + k) & mask, words));
+                if (std::memcmp(words, kHashVectors[i].key.data(), sizeof(DescriptorKey)) == 0) {
+                    EXPECT(words[8] == i + 1 && words[9] == kSlotOccupiedMarker);
+                    found = true;
+                    break;
+                }
+            }
+            EXPECT(found);
+        }
+    }
+    // Lookups placed with fnv1a_fmix32 fall outside the bare FNV-1a window (345..352) of the clustered keys.
+    DescriptorTable fmix32_table(slots, DescriptorHashKind::fnv1a_fmix32);
+    for (std::size_t i = 0; i < 4; ++i) EXPECT(fmix32_table.insert(kHashVectors[i].key, i + 1));
+    for (std::size_t i = 0; i < 4; ++i) {
+        const std::uint32_t fnv1a_home = hash_descriptor_key(kHashVectors[i].key, DescriptorHashKind::fnv1a) & mask;
+        bool found = false;
+        for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
+            std::uint32_t words[10] = {};
+            EXPECT(fmix32_table.read_slot((fnv1a_home + k) & mask, words));
+            found |= std::memcmp(words, kHashVectors[i].key.data(), sizeof(DescriptorKey)) == 0;
+        }
+        EXPECT(!found);
+    }
+    // The table's own kind still finds them (the same table, looked up as the device would).
+    for (std::size_t i = 0; i < 4; ++i) EXPECT(fmix32_table.lookup(kHashVectors[i].key) == i + 1);
+    return 0;
+}// The bare FNV-1a contract the translator's desc_probe has always used (the default, no marker).
 int test_fnv1a_hash_matches_contract() {
     // Verified against vk_texture_test.cpp key_hash and rdna2spirv.py desc_probe
     const std::uint32_t zeros[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -448,10 +546,56 @@ int test_capacity_overflow() {
     return 0;
 }
 
+// The entry's last dword is what a `descriptor_table` tagged module reads next to the index: the occupied bit and
+// the arrays the index is bound in (kind_sampled_bit / kind_storage_bit). A plain module never reads it, so a table
+// inserted without a kind must serialize exactly as before (marker, no kind bits).
+int test_kind_word() {
+    DescriptorTable table(16);
+    const DescriptorKey image = make_tsharp_key(std::array<std::uint32_t, 8>{0x00001000u, 0x00000000u, 0u, 0u,
+                                                                            0u, 0u, 0u, 0u}.data());
+    const std::uint32_t kind = kind_sampled_bit(1) | kind_storage_bit(1);
+    EXPECT(table.insert(image, 5, kind));
+    EXPECT(table.lookup(image) == 5);
+    const auto words = table.build_gpu_buffer();
+    EXPECT(words[0] == 15);
+    const std::uint32_t slot = (hash_descriptor_key(image.data(), DescriptorHashKind::fnv1a) & 15);
+    if (words[1 + slot * 10 + 8] != 5) return 1;                 // find the slot the key landed in
+    EXPECT((words[1 + slot * 10 + 9] & kSlotOccupiedMarker) != 0);
+    EXPECT((words[1 + slot * 10 + 9] & kKindMask) == kind);
+
+    // A plain entry: the marker and no kind bits, as before the marker existed.
+    const DescriptorKey plain = make_tsharp_key(std::array<std::uint32_t, 8>{0x00002000u, 0u, 0u, 0u, 0u, 0u, 0u,
+                                                                            0u}.data());
+    EXPECT(table.insert(plain, 6));
+    std::uint32_t found[10];
+    EXPECT(table.read_slot(slot, found));
+    (void)found;
+    DescriptorEntry entry{};
+    entry.kind = kSlotOccupiedMarker;
+    EXPECT(slot_occupied(entry) && slot_kind(entry) == 0);
+
+    // The same index with a new kind is a change the GPU copy needs.
+    EXPECT(table.insert_or_update(image.data(), 5, kind_sampled_bit(2)) ==
+           DescriptorTable::InsertResult::replaced);
+    EXPECT(table.insert_or_update(image.data(), 5, kind_sampled_bit(2)) ==
+           DescriptorTable::InsertResult::unchanged);
+    const auto changed = table.take_changes();
+    EXPECT(!changed.slots.empty() || changed.all);
+
+    // clear_occupied drops the marker but keeps the kind, which is what a shader reads.
+    const auto gpu = table.build_gpu_buffer(true);
+    EXPECT((gpu[1 + slot * 10 + 9] & kSlotOccupiedMarker) == 0);
+    EXPECT((gpu[1 + slot * 10 + 9] & kKindMask) == kind_sampled_bit(2));
+    return 0;
+}
+
 int main() {
     EXPECT(test_unresolvable_hash_collision() == 0);
     EXPECT(test_capacity_overflow() == 0);
     EXPECT(test_fnv1a_hash_matches_contract() == 0);
+    EXPECT(test_shared_hash_vectors() == 0);
+    EXPECT(test_fmix32_spreads_the_clustered_keys() == 0);
+    EXPECT(test_table_uses_the_kind_it_was_built_with() == 0);
     EXPECT(test_ssharp_key_padding() == 0);
     EXPECT(test_basic_insertion_and_lookup() == 0);
     EXPECT(test_insert_reports_mapping_changes() == 0);
@@ -464,6 +608,7 @@ int main() {
     EXPECT(test_multithreaded_insert_and_lookup() == 0);
     EXPECT(test_clear_resets_table() == 0);
     EXPECT(test_erase_and_reinsert() == 0);
+    EXPECT(test_kind_word() == 0);
 
     std::printf("descriptor_table_test: all tests passed (0 failures)\n");
     return 0;

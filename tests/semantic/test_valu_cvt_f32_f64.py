@@ -1821,5 +1821,38 @@ class TestValuCvtF32F64NegativeControlsAndMutations(unittest.TestCase):
         self.assertNotEqual(sim.read_lane_reg_u32(0, RegKind.VGPR, 0), 0xAAAAAAAA)
 
 
+# ==============================================================================
+# The translator: tools/rdna2spirv.py's output, run in tests/spirv_interp.py, gives the oracle's word
+# ==============================================================================
+import os as _os  # noqa: E402
+import sys as _sys  # noqa: E402
+
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import f64_translate as ft  # noqa: E402
+
+class TranslatorMatchesOracle(unittest.TestCase):
+    """v_cvt_f32_f64 is OpFConvert to binary32 (round to nearest even). On every input whose binary32 result is a
+    normal number, a zero or an infinity - no NaN, no binary32 subnormal (it follows the driver's denormal mode), no
+    overflow - the translated instruction gives ref_cvt_f32_f64's word."""
+
+    VALUES = (1.0, 1 / 3, 0.1, 2.5, 1e20, 7.0, 1e-30, 3.4028234663852886e38, 1.1754943508222875e-38, 0.0)
+
+    def check(self, word, src="v[2:3]", mods="", **oracle):
+        with self.subTest(word=hex(word), src=src, mods=mods):
+            self.assertEqual(hex(ft.run_f64("v_cvt_f32_f64", word, src=src, mods=mods, wide=False)),
+                             hex(ref_cvt_f32_f64(word, **oracle)))
+
+    def test_values_both_signs_and_infinities(self):
+        for word in [ft.f64_bits(x) for x in self.VALUES] + [0x7FF0000000000000]:
+            for sign in (0, 1 << 63):
+                self.check(word | sign)
+
+    def test_source_modifiers_and_clamp(self):
+        for x in (0.75, 3.0, -0.5, -1e20):
+            self.check(ft.f64_bits(x), src="-v[2:3]", neg=True)
+            self.check(ft.f64_bits(x), src="|v[2:3]|", abs_val=True)
+            self.check(ft.f64_bits(x), mods=" clamp", clamp=True)
+
+
 if __name__ == "__main__":
     unittest.main()

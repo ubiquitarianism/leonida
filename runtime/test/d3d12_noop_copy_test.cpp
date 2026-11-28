@@ -1,6 +1,8 @@
 // Legal D3D12 no-op copies must not poison Close or emit invalid Vulkan copy commands.
-// Synthetic resources and native host WARP comparator; no game content.
+// Synthetic resources and native host WARP comparator; no game content. Under Wine the comparator is skipped
+// (host_wine.h) and the layer is still checked.
 #include "../shims/d3d12_com.h"
+#include "host_wine.h"
 #include <dxgi1_4.h>
 #include <cstdio>
 #include <cstring>
@@ -118,10 +120,14 @@ int main() {
     Ref<IDXGIFactory4> factory;
     Ref<IDXGIAdapter> warp;
     Ref<ID3D12Device> host;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
-        FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
-        FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) return 77;
-    if (check(host.p, "native WARP")) return 1;
+    // Wine's host is vkd3d, which accepts the upload-heap self-copy Microsoft's runtime refuses: check() would stop
+    // there, before the layer is looked at.
+    if (!hostwine::host_is_wine()) {
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
+            FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
+            FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) return 77;
+        if (check(host.p, "native WARP")) return 1;
+    }
     Ref<ID3D12Device> layer;
     if (FAILED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&layer.p)))) return 77;
     return check(layer.p, "Leonida Vulkan");

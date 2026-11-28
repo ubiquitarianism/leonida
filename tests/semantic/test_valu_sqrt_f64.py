@@ -1110,5 +1110,40 @@ class TestNegativeControlsAndMutationDetection(unittest.TestCase):
         self.assertNotEqual(golden, mutant)
 
 
+# ==============================================================================
+# The translator: tools/rdna2spirv.py's output, run in tests/spirv_interp.py, gives the oracle's word
+# ==============================================================================
+import os as _os  # noqa: E402
+import sys as _sys  # noqa: E402
+
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import f64_translate as ft  # noqa: E402
+
+class TranslatorMatchesOracle(unittest.TestCase):
+    """v_sqrt_f64 is GLSL.std.450 Sqrt on the double (docs/design.md: the correctly rounded root, while RDNA2's own
+    instruction is not). On every input whose SPIR-V result is defined - no NaN, nothing below zero - the translated
+    instruction gives oracle_v_sqrt_f64's word."""
+
+    FINITE = (1.0, 2.0, 4.0, 0.25, 3.0, 10.0, 1 / 3, 0.1, 7.0, 1e300, 1e-300, 1.7976931348623157e308,
+              2.2250738585072014e-308)
+    SPECIAL = (0x0000000000000000, 0x0000000000000001, 0x000FFFFFFFFFFFFF, 0x7FF0000000000000)   # +0, subnormals, +inf
+
+    def check(self, word, src="v[2:3]", mods="", **oracle):
+        with self.subTest(word=hex(word), src=src, mods=mods):
+            self.assertEqual(hex(ft.run_f64("v_sqrt_f64", word, src=src, mods=mods)),
+                             hex(oracle_v_sqrt_f64(word, **oracle)))
+
+    def test_non_negative_inputs(self):
+        for word in [ft.f64_bits(x) for x in self.FINITE] + list(self.SPECIAL):
+            self.check(word)
+
+    def test_source_modifiers_on_negative_inputs_and_clamp(self):
+        for x in (4.0, 0.25, 2.0, 1e300):
+            self.check(ft.f64_bits(-x), src="-v[2:3]", neg_mod=True)
+            self.check(ft.f64_bits(-x), src="|v[2:3]|", abs_mod=True)
+        for x in (0.25, 0.5, 4.0, 2.0):
+            self.check(ft.f64_bits(x), mods=" clamp", clamp=True)
+
+
 if __name__ == "__main__":
     unittest.main()

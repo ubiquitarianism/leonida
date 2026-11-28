@@ -5,6 +5,8 @@
 Every fixture is synthetic: 40-byte header + u64 offset table + 16-byte-aligned
 struct, wrapper and array records linked by 0x71717171-tagged pointers.
 """
+import contextlib
+import io
 import json
 import os
 import struct
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -188,9 +191,10 @@ class ScriptQtableTests(unittest.TestCase):
     def test_missing_input_is_one_error_line_and_exit_2(self):
         # A target the tool cannot open is a diagnostic, not a short census: the other tools exit 2 here.
         with tempfile.TemporaryDirectory() as tmp:
-            missing = os.path.join(tmp, "no_such_container.bin")
+            missing = os.path.join(tmp, "no_such_container_\u00f8.bin")
             p = subprocess.run(
-                [sys.executable, "-I", TOOL, missing],
+                # UTF-8 mode: a piped stderr is the ANSI code page on Windows, and the error names the path.
+                [sys.executable, "-I", "-X", "utf8", TOOL, missing],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
             )
             self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
@@ -332,6 +336,162 @@ class ScriptQtableTests(unittest.TestCase):
         self.assertLess(elapsed, 1.0)
         self.assertFalse(rep["valid"])
         self.assertEqual(rep["cross_tree_edges"], n - 1)
+
+    def test_bin_folder_sorts_hex_offsets_numerically_and_skips_bin_subdirs(self):
+        # Build a 2-chunk qtable (> 64 KiB) split across unpadded hex names 90000.bin and 100000.bin.
+        # Lexicographic sort puts 100000.bin before 90000.bin, and a subdir ending in .bin used to crash.
+        table_end = 40 + 2 * 8
+        first_off = (table_end + 15) & ~15
+        off0 = first_off
+        off1 = 65536 + 16  # second record starts in chunk 2 so chunk 1 alone is incomplete
+        root_rec = struct.pack("<4I2Q", 0x11111111, 0, 0xAAAA0001, 0, Q_PTR_HIGH | (off1 + 8), 0) + bytes(off1 - off0 - 32)
+        child_rec = struct.pack("<4I", 0, 0, 0xAAAA0002, 0) + bytes(16)
+        blob = (
+            struct.pack("<10I", 0, 0, 0, 0, 0, 2, 0, 0, 0, 0)
+            + struct.pack("<2Q", off0, off1)
+            + bytes(first_off - table_end)
+            + root_rec
+            + child_rec
+        )
+        self.assertGreater(len(blob), 65536)
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, "000000.bin"))
+            with open(os.path.join(d, "90000.bin"), "wb") as f:
+                f.write(blob[:65536])
+            with open(os.path.join(d, "100000.bin"), "wb") as f:
+                f.write(blob[65536:])
+            loaded, meta = script_qtable.load_qtable_payload(d)
+        self.assertEqual(loaded, blob)
+        self.assertEqual((meta["offset"], meta["chunks"]), (0x90000, 2))
+
+    def test_type_query_sorts_histograms_numerically(self):
+        # Two structs sharing the same type hash with sizes 32 and 112: "32" must come before "112".
+        table_end = 40 + 2 * 8
+        first_off = (table_end + 15) & ~15
+        off0 = first_off
+        off1 = off0 + 32
+        r0 = struct.pack("<4I2Q", 0x22222222, 0, 0xBBBB0001, 0, Q_PTR_HIGH | (off1 + 8), 0)
+        r1 = struct.pack("<4I", 0, 0, 0xBBBB0001, 0) + bytes(112 - 16)
+        blob = (
+            struct.pack("<10I", 0, 0, 0, 0, 0, 2, 0, 0, 0, 0)
+            + struct.pack("<2Q", off0, off1)
+            + bytes(first_off - table_end)
+            + r0
+            + r1
+        )
+        rep = script_qtable.parse_qtable(blob, type_hash=0xBBBB0001)
+        self.assertEqual(list(rep["type_query"]["struct_sizes"].keys()), ["32", "112"])
+
+    def test_empty_whitespace_and_trailing_sep_json_paths_are_usage_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = os.path.join(tmp, "qtable.bin")
+            with open(bin_path, "wb") as f:
+                f.write(build_synthetic_qtable())
+            for bad in ("", "   ", os.path.join(tmp, "newdir") + os.sep):
+                with self.subTest(bad=bad):
+                    err = io.StringIO()
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                        rc = script_qtable.main([bin_path, "--json", bad])
+                    self.assertEqual(rc, 2)
+                    self.assertTrue(err.getvalue().startswith("ERROR:"), err.getvalue())
+
+    def test_json_write_is_atomic_has_trailing_newline_and_preserves_existing_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = os.path.join(tmp, "qtable.bin")
+            out_dir = os.path.join(tmp, "reports")
+            out_json = os.path.join(out_dir, "report.json")
+            with open(bin_path, "wb") as f:
+                f.write(build_synthetic_qtable())
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = script_qtable.main([bin_path, "--json", out_json])
+            self.assertEqual(rc, 0)
+            with open(out_json, "rb") as f:
+                raw = f.read()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+
+            before = b'{"keep": true}\n'
+            with open(out_json, "wb") as f:
+                f.write(before)
+
+            def fail_dump(_data, handle, **_kwargs):
+                handle.write("{")
+                raise OSError("disk full")
+
+            for target_obj, attr, side_effect in (
+                (script_qtable.json, "dump", fail_dump),
+                (os, "replace", PermissionError("locked")),
+            ):
+                with self.subTest(mock_attr=attr):
+                    err = io.StringIO()
+                    with mock.patch.object(target_obj, attr, side_effect=side_effect), \
+                            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                        rc = script_qtable.main([bin_path, "--json", out_json])
+                    self.assertEqual(rc, 2)
+                    self.assertTrue(err.getvalue().startswith("ERROR: cannot write "), err.getvalue())
+                    with open(out_json, "rb") as f:
+                        self.assertEqual(f.read(), before)
+                    self.assertEqual(os.listdir(out_dir), ["report.json"])
+
+    def test_symlinked_json_updates_target_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = os.path.join(tmp, "qtable.bin")
+            real_json = os.path.join(tmp, "real.json")
+            link_json = os.path.join(tmp, "link.json")
+            with open(bin_path, "wb") as f:
+                f.write(build_synthetic_qtable())
+            with open(real_json, "wb") as f:
+                f.write(b"{}\n")
+            try:
+                os.symlink(real_json, link_json)
+            except OSError as exc:
+                self.skipTest(f"symlink unavailable: {exc}")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = script_qtable.main([bin_path, "--json", link_json])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.islink(link_json))
+            with open(real_json, encoding="utf-8") as f:
+                self.assertTrue(json.load(f)["valid"])
+
+    def test_bin_folder_does_not_parse_negative_hex_stem_as_negative_offset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "-10.bin"), "wb") as f:
+                f.write(b"JUNK")
+            with open(os.path.join(tmp, "000000001000.bin"), "wb") as f:
+                f.write(build_synthetic_qtable())
+            src = script_qtable._BinFolderSource(tmp)
+        by_name = {row["_name"]: row["off"] for row in src.rows}
+        self.assertEqual(by_name["000000001000.bin"], 0x1000)
+        self.assertGreater(by_name["-10.bin"], 0x1000)
+
+    def test_empty_json_rejected_and_atomic_write_preserves_existing(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "qtable.bin")
+            with open(src, "wb") as f:
+                f.write(build_synthetic_qtable())
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                rc = script_qtable.main([src, "--json", ""])
+            self.assertEqual(rc, 2)
+
+            out = os.path.join(tmp, "report.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = script_qtable.main([src, "--json", out])
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(os.listdir(tmp)), ["qtable.bin", "report.json"])
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": true}\n')
+            with mock.patch.object(script_qtable, "replace_retry", side_effect=OSError("replace denied")), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = script_qtable.main([src, "--json", out])
+            self.assertEqual(rc, 2)
+            self.assertEqual(sorted(os.listdir(tmp)), ["qtable.bin", "report.json"])
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": true}\n')
 
 
 if __name__ == "__main__":

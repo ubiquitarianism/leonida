@@ -67,7 +67,7 @@ and the individual stubs in
 | 4 | `D3D12ConfigureVirtualMemoryX` | console | present (returns `S_OK`) | VM policy; PC/Vulkan owns it. Measured: one pointer argument (a zeroed 32-byte block, dword +4 set to a count); the title only tests the result for failure |
 | 5 | `D3D12CreateDevice` | standard | **absent** | Leonida exports only the Xbox entry point; see §2.3 |
 | 6 | `D3D12CreateRootSignatureDeserializer` | standard | present | forwarded |
-| 7 | `D3D12CreateVersionedRootSignatureDeserializer` | standard | absent | forward if imported |
+| 7 | `D3D12CreateVersionedRootSignatureDeserializer` | standard | present | forwarded, Xbox flags cleared on a copy |
 | 8 | `D3D12EnableExperimentalFeatures` | standard | absent | forward if imported |
 | 9 | `D3D12GetDebugInterface` | standard | absent | forward if imported |
 | 10 | `D3D12SerializeRootSignature` | standard | present | forwarded, flags cleared on a copy |
@@ -222,6 +222,20 @@ the fact; the spelling may be de-branded.
 
 The other 18 function names and all 83 standard GUID names carry no token and can be used as
 published.
+
+**Feature level at device creation (BL-2).** The 24-word `params` block carries no feature level that Leonida
+reads, so the host path of `D3D12XboxCreateDevice` picks the PC `D3D12CreateDevice`'s *minimum* itself. It used to
+ask for `D3D_FEATURE_LEVEL_12_0`, which a comment called the least restrictive floor. That is wrong: the minimum
+refuses every adapter below it, so a host that tops out at 11_x (vkd3d on some Wine/Proton setups) failed with
+`E_INVALIDARG`. `rt::d3d12_xs::create_host_device` now asks for `kHostDeviceFloor` = 11_0, the lowest level D3D12
+creates a device at. The device keeps its highest level, which `D3D12_FEATURE_FEATURE_LEVELS` reports and the run log
+prints ("host device created at minimum feature level 11_0; highest level 12_1" with WARP or the RTX 5070 Ti, driver
+617.42). `xs_proxy_mock_test` drives it with mock hosts that top out at 11_0, 11_1, 12_0, 12_1 and 12_2. Each one is
+created at 11_0, and the Xbox-ABI proxy's slot 13 (`CheckFeatureSupport`) reports that host's own top level. With
+12_0 as the floor, the 11_x hosts fail. The Vulkan-backed device (`LEONIDA_D3D12=vulkan`) takes no feature level. It
+answers `FEATURE_LEVELS` up to 12_1, because it reports no ray tracing tier and no sampler feedback, both of which
+12_2 requires (`docs/d3d12_vulkan.md`). No Wine host was available, so the original 11_x failure is not reproduced
+here; the mock is its stand-in.
 
 ### 2.4 How ordinals 72–99 were recovered
 
@@ -435,6 +449,124 @@ of a console-only method. Check every name against the SDK version the game was 
 before treating it as new. For `OMSetFrontAndBackStencilRef` the signature is identical, so a
 GCL8-compiled game calls it at the public slot; SCARAB's placement after GCL6 would land in the
 wrong slot. Leonida's public-chain command list already has it at GCL8.
+
+### 5.2 Arity and receiver of device slots 86, 101, 108, 132 and 133 (and offset `+0x418` / 131)
+
+These six offsets are called in the title's executable; five reach the device and `+0x418` (131)
+does not. `+0x2B0`, `+0x328`, `+0x360` and `+0x418`-`+0x428` are past every published interface,
+so they are console slots on whatever object the call is made on, and the receiver is not
+automatically the device: the console runtime repeats offsets across object vtables. The whole
+image has **243** indirect calls `call [reg+disp]` at these six offsets; most of them are *not* on
+the device, and a count that ignores the receiver overstates the device surface by an order of
+magnitude.
+
+The receiver is proven by a backward definition chain from the `call` that ends in a full-width load
+of the device pointer. The title keeps that pointer in a block of `.data` aliases
+(`0x1475DF000`-`0x1475DF048` and `0x148759D00`) that one constructor fills with the same value
+(`0x1424785D4`-`0x142478621` copies the qword at `0x1475DF048` into the other eleven). A site whose
+chain ends in one of those globals is a device site. A site whose chain ends in a *different*
+global, in an argument of unknown provenance or in the return of a helper is counted but not
+attributed.
+
+| Slot | Offset | Raw sites | Sites on the device | Receiver at those sites | Registers / stack at those sites | What the device sites support |
+|---:|---|---:|---:|---|---|---|
+| 86 | `+0x2B0` | 37 | **1** (`0x142479A87`) | `[0x1475DF000]` (alias of the device pointer) | `rcx`=device, `rdx`=&desc (first qword `0x2B0`), `r8`=&`IID_ID3D12PipelineState`, `r9`=&out | three-argument, `riid`-out PSO stream creation (`CreatePipelineState` in [d3d12_vulkan.md](d3d12_vulkan.md) §3.1) |
+| 101 | `+0x328` | 28 | **1** (`0x1424813EF`) | `[0x1475DF018]` (alias) | `rcx`=device, `rdx`=&desc (dword 0 = `3`, dword 4 = index, `+8` = pointer), `r8`=&`IID_ID3D12StateObject`, `r9`=&out | three-argument, `riid`-out state-object creation with a leading type word `3` (`CreateStateObject` in [d3d12_vulkan.md](d3d12_vulkan.md) §3.1) |
+| 108 | `+0x360` | 31 | **2** (`0x140ABFDA9`, `0x140ABFE07`) | vtable fetched from the device (`[0x1475DF030]` / `[0x1475DF035]`); `rdx` is the device itself: the slot returns a 16-byte struct, so the MSVC x64 ABI puts the hidden return buffer in `rcx` and `this` moves to `rdx` | `rcx`=&16-byte `D3D12_RESOURCE_ALLOCATION_INFO` return, `rdx`=device, `r8d`=1 (`visibleMask`), `r9d`=1 (`numResourceDescs`), `[rsp+0x20]`=&56-byte `D3D12_RESOURCE_DESC`, `[rsp+0x28]`=&24-byte scratch (`D3D12_RESOURCE_ALLOCATION_INFO1`-sized) | allocation-info query over one 56-byte resource description (4 KiB small-resource retry; routed as `GetResourceAllocationInfo2` in [d3d12_vulkan.md](d3d12_vulkan.md) §3.1) |
+| 131 | `+0x418` | 26 | **0** | - | - | the offset is called, but only on non-device receivers here; a device form is unproven |
+| 132 | `+0x420` | 47 | **1** (`0x1424745E4`) | `[0x1475DF048]` (the alias the copy loop reads) | `rcx`=device, `edx`=3 | single small enum/int argument |
+| 133 | `+0x428` | 74 | **5** (`0x14006DD85`, `0x14193DFF8`, `0x14193E2D4`, `0x141E8684C`, `0x1456F802B`) | `[0x1475DF048]` or `[0x148759D00]` | `rcx`=device, `rdx`=GPU VA, `r8`=&`D3D12_RESOURCE_DESC`, `r9d`=state (`6`, `0xFFFFFFFF` or a register), `[rsp+0x20]`=clear, `[rsp+0x28]`=&`IID_ID3D12Resource`, `[rsp+0x30]`=&out | six-argument placed-resource creation, stable across all five sites |
+
+Per slot:
+
+- **86.** The `riid` at `0x1461E06B8` is `765a30f3-f624-4c6f-a828-ace948622445`,
+  `IID_ID3D12PipelineState` (§3), so the device form creates a PSO: `(desc, riid, out)`, which
+  [d3d12_vulkan.md](d3d12_vulkan.md) §3.1 (`runtime/shims/d3d12_xs_device.cpp`) routes as
+  `CreatePipelineState` to PC slot 47 (`ID3D12Device2::CreatePipelineState`). The
+  descriptor's first qword is the slot number itself (`mov qword ptr [rdx], 0x2B0`), i.e. the
+  caller keeps a command record. A second caller reaches the pair 86/87 on *another* object: at
+  `0x14258FC20`-`0x14258FC56` it loads the vtable into `r8`, sets `edx`, branches on a byte and
+  calls `+0x2B8` or `+0x2B0` with that one argument, then tags the returned qword `4` or `3`. So
+  the recorder form is one argument and a returned value, and the device form is the three-argument
+  creation; do not generalise either to the other. A shim that only knows 86 will miss the 87
+  branch.
+- **101.** The `riid` at `0x1461E06D8` is `47016943-fca8-4594-93ea-af258b55346d`,
+  `IID_ID3D12StateObject` (SDK `d3d12.h:44486`, not in the 28-IID set of §3). The descriptor is
+  `{dword 3, dword index, pointer}`: `[rdx]` is the type word `3` (`D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE`
+  or collection), `[rdx+4]` an index into the table the caller just filled (`0x142481350`-`0x1424813BD`)
+  and `[rdx+8]` a pointer (`rdi`). That is the DXR state-object side of the game, routed in
+  [d3d12_vulkan.md](d3d12_vulkan.md) §3.1 (`runtime/shims/d3d12_xs_device.cpp`) as
+  `CreateStateObject(desc, riid, out)` to PC slot 62 (`ID3D12Device5::CreateStateObject`).
+- **108.** No GUID is compared at either site. Both sit in one function, `0x140ABFAE0`-`0x140ABFE6C`
+  (reached through the thunk at `0x140ABFAD0`), which first computes the surface size and then makes
+  the one call twice at most. The 5th argument is a 56-byte `D3D12_RESOURCE_DESC`: the callee reads
+  `Dimension` at `+0`, `Alignment` at `+8`, `Width` at `+0x10`, `Height` at `+0x18`,
+  `DepthOrArraySize` at `+0x1C`, `Format` at `+0x20`, `Layout` at `+0x2C` and `Flags` at `+0x30`, and
+  writes back the 4-texel-aligned `Width`/`Height` for block-compressed formats
+  (`0x140ABFB2B`-`0x140ABFB40`). `Format` becomes bits per pixel through `0x144D9F3C0`, which indexes
+  the 128/96/64/32/16/8/4-bit table at `0x1461ED5B8`; dimension 4 (3D) with `Layout` 0 has `Layout`
+  set to the console word `0x105` (`0x140ABFD4B`-`0x140ABFD57`), dimension 3 (2D) takes the tile-shape
+  table, and a buffer is plain `Width × Height × Depth × bits`. When the whole surface is under
+  `0x80008` bits it writes `Alignment = 0x1000`, asks for that alignment, and if the returned alignment
+  is not `0x1000` clears `Alignment` to 0 and calls again (`0x140ABFDBF`-`0x140ABFE07`) — the retry the
+  SDK's small-resource sample does with `D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT` (4096,
+  `d3d12.h:1304`), and the 4 KiB small-texture alignment the host layer already answers
+  ([d3d12_vulkan.md](d3d12_vulkan.md) §4.2). The 16-byte return is `{SizeInBytes, Alignment}` and the
+  code traps unless the high dword of `SizeInBytes` is 0, so a returned size has to fit 32 bits
+  (`0x140ABFE15`).
+  That is the argument list, return placement and struct use of
+  `ID3D12Device4::GetResourceAllocationInfo1(visibleMask, numResourceDescs, pResourceDescs,
+  pResourceAllocationInfo1)` (`d3d12.h:12418-12422`), including a 24-byte
+  `D3D12_RESOURCE_ALLOCATION_INFO1` buffer as the 4th argument (`d3d12.h:2965-2970`);
+  [d3d12_vulkan.md](d3d12_vulkan.md) §3.1 (`runtime/shims/d3d12_xs_device.cpp`) serves it by
+  expanding the 56-byte `D3D12_RESOURCE_DESC` (normalising `0x105` and Xbox flag bits) and routing to
+  PC slot 68 (`ID3D12Device8::GetResourceAllocationInfo2`). **Measured**: the shape, the struct
+  offsets, `0x1000`/`0x105`, the retry and the assert. **Open**: the exact console wire method name
+  (`GetResourceAllocationInfo1` vs `GetResourceAllocationInfoX` / `2`) — no IID or symbol string is
+  present at the sites.
+- **131.** Twenty-six sites, none on the device. Two are on sub-objects reached through another
+  global (`0x1415A487D` indexes a table at `[rax+0x28]`), one at `0x14437CFED` follows slot 130
+  (`+0x410`) on the same receiver and reads the out dword it wrote, and the rest are on arguments
+  whose caller does not carry the device. The shape there is `(dword* out)` with a returned value
+  that a site compares (`0x141F9BE30`), plus a four-argument form
+  (`0xC280`, `0x20000`, `0`, `0xFFFFFFFFFF00` at `0x141560994`). It sits in the 0x400 block with
+  132/133, and both of those do have device sites, so a device form is plausible but not shown:
+  do not implement it on the strength of these sites.
+- **132.** The only device site passes `edx=3` and nothing else. Off the device the same offset is
+  a predicate taking one 32-bit constant (`2`, `3`, `0xFFF7E7A4`, `0xBD8817DB`) and returning in
+  `al` (`test al, al` at `0x14118ABB4`), which reads as a feature or capability query; that family's
+  receiver is not the device, so `3` cannot be read as a capability id for the device form yet.
+- **133.** All five device sites are identical: VA, a console `D3D12_RESOURCE_DESC` (Xbox `Flags`
+  bits above the PC ones), state, clear, `IID_ID3D12Resource`, out. That is the same shape and the
+  same `riid` the retail run logged (`retail_boot_chain.md` §3.4, "device slot 133 places a
+  resource at a virtual address"), measured independently here from the same `riid` constant at
+  `0x1463FA690` in three different sites, all `696442be-a72e-4059-bc79-5b5c98040fad`.
+  Static and run agree on six arguments and on the order. This is the strongest row of the six.
+  Off the device the same offset is a different shape - `this` only, returning an object, at
+  `0x14107D67F`; `this` + `0` at `0x143BF0C50` - so 133 on another receiver is not this method.
+
+The co-occurrence fits the block reading: 108 is called alongside 106/107/109/110/111 in
+`0x140504AB0`, 131 alongside 57 in `0x14123C630`/`0x14123CD70`, and 132 with 133 in
+`0x1403D2260`, `0x14060C420`, `0x14060CA50`, `0x141394800` and `0x141597B60`, always with the same
+argument (`rdx` = the struct that carries the size/VA). None of those receivers is proven to be
+the device, so the pairing says "one feature area", not "same arity" and not "device slot".
+
+What this does not say:
+
+- A raw site count is not a device count. The largest raw buckets are argument-provenance sites
+  (26 of 47 at 132, 40 of 74 at 133), many of them in wrapper code that re-dispatches on an
+  inherited or returned pointer. The same offset also carries a different arity off the device
+  (`0x14107D67F`, `0x143BF0C50` above), so an offset alone never names a method.
+- `rdx`, `r8` and `r9` at a site can be dead for the method; only the setup within the last few
+  instructions is listed. The arity above is the *caller's* setup, not a header.
+- No symbol string appears at any of the six call-site groups. On the device, 86, 101, 108 and
+  133 match the routes in [d3d12_vulkan.md](d3d12_vulkan.md) §3.1 and
+  [retail_boot_chain.md](retail_boot_chain.md) §3.4 (`CreatePipelineState`, `CreateStateObject`,
+  `GetResourceAllocationInfo2` and `CreatePlacedResourceX` in
+  `runtime/shims/d3d12_xs_device.cpp`). Offsets `+0x418` (131) and `+0x420` (132) remain unnamed
+  here, and 131 has no device receiver.
+- The proxy table must still be long enough: slot 133 is the highest slot the title reaches, so a
+  128-entry table faults (retail observation) and anything below 134 is a guess.
 
 ## 6. Command lists and `CreateCommandList`
 
@@ -661,7 +793,7 @@ evidence.
 | Leonida unknown | Status after SCARAB (and §7.1) | What is actually new |
 |---|---|---|
 | #1 device entry point and 24-word params | **described** | The separate console device export exists at ordinal 13 and is named `D3D12ConsCreateDevice` internally / `D3D12XboxCreateDevice` publicly; the params struct is named `D3D12CONS_CREATE_DEVICE_PARAMETERS`. Public sources name 17 fields and their x64 offsets, plus two more field names; a 24-word block still has at least four words unaccounted (§7.1). |
-| #2 device/heap/queue/command-list slots | **partly measured** | SCARAB has no console slot map. Its appended-after-GCL6 model conflicts with the SDK's GCL8/GCL9 methods (§5.1). Public §7.1 gives the presentation slots (device 78-81, queue 30/32); the heap and command-list slot map is still unknown. Do not use SCARAB as a slot source. |
+| #2 device/heap/queue/command-list slots | **partly measured** | §5.2 measures the arity and receiver of device slots 86, 101, 108, 132 and 133 (86, 101, 108 and 133 match the routes in [d3d12_vulkan.md](d3d12_vulkan.md) §3.1 and [retail_boot_chain.md](retail_boot_chain.md) §3.4); offset `+0x418` (131) has no device receiver, so it stays open. SCARAB has no console slot map. Its appended-after-GCL6 model conflicts with the SDK's GCL8/GCL9 methods (§5.1). Public §7.1 gives the presentation slots (device 78-81, queue 30/32); the heap and command-list slot map is still unknown. Do not use SCARAB as a slot source. |
 | #3 root signature → `s0..s31` | **still unknown** | Only flag names (`D3D12CONS_ROOT_SIGNATURE_FLAG_FORCE_MEMORY_BASED_ABI`, `_RAYTRACING`); no mapping. Leonida's own register-based/spill facts already go further. |
 | #4 descriptor bytes and increments | **still unknown** | No measured increment. `D3D12CONS_DESCRIPTOR_HEAP_TYPE_SAMPLER_UNBOUNDED` is a new name, not a size. |
 | #5 VA range / arena capacity | **still unknown** | — |
@@ -679,8 +811,9 @@ evidence.
 | free-function dispositions | **answered as a list** | 7 standard + 16 console-only; Leonida serves 4 today. |
 
 The honest summary: SCARAB closes the **export/IID contract** and the **DMA-list rule**, and gives
-a **name-level map** of the extension surface. It does not close presentation, slots, struct
-layouts, numeric flags or tiling.
+a **name-level map** of the extension surface. It does not close presentation, the slot map,
+struct layouts, numeric flags or tiling; §5.2 adds five device slots to what the game itself
+answers (leaving offset `+0x418` / 131 open with 0 device sites).
 
 ## 10. Claims that did not hold up
 

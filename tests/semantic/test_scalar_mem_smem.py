@@ -429,6 +429,8 @@ class SmemBodyEvaluator:
     def _value(self, name):
         if name == "%heap_base":          # built once in the entry block, outside the body run here
             return self.heap_base
+        if name in ("%vcc", "%vcc_hi"):
+            return ("sgpr", 106 if name == "%vcc" else 107)
         if name == "%c64_32":
             return 32
         if name in self.ids:
@@ -478,6 +480,11 @@ class SmemBodyEvaluator:
             value = self._value(args[0]) & MASK32
         elif op == "OpShiftLeftLogical" and ty == "%ulong":
             value = (self._value(args[0]) << self._value(args[1])) & MASK64
+        elif op == "OpShiftRightArithmetic" and ty == "%ulong":
+            operand = self._value(args[0])
+            if operand >> 63:
+                operand -= 1 << 64
+            value = (operand >> self._value(args[1])) & MASK64
         elif op == "OpBitwiseOr" and ty == "%ulong":
             value = self._value(args[0]) | self._value(args[1])
         elif op == "OpIAdd" and ty == "%ulong":
@@ -611,6 +618,19 @@ class SmemSoffsetImmTranslatorTests(unittest.TestCase):
         ev = SmemBodyEvaluator(g, {24: 0x1000, 25: 0, 26: 0x10000, 40: 8}, SmemMemoryBank(),
                                heap_base=0x0000007F00000000)
         self.assertEqual(ev.reads, [0x0000007F00000000 + 0x1000 + 12])
+
+    def test_vcc_data_pointer_reads_both_halves(self):
+        for width in (4, 8):
+            ins = parse_line(f"s_load_dwordx{width} s[8:{7 + width}], vcc, 0x10")
+            g = rdna2spirv.Gen("cs")
+            g.scalar_load(ins["op"], ins["args"], ins["mods"])
+            bank = SmemMemoryBank()
+            addresses = [self.POINTER + 16 + 4 * n for n in range(width)]
+            for n, address in enumerate(addresses):
+                bank.write_dword(address, 0x7210 + n)
+            result = SmemBodyEvaluator(g, {106: self.POINTER & MASK32, 107: self.POINTER >> 32}, bank)
+            self.assertEqual(result.reads, addresses)
+            self.assertEqual([result.sgpr[r] for r in range(8, 8 + width)], list(range(0x7210, 0x7210 + width)))
 
     def test_offset_forms_the_assembler_rejects_raise(self):
         # llvm-mc accepts none of these; hand-written or damaged listings must not translate to a guessed address.

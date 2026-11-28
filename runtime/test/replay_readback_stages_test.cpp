@@ -239,7 +239,61 @@ int main() {
                "non-host_readable buffer UAV clear leaves wrote_readback false");
     }
 
+    // 9. XDXR AccelerationStructurePostbuild writes compacted/current size via compute shader to dest_va,
+    // which may target a host-readable buffer, so prepare() must request a COMPUTE_SHADER_BIT -> HOST flush.
+    {
+        ReplayFunctions xdxr_vk = vk;
+        xdxr_vk.xdxr_postbuild = [](VkCommandBuffer, std::uint64_t, std::uint64_t) {};
+        xdxr_vk.buffer_at = [&](std::uint64_t va, std::uint64_t& size, VkBuffer& buf, VkDeviceSize& off) {
+            if (va == 0x10000 && size <= 64) {
+                buf = readback_buf.buffer;
+                off = 0;
+                size = 64;
+                return true;
+            }
+            if (va == 0x20000) {
+                buf = readback_buf.buffer;
+                off = 0;
+                size = 4;  // too small for 8 bytes
+                return true;
+            }
+            return false;
+        };
+
+        CommandList compacted;
+        expect(compacted.acceleration_structure_postbuild({0x10000, 0, {0x40000}}) && compacted.close(),
+               "record XDXR postbuild compacted size");
+        expect(prepare(compacted, resolve, xdxr_vk, out) == ReplayResult::success,
+               "prepare XDXR postbuild compacted size");
+        expect(out.wrote_readback && out.readback_src_stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+               "XDXR postbuild compacted size reports COMPUTE_SHADER_BIT");
+
+        CommandList current;
+        expect(current.acceleration_structure_postbuild({0x10000, 3, {0x40000, 0x40100}}) && current.close(),
+               "record XDXR postbuild current size");
+        expect(prepare(current, resolve, xdxr_vk, out) == ReplayResult::success,
+               "prepare XDXR postbuild current size");
+        expect(out.wrote_readback && out.readback_src_stages == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+               "XDXR postbuild current size reports COMPUTE_SHADER_BIT");
+
+        CommandList bad_type;
+        expect(bad_type.acceleration_structure_postbuild({0x10000, 1, {0x40000}}) && bad_type.close(),
+               "record XDXR postbuild unsupported type");
+        expect(prepare(bad_type, resolve, xdxr_vk, out) == ReplayResult::unsupported,
+               "XDXR postbuild unsupported type returns unsupported");
+        expect(!out.wrote_readback && out.readback_src_stages == 0,
+               "failed XDXR postbuild leaves wrote_readback false");
+
+        CommandList bad_room;
+        expect(bad_room.acceleration_structure_postbuild({0x20000, 0, {0x40000}}) && bad_room.close(),
+               "record XDXR postbuild too-small dest");
+        expect(prepare(bad_room, resolve, xdxr_vk, out) == ReplayResult::invalid_copy,
+               "XDXR postbuild too-small dest returns invalid_copy");
+        expect(!out.wrote_readback && out.readback_src_stages == 0,
+               "too-small XDXR postbuild leaves wrote_readback false");
+    }
+
     if (failures) return 1;
-    std::printf("replay_readback_stages: depth24, rgb96, copy and UAV-clear readback stages exact\n");
+    std::printf("replay_readback_stages: depth24, rgb96, copy, UAV-clear and XDXR postbuild readback stages exact\n");
     return 0;
 }

@@ -1440,5 +1440,39 @@ class TestVRcpF64ReferenceOracle(unittest.TestCase):
             rf.get_vgpr_pair(15)
 
 
+# ==============================================================================
+# The translator: tools/rdna2spirv.py's output, run in tests/spirv_interp.py, gives the oracle's word
+# ==============================================================================
+import os as _os  # noqa: E402
+import sys as _sys  # noqa: E402
+
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import f64_translate as ft  # noqa: E402
+
+class TranslatorMatchesOracle(unittest.TestCase):
+    """v_rcp_f64 is `OpFDiv %double 1.0 x` (docs/design.md), so on every input whose SPIR-V result is defined - no
+    NaN and no zero divisor - the translated instruction gives ref_rcp_f64's word, both signs, subnormals included."""
+
+    FINITE = (1.0, 2.0, 4.0, 0.25, 3.0, 10.0, 1 / 3, 0.1, 7.0, 1e300, 1e-300, 1.7976931348623157e308,
+              2.2250738585072014e-308)
+    SPECIAL = (0x0000000000000001, 0x000FFFFFFFFFFFFF, 0x7FF0000000000000)   # subnormals, +inf
+
+    def check(self, word, src="v[2:3]", mods="", **oracle):
+        with self.subTest(word=hex(word), src=src, mods=mods):
+            self.assertEqual(hex(ft.run_f64("v_rcp_f64", word, src=src, mods=mods)), hex(ref_rcp_f64(word, **oracle)))
+
+    def test_finite_subnormal_and_infinite_inputs(self):
+        for word in [ft.f64_bits(x) for x in self.FINITE] + list(self.SPECIAL):
+            for sign in (0, 1 << 63):
+                self.check(word | sign)
+
+    def test_source_modifiers_and_clamp(self):
+        for x in (4.0, 0.25, 3.0):
+            self.check(ft.f64_bits(-x), src="-v[2:3]", src0_neg=True)
+            self.check(ft.f64_bits(-x), src="|v[2:3]|", src0_abs=True)
+        for x in (0.25, 0.5, 4.0, 3.0):
+            self.check(ft.f64_bits(x), mods=" clamp", clamp=True)
+
+
 if __name__ == "__main__":
     unittest.main()

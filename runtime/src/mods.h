@@ -78,8 +78,8 @@ struct LoadResult {
 // "0x..." -> that value; anything else -> joaat(name). Returns false for an empty name or a malformed hex value.
 inline bool parse_model_id(const std::string& text, uint32_t& out) {
     if (text.empty()) return false;
-    if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
-        if (text.size() > 10) return false;
+    if (text.size() >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        if (text.size() == 2 || text.size() > 10) return false;
         uint32_t v = 0;
         for (std::size_t i = 2; i < text.size(); ++i) {
             const char c = text[i];

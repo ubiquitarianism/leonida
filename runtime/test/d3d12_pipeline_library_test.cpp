@@ -206,8 +206,9 @@ int main() {
     EXPECT(lib->LoadPipeline(L"gfx", &empty_stream, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
     EXPECT(SUCCEEDED(lib->LoadPipeline(L"gfx", &stream_desc, IID_PPV_ARGS(&loaded_any.p))) && loaded_any.p);
 
+    constexpr SIZE_T lpl1_header_size = 4 * sizeof(std::uint32_t);
     const SIZE_T blob_size = lib->GetSerializedSize();
-    EXPECT(blob_size >= 16);
+    EXPECT(blob_size >= lpl1_header_size);
     std::vector<std::uint8_t> blob(blob_size);
     EXPECT(lib->Serialize(nullptr, blob_size) == E_INVALIDARG);
     EXPECT(lib->Serialize(blob.data(), blob_size - 1) == E_INVALIDARG);
@@ -215,6 +216,12 @@ int main() {
 
     Ref<ID3D12PipelineLibrary> reloaded;
     EXPECT(SUCCEEDED(device->CreatePipelineLibrary(blob.data(), blob.size(), IID_PPV_ARGS(&reloaded.p))) && reloaded.p);
+
+    // The final word in the LPL1 header is reserved and must be zero.
+    blob[lpl1_header_size - 1] ^= 0xFF;
+    Ref<ID3D12PipelineLibrary> rejected;
+    EXPECT(device->CreatePipelineLibrary(blob.data(), blob.size(), IID_PPV_ARGS(&rejected.p)) == E_INVALIDARG &&
+           !rejected.p);
 
     // 4. Execute the loaded compute PSO and loaded graphics PSO on the GPU.
     Ref<ID3D12CommandQueue> queue;

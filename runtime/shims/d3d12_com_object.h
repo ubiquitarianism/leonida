@@ -24,10 +24,42 @@ void stub(const char* method);
 template<class Derived, class Stubs, class... Interfaces>
 class Object : public Stubs {
 public:
-    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        if constexpr (requires(Derived& object) { object.last_release(); }) {
+            // Such an object can outlive its last Release (its deletion deferred): a reference taken from zero would
+            // bring it back, and its next last Release would delete it a second time. Refused, and logged once.
+            ULONG refs = refs_.load();
+            do {
+                if (!refs) {
+                    static std::atomic<bool> logged{false};
+                    if (!logged.exchange(true))
+                        std::fprintf(stderr, "[rt] d3d12: AddRef on an object already released (ignored)\n");
+                    return 0;
+                }
+            } while (!refs_.compare_exchange_weak(refs, refs + 1));
+            return refs + 1;
+        } else {
+            return ++refs_;
+        }
+    }
+    // At zero, a class with a last_release() decides when it is deleted (PipelineState: after its running build).
+    // Adds a reference unless the count already reached zero. Registry callers must hold their registry lock while
+    // taking this reference.
+    bool try_add_ref() {
+        ULONG count = refs_.load();
+        while (count) {
+            if (refs_.compare_exchange_weak(count, count + 1)) return true;
+        }
+        return false;
+    }
     ULONG STDMETHODCALLTYPE Release() override {
         const ULONG left = --refs_;
-        if (!left) delete static_cast<Derived*>(this);
+        if (!left) {
+            if constexpr (requires(Derived& object) { object.last_release(); })
+                static_cast<Derived*>(this)->last_release();
+            else
+                delete static_cast<Derived*>(this);
+        }
         return left;
     }
 
@@ -175,6 +207,9 @@ public:
     }
 
     IUnknown* attached_device() const { return device_; }
+
+    // Takes the device reference out, for a child that lets it go before it is deleted; the caller releases it.
+    IUnknown* detach_device() { return std::exchange(device_, nullptr); }
 
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** out) override {
         if (!out) return E_POINTER;

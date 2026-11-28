@@ -4,10 +4,13 @@
 // fence): counts of 0, null arrays, null entries, the same object twice, evicting twice, every named priority and a
 // few others, residency flags, a null fence, and the fence values EnqueueMakeResident signals (the value the fence
 // reaches is recorded too). Every HRESULT is recorded and the two records must be the same, step by step. A step the
-// host runtime faults on is reported and not compared. No shaders or game data. Skips (77) without a Vulkan GPU;
-// without a host D3D12 device only the layer's own record is printed. Set LEONIDA_D3D49_VERBOSE=1 to print every
-// step.
+// host runtime faults on is reported and not compared. No shaders or game data. Skips (77) without a Vulkan GPU.
+// The layer's record is first checked on its own (layer_wrong: the valid calls succeed, the fence reaches the values
+// asked for), on every host; without a host D3D12 device that is all that is checked, and so it is under Wine, whose
+// host is vkd3d (host_wine.h: it answers S_OK to calls Microsoft's runtime refuses). Set LEONIDA_D3D49_VERBOSE=1 to
+// print every step.
 #include "vk_test_device.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
@@ -337,6 +340,68 @@ bool run(ID3D12Device* device, bool host, Record& out) {
     return true;
 }
 
+// Steps that are plain, valid use of the API on a committed buffer, a heap and a fence: they have to succeed.
+bool must_succeed(const char* name) {
+    static const char* const kValid[] = {
+        "MakeResident a resident buffer", "Evict the buffer", "MakeResident the evicted buffer",
+        "SetResidencyPriority the buffer", "SetResidencyPriority the heap", "SetResidencyPriority MINIMUM",
+        "SetResidencyPriority LOW", "SetResidencyPriority HIGH", "SetResidencyPriority MAXIMUM",
+        "EnqueueMakeResident NONE, two objects, value 7", "EnqueueMakeResident all six, value 10",
+    };
+    for (const char* valid : kValid)
+        if (std::strcmp(name, valid) == 0) return true;
+    return false;
+}
+
+// What the layer has to answer whatever the host is, checked on its record alone (the one run() makes with `host`
+// false) so that a run with no host to compare with (no host device, or Wine's) still fails on a wrong answer: no
+// call raises an exception; the valid calls above succeed; the device is never removed (the host removes its own on
+// some steps, the layer has no reason to); and after an EnqueueMakeResident that succeeded the fence holds the value
+// asked for, or stays where it was when that value is below it (a Vulkan timeline only goes up, docs/d3d12_vulkan.md),
+// and after one that failed it has not moved. The HRESULTs of the invalid calls are the host comparison's.
+// Returns the number of wrong answers.
+int layer_wrong(const Record& ours) {
+    int wrong = 0;
+    const auto bad = [&](const std::string& name, std::uint64_t got, const char* why) {
+        std::printf("residency %s: the layer answers 0x%llx: %s\n", name.c_str(),
+                    static_cast<unsigned long long>(got), why);
+        ++wrong;
+    };
+    std::size_t i = 0;
+    const auto next = [&](const std::string& name, std::uint64_t* value) {
+        if (i >= ours.values.size() || ours.names[i] != name) {
+            bad(name, 0, "missing from the layer's record");
+            return false;
+        }
+        *value = ours.values[i++];
+        return true;
+    };
+    UINT64 fence = 0;  // make() creates it at 0
+    for (const Step& s : kSteps) {
+        std::uint64_t hr = 0;
+        if (!next(s.name, &hr)) return wrong;
+        if (hr == kFaulted) bad(s.name, hr, "the call raised an exception");
+        else if (must_succeed(s.name) && hr != std::uint32_t(S_OK)) bad(s.name, hr, "a valid call has to succeed");
+        if (s.isolated) continue;
+        std::uint64_t removed = 0;
+        if (!next(std::string(s.name) + " (removed reason)", &removed)) return wrong;
+        if (removed != std::uint32_t(S_OK))
+            bad(std::string(s.name) + " (removed reason)", removed, "the device was removed");
+        if (!s.fence_value) continue;
+        std::uint64_t reached = 0;
+        if (!next(std::string(s.name) + " (fence)", &reached)) return wrong;
+        const bool succeeded = hr != kFaulted && SUCCEEDED(HRESULT(std::uint32_t(hr)));
+        const UINT64 want = succeeded && s.fence_value > fence ? s.fence_value : fence;
+        if (reached != want)
+            bad(std::string(s.name) + " (fence)", reached,
+                succeeded ? "the fence has to hold the value asked for, or stay where it was for a lower one"
+                          : "a call that failed must not move the fence");
+        else
+            fence = reached;
+    }
+    return wrong;
+}
+
 // --host-step N: one isolated step on a fresh host device; the exit code is its HRESULT.
 int host_step(std::size_t index) {
     if (index >= sizeof(kSteps) / sizeof(kSteps[0])) return int(kNoChild);
@@ -369,12 +434,21 @@ int main(int argc, char** argv) {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
         Record ours;
         EXPECT(run(device.p, false, ours));
+        // The layer's own answers first, on every host: the comparison below needs a host, and Wine's is not one.
+        const int layer_wrong_answers = layer_wrong(ours);
+        std::printf("residency: the layer's %zu values checked on their own, %d wrong\n", ours.values.size(),
+                    layer_wrong_answers);
+        EXPECT(layer_wrong_answers == 0);
 
         Ref<ID3D12Device> host;
-        host.p = create_host();
+        host.p = hostwine::host_is_wine() ? nullptr : create_host();
         if (!host.p) {
             std::printf("residency: no host D3D12 device to compare with; %zu steps recorded, not compared\n",
                         ours.values.size());
+            if (verbose)
+                for (std::size_t i = 0; i < ours.values.size(); ++i)
+                    std::printf("residency %s: ours 0x%llx\n", ours.names[i].c_str(),
+                                static_cast<unsigned long long>(ours.values[i]));
         } else {
             Record theirs;
             EXPECT(run(host.p, true, theirs));

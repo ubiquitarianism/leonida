@@ -14,8 +14,9 @@ questions the arm64 port needs answered before any machine code gets emitted:
   * what are the blockers: decode gaps, unhandled mnemonics, indirect control
     flow that needs the pc-table dispatch, x87/SIMD/sys instructions?
 
-Writes <out>/<file>.json and <out>/<file>.md. Standard library only; reads the
-file, never runs it.
+Writes <out>/<file>.recomp.json and <out>/<file>.recomp.md. A wrong input or an
+--out that cannot be written is one ERROR line and exit code 2. Standard library
+only; reads the file, never runs it.
 """
 from __future__ import annotations
 
@@ -205,14 +206,21 @@ def main(argv=None):
     except pe_inspect.PeFormatError as e:
         print(f"{a.image}: {e}", file=sys.stderr)
         return 1
+    except OSError as e:  # missing image, a folder, no permission: one line, not a traceback
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     r["top_mnemonics"] = r["top_mnemonics"][:a.top]
     r["unhandled"] = r["unhandled"][:a.top]
-    os.makedirs(a.out, exist_ok=True)
     name = os.path.basename(a.image)
-    with open(os.path.join(a.out, name + ".recomp.json"), "w", encoding="utf-8", newline="\n") as f:
-        json.dump(r, f, indent=1)
-    with open(os.path.join(a.out, name + ".recomp.md"), "w", encoding="utf-8", newline="\n") as f:
-        f.write(to_markdown(r))
+    try:  # --out naming a file, or a folder that cannot be written
+        os.makedirs(a.out, exist_ok=True)
+        with open(os.path.join(a.out, name + ".recomp.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(r, f, indent=1)
+        with open(os.path.join(a.out, name + ".recomp.md"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(to_markdown(r))
+    except OSError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     print(f"{r['file']}: {r['pdata_functions']:,} fns, {r['insns']:,} insns, "
           f"{r['insn_coverage_pct']}% covered, {len(r['unhandled'])} hazard kinds")
     return 0

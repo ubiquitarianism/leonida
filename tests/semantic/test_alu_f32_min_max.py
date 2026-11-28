@@ -808,10 +808,11 @@ class TestNegativeControls(unittest.TestCase):
         # The reference oracle correctly returns 2.0.
         self.assertEqual(ref_min_f32(QNAN, TWO), TWO)
 
-    def test_clamp_on_all_nan_raises_unsupported(self) -> None:
-        # Clamping an all-NaN result is undefined in GLSL.std.450 / SPIR-V and raises UnsupportedConstruct.
-        with self.assertRaises(si.UnsupportedConstruct):
-            run_f32_2op("v_min_f32", QNAN, QNAN, e64=True, clamp=True)
+    def test_clamp_on_all_nan_gives_plus_zero(self) -> None:
+        # The all-NaN result is a NaN; the clamp bit turns it into +0 under the game's DX10_CLAMP 1
+        # (docs/shader_validation.md), selected before FClamp, which is undefined for a NaN operand.
+        self.assertEqual(run_f32_2op("v_min_f32", QNAN, QNAN, e64=True, clamp=True), POS_ZERO)
+        self.assertEqual(run_f32_2op("v_max_f32", NEG_QNAN, SNAN, e64=True, clamp=True), POS_ZERO)
 
     def test_med3_third_operand_nan_is_min3(self) -> None:
         # Since #2029 a NaN operand gives min3 of the operands (measured on gfx1030), not an eager FClamp on NaN.

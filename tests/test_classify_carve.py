@@ -63,6 +63,11 @@ class ClassifyTests(unittest.TestCase):
     def test_signature_must_be_at_the_start(self):
         self.assertEqual(carve.classify({"head": "ff" + RBF0_HEAD, "size": 1}), "other:ff524246")
 
+    def test_uppercase_hex_signatures_classify_the_same_as_lowercase(self):
+        self.assertEqual(carve.classify({"head": RBF0_HEAD.upper(), "size": 1}), "rbf0")
+        self.assertEqual(carve.classify({"head": RESPAGE_HEAD.upper(), "size": 1}), "respage")
+        self.assertEqual(carve.classify({"head": "DEADBEEFCAFEBABE", "size": 1}), "other:deadbeef")
+
 
 class BomIndexTests(unittest.TestCase):
     def test_utf8_bom_index_is_accepted(self):
@@ -359,6 +364,106 @@ class MainTests(unittest.TestCase):
             with open(target, encoding="utf-8") as f:
                 data = json.load(f)
             self.assertEqual(counts(data["overall"]["rbf0"]), {"files": 1, "bytes": 42})
+
+    def _restore_writable_root(self):
+        for entry in os.listdir(self.root):
+            try:
+                os.chmod(os.path.join(self.root, entry), 0o600)
+            except OSError:
+                pass
+
+    def test_failed_replace_over_readonly_report_cleans_staging_file(self):
+        self.archive("a", [{"head": RBF0_HEAD, "size": 1}])
+        self.run_main()
+        before = self.types()
+        dest = os.path.join(self.root, "types.json")
+        os.chmod(dest, 0o444)
+        self.addCleanup(self._restore_writable_root)
+        with mock.patch.object(carve.os, "replace", side_effect=PermissionError("replace failed")):
+            with self.assertRaisesRegex(PermissionError, "replace failed"):
+                self.run_main()
+        self.assertEqual(self.types(), before)
+        self.assertEqual([n for n in os.listdir(self.root) if n.startswith(".types-")], [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows enforces read-only file replace and unlink")
+    def test_windows_readonly_report_failure_cleans_staging_file(self):
+        self.archive("a", [{"head": RBF0_HEAD, "size": 1}])
+        self.run_main()
+        before = self.types()
+        dest = os.path.join(self.root, "types.json")
+        os.chmod(dest, 0o444)
+        self.addCleanup(self._restore_writable_root)
+        with self.assertRaises(PermissionError):
+            self.run_main()
+        self.assertEqual(self.types(), before)
+        self.assertEqual([n for n in os.listdir(self.root) if n.startswith(".types-")], [])
+
+    def test_fdopen_failure_closes_descriptor_and_cleans_staging_file(self):
+        self.archive("a", [{"head": RBF0_HEAD, "size": 1}])
+        real_mkstemp = carve.tempfile.mkstemp
+        real_close = os.close
+        created = []
+        closed = []
+
+        def spy_mkstemp(*args, **kwargs):
+            fd, temp = real_mkstemp(*args, **kwargs)
+            created.append((fd, temp))
+            return fd, temp
+
+        def spy_close(fd):
+            closed.append(fd)
+            return real_close(fd)
+
+        try:
+            with (
+                mock.patch.object(carve.tempfile, "mkstemp", side_effect=spy_mkstemp),
+                mock.patch.object(carve.os, "fdopen", side_effect=OSError("fdopen failed")),
+                mock.patch.object(carve.os, "close", side_effect=spy_close),
+            ):
+                with self.assertRaisesRegex(OSError, "fdopen failed"):
+                    self.run_main()
+            self.assertEqual(len(created), 1)
+            self.assertIn(created[0][0], closed)
+            self.assertEqual([n for n in os.listdir(self.root) if n.startswith(".types-")], [])
+        finally:
+            for fd, temp in created:
+                if fd not in closed:
+                    try:
+                        real_close(fd)
+                    except OSError:
+                        pass
+                try:
+                    os.unlink(temp)
+                except OSError:
+                    pass
+
+    def test_main_accepts_explicit_argv_and_writes_trailing_lf_newline(self):
+        self.archive("a", [{"head": "DEADBEEFCAFEBABE", "size": 9}])
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = carve.main([self.root])
+        self.assertEqual(rc, 0)
+        with open(os.path.join(self.root, "types.json"), "rb") as f:
+            raw = f.read()
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertNotIn(b"\r\n", raw)
+        self.assertEqual(self.types()["overall"]["other:deadbeef"]["files"], 1)
+
+    def test_resolved_report_directory_or_non_dir_parent_stops_before_scanning(self):
+        self.archive("a", [{"head": RBF0_HEAD, "size": 1}])
+        existing_dir = os.path.join(self.root, "existing_dir")
+        existing_file = os.path.join(self.root, "existing_file")
+        os.mkdir(existing_dir)
+        with open(existing_file, "wb") as f:
+            f.write(b"x")
+        for resolved in (existing_dir, os.path.join(existing_file, "types.json")):
+            with self.subTest(resolved=os.path.basename(resolved)):
+                err = io.StringIO()
+                with mock.patch.object(carve.os.path, "realpath", return_value=resolved), \
+                        mock.patch.object(carve.os, "listdir", side_effect=AssertionError("scanned unexpectedly")), \
+                        contextlib.redirect_stderr(err):
+                    rc = carve.main([self.root])
+                self.assertEqual(rc, 2)
+                self.assertNotEqual(err.getvalue().strip(), "")
 
 
 if __name__ == "__main__":

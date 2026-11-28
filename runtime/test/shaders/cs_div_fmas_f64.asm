@@ -4,7 +4,8 @@
 ; fma(a, a, c) = 2^-60 = 0x3c300000_00000000 fused; rounding a*a first gives 1 + 2^-29 and a result of 0 ("split").
 ; out[0..1] = 0x00000000 0x3c300000 (split: 0x00000000 0x00000000). Under --fma khr (LEONIDA_FMA=khr) the translator
 ; emits OpFmaKHR on doubles (feature shaderFmaFloat64) and only the fused words pass; under the default GLSL Fma a
-; driver may split (NVIDIA RTX 4090, 621.24, does).
+; driver may split. The operands here are literals, so a driver that folds the constant Fma while compiling can
+; round it twice: NVIDIA RTX 4090 (621.24) does, while the same values as run-time operands are fused there.
 s_mov_b64 vcc, 0
 v_mov_b32 v0, 0x00400000
 v_mov_b32 v1, 0x3ff00000

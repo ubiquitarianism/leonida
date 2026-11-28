@@ -5,10 +5,12 @@
 // The test prints which path each instruction took. No game files.
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <thread>
 #include <vector>
 
 #include "cpu_emulation.h"
@@ -87,6 +89,11 @@ void test_decode() {
     check(dec({0x66, 0x0F, 0xAE, 0x39}).op == ce::Op::none, "66 0F AE /7 is clflushopt");
     check(dec({0x66, 0x0F, 0xAE, 0x74, 0x01}).op == ce::Op::none, "a cut-off clwb is not decoded");
     check(dec({0x0F, 0x0B}).op == ce::Op::none, "ud2 is not handled");
+    check(ce::decode(nullptr, 15).op == ce::Op::none, "null code buffer is refused");
+    // 14 prefixes + 3-byte CLZERO = 17 bytes (> 15-byte architectural limit) must not decode.
+    check(dec({0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+               0x0F, 0x01, 0xFC}).op == ce::Op::none,
+          "overlong >15-byte clzero is refused");
 }
 
 void test_bits() {
@@ -145,6 +152,74 @@ void test_apply() {
     check(fault.ExceptionCode == STATUS_ACCESS_VIOLATION && fault.NumberParameters == 2 &&
               fault.ExceptionInformation[0] == 1 && fault.ExceptionInformation[1] == 0,
           "clzero on an unwritable line reports a write access violation at the line");
+
+    // try_clzero_loop EFlags: first-line fault keeps incoming flags, post-prefix fault and >64 MiB batch apply CMP.
+    const uint8_t loop12[] = {0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4};
+    if (auto* two_pages = static_cast<uint8_t*>(VirtualAlloc(nullptr, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
+        const uint64_t start = reinterpret_cast<uint64_t>(two_pages);
+        DWORD old = 0;
+        VirtualProtect(two_pages, 8192, PAGE_READONLY, &old);
+        c = {};
+        c.Rax = start;
+        c.Rdx = start + 8192;
+        c.Rip = rip;
+        c.EFlags = 0x202;
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::faulted &&
+                  c.Rax == start && c.Rip == rip && c.EFlags == 0x202,
+              "clzero loop fault on first line preserves entry EFlags");
+
+        VirtualProtect(two_pages, 4096, PAGE_READWRITE, &old);
+        std::memset(two_pages, 0x5A, 4096);
+        c = {};
+        c.Rax = start;
+        c.Rdx = start + 8192;
+        c.Rip = rip;
+        c.EFlags = 0x246;  // ZF=1, CF=0 on entry
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::faulted,
+              "clzero loop post-prefix fault reported");
+        bool prefix_zeroed = true;
+        for (int i = 0; i < 4096; ++i) prefix_zeroed &= two_pages[i] == 0;
+        check(prefix_zeroed && c.Rax == start + 4096 && c.Rip == rip &&
+                  fault.ExceptionCode == STATUS_ACCESS_VIOLATION && fault.ExceptionInformation[1] == start + 4096 &&
+                  (c.EFlags & 0xC1u) == 0x81u,
+              "clzero loop post-prefix fault zeroes prefix and applies CMP flags (CF=1, ZF=0, SF=1)");
+        VirtualFree(two_pages, 0, MEM_RELEASE);
+    }
+
+    constexpr size_t kLargeSpan = (size_t(64) << 20) + 4096;
+    if (auto* large = static_cast<uint8_t*>(VirtualAlloc(nullptr, kLargeSpan, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
+        const uint64_t base = reinterpret_cast<uint64_t>(large);
+        c = {};
+        c.Rax = base;
+        c.Rdx = base + kLargeSpan;
+        c.Rip = rip;
+        c.EFlags = 0x202;
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::ok &&
+                  c.Rip == rip && c.Rax == base + (uint64_t(64) << 20) && (c.EFlags & 0xC1u) == 0x81u,
+              "clzero loop >64 MiB first batch applies CMP flags (CF=1, ZF=0, SF=1)");
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::ok &&
+                  c.Rip == rip + 12 && c.Rax == base + kLargeSpan && (c.EFlags & 0xC1u) == 0x40u,
+              "clzero loop >64 MiB second batch completes with CF=0, ZF=1, SF=0");
+        VirtualFree(large, 0, MEM_RELEASE);
+    }
+
+    // Wraparound guards: start near UINT64_MAX and full-span [0, UINT64_MAX) must not wrap total to 0 or loop.
+    {
+        c = {};
+        c.Rax = UINT64_MAX - 63;  // 0xFFFFFFFFFFFFFFC0 (64-byte aligned); start + 64 would wrap to 0
+        c.Rdx = UINT64_MAX;
+        c.Rip = rip;
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::no_match,
+              "clzero loop rejects wraparound start near UINT64_MAX");
+
+        c = {};
+        c.Rax = 0;
+        c.Rdx = UINT64_MAX;  // limit - start + 63 would wrap to 0 without kMaxBatch clamp first
+        c.Rip = rip;
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::faulted &&
+                  fault.ExceptionCode == STATUS_ACCESS_VIOLATION && fault.ExceptionInformation[1] == 0,
+              "clzero loop with UINT64_MAX limit faults on null page instead of wrapping total to 0");
+    }
 }
 
 // ---- Running the real encodings ----
@@ -244,6 +319,33 @@ void test_live(const ce::Host& host) {
               "clzero with 66 emulated");
     }
 
+    // clzero loop fast-path: mov rax, rcx; clzero; add rax, 0x40; cmp rax, rdx; jb -12; ret
+    {
+        alignas(64) static uint8_t buf[512];
+        std::memset(buf, 0xA5, sizeof buf);
+        Code clz_loop({0x48, 0x89, 0xC8, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4, 0xC3});
+        check(run(clz_loop, buf + 64, buf + 320, &ex), "clzero loop ran");
+        bool loop_ok = true;
+        for (int i = 0; i < 512; ++i) loop_ok &= buf[i] == ((i >= 64 && i < 320) ? 0 : 0xA5);
+        check(loop_ok, "clzero loop zeroed exact span [64, 320)");
+
+        // REX.R limit register (r8): mov rax, rcx; mov r8, rdx; clzero; add rax, 0x40; cmp rax, r8; jb -12; ret
+        std::memset(buf, 0xA5, sizeof buf);
+        Code clz_r8({0x48, 0x89, 0xC8, 0x49, 0x89, 0xD0, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xC0,
+                     0x72, 0xF4, 0xC3});
+        check(run(clz_r8, buf + 64, buf + 320, &ex), "clzero loop (r8) ran");
+        bool r8_ok = true;
+        for (int i = 0; i < 512; ++i) r8_ok &= buf[i] == ((i >= 64 && i < 320) ? 0 : 0xA5);
+        check(r8_ok, "clzero loop (r8) zeroed exact span [64, 320)");
+
+        // Non-multiple-of-64 limit (300): rounds up to 320, matching native do-while `cmp rax, limit; jb`.
+        std::memset(buf, 0xA5, sizeof buf);
+        check(run(clz_loop, buf + 64, buf + 300, &ex), "clzero loop (unaligned limit) ran");
+        bool unaligned_ok = true;
+        for (int i = 0; i < 512; ++i) unaligned_ok &= buf[i] == ((i >= 64 && i < 320) ? 0 : 0xA5);
+        check(unaligned_ok, "clzero loop (unaligned limit 300) zeroed span [64, 320)");
+    }
+
     // mov rax,rcx; xor ecx,ecx; xor edx,edx; monitorx; xor eax,eax; xor ecx,ecx; mwaitx; ret
     // (no timer: an interrupt or a store ends a native wait; the emulated one returns at once)
     Code mon({0x48, 0x89, 0xC8, 0x31, 0xC9, 0x31, 0xD2, 0x0F, 0x01, 0xFA, 0x31, 0xC0, 0x31, 0xC9, 0x0F, 0x01, 0xFB,
@@ -257,10 +359,130 @@ void test_live(const ce::Host& host) {
     uint32_t marker = 0;
     check(run(wb, lines, &marker, &ex) && marker == 1, "clwb ran and execution continued after it");
     std::printf("clwb: %s\n", path(host.clwb));
+    if (!host.clwb) {
+        // Both sites were rewritten at their first #UD: CLFLUSHOPT (reg field 7) or the same-length NOP.
+        const auto rewritten = [&](int at) {
+            return (wb.mem[at] == 0xAE && (wb.mem[at + 1] & 0x38) == 0x38) ||
+                   (wb.mem[at] == 0x1F && (wb.mem[at + 1] & 0x38) == 0);
+        };
+        check(rewritten(4) && rewritten(8), "clwb sites rewritten in place");
+        check(wb.mem[10] == 0x01 && wb.mem[11] == 0x08, "the rewritten clwb keeps its SIB and displacement");
+        marker = 0;
+        check(run(wb, lines, &marker, &ex) && marker == 1, "the rewritten code runs again");
+    }
 
     // A #UD the handler does not know stays an illegal-instruction exception: ud2; ret
     Code ud({0x0F, 0x0B, 0xC3});
     check(!run(ud, nullptr, nullptr, &ex) && ex == STATUS_ILLEGAL_INSTRUCTION, "ud2 still faults");
+}
+
+// ---- CLWB rewritten in place, with the handler called on a made-up #UD ----
+// The #UD a CPU without CLWB raises is handed to the handler directly, so this runs on a host with CLWB too. A
+// thread whose #UD is handled after another thread rewrote the same site reads the new bytes: it must continue at
+// the site (the CPU runs the rewritten instruction), never pass the exception on. Each site is rewritten once.
+
+// The handler's answer to a #UD at `rip`, and the RIP it continues at; -2 when the handler itself faulted.
+LONG fake_ud(uint64_t rip, uint64_t* rip_after) {
+    EXCEPTION_RECORD record{};
+    record.ExceptionCode = DWORD(STATUS_ILLEGAL_INSTRUCTION);
+    record.ExceptionAddress = reinterpret_cast<void*>(rip);
+    CONTEXT context{};
+    context.Rip = rip;
+    EXCEPTION_POINTERS pointers{&record, &context};
+    __try {
+        const LONG r = ce::handler(&pointers);
+        *rip_after = context.Rip;
+        return r;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -2;
+    }
+}
+
+bool call_at(const uint8_t* code, const void* in) {
+    __try {
+        reinterpret_cast<Fn>(const_cast<uint8_t*>(code))(in, nullptr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// clwb [rcx]; ret at `at` became CLFLUSHOPT [rcx] (reg field 7) or the NOP 0F 1F /0 with the same operand.
+bool clwb_rewritten(const uint8_t* at) {
+    return at[0] == 0x66 && at[1] == 0x0F && at[4] == 0xC3 && (at[3] & 0xC7) == 0x01 &&
+           ((at[2] == 0xAE && (at[3] & 0x38) == 0x38) || (at[2] == 0x1F && (at[3] & 0x38) == 0));
+}
+
+bool executable_read_only(const void* p) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    return VirtualQuery(p, &mbi, sizeof mbi) && mbi.Protect == PAGE_EXECUTE_READ;
+}
+
+void test_clwb_rewrite() {
+    char value[4]{};
+    if (GetEnvironmentVariableA("LEONIDA_CLWB_PATCH", value, sizeof(value)) > 0 && value[0] == '0') {
+        std::printf("clwb rewrite: skipped (LEONIDA_CLWB_PATCH=0)\n");
+        return;
+    }
+    constexpr int kSites = 2048, kStride = 8, kThreads = 16;
+    const std::size_t bytes = std::size_t(kSites + 1) * kStride;
+    auto* mem = static_cast<uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    check(mem != nullptr, "clwb rewrite: allocate the sites");
+    if (!mem) return;
+    for (int s = 0; s <= kSites; ++s) {  // clwb [rcx]; ret; int3 x3
+        const uint8_t site[kStride] = {0x66, 0x0F, 0xAE, 0x31, 0xC3, 0xCC, 0xCC, 0xCC};
+        std::memcpy(mem + std::size_t(s) * kStride, site, kStride);
+    }
+    DWORD old = 0;
+    VirtualProtect(mem, bytes, PAGE_EXECUTE_READ, &old);  // as the game's code: the handler must unprotect it
+    FlushInstructionCache(GetCurrentProcess(), mem, bytes);
+
+    // (a) The first #UD rewrites the site and continues at it, which then runs on any host.
+    uint8_t* const one = mem + std::size_t(kSites) * kStride;
+    const uint64_t rip = reinterpret_cast<uint64_t>(one);
+    const unsigned before = ce::clwb_sites().load();
+    uint64_t after = 0;
+    check(fake_ud(rip, &after) == EXCEPTION_CONTINUE_EXECUTION && after == rip,
+          "clwb rewrite: the first #UD continues at the site");
+    check(clwb_rewritten(one), "clwb rewrite: the site is rewritten, operand kept");
+    check(ce::clwb_sites().load() == before + 1, "clwb rewrite: the site is counted once");
+    check(executable_read_only(one), "clwb rewrite: the page is execute-read again");
+    alignas(64) static uint8_t line[64];
+    check(call_at(one, line), "clwb rewrite: the rewritten site runs");
+
+    // (b) A #UD handled after the site was rewritten (another thread's, in the game) continues at the site too.
+    after = 0;
+    check(fake_ud(rip, &after) == EXCEPTION_CONTINUE_EXECUTION && after == rip,
+          "clwb rewrite: a #UD on an already rewritten site continues at it");
+    check(ce::clwb_sites().load() == before + 1, "clwb rewrite: an already rewritten site is not counted again");
+
+    // (c) 16 threads take a #UD on each of 2048 fresh sites at once, in the same order so they meet on each site.
+    std::atomic<int> waiting{kThreads}, bad{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t)
+        threads.emplace_back([&] {
+            waiting.fetch_sub(1);
+            while (waiting.load()) std::this_thread::yield();
+            for (int s = 0; s < kSites; ++s) {
+                const uint64_t at = reinterpret_cast<uint64_t>(mem + std::size_t(s) * kStride);
+                uint64_t continued = 0;
+                if (fake_ud(at, &continued) != EXCEPTION_CONTINUE_EXECUTION || continued != at) bad.fetch_add(1);
+            }
+        });
+    for (auto& t : threads) t.join();
+    if (bad.load()) std::fprintf(stderr, "clwb rewrite: %d of %d concurrent #UDs not continued at the site\n",
+                                 bad.load(), kThreads * kSites);
+    check(bad.load() == 0, "clwb rewrite: every concurrent #UD continues at its site");
+    const unsigned counted = ce::clwb_sites().load() - before - 1;
+    if (counted != unsigned(kSites)) std::fprintf(stderr, "clwb rewrite: %u sites counted for %d\n", counted, kSites);
+    check(counted == unsigned(kSites), "clwb rewrite: each concurrently hit site is counted once");
+    bool all = true;
+    for (int s = 0; s < kSites; ++s) all &= clwb_rewritten(mem + std::size_t(s) * kStride);
+    check(all, "clwb rewrite: every concurrently hit site is rewritten");
+    check(executable_read_only(mem) && executable_read_only(mem + bytes - 1),
+          "clwb rewrite: the pages are execute-read again");
+    std::printf("clwb rewrite: %d threads x %d sites\n", kThreads, kSites);
+    VirtualFree(mem, 0, MEM_RELEASE);
 }
 }  // namespace
 
@@ -273,6 +495,7 @@ int main() {
                 host.clwb);
     check(ce::install(), "install the handler");
     test_live(host);
+    test_clwb_rewrite();
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

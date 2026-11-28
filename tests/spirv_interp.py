@@ -15,6 +15,23 @@ import struct
 M32 = 0xFFFFFFFF
 
 
+def float_literal_bits(tok):
+    """The binary32 bits of an OpConstant %float literal as spirv-as reads it: a decimal, or a hex-float, where
+    exponent +128 is the SPIRV-Tools spelling of an infinity (0x1p+128) or a NaN with its payload (0x1.8p+128),
+    as tools/rdna2spirv.py's float_literal writes them. Raises ValueError for anything else."""
+    m = re.fullmatch(r"([+-]?)0[xX]([0-9a-fA-F]*)\.?([0-9a-fA-F]*)[pP]([+-]?\d+)", tok)
+    if m is None:
+        return struct.unpack("<I", struct.pack("<f", float(tok)))[0]
+    sign, ipart, fpart, exp = m.groups()
+    sig = int(ipart + fpart or "0", 16)
+    top = sig.bit_length() - 1
+    if sig and int(exp) - 4 * len(fpart) + top == 128:
+        frac = sig & ((1 << top) - 1)
+        mant = frac << (23 - top) if top <= 23 else frac >> (top - 23)
+        return (0x80000000 if sign == "-" else 0) | 0x7F800000 | mant
+    return struct.unpack("<I", struct.pack("<f", float.fromhex(tok)))[0]
+
+
 def f32(x):
     try:
         return struct.unpack("<f", struct.pack("<f", x))[0]
@@ -42,6 +59,59 @@ def f2u(x):
     if isinstance(x, _F32):
         return x.bits
     return struct.unpack("<I", struct.pack("<f", x))[0]
+
+
+def _fneg(v):
+    """Negate a float, _F32 bit pattern, or vector without dropping _F32 NaN payload bits."""
+    if isinstance(v, tuple):
+        return tuple(_fneg(c) for c in v)
+    if isinstance(v, _F32):
+        return _F32(v.bits ^ 0x80000000)
+    if isinstance(v, float) and math.isnan(v):
+        bits = struct.unpack("<Q", struct.pack("<d", v))[0] ^ (1 << 63)
+        return struct.unpack("<d", struct.pack("<Q", bits))[0]
+    return -v
+
+
+def _ieee_sqrt(x):
+    if math.isnan(x) or x < 0.0:
+        return math.nan
+    if x == 0.0:
+        return x
+    return math.inf if math.isinf(x) else math.sqrt(x)
+
+
+def _ieee_rsqrt(x):
+    if math.isnan(x) or x < 0.0:
+        return math.nan
+    if x == 0.0:
+        return math.copysign(math.inf, x)
+    return 0.0 if math.isinf(x) else 1.0 / math.sqrt(x)
+
+
+def _ieee_log2(x):
+    if math.isnan(x) or x < 0.0:
+        return math.nan
+    if x == 0.0:
+        return -math.inf
+    return math.inf if math.isinf(x) else math.log2(x)
+
+
+def _ieee_exp2(x):
+    if math.isnan(x):
+        return math.nan
+    if x == math.inf:
+        return math.inf
+    if x == -math.inf:
+        return 0.0
+    try:
+        return 2.0 ** x
+    except OverflowError:
+        return math.inf
+
+
+def _ieee_trig(op, x):
+    return math.nan if math.isnan(x) or math.isinf(x) else op(x)
 
 
 def u2f(u):
@@ -152,7 +222,8 @@ def run(spvasm):
         elif op == "OpConstant":
             t = types[args[0]][0]
             if t == "Float":
-                consts[res] = float(args[1]) if types[args[0]][1] == "64" else f32(float(args[1]))
+                consts[res] = float(args[1]) if types[args[0]][1] == "64" else (
+                    u2f(float_literal_bits(args[1])) if "x" in args[1].lower() else f32(float(args[1])))
             else:
                 consts[res] = int(args[1]) & M32
         elif op == "OpConstantTrue":
@@ -205,7 +276,11 @@ def run(spvasm):
         "OpIEqual": lambda a, b: a == b, "OpINotEqual": lambda a, b: a != b,
     }
 
-    F64 = {"OpFAdd": lambda a, b: a + b, "OpFSub": lambda a, b: a - b, "OpFMul": lambda a, b: a * b}
+    # Without an entry here a binary64 op falls through to ARITH and is rounded to binary32: until OpFDiv was added,
+    # the translated v_rcp_f64 of 3.0 gave 0x3fd5555560000000 (1/3 as a binary32) and of 1e300 gave 0.
+    F64 = {"OpFAdd": lambda a, b: a + b, "OpFSub": lambda a, b: a - b, "OpFMul": lambda a, b: a * b,
+           "OpFDiv": lambda a, b: a / b if b else
+           math.copysign(math.inf, math.copysign(1.0, a) * math.copysign(1.0, b)) if a and not math.isnan(a) else math.nan}
 
     def float_bits(rt):
         t = types.get(rt)
@@ -227,13 +302,23 @@ def run(spvasm):
             from fractions import Fraction
             if any(math.isnan(x) or math.isinf(x) for x in a):
                 return round_out(a[0] * a[1] + a[2])
-            return round_out(float(Fraction(a[0]) * Fraction(a[1]) + Fraction(a[2])))
+            exact = Fraction(a[0]) * Fraction(a[1]) + Fraction(a[2])
+            if exact == 0:
+                prod = a[0] * a[1]
+                if prod == 0.0 and a[2] == 0.0 and math.copysign(1.0, prod) < 0 and math.copysign(1.0, a[2]) < 0:
+                    return -0.0
+                return 0.0
+            try:
+                return round_out(float(exact))
+            except OverflowError:
+                return round_out(-math.inf if exact < 0 else math.inf)
         rounding = {"Floor": math.floor, "Ceil": math.ceil, "Trunc": math.trunc, "RoundEven": round}
         if fn in rounding:      # a zero result keeps the sign of the operand (IEEE 754; RDNA2 and Vulkan GPUs do)
             return a[0] if math.isnan(a[0]) or math.isinf(a[0]) else math.copysign(float(rounding[fn](a[0])), a[0])
-        simple = {"FMin": min, "FMax": max, "FAbs": abs, "Sin": math.sin, "Cos": math.cos,
-                  "Sqrt": math.sqrt, "InverseSqrt": lambda x: 1 / math.sqrt(x), "Exp2": lambda x: 2.0 ** x,
-                  "Log2": math.log2}
+        simple = {"FMin": min, "FMax": max, "FAbs": abs,
+                  "Sin": lambda x: _ieee_trig(math.sin, x), "Cos": lambda x: _ieee_trig(math.cos, x),
+                  "Sqrt": _ieee_sqrt, "InverseSqrt": _ieee_rsqrt, "Exp2": _ieee_exp2,
+                  "Log2": _ieee_log2}
         if fn in ("NMin", "NMax"):
             # A NaN operand gives the other operand (both NaN: a NaN); zeros ordered -0 < +0 as on RDNA2.
             def pick(x, y):
@@ -247,6 +332,8 @@ def run(spvasm):
         if fn in simple:
             return round_out(float(simple[fn](*a)))
         if fn == "Fract":
+            if math.isnan(a[0]) or math.isinf(a[0]):
+                return math.nan
             return round_out(a[0] - math.floor(a[0]))
         if fn == "FClamp":
             return round_out(min(max(a[0], a[1]), a[2]))
@@ -305,7 +392,7 @@ def run(spvasm):
         elif op == "OpLogicalNot":
             val[res] = not get(args[1])
         elif op == "OpFNegate":
-            val[res] = -get(args[1])
+            val[res] = _fneg(get(args[1]))
         elif op == "OpIsNan":
             val[res] = math.isnan(get(args[1]))
         elif op == "OpIsInf":
@@ -330,6 +417,11 @@ def run(spvasm):
             val[res] = x if float_bits(args[0]) == 64 else f32(x)
         elif op == "OpConvertSToF":
             x = float(s32(get(args[1])))
+            val[res] = x if float_bits(args[0]) == 64 else f32(x)
+        elif op == "OpFConvert":
+            # binary64 -> binary32 rounds to nearest even (past the binary32 range: infinity); binary32 -> binary64 is
+            # exact. v_cvt_f32_f64 and v_cvt_f64_f32 are this.
+            x = float(get(args[1]))
             val[res] = x if float_bits(args[0]) == 64 else f32(x)
         elif op == "OpConvertFToU":
             x = get(args[1]); val[res] = 0 if math.isnan(x) or x <= 0 else M32 if x >= 2**32 else int(x)

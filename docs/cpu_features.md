@@ -58,7 +58,33 @@ in the image.
   `insertq`/`extrq` are bit-field operations on the low quadword. `cpu_emulation_test` checks each form against the
   CPU on a host that has it and against the handler on one that does not (an i7-10700K: all four lacking, all checks
   pass).
+- The CLZERO routine is too hot for the #UD path: one exception and two `VirtualQuery` calls per 64-byte line. On an
+  i9-13900K the routine held one thread at ~99% for the whole boot (sampled: `VirtualQuery` under
+  `cpu_emulation::apply`) and the title presented ~3 frames a second. On a CPU without CLZERO the loader therefore
+  rewrites the routine's loops before any image code runs (`runtime/src/clzero_patch.h`): each of the two loop shapes
+  (6 + 4 sites) jumps to a stub within 2 GiB of the image that zeroes the line with eight 8-byte stores and keeps the
+  loop's registers and flags. Same boot afterwards: 164,946 PresentX in 300 s against 869 in 420 s, no CLZERO left on
+  the #UD path. `LEONIDA_CLZERO_PATCH=0` keeps the emulation; `clzero_patch_test` runs both shapes on any CPU.
 - The CPUID sites see the host's vendor, family and features, not the console's. What the game does with the
   answers is not measured here.
 
 Not measured: which of these sites a boot reaches, and in which order.
+
+### Hosts without AVX
+
+Measured on one host: Intel Xeon X5675 (Westmere, SSE4.2; no AVX, AVX2, FMA, BMI2 or XSAVE), Fedora 44,
+`wine-11.21 (Staging)`, Intel SDE 10.13.1, and a local `gta6rt.exe` build from 2026-11-24.
+
+- **What works without AVX:** building the native Linux runtime and Vulkan test tools (`ctest`), running the Vulkan GPU
+  suite (`scripts/run_gpu_tests.py`), shader translation and asset export (`make_game.py` stages).
+- **Running `gta6rt` directly:** `--init` and `--run` exit 4 at the AVX preflight. With `LEONIDA_SKIP_CPU_CHECK=1`,
+  the preflight is skipped and the guest faults on its first AVX instruction.
+- **Under Intel SDE (`sde64 -hsw`):** without `-chip_check_disable 1`, SDE aborts on `clzero` instead of raising
+  `SIGILL` for `gta6rt`'s handler. With `-chip_check_disable 1`, the guest passes its first AVX instruction and reaches
+  `InitializeApiImplEx2` (offline) after ~110 s, then stops before any window or D3D12 call: SDE traps an `int 3`
+  without `-raise-int3`, and with `-raise-int3` the process terminates with `SIGSEGV` (`LEONIDA_SKIP_INT3=1` with
+  `--trace` did not change this, recording `0` `int3_skipped` events). Adding `-ptr-raise` causes Pin to abort with an
+  internal instrumentation error under Wine's exception handling.
+- **Outcome on this host:** no useful path to boot `gta6rt --run` was found under SDE + Wine.
+
+Not measured: other emulators (such as QEMU TCG with AVX2) or Rosetta 2.

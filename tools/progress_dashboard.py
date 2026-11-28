@@ -5,7 +5,7 @@
 
 Writes, into --out only (a folder inside the repository is refused, so nothing here can be committed by accident):
     progress.html                 one self-contained page (no network, no packages; open it from disk)
-    snapshots/progress_<utc>.json the data behind it; a snapshot equal to the previous one is not written again
+    snapshots/progress_<utc>_<hash>.json  the data behind it; an unchanged snapshot is not written again
     history.json                  one summary line per snapshot, for the trend chart
     unit_results.json             the last --run-tests outcome, kept so a later run can show what changed since
 
@@ -31,6 +31,7 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -372,6 +373,14 @@ def group_of_test(name):
 
 
 # ----------------------------------------------------------------------------------------------- ctest / junit
+def _test_duration(value: str | None) -> float | None:
+    try:
+        seconds = float(value or "")
+    except ValueError:
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
 def parse_junit(xml):
     """[(name, result, seconds, detail)] from CTest (--output-junit) or pytest (--junitxml) XML."""
     root = xml if isinstance(xml, ET.Element) else ET.fromstring(xml)
@@ -391,10 +400,7 @@ def parse_junit(xml):
             name, cls = tc.get("name") or "?", tc.get("classname")
             if cls and cls != name:
                 name = f"{cls}::{name}"
-            try:
-                secs = float(tc.get("time")) if tc.get("time") else None
-            except ValueError:
-                secs = None
+            secs = _test_duration(tc.get("time"))
             detail = scrub((fail.get("message") or "") if fail is not None else "")
             out.append((name, res, secs, detail))
     return out
@@ -428,7 +434,7 @@ def parse_lasttest(text: str) -> list[tuple[str, str, float | None]]:
             continue
         m = re.match(r"^Test time =\s*([\d.]+) sec", line)
         if m:
-            secs = float(m.group(1))
+            secs = _test_duration(m.group(1))
             continue
         if line.startswith("Test Passed"):
             res = "pass"
@@ -1025,7 +1031,8 @@ def write_outputs(snap, out_dir):
     new = not history or history[-1]["content_hash"] != snap["content_hash"][:16]
     if new:
         stamp = snap["generated_at"].replace("-", "").replace(":", "")
-        save_text(os.path.join(out_dir, "snapshots", f"progress_{stamp}.json"), dump_json(snap))
+        archive = f"progress_{stamp}_{snap['content_hash']}.json"
+        save_text(os.path.join(out_dir, "snapshots", archive), dump_json(snap))
         history.append(summary_line(snap))
         save_text(hist_path, dump_json(history))
     save_text(os.path.join(out_dir, "progress.html"), render_page(snap, history))

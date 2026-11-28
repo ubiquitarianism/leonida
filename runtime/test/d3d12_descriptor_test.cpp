@@ -333,6 +333,7 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.a8_render_target = d.a8_render_target;
         info.texture_compression_bc = d.bc;
         info.bindless = d.bindless;
         info.bindless_partially_bound = d.partially_bound;
@@ -344,7 +345,7 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);  // the proxy now owns `inner`
 
         D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8{};
@@ -491,8 +492,10 @@ int main() {
         EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0);
         EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER) != 0);
         EXPECT((support.Support1 & D3D12_FORMAT_SUPPORT1_MIP) != 0);
-        EXPECT(!(support.Support1 & (D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_BLENDABLE |
-                                     D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) && !support.Support2);
+        // Render targets where the device has VK_FORMAT_A8_UNORM_KHR (they are then blendable too); never UAVs.
+        const bool a8_render_target = (support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) != 0;
+        EXPECT(a8_render_target == ((support.Support1 & D3D12_FORMAT_SUPPORT1_BLENDABLE) != 0));
+        EXPECT(!(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) && !support.Support2);
         for (UINT count : {1u, 4u}) {
             D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS quality_levels{DXGI_FORMAT_A8_UNORM, count};
             EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &quality_levels,
@@ -504,10 +507,12 @@ int main() {
             auto desc = texture_desc;
             desc.Format = DXGI_FORMAT_A8_UNORM;
             desc.Flags = flag;
-            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                          __uuidof(ID3D12Resource), nullptr)));
-            EXPECT(device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes == UINT64_MAX);
+            const bool allowed = flag == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET && a8_render_target;
+            // With no output, a valid description is S_FALSE.
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             __uuidof(ID3D12Resource), nullptr)) == allowed);
+            EXPECT((device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes == UINT64_MAX) == !allowed);
         }
         Ref<ID3D12Resource> byte_textures[2];
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT byte_placed[2]{}, a8_mip_placed{};
@@ -526,6 +531,17 @@ int main() {
         }
         EXPECT(byte_placed[0].Offset == byte_placed[1].Offset &&
                byte_placed[0].Footprint.RowPitch == byte_placed[1].Footprint.RowPitch);
+        // An A8 render target (VK_FORMAT_A8_UNORM_KHR where the device has it) gets the same bytes, and its SRVs must
+        // read them as the R8-backed A8 texture's do. Without render-target support, slots 5 and 6 view that one.
+        Ref<ID3D12Resource> a8_target;
+        if (a8_render_target) {
+            auto desc = texture_desc;
+            desc.Format = DXGI_FORMAT_A8_UNORM;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                              IID_PPV_ARGS(&a8_target.p))));
+        }
         for (UINT y = 0; y < size; ++y) {
             auto* row = static_cast<std::uint8_t*>(mapped) + byte_placed[0].Offset + y * byte_placed[0].Footprint.RowPitch;
             for (UINT x = 0; x < size; ++x) row[x] = std::uint8_t(1 + 3 * (y * size + x));
@@ -1194,7 +1210,7 @@ int main() {
                     }
         }
 
-        constexpr UINT a8_mip_slot = 4, byte_view_count = a8_mip_slot + 1;
+        constexpr UINT a8_mip_slot = 4, a8_target_slot = 5, byte_view_count = a8_target_slot + 2;
         D3D12_DESCRIPTOR_HEAP_DESC byte_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, byte_view_count,
                                                   D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Ref<ID3D12DescriptorHeap> byte_heap;
@@ -1224,6 +1240,18 @@ int main() {
         byte_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         byte_view.Texture2D.MostDetailedMip = 1;
         device->CreateShaderResourceView(byte_textures[0].p, &byte_view, byte_slot(a8_mip_slot));
+        {
+            // The A8 render target: a default view (null description) and the remapped one of slot 1.
+            ID3D12Resource* const a8_source = a8_target.p ? a8_target.p : byte_textures[0].p;
+            device->CreateShaderResourceView(a8_source, nullptr, byte_slot(a8_target_slot));
+            D3D12_SHADER_RESOURCE_VIEW_DESC remapped = byte_view;
+            remapped.Texture2D.MostDetailedMip = 0;
+            remapped.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+                D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3,
+                D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1,
+                D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0);
+            device->CreateShaderResourceView(a8_source, &remapped, byte_slot(a8_target_slot + 1));
+        }
 
         // D3D-75: plane 1 of a depth-stencil texture is its stencil. The T# is 8_UINT at the texture's own address,
         // with the eight bits read as G and R, B, A as 0, 0, 1 (D3D12's X24_TYPELESS_G8_UINT / X32_..._G8X24_UINT).
@@ -1484,6 +1512,18 @@ int main() {
                 list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
             }
             const auto ready = transition(to.pResource, D3D12_RESOURCE_STATE_COPY_DEST,
+                                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &ready);
+        }
+        if (a8_target.p) {
+            D3D12_TEXTURE_COPY_LOCATION to{}, from{};
+            to.pResource = a8_target.p;
+            to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            from.pResource = upload.p;
+            from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            from.PlacedFootprint = byte_placed[0];
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            const auto ready = transition(a8_target.p, D3D12_RESOURCE_STATE_COPY_DEST,
                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &ready);
         }
@@ -1976,12 +2016,17 @@ int main() {
                                                  {value, 0, 0, 255}, {255, value, 255, 0}};
             for (UINT k = 0; k < 4; ++k)
                 EXPECT(std::memcmp(byte_results.data() + k * bytes + 4 * i, expected[k], 4) == 0);
+            // The A8 render target's default and remapped views read as the A8 texture's (slots 0 and 1).
+            EXPECT(std::memcmp(byte_results.data() + a8_target_slot * bytes + 4 * i, expected[0], 4) == 0);
+            EXPECT(std::memcmp(byte_results.data() + (a8_target_slot + 1) * bytes + 4 * i, expected[1], 4) == 0);
             const UINT mip_texel = (i / size / 2) * mip_size + (i % size) / 2;
             const std::uint8_t mip_expected[] = {0, 0, 0, std::uint8_t(208 + mip_texel)};
             EXPECT(std::memcmp(byte_results.data() + a8_mip_slot * bytes + 4 * i, mip_expected, 4) == 0);
         }
         std::printf("A8 mip 1: %u samples matched across %u texels\n", texels, mip_size * mip_size);
         std::printf("A8 and R8 default and remapped views: %u texels matched each\n", texels);
+        std::printf("A8 render target (%s) default and remapped views: %u texels matched each\n",
+                    a8_target.p ? "VK_FORMAT_A8_UNORM_KHR" : "not supported: the R8-backed texture", texels);
 
         // A gather across the center of each 2x2 block uses the A8 view's R-to-A swizzle.
         // The remapped view of the same image forces alpha to zero.
@@ -2887,6 +2932,7 @@ int main() {
         typeless_heap.reset();
         uint_texture.reset();
         for (auto& resource : byte_textures) resource.reset();
+        a8_target.reset();
         byte_heap.reset();
         ms_texture.reset();
         ms_array.reset();

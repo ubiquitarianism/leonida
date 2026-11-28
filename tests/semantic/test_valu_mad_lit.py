@@ -723,6 +723,15 @@ class ExecMaskingTests(unittest.TestCase):
 class NegativeControlsTests(unittest.TestCase):
     """Sabotage translated SPIR-V output and confirm value assertions catch each mutation."""
 
+    def arithmetic(self, spv):
+        # Explicit product flushing can separate the multiply and add. Find each
+        # independently so the mutations retain the intervening flush operations.
+        muls = list(re.finditer(r"(%\w+) = OpFMul %float (%\w+) (%\w+)", spv))
+        adds = list(re.finditer(r"(%\w+) = OpFAdd %float (%\w+) (%\w+)", spv))
+        self.assertEqual(len(muls), 1)
+        self.assertEqual(len(adds), 1)
+        return muls[0], adds[0]
+
     def test_sabotaged_spirv_is_detected(self):
         # 1. v_madak_f32 OpFAdd mutated to OpFSub.
         spv_ak = translate_ps([
@@ -742,12 +751,11 @@ class NegativeControlsTests(unittest.TestCase):
         ])
         want_mk = f32_to_bits(13.0)
         self.assertEqual(si.run_fragment(spv_mk)["%out_mrt0"][0], want_mk)
-        bad_mk, count = re.subn(
-            r"(%\w+) = OpFMul %float (%\w+) (%\w+)\n(\s*)(%\w+) = OpFAdd %float \1 (%\w+)",
-            r"\1 = OpFMul %float \2 \6\n\4\5 = OpFAdd %float \1 \3",
-            spv_mk,
-        )
-        self.assertEqual(count, 1)
+        mul, add = self.arithmetic(spv_mk)
+        product, x, y = mul.groups()
+        total, flushed_product, z = add.groups()
+        bad_mk = spv_mk.replace(mul.group(0), f"{product} = OpFMul %float {x} {z}", 1)
+        bad_mk = bad_mk.replace(add.group(0), f"{total} = OpFAdd %float {flushed_product} {y}", 1)
         self.assertEqual(si.run_fragment(bad_mk)["%out_mrt0"][0], want_ak)
         self.assertNotEqual(si.run_fragment(bad_mk)["%out_mrt0"][0], want_mk)
 
@@ -758,15 +766,11 @@ class NegativeControlsTests(unittest.TestCase):
             f"v_madak_f32 v0, v1, v2, {NEG_ONE:#x}",
         ])
         self.assertEqual(si.run_fragment(spv_unfused)["%out_mrt0"][0], POS_ZERO)
-        bad_fused, fcnt = re.subn(
-            r"(%\w+) = OpFMul %float (%\w+) (%\w+)\n(\s*)(%\w+) = OpFAdd %float \1 (%\w+)",
-            r"\5 = OpExtInst %float %glsl Fma \2 \3 \6",
-            spv_unfused,
-        )
-        self.assertEqual(fcnt, 1)
-        # Drop any dangling OpDecorate on the removed OpFMul id so spirv_mini_interp parses cleanly.
-        fmul_id = re.search(r"(%\w+) = OpFMul %float", spv_unfused).group(1)
-        bad_fused = re.sub(rf"^\s*OpDecorate {re.escape(fmul_id)} NoContraction\n", "", bad_fused, flags=re.M)
+        mul, add = self.arithmetic(spv_unfused)
+        _, x, y = mul.groups()
+        total, _, z = add.groups()
+        # Keep the now-unused multiply/flush chain: its IDs and decorations stay valid.
+        bad_fused = spv_unfused.replace(add.group(0), f"{total} = OpExtInst %float %glsl Fma {x} {y} {z}", 1)
         self.assertNotEqual(si.run_fragment(bad_fused)["%out_mrt0"][0], POS_ZERO)
 
 

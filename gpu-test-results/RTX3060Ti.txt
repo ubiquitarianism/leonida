@@ -1,0 +1,19 @@
+GPU:        NVIDIA GeForce RTX 3060 Ti (Ampere / GA104, PCI 10de:2489), subgroup 32..32
+Driver:     NVIDIA 615.78.08 (proprietary), Vulkan 1.4.351
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32)
+OS:         Arch Linux, kernel 7.3.5-arch1-1
+Commit:     84347bbb61ed406db10195f50d5911893b8b9a4b (main, 2026-11-24)
+Tools:      llvm-mc 23.1.5 (native, Arch package), SPIRV-Tools v2026.4, CMake 4.5.1,
+            GCC 16.2.1, Python 3.14.10
+run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val
+            native:                 197/248 passed, 49 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  229/248 passed, 17 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (native and emulated alike, exit 1), #31.
+Skipped:    native: 31 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this
+            device" and 1 "cannot require a 64-wide fragment subgroup" (the wave64 fixtures, which the
+            emulated run covers), plus the 16 documented "run by d3d12_*_test / w64_graphics.py" cases.
+            Emulated: the same 16, plus the 64-wide fragment one (ps_w64x_readlane).
+Notes:
+- Built natively on Linux with cmake -S runtime -B runtime/build/linux.
+- Every other compute, vertex and pixel test passed exact.
+- AI-assisted (Antigravity): built main, ran run_gpu_tests.py native and emulated. No game files, nothing online.

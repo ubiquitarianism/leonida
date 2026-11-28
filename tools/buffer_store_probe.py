@@ -22,6 +22,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -332,11 +333,24 @@ def write_json_report(path, data):
             os.makedirs(parent, exist_ok=True)
         except OSError as e:
             return f"cannot create directory for --json {path}: {e.strerror or e}"
+    tmp_path = None
     try:
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", newline="\n",
+            dir=parent or ".", prefix=".buffer_store_probe-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp_path = f.name
             json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+        tmp_path = None
     except OSError as e:
         return f"cannot write --json {path}: {e.strerror or e}"
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     return None
 
 
@@ -366,37 +380,41 @@ def main(argv=None):
     except runner.Unavailable as exc:
         print(f"SKIP: {exc}", file=sys.stderr)
         return 77
-    if asm.family(oracle.arch) != "gfx10":
-        print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
-        return 77
-    out = {"arch": oracle.arch, "waves": {}}
-    mismatches = 0
-    for wave in waves:
-        norm = probe_norm(oracle, asm, wave)
-        two = probe_two_comp(oracle, asm, wave)
-        out["waves"][str(wave)] = {"norm": norm, "two_comp": two}
-        sweeps = [(f"{name} {inst}", info) for name, *_ in NORM_FORMATS for inst, info in norm[name].items()]
-        bad_sweeps = [(label, info) for label, info in sweeps if info["exact"] != info["inputs"]]
-        mismatches += len(bad_sweeps)
-        ties = norm["snorm2_ties"]
-        if ties["exact"] != ties["inputs"]:
-            mismatches += 1
-        if two["formats_ok"] != two["formats_total"] or two["triples_ok"] != two["triples_total"]:
-            mismatches += 1
-        print(f"wave{wave} ({oracle.arch}): norm {len(sweeps) - len(bad_sweeps)}/{len(sweeps)} sweeps exact across "
-              f"{len(NORM_FORMATS)} formats, snorm2 ties {ties['exact']}/{ties['inputs']}, "
-              f"2-comp {two['formats_ok']}/{two['formats_total']} formats, "
-              f"{two['triples_ok']}/{two['triples_total']} DST_SEL triples")
-        for label, info in bad_sweeps:
-            first = info["first_mismatch"]
-            print(f"  {label}: {info['exact']}/{info['inputs']} exact, first mismatch f32 {first['f32']} "
-                  f"hw {first['hw']} want {first['want']} (double-rounded {first['double']})")
-    if args.json_out is not None:
-        err = write_json_report(args.json_out, out)
-        if err:
-            print(f"error: {err}", file=sys.stderr)
-            return 1
-    return 1 if mismatches else 0
+    try:
+        if asm.family(oracle.arch) != "gfx10":
+            print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
+            return 77
+        out = {"arch": oracle.arch, "waves": {}}
+        mismatches = 0
+        for wave in waves:
+            norm = probe_norm(oracle, asm, wave)
+            two = probe_two_comp(oracle, asm, wave)
+            out["waves"][str(wave)] = {"norm": norm, "two_comp": two}
+            sweeps = [(f"{name} {inst}", info) for name, *_ in NORM_FORMATS for inst, info in norm[name].items()]
+            bad_sweeps = [(label, info) for label, info in sweeps if info["exact"] != info["inputs"]]
+            mismatches += len(bad_sweeps)
+            ties = norm["snorm2_ties"]
+            if ties["exact"] != ties["inputs"]:
+                mismatches += 1
+            if two["formats_ok"] != two["formats_total"] or two["triples_ok"] != two["triples_total"]:
+                mismatches += 1
+            print(f"wave{wave} ({oracle.arch}): norm {len(sweeps) - len(bad_sweeps)}/{len(sweeps)} sweeps exact across "
+                  f"{len(NORM_FORMATS)} formats, snorm2 ties {ties['exact']}/{ties['inputs']}, "
+                  f"2-comp {two['formats_ok']}/{two['formats_total']} formats, "
+                  f"{two['triples_ok']}/{two['triples_total']} DST_SEL triples")
+            for label, info in bad_sweeps:
+                first = info["first_mismatch"]
+                print(f"  {label}: {info['exact']}/{info['inputs']} exact, first mismatch f32 {first['f32']} "
+                      f"hw {first['hw']} want {first['want']} (double-rounded {first['double']})")
+        if args.json_out is not None:
+            err = write_json_report(args.json_out, out)
+            if err:
+                print(f"error: {err}", file=sys.stderr)
+                return 1
+        return 1 if mismatches else 0
+    finally:
+        if hasattr(oracle, "close"):
+            oracle.close()
 
 
 if __name__ == "__main__":

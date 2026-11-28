@@ -316,3 +316,35 @@ test('single-mip single-layer DDS still shows dimensions without adding inputs',
     assert.equal(controls.children[0].children.length, 0);
     assert.equal(image.src, '/a.png');
 });
+
+test('hostile texture preview URLs and format labels render escaped across both batches', () => {
+    function renderCards(preview, format) {
+        const studio = loadStudio();
+        studio.context.textures = Array.from({ length: 81 },
+            () => ({ name: 'plain.png', format, size: 4, preview }));
+        studio.run('allTextures = textures; renderTexturesGrid();');
+        const grid = studio.elements.get('textures-grid');
+        grid.children.at(-1).onclick();
+        const cards = grid.children.filter(child => child.className === 'tex-card');
+        assert.equal(cards.length, 81);
+        return [cards[0].innerHTML, cards[80].innerHTML];
+    }
+
+    const [plain0, plain80] = renderCards('/textures/x.png', 'PNG Image');
+    const plainShape0 = tagShape(plain0);
+    const plainShape80 = tagShape(plain80);
+    for (const [label, preview, format] of [
+        ['preview', '/textures/' + HOSTILE, 'PNG Image'],
+        ['format', '/textures/x.png', HOSTILE],
+    ]) {
+        const cards = renderCards(preview, format);
+        assert.deepEqual(tagShape(cards[0]), plainShape0, `${label} in initial batch injected markup`);
+        assert.deepEqual(tagShape(cards[1]), plainShape80, `${label} in show-all batch injected markup`);
+        for (const markup of cards) {
+            assert.ok(!markup.includes(HOSTILE), `${label} rendered unescaped hostile string`);
+            if (label === 'format') {
+                assert.ok(visibleText(markup).includes(HOSTILE), 'escaped format must preserve visible text');
+            }
+        }
+    }
+});

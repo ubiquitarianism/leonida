@@ -24,6 +24,9 @@
 
 #include "pe_loader.h"
 
+// The CRT's record of the module TLS index Windows gave this EXE.
+extern "C" unsigned long _tls_index;
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -790,7 +793,8 @@ void test_ga_tls_existing_thread(const fs::path& exe) {
     {
         rt::Loader loader(exe.parent_path());
         rt::Module& m = loader.load(exe);
-        check(m.tls_index != 0, "the /GA fixture gets a module TLS index other than the process EXE's 0");
+        check(m.tls_index != rt::kNoTlsIndex && m.tls_index != 0,
+              "the /GA fixture gets a valid module TLS index other than the process EXE's 0");
         check(m.tls_ga_slot != rt::kNoTlsIndex, "load() rewrites the /GA fixture's index-0 TLS reads");
         get = find_export<int(__cdecl*)()>(m, "ga_tls_get");
         set = find_export<void(__cdecl*)(int)>(m, "ga_tls_set");
@@ -816,6 +820,163 @@ void test_ga_tls_existing_thread(const fs::path& exe) {
     }
     early.join();
     for (HANDLE h : {first.go, first.done, second.go, second.done, started}) CloseHandle(h);
+}
+
+// This EXE's TLS template size, from its own TLS directory: the size of the block Windows puts at its index.
+uint64_t own_tls_template_size() {
+    const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (!dir.Size || !dir.VirtualAddress) return 0;
+    const auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(base + dir.VirtualAddress);
+    return tls->EndAddressOfRawData - tls->StartAddressOfRawData;
+}
+
+// Sets an environment variable for one scope. An empty value removes it.
+struct ScopedEnv {
+    std::string name, previous;
+    bool had = false;
+    ScopedEnv(const char* variable, const char* value) : name(variable) {
+        char buffer[64] = {};
+        size_t size = 0;
+        had = getenv_s(&size, buffer, name.c_str()) == 0 && size > 0;
+        if (had) previous = buffer;
+        _putenv_s(name.c_str(), value);
+    }
+    ~ScopedEnv() { _putenv_s(name.c_str(), had ? previous.c_str() : ""); }
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+};
+
+// BL-1 (docs/boot_leads.md): code built with /GA reads ThreadLocalStoragePointer[0] and takes the block there for
+// its own executable's, while a second mapped module has static TLS of its own. Index 0 of the process belongs to
+// the EXE Windows started: this test here, gta6rt.exe in a real run. ga_tls_address() says where the fixture's code
+// looks for its variable, so the checks name whose block index 0 resolved to. With the rewrite off it is this EXE's
+// block, which is stop 4 of docs/retail_boot_chain.md. As load() leaves the image by default, it is the fixture's
+// own block, on the loading thread and on a thread started later, with tiny_tls.dll's block at its own index
+// beside it and this EXE's block still at index 0 of the thread's TLS array.
+void test_ga_exe_beside_tls_module(const fs::path& exe, const fs::path& dll) {
+    std::printf("\n-- /GA EXE reading index 0 beside a second TLS module --\n");
+    const auto offset_in = [](const void* address, const void* block) {
+        return static_cast<const uint8_t*>(address) - static_cast<const uint8_t*>(block);
+    };
+    void* const host_block = module_tls_slots()[0];
+    const ptrdiff_t sentinel_offset = offset_in(&g_host_tls_sentinel, host_block);
+    check(_tls_index == 0, "this EXE has module TLS index 0, as the process EXE does");
+    check(sentinel_offset >= 0 && static_cast<uint64_t>(sentinel_offset) + sizeof(int) <= own_tls_template_size(),
+          "its own thread-local variable is in the block at index 0");
+
+    // The fixture as built. Only the address is taken: reading or writing there would use this EXE's TLS.
+    ptrdiff_t offset = -1;  // of the fixture's variable in a TLS block
+    {
+        ScopedEnv rewrite_off("LEONIDA_TLS_GA_PATCH", "0");
+        rt::Loader loader(exe.parent_path());
+        rt::Module& game = loader.load(exe);
+        check(game.tls_ga_slot == rt::kNoTlsIndex && game.tls_index != rt::kNoTlsIndex && game.tls_index != 0,
+              "with LEONIDA_TLS_GA_PATCH=0 the fixture is left as built, at a module TLS index that is not 0");
+        const auto address = find_export<void*(__cdecl*)()>(game, "ga_tls_address");
+        offset = offset_in(address(), host_block);
+        check(offset >= 0 && static_cast<uint64_t>(offset) + sizeof(int) <= game.tls_block_size,
+              "as built, its code looks for its variable in the block at index 0, which is this EXE's (stop 4)");
+        check(module_tls_slots()[game.tls_index] == game.tls_block && game.tls_block != host_block,
+              "while its own block sits at its module index, where that code never looks");
+    }
+
+    struct Seen {
+        int host = -1, host_after = -1;
+        int game = -1, lib = -1, game_after = -1, lib_after = -1;
+        void* address = nullptr;    // where the fixture's code looks for its variable
+        void* view0 = nullptr;      // [0] of the array that code reads
+        void* at_index0 = nullptr;  // the thread's real TLS array: index 0, the fixture's index, the DLL's index
+        void* at_game = nullptr;
+        void* at_lib = nullptr;
+        ptrdiff_t sentinel_offset = -1;
+    };
+    uint32_t ga_slot = rt::kNoTlsIndex;
+    {
+        rt::Loader loader(exe.parent_path());
+        rt::Module& game = loader.load(exe);
+        rt::Module& lib = loader.load(dll);
+        loader.initialise();  // from here on thread events run both images' TLS callbacks
+        ga_slot = game.tls_ga_slot;
+        check(game.tls_index != rt::kNoTlsIndex && lib.tls_index != rt::kNoTlsIndex && game.tls_index != 0 &&
+                  lib.tls_index != 0 && game.tls_index != lib.tls_index,
+              "the EXE and the DLL each get a module TLS index of their own, neither of them 0");
+        check(ga_slot != rt::kNoTlsIndex, "by default load() rewrites the EXE's index-0 TLS reads");
+        if (ga_slot == rt::kNoTlsIndex) return;  // nothing below can hold, and this EXE's TLS must not be written
+
+        const auto game_get = find_export<int(__cdecl*)()>(game, "ga_tls_get");
+        const auto game_set = find_export<void(__cdecl*)(int)>(game, "ga_tls_set");
+        const auto game_address = find_export<void*(__cdecl*)()>(game, "ga_tls_address");
+        const auto lib_get = find_export<int(__cdecl*)()>(lib, "tiny_tls_get");
+        const auto lib_set = find_export<void(__cdecl*)(int)>(lib, "tiny_tls_set");
+        const auto lib_watch = find_export<void(__cdecl*)(DWORD)>(lib, "tiny_tls_watch_thread");
+        const auto lib_thread_attach = find_export<int(__cdecl*)()>(lib, "tiny_tls_thread_attach_count");
+        const auto lib_thread_detach = find_export<int(__cdecl*)()>(lib, "tiny_tls_thread_detach_count");
+        const auto lib_value_at_attach = find_export<int(__cdecl*)()>(lib, "tiny_tls_value_at_thread_attach");
+
+        const auto look = [&](Seen& seen, int game_value, int lib_value) {
+            seen.host = g_host_tls_sentinel;
+            seen.game = game_get();
+            seen.lib = lib_get();
+            game_set(game_value);
+            lib_set(lib_value);
+            seen.game_after = game_get();
+            seen.lib_after = lib_get();
+            seen.address = game_address();
+            auto* view = static_cast<void**>(TlsGetValue(ga_slot));
+            seen.view0 = view ? view[0] : nullptr;
+            void** slots = module_tls_slots();
+            seen.at_index0 = slots[0];
+            seen.at_game = slots[game.tls_index];
+            seen.at_lib = slots[lib.tls_index];
+            seen.sentinel_offset = offset_in(&g_host_tls_sentinel, slots[0]);
+            seen.host_after = g_host_tls_sentinel;
+        };
+
+        Seen here;
+        look(here, 11, 22);
+        check(here.game == 7 && here.lib == 7, "the loading thread reads both templates' value 7");
+        check(here.game_after == 11 && here.lib_after == 22, "and its writes to the two modules stay apart");
+        check(here.address == static_cast<uint8_t*>(game.tls_block) + offset,
+              "the EXE's index-0 read resolves to its own block on the loading thread");
+        check(here.view0 == game.tls_block && here.at_game == game.tls_block,
+              "that block is at [0] of the array its code reads and at its module index");
+        check(here.at_lib == lib.tls_block && lib.tls_block != game.tls_block,
+              "the DLL's block is at the DLL's own index");
+        check(here.at_index0 == host_block && here.sentinel_offset == sentinel_offset && here.host == 2 &&
+                  here.host_after == 2,
+              "this EXE's block is still at index 0 of the thread's TLS array, its value unchanged");
+
+        Seen there;
+        int attach_inside = -1;
+        auto body = [&] {
+            attach_inside = lib_thread_attach();
+            look(there, 33, 44);
+        };
+        WatchedThread thread(lib_watch, &body);
+        thread.join();
+        check(there.game == 7 && there.lib == 7,
+              "a thread started after load() reads both templates' value 7, not 11 and 22");
+        check(there.game_after == 33 && there.lib_after == 44, "and its writes to the two modules stay apart");
+        check(there.view0 != nullptr && there.view0 != game.tls_block &&
+                  there.address == static_cast<uint8_t*>(there.view0) + offset,
+              "on that thread the EXE's index-0 read resolves to the thread's own copy");
+        check(there.at_game == there.view0, "which is also at the EXE's module index there");
+        check(there.at_lib != nullptr && there.at_lib != lib.tls_block && there.at_lib != there.view0,
+              "the DLL has a copy of its own at its own index there");
+        check(there.at_index0 != host_block && there.at_index0 != there.view0 &&
+                  there.sentinel_offset == sentinel_offset && there.host == 1 && there.host_after == 1,
+              "index 0 of that thread's TLS array is its copy of this EXE's TLS, its value unchanged");
+        check(attach_inside == 1 && lib_thread_detach() == 1 && lib_value_at_attach() == 7,
+              "the DLL's TLS callback got that thread's attach and detach, with its copy in place");
+        check(game_get() == 11 && lib_get() == 22 && g_host_tls_sentinel == 2,
+              "the loading thread's three values are unchanged by the other thread");
+    }
+    check(module_tls_slots()[0] == host_block && g_host_tls_sentinel == 2,
+          "~Loader leaves this EXE's block at index 0");
+    check(TlsGetValue(ga_slot) == nullptr, "and takes the EXE's view out of the loading thread");
 }
 
 void print_result() {
@@ -857,6 +1018,7 @@ int main(int argc, char** argv) {
         const fs::path ga_exe = tls_dll.parent_path() / "tiny_ga_tls.exe";
         check(fs::exists(ga_exe), "tiny_ga_tls fixture exists");
         if (fs::exists(ga_exe)) test_ga_tls_existing_thread(ga_exe);
+        if (fs::exists(ga_exe)) test_ga_exe_beside_tls_module(ga_exe, tls_dll);
         check(g_host_tls_sentinel == 2, "this EXE's own TLS at module index 0 is untouched");
 
         // The --run path calls cleanup_tls_clones() before ExitProcess because atexit never runs there.

@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -186,6 +187,18 @@ class BootTraceTests(unittest.TestCase):
         self.assertIn("debug strings: 1", text)
         self.assertNotIn("secret game text", text)
 
+    def test_last_startup_record_survives_a_torn_tail(self):
+        self.write(self.startup, [{"kind": "map", "module": "a"},
+                                  {"kind": "debug_string", "text": "private text", "seq": 8, "t": 1.25}])
+        with open(self.startup, "ab") as tail:
+            tail.write(b'{"kind":')
+        report = bt.summarize(bt.parse_startup(self.startup, limit=0), None)
+        self.assertEqual(report["startup"]["last_event"], {"kind": "debug_string", "seq": 8, "t": 1.25})
+        text = bt.format_text(report, 0)
+        self.assertIn("last startup event: debug_string #8 at 1.25 s", text)
+        self.assertNotIn("private text", text)
+        self.assertNotIn("last_event", bt.counts_only(report)["startup"])
+
     def test_truncated_line_is_counted_not_fatal(self):
         self.write(self.startup, STARTUP)
         with open(self.startup, "a", encoding="utf-8", newline="\n") as f:
@@ -194,6 +207,37 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(trace["events"], len(STARTUP))
         self.assertEqual(trace["bad_lines"], 1)
         self.assertEqual(trace["bad_line_numbers"], [len(STARTUP) + 1])
+
+    def test_json_decoder_limits_do_not_hide_later_events(self):
+        digit_limit = sys.int_info.str_digits_check_threshold
+        self.addCleanup(sys.set_int_max_str_digits, sys.get_int_max_str_digits())
+        sys.set_int_max_str_digits(digit_limit)
+        nested_record = '{"kind":"fixture","value":[[0]]}'
+        decode = json.loads
+
+        def decode_row(line):
+            # The nesting depth that triggers an error varies across Python builds.
+            if line == nested_record:
+                raise RecursionError("synthetic decoder nesting limit")
+            return decode(line)
+
+        records = (
+            ("integer digits", '{"kind":"fixture","value":' + "1" * (digit_limit + 1) + '}'),
+            ("nesting", nested_record),
+        )
+        for decoder_limit, record in records:
+            with self.subTest(decoder_limit=decoder_limit):
+                self.write_lines(self.startup, [
+                    '{"kind":"trace_open","pid":7}',
+                    record,
+                    '{"kind":"exit","code":0}',
+                ])
+                with mock.patch.object(bt.json, "loads", side_effect=decode_row):
+                    trace = bt.parse_startup(self.startup)
+                self.assertEqual(trace["events"], 2)
+                self.assertEqual(trace["bad_lines"], 1)
+                self.assertEqual(trace["bad_line_numbers"], [2])
+                self.assertEqual(trace["exit"], 0)
 
     def test_crlf_and_non_object_lines_are_counted(self):
         self.write(
@@ -540,6 +584,7 @@ class BootTraceTests(unittest.TestCase):
         for needle in (
             "pid 123",
             "modules (2)",
+            "game.exe, x.dll (relocated)",
             "dllmain: 1 ok, 1 failed",
             "unimplemented: 2 unique",
             "x.dll!Foo from game.exe+0x10",
@@ -551,6 +596,17 @@ class BootTraceTests(unittest.TestCase):
             "exit: 0",
         ):
             self.assertIn(needle, text)
+
+    def test_file_open_error_histogram_counts_beyond_the_sample_limit(self):
+        self.write(self.startup, [{"kind": "file_open_failed", "error": code, "path": "private-path"}
+                                  for code in (5, 2, 2, 2, True, -1, 2**32, "private-error")])
+        for limit in (0, 1):
+            report = bt.summarize(bt.parse_startup(self.startup, limit), None)
+            counters = bt.counts_only(report)["startup"]
+            self.assertEqual(counters["file_open_errors"], {"5": 1, "2": 3, "unknown": 4})
+            self.assertEqual(sum(counters["file_open_errors"].values()), counters["file_open_failed_count"])
+            self.assertNotIn("private", json.dumps(counters))
+            self.assertEqual(len(report["startup"]["file_open_failed"]), limit)
 
     def test_failed_file_opens_and_skipped_int3_are_listed(self):
         self.write(
@@ -614,6 +670,21 @@ class BootTraceTests(unittest.TestCase):
         self.assertIn(f"  XMem physical page observations: {len(observations)}", text.getvalue())
         return text.getvalue(), startup["xmem_physical_pages"]
 
+    def test_xmem_attribute_samples_and_private_counts(self):
+        self.write(self.startup, [
+            {"kind": "xmem_attributes", "attributes": "0x10", "size": 0, "api": "XMemAlloc", "caller": "private"},
+            {"kind": "xmem_attributes", "attributes": "0x20", "api": "XMemFree"},
+            {"kind": "xmem_attributes", "size": True},
+        ])
+        report = bt.summarize(bt.parse_startup(self.startup, 2), None)
+        samples = report["startup"]["xmem_attributes"]
+        self.assertEqual([r["size"] for r in samples], [0, None])
+        self.assertIn("XMemAlloc attributes 0x10 size 0", bt.format_text(report, 2))
+        counts = bt.counts_only(report)
+        self.assertEqual(counts["startup"]["xmem_attributes_count"], 3)
+        self.assertNotIn("private", json.dumps(counts))
+        self.assertEqual(bt.parse_startup(self.startup, 0)["xmem_attributes"], [])
+
     def test_single_xmem_physical_pages_observation(self):
         observation = {
             "api": "XMemAllocatePhysicalPages", "attributes": "0x0", "pages": 0, "caller": "0x20",
@@ -646,6 +717,19 @@ class BootTraceTests(unittest.TestCase):
                 else:
                     self.assertNotIn("more", text)
 
+    def test_counts_only_includes_all_xmem_physical_page_observations(self):
+        self.write(self.startup, [
+            {"kind": "xmem_physical_pages", "api": "private-api", "attributes": "0x20",
+             "pages": 4, "caller": "private-caller"},
+        ] * 3)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main([self.startup, "--counts-only", "--limit", "1"]), 0)
+        summary = json.loads(out.getvalue())["startup"]
+        self.assertEqual(summary["xmem_physical_pages_count"], 3)
+        self.assertNotIn("xmem_physical_pages", summary)
+        self.assertNotIn("private-", out.getvalue())
+
     def test_xmem_physical_pages_handles_missing_and_malformed_fields(self):
         unknown = {"api": None, "attributes": None, "pages": None, "caller": None}
         nbsp_caller = "fixture\u00a0one.dll+0x20"
@@ -664,6 +748,73 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(text.count("    ? attributes ? requested ? pages from ?\n"), 2)
         self.assertIn("    XMemAllocatePhysicalPages attributes 0x10 requested ? pages from fixture.dll+0x50\n", text)
         self.assertIn(f"    XMemAllocatePhysicalPages attributes 0x20 requested 4 pages from {nbsp_caller}\n", text)
+
+    def test_pipeline_timing_counts_overlapping_compiles_and_waits(self):
+        self.write_lines(self.d3d12, [
+            D3D12[1],
+            "fixture.exe : [rt] pipeline-compile-begin trigger=draw tid=7 bytes=512 "
+            "variant=0 begin_ms=100 key=synthetic-key shaders=private_vs,private_ps",
+            "[rt] pipeline-compile-begin trigger=draw tid=8 bytes=512 "
+            "variant=0 begin_ms=101 key=synthetic-key shaders=private_vs,private_ps",
+            "[rt] pipeline-compile trigger=draw tid=8 start_us=1500 us=800 hit=1 bytes=512 "
+            "variant=0 result=0 end_ms=102 key=synthetic-key shaders=private_vs,private_ps",
+            "[rt] pipeline-compile trigger=dispatch tid=9 start_us=1600 us=5000 hit=-1 bytes=512 "
+            "variant=0 result=-4 end_ms=106 key=other-key shaders=private_cs",
+            "[rt] pipeline-use trigger=draw tid=10 us=6000 ready=0 end_ms=107",
+            "[rt] pipeline-use trigger=draw tid=11 us=1000 ready=1 end_ms=107",
+        ])
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["ignored_lines"], 0)
+        self.assertEqual(trace["pipeline_timing"], {
+            "started": 2, "completed": 2, "completions_without_start": 1, "non_success_results": 1,
+            "cache_hits": 1, "max_compile_us": 5000, "logged_waits": 2, "waits_not_ready": 1,
+            "max_wait_us": 6000, "starts_without_completion": 1,
+        })
+        summary = bt.summarize(None, trace)
+        text = bt.format_text(summary, 10)
+        safe_json = json.dumps(bt.counts_only(summary))
+        self.assertIn("1 without a recorded completion", text)
+        self.assertIn("longest 6000 us", text)
+        self.assertEqual(bt.counts_only(summary)["d3d12"]["pipeline_timing"], trace["pipeline_timing"])
+        for raw in ("private_", "synthetic-key", "other-key"):
+            self.assertNotIn(raw, text)
+            self.assertNotIn(raw, safe_json)
+
+    def test_frame_pacing_summary_parsed_formatted_and_kept_in_counts_only(self):
+        self.write_lines(self.d3d12, [
+            "[d3d12-trace] #1 XboxPresentation::PresentX ok",
+            "gta6rt.exe : [rt] present: pacing summary frames=101 samples=100 target_us=16667 "
+            "mean_us=16712.5 drift_us=+45.5 p50_us=16667 p95_us=17100 p99_us=18200 "
+            "latency_samples=101 latency_p50_us=4200 latency_p95_us=6100 latency_p99_us=7900",
+        ])
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["ignored_lines"], 0)
+        self.assertEqual(trace["frame_pacing"], {
+            "frames": 101,
+            "samples": 100,
+            "target_us": 16667,
+            "mean_us": 16712.5,
+            "drift_us": 45.5,
+            "p50_us": 16667,
+            "p95_us": 17100,
+            "p99_us": 18200,
+            "latency_samples": 101,
+            "latency_p50_us": 4200,
+            "latency_p95_us": 6100,
+            "latency_p99_us": 7900,
+        })
+        text = bt.format_text(bt.summarize(None, trace), 10)
+        self.assertIn(
+            "frame pacing: 101 frame(s), 100 interval(s), target 16667 us, mean 16712.5 us (drift +45.5 us), "
+            "p50/p95/p99 16667/17100/18200 us; origin-to-present p50/p95/p99 4200/6100/7900 us",
+            text,
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main(["--d3d12", self.d3d12, "--counts-only"]), 0)
+        counts = json.loads(out.getvalue())
+        self.assertEqual(counts["d3d12"]["frame_pacing"]["drift_us"], 45.5)
+        self.assertEqual(counts["d3d12"]["frame_pacing"]["p99_us"], 18200)
 
 
 if __name__ == "__main__":

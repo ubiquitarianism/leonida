@@ -1,0 +1,83 @@
+GPU:        NVIDIA GeForce RTX 3060 Ti (Ampere / GA104, 8 GB, PCI 10de:2486)
+Driver:     NVIDIA 621.14 (proprietary), Vulkan 1.4.357
+Subgroup:   32..32 (default 32)
+OS:         Windows 11 Pro, build 26200.9974
+Commit:     3f81d46ac01021bd7517f0cce153f4283bc8dd17 (main, 2026-11-25)
+            Replaces the record of 3aa975421 (2026-11-24).
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools, Windows, AMDGPU target),
+            SPIRV-Tools v2026.4 and glslang (conda-forge),
+            Khronos Vulkan-Headers fetched by CMake (no Vulkan SDK installed),
+            VK_LAYER_KHRONOS_validation 1.4.357 (conda-forge, found through
+            VK_ADD_LAYER_PATH),
+            CMake 4.4.5 + Ninja 1.13.2, MSVC 19.44.35211 (toolset 14.44.35207),
+            Windows SDK 10.0.26100.0, Python 3.13.14
+CPU:        AMD Ryzen 5 5600X
+RAM:        31.92 GiB reported
+
+run_gpu_tests.py:
+            273/273 shaders translated and passed spirv-val in both modes.
+            Native: 209/263 passed, 53 skipped, 1 failed.
+            LEONIDA_W64_EMULATE=1: 243/263 passed, 19 skipped, 1 failed.
+
+Failed:     cs_imgatomic_ext, natively and emulated: "6 of 64 sint words
+            differ; first word 32: got 0x0badf00d, expected 0x00000101"
+            (pull request 1518 addresses it).
+
+Skipped:    Native: 34 "no 64-wide (compute) subgroup on this device",
+            18 cases run by other test programs (d3d12_*_test,
+            w64_graphics.py), 1 "cannot require a 64-wide fragment subgroup".
+            Emulated: the same 18, plus the 64-wide fragment one.
+
+Runtime:    RelWithDebInfo, Windows native build (ctest -j 6).
+            403 registered; 391 passed, 12 skipped, 0 failed.
+            With LEONIDA_VK_VALIDATION=1: 391 passed, 12 skipped, 0 failed.
+
+Runtime skips (12):
+  shader_library_corpus, bink_decode, bink_abi, bink_play_headless,
+  bink_audio, fsr_dispatch, bvh_builder, vk_sync_validation,
+  d3d12_boot_movie, d3d12_first_light, d3d12_rgb9e5_rtv,
+  d3d12_sparse_queue_family_contract.
+  With LEONIDA_VK_VALIDATION=1, vk_sync_validation runs and passes, and
+  xbox_present skips itself on the sRGB swapchain STORAGE message it
+  knows (see "Known problems" in docs/testing.md).
+
+GPU-assisted validation (VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation and
+VK_KHRONOS_VALIDATION_GPUAV_ENABLE=1 for every test program run_gpu_tests.py
+starts, 284 runs in each mode):
+            The same results as above. Seven fixtures print a validation
+            error, natively and emulated alike:
+            - cs_pk_mul_lo_const: VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819,
+              6 times (pull request 481).
+            - cs_lds_atomics_ext, cs_lds_b64_cmpst, cs_lds_xchg64_ext,
+              cs_w32_fcmpswap, cs_w32_misc_ext, cs_w32_new_ops:
+              SharedMemoryDataRace-RaceOnLoadStoreVsAtomic, once each
+              (pull request 1352).
+            The 32 wave64 fixtures that printed RaceOnStore for the shared
+            sink word on 4a50cafc7 no longer do (pull request 1110).
+
+Notes:
+- wave64 VS/PS/GS on this 32-wide-subgroup device: tier A: 1, tier C: 1
+  (tier C is not exact there; see wave64_graphics_reasons in the index).
+- The 3aa975421 record listed d3d12_execute_indirect_validation as failed
+  (issue 504). It passes since pull request 1066.
+- Two runtime tests failed once each in other runs of this commit and pass
+  when run alone: xmem_no_write_watch ("writing to 512 of them charges about
+  those 512 pages", 1 of 3 runs of xmem_test alone as well; pull request
+  1316) and, on b4b7756e8 with other GPU work running beside ctest,
+  d3d12_queue_handover ("HANG in case two threads signalling and
+  releasing", 6 of 6 alone pass).
+- One native run of run_gpu_tests.py reported cs_exec_const as failed: the
+  program exited 0 and printed its device line without its out[0..7] line.
+  A second native run passed it, and so did 800 runs of
+  "vk_compute_test cs_exec_const.spv 1 dump" (400 of them under CPU load),
+  every one with the expected words. Not explained.
+- Built with cmake -S runtime -B <build> -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+  -DLEONIDA_VULKAN_HEADERS_FETCH=ON from a vcvars64 prompt, with llvm-mc,
+  spirv-as, spirv-val and glslangValidator on PATH.
+- xma_decoder not built (no cargo), GameInput shim not built (no SDL3).
+- Upload heaps in system memory (no Resizable BAR).
+- No game files involved: run_gpu_tests.py assembles its own RDNA2 fixtures
+  with llvm-mc and runs the translated SPIR-V on the Vulkan device.
+- AI-assisted (Claude Code): built main and ran ctest and run_gpu_tests.py,
+  native and under LEONIDA_W64_EMULATE=1, on the owner's machine. The numbers
+  are the runners' own output. No game data, nothing online.

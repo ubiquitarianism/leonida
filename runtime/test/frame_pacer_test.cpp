@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <future>
 #include <limits>
+#include <memory>
 #include <thread>
 
 using namespace leonida;
@@ -35,6 +36,23 @@ std::future<Result> wait_async(FramePacer& pacer, std::uint32_t timeout_ms) {
 // True when the wait is still blocked after real time has had a chance to let it through.
 bool blocked(std::future<Result>& f) {
     return f.wait_for(std::chrono::milliseconds(40)) == std::future_status::timeout;
+}
+
+// True when the wait has returned; otherwise the pacer is suspended, which lets the waiter go, so that a failure ends
+// the test instead of hanging it on the fake clock.
+bool finishes(std::future<Result>& f, FramePacer& pacer) {
+    if (f.wait_for(std::chrono::seconds(10)) == std::future_status::ready) return true;
+    pacer.suspend();
+    return false;
+}
+
+// Display time of `token`'s frame, or no_deadline when the pacer has none (not shown, or replaced and never shown).
+std::uint64_t display_time(FramePacer& pacer, std::uint64_t token) {
+    std::uint32_t count = 1;
+    FrameStatistic stat{};
+    if (pacer.get_frame_statistics(token, stat_display, &count, &stat) != pacer_hr::ok || count != 1)
+        return no_deadline;
+    return stat.time_us;
 }
 
 bool setup(FramePacer& pacer, std::uint32_t latency, std::uint32_t offset = 0) {
@@ -86,6 +104,24 @@ int main() {
         EXPECT(pacer.tokens_issued() == 2);
     }
 
+    {
+        ManualFrameClock clock;
+        auto tokens = std::make_shared<FrameTokenSource>();
+        FramePacer pacer(clock, tokens);
+        EXPECT(pacer.token_source() == tokens);
+        const std::uint64_t outside = tokens->issue();
+        EXPECT(outside == 1 && pacer.tokens_issued() == 1);
+        EXPECT(pacer.check_present_token(outside) == pacer_hr::ok);
+        EXPECT(pacer.check_present_token(outside + 1) == pacer_hr::invalid_arg);
+        EXPECT(setup(pacer, 1));
+        clock.advance_us(period);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == outside + 1);
+        EXPECT(tokens->issue() == outside + 2);
+        EXPECT(pacer.check_present_token(outside + 2) == pacer_hr::ok);
+        EXPECT(pacer.check_present_token(outside + 3) == pacer_hr::invalid_arg);
+    }
+
     // An offset delays the event inside the period: origin n comes at n * period + offset.
     {
         ManualFrameClock clock;
@@ -134,6 +170,51 @@ int main() {
         EXPECT(blocked(next));
         clock.advance_us(period / 2);
         EXPECT(next.get().token == 2);
+    }
+
+    // wait_flag_current_token never blocks or times out: a fresh token for the newest passed origin, registered or not.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock, nullptr, true);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &token) == pacer_hr::ok &&
+               token == 1);
+        EXPECT(setup(pacer, 1));
+        clock.advance_us(period * 2 + period / 4);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &token) == pacer_hr::ok &&
+               token == 2);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &token) == pacer_hr::ok &&
+               token == 3);
+        std::uint32_t count = 1;
+        FrameStatistic stat;
+        EXPECT(pacer.get_frame_statistics(3, stat_frame_event, &count, &stat) == pacer_hr::ok);
+        EXPECT(stat.time_us == period * 2);
+        auto next = wait_async(pacer, infinite_timeout_ms);
+        EXPECT(blocked(next));
+        clock.advance_us(period * 3 / 4);
+        EXPECT(next.get().token == 4);
+    }
+
+    // A current-token poll before the first origin offset still issues immediately.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock, nullptr, true);
+        const std::uint32_t offset = period / 3;
+        const std::uint64_t poll_us = offset / 2;
+        EXPECT(pacer.set_frame_interval(period, 1, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, offset, 0) == pacer_hr::ok);
+        clock.advance_us(poll_us);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &token) == pacer_hr::ok);
+        pacer.commit_present_token(token, 1);
+        std::uint32_t count = 2;
+        FrameStatistic stats[2];
+        EXPECT(pacer.get_frame_statistics(token, stat_frame_event | stat_present, &count, stats) == pacer_hr::ok);
+        EXPECT(count == 2 && stats[0].time_us == poll_us && stats[1].time_us == poll_us);
+        clock.advance_us(period - poll_us);
+        count = 1;
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, stats) == pacer_hr::ok);
+        EXPECT(count == 1 && stats[0].time_us == period);
     }
 
     // Timeouts: 0 polls, a finite one counts fake time, the token is left alone, and a later wait still works.
@@ -212,6 +293,94 @@ int main() {
         EXPECT(pacer.frames_in_flight() == 1);
     }
 
+    // Presents beyond the latency while the event is armed (several presents per wait): at most `latency` frames are
+    // in flight. A present into a full queue replaces the newest queued frame (mailbox) and the older ones keep their
+    // vblanks, so the next wait passes when the oldest is shown, within one period and not 999. Latency 1, 2 and 3.
+    for (std::uint32_t latency = 1; latency <= 3; ++latency) {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, latency));
+        clock.advance_us(period);  // origin 1
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 1);
+
+        // 1000 blank presents with no wait between them: they queue for vblanks 2 .. latency + 1, and no further.
+        for (int i = 0; i < 1000; ++i) pacer.note_untokened_present();
+        EXPECT(pacer.frames_in_flight() == latency);
+        auto wait = wait_async(pacer, infinite_timeout_ms);
+        EXPECT(blocked(wait));
+        clock.advance_us(period);  // vblank 2 shows the oldest: the wait passes with origin 2, not 999 periods later
+        EXPECT(finishes(wait, pacer));
+        Result r = wait.get();
+        EXPECT(r.hr == pacer_hr::ok && r.token == 2);
+        EXPECT(pacer.frames_in_flight() == latency - 1);
+        clock.advance_us(std::uint64_t(period) * (latency - 1));  // vblank latency + 1 shows the newest
+        EXPECT(pacer.frames_in_flight() == 0);
+
+        // Tokened frames: latency + 1 tokens handed out with nothing in flight, then all presented at once.
+        std::uint64_t tokens[4] = {};
+        for (std::uint32_t i = 0; i <= latency; ++i) {
+            clock.advance_us(period);
+            EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &tokens[i]) == pacer_hr::ok);
+            EXPECT(tokens[i] == 3 + i);
+        }
+        const std::uint64_t now = std::uint64_t(period) * (2 * latency + 2);
+        for (std::uint32_t i = 0; i < latency; ++i) {  // `latency` presents fill the queue: nothing is replaced
+            EXPECT(pacer.check_present_token(tokens[i]) == pacer_hr::ok);
+            pacer.commit_present_token(tokens[i], 1);
+        }
+        EXPECT(pacer.frames_in_flight() == latency);
+        pacer.commit_present_token(tokens[latency], 1);  // replaces the newest queued frame and takes its vblank
+        EXPECT(pacer.frames_in_flight() == latency);
+        wait = wait_async(pacer, infinite_timeout_ms);
+        EXPECT(blocked(wait));
+        clock.advance_us(period);
+        EXPECT(finishes(wait, pacer));
+        r = wait.get();
+        EXPECT(r.hr == pacer_hr::ok && r.token == latency + 4);
+        clock.advance_us(std::uint64_t(period) * (latency - 1));
+        EXPECT(pacer.frames_in_flight() == 0);
+        for (std::uint32_t i = 0; i + 1 < latency; ++i)  // the older frames keep their vblanks
+            EXPECT(display_time(pacer, tokens[i]) == now + std::uint64_t(period) * (i + 1));
+        EXPECT(display_time(pacer, tokens[latency - 1]) == no_deadline);  // replaced: never shown
+        EXPECT(display_time(pacer, tokens[latency]) == now + std::uint64_t(period) * latency);
+
+        // One present per wait, each a quarter period after its origin: nothing is replaced, each frame is shown at the
+        // vblank after its origin, and that vblank is the next origin.
+        token = r.token;
+        clock.advance_us(period);  // back on an origin
+        for (int frame = 0; frame < 8; ++frame) {
+            const std::uint64_t origin = clock.now_us();
+            std::uint64_t next = 0;
+            EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &next) == pacer_hr::ok && next == token + 1);
+            token = next;
+            clock.advance_us(period / 4);
+            pacer.commit_present_token(token, 1);
+            EXPECT(pacer.frames_in_flight() == 1);
+            clock.advance_us(period - period / 4);
+            EXPECT(pacer.frames_in_flight() == 0);
+            EXPECT(display_time(pacer, token) == origin + period);
+        }
+    }
+
+    // SetFrameIntervalX lowering the latency below the frames already queued: the next present cuts the queue back
+    // to the new latency from the newest end, and the oldest frame keeps its vblank.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 3));
+        for (int i = 0; i < 3; ++i) pacer.note_untokened_present();  // vblanks 1, 2 and 3
+        EXPECT(pacer.frames_in_flight() == 3);
+        EXPECT(pacer.set_frame_interval(period, 1, 0) == pacer_hr::ok);
+        EXPECT(pacer.frames_in_flight() == 3);  // already queued: left alone until the next present
+        pacer.note_untokened_present();
+        EXPECT(pacer.frames_in_flight() == 1);
+        clock.advance_us(period - 1);
+        EXPECT(pacer.frames_in_flight() == 1);
+        clock.advance_us(1);  // vblank 1, the oldest frame's
+        EXPECT(pacer.frames_in_flight() == 0);
+    }
+
     // Tokens: only one that was never handed out is refused. Null, stale and repeated ones are accepted and reported
     // as such, so a title that presents with Token = 0, twice with one token, or out of order does not freeze.
     {
@@ -267,6 +436,82 @@ int main() {
         EXPECT(pacer.schedule_frame_event(frame_event_origin, period + 1000, 0) == pacer_hr::ok);
         EXPECT(pacer.set_frame_interval(period / 2, 1, 0) == pacer_hr::ok);
         EXPECT(pacer.registered());
+    }
+
+    // Preserve already displayed frames and move each remaining frame to a vblank on the rebased grid.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 3));
+        clock.advance_us(period);
+        std::uint64_t first = 0, second = 0, third = 0, fourth = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &first) == pacer_hr::ok);
+        pacer.commit_present_token(first, 1);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, frame_wait_flag_token_on_timeout, &second) ==
+               pacer_hr::false_);
+        pacer.commit_present_token(second, 1);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, frame_wait_flag_token_on_timeout, &third) ==
+               pacer_hr::false_);
+        pacer.commit_present_token(third, 1);
+        EXPECT(pacer.frames_in_flight() == 3);
+
+        constexpr auto new_epoch = 2 * period + period / 4;
+        constexpr auto new_period = period / 2;
+        clock.advance_us(new_epoch - period);
+        EXPECT(pacer.set_frame_interval(new_period, 3, 0) == pacer_hr::ok);
+        EXPECT(pacer.frames_in_flight() == 2);
+
+        const auto displayed_at = [&](std::uint64_t token) {
+            FrameStatistic stats;
+            std::uint32_t count = 1;
+            return pacer.get_frame_statistics(token, stat_display, &count, &stats) == pacer_hr::ok ?
+                   stats.time_us : no_deadline;
+        };
+        EXPECT(displayed_at(first) == 2 * period);
+        EXPECT(displayed_at(second) == no_deadline);
+        clock.advance_us(new_period);
+        EXPECT(displayed_at(second) == new_epoch + new_period);
+        EXPECT(displayed_at(third) == no_deadline);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &fourth) == pacer_hr::ok);
+        pacer.commit_present_token(fourth, 1);
+        clock.advance_us(new_period);
+        EXPECT(displayed_at(third) == new_epoch + 2 * new_period);
+        EXPECT(displayed_at(fourth) == no_deadline);
+        clock.advance_us(new_period);
+        EXPECT(displayed_at(fourth) == new_epoch + 3 * new_period);
+    }
+
+    // Reapplying the same interval leaves a queued frame on its original display deadline.
+    {
+        constexpr std::uint32_t unchanged_period = 16000;
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(pacer.set_frame_interval(unchanged_period, 3, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, 0, 0) == pacer_hr::ok);
+        clock.advance_us(unchanged_period);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok);
+        pacer.commit_present_token(token, 1);
+        clock.advance_us(unchanged_period / 2);
+        EXPECT(pacer.set_frame_interval(unchanged_period, 3, 0) == pacer_hr::ok);
+
+        FrameStatistic stat;
+        std::uint32_t count = 1;
+        clock.advance_us(unchanged_period / 2 - 1);
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, &stat) == pacer_hr::false_ && count == 0);
+        count = 1;
+        clock.advance_us(1);
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, &stat) == pacer_hr::ok);
+        EXPECT(stat.time_us == 2 * unchanged_period);
+
+        // Origin events still use the epoch set by the latest call.
+        std::uint64_t next = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &next) == pacer_hr::timeout);
+        clock.advance_us(unchanged_period / 2);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &next) == pacer_hr::ok);
+        count = 1;
+        EXPECT(pacer.get_frame_statistics(next, stat_frame_event, &count, &stat) == pacer_hr::ok);
+        EXPECT(stat.time_us == 2 * unchanged_period + unchanged_period / 2);
     }
 
     // Scheduling inside a period, before the offset has passed: that period's origin is still to come.
@@ -625,6 +870,152 @@ int main() {
         // Origin wait at tick 2 advances consecutively after the early-started token 1.
         std::uint64_t tok2 = 0;
         EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &tok2) == pacer_hr::ok && tok2 == 2);
+    }
+
+    // BL-6: frame pacing drift reporting (p50/p95/p99 frame times, mean drift vs target interval,
+    // origin-to-present latency, ring-buffer wrap-around, suspend/resume gap exclusion, and uncapped mode).
+    {
+        auto near = [](double a, double b) { return (a > b ? a - b : b - a) < 1e-6; };
+
+        // 1) Empty and single-frame edge cases.
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 2));
+        FramePacingSummary s0 = pacer.pacing_summary();
+        EXPECT(s0.frames == 0 && s0.samples == 0 && s0.target_interval_us == period);
+        EXPECT(near(s0.mean_us, 0.0) && near(s0.drift_us, 0.0));
+        EXPECT(s0.p50_us == 0 && s0.p95_us == 0 && s0.p99_us == 0 && s0.latency_samples == 0);
+
+        clock.advance_us(period);
+        std::uint64_t tok = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &tok) == pacer_hr::ok);
+        clock.advance_us(2000);
+        pacer.commit_present_token(tok, 1);
+        FramePacingSummary s1 = pacer.pacing_summary();
+        EXPECT(s1.frames == 1 && s1.samples == 0 && s1.latency_samples == 1 && s1.latency_p50_us == 2000);
+        EXPECT(near(s1.mean_us, 0.0) && near(s1.drift_us, 0.0));
+
+        // 2) 100 known intervals (16000 + 100*i us for i = 1..100) and known origin->present latencies:
+        //    mean = 16000 + 5050 = 21050.0 us, drift = +5050.0 us,
+        //    nearest-rank p50 = 16000 + 50*100 = 21000, p95 = 25500, p99 = 25900.
+        ManualFrameClock clock2;
+        FramePacer pacer2(clock2);
+        EXPECT(setup(pacer2, 4));
+        // Present an anchor frame first at t = period + 1000 (latency = 1000 us).
+        clock2.advance_us(period);
+        std::uint64_t t = 0;
+        EXPECT(pacer2.wait_frame_event(frame_event_origin, 0, 0, &t) == pacer_hr::ok);
+        clock2.advance_us(1000);
+        pacer2.commit_present_token(t, 1);
+        for (std::uint64_t i = 1; i <= 100; ++i) {
+            const std::uint64_t dt = period + i * 100;
+            clock2.advance_us(dt);
+            // Issue token after dt - (i * 50)? Simpler: issue token at origin (which passed), present immediately.
+            std::uint64_t tok_i = 0;
+            EXPECT(pacer2.wait_frame_event(frame_event_origin, 0, 0, &tok_i) == pacer_hr::ok);
+            pacer2.commit_present_token(tok_i, 1);
+        }
+        const FramePacingSummary s100 = pacer2.pacing_summary();
+        EXPECT(s100.frames == 101 && s100.samples == 100 && s100.target_interval_us == period);
+        EXPECT(near(s100.mean_us, 21050.0));
+        EXPECT(near(s100.drift_us, 5050.0));
+        EXPECT(s100.p50_us == 21000 && s100.p95_us == 25500 && s100.p99_us == 25900);
+        EXPECT(s100.latency_samples == 101);
+
+        // 3) Negative drift (untokened/early presents faster than target period) + exact origin-to-present latency.
+        ManualFrameClock clock3;
+        FramePacer pacer3(clock3);
+        EXPECT(setup(pacer3, 4));
+        clock3.advance_us(period);
+        EXPECT(pacer3.wait_frame_event(frame_event_origin, 0, 0, &t) == pacer_hr::ok);
+        clock3.advance_us(3000);  // latency = 3000
+        pacer3.commit_present_token(t, 1);
+        clock3.advance_us(10000);  // dt = 10000 (< 16000) -> drift = -6000
+        pacer3.note_untokened_present();
+        const FramePacingSummary sneg = pacer3.pacing_summary();
+        EXPECT(sneg.frames == 2 && sneg.samples == 1 && sneg.target_interval_us == period);
+        EXPECT(near(sneg.mean_us, 10000.0) && near(sneg.drift_us, -6000.0));
+        EXPECT(sneg.p50_us == 10000 && sneg.p95_us == 10000 && sneg.p99_us == 10000);
+        EXPECT(sneg.latency_samples == 1 && sneg.latency_p50_us == 3000 && sneg.latency_p99_us == 3000);
+
+        // 4) Suspend/resume gap is excluded from frame intervals.
+        pacer3.suspend();
+        clock3.advance_us(5'000'000);  // 5 second pause while suspended
+        pacer3.resume();
+        EXPECT(setup(pacer3, 2));
+        clock3.advance_us(period);
+        EXPECT(pacer3.wait_frame_event(frame_event_origin, 0, 0, &t) == pacer_hr::ok);
+        pacer3.commit_present_token(t, 1);
+        const FramePacingSummary ssusp = pacer3.pacing_summary();
+        EXPECT(ssusp.frames == 3 && ssusp.samples == 1 && ssusp.p99_us == 10000);  // 5s gap not recorded
+
+        // 5) Ring-buffer wrap-around: fill with slow 32000 us frames, then overwrite entire window with steady 16000 us.
+        ManualFrameClock clock4;
+        FramePacer pacer4(clock4);
+        EXPECT(setup(pacer4, 2));
+        clock4.advance_us(period);
+        EXPECT(pacer4.wait_frame_event(frame_event_origin, 0, 0, &t) == pacer_hr::ok);
+        pacer4.commit_present_token(t, 1);
+        for (std::size_t i = 0; i < frame_pacing_window; ++i) {
+            clock4.advance_us(period * 2);
+            EXPECT(pacer4.wait_frame_event(frame_event_origin, 0, 0, &t) == pacer_hr::ok);
+            pacer4.commit_present_token(t, 1);
+        }
+        const FramePacingSummary slow = pacer4.pacing_summary();
+        EXPECT(slow.samples == frame_pacing_window && near(slow.mean_us, double(period * 2)) &&
+               near(slow.drift_us, double(period)));
+        for (std::size_t i = 0; i < frame_pacing_window; ++i) {
+            clock4.advance_us(period);
+            EXPECT(pacer4.wait_frame_event(frame_event_origin, 0, 0, &t) == pacer_hr::ok);
+            pacer4.commit_present_token(t, 1);
+        }
+        const FramePacingSummary steady = pacer4.pacing_summary();
+        EXPECT(steady.frames == 1 + 2 * frame_pacing_window && steady.samples == frame_pacing_window);
+        EXPECT(near(steady.mean_us, double(period)) && near(steady.drift_us, 0.0));
+        EXPECT(steady.p50_us == period && steady.p95_us == period && steady.p99_us == period);
+
+        // 6) Uncapped mode: target_interval_us == 0 and drift_us == 0 while intervals are still tracked.
+        pacer4.set_uncapped(true);
+        const FramePacingSummary uncap = pacer4.pacing_summary();
+        EXPECT(uncap.target_interval_us == 0 && near(uncap.drift_us, 0.0) && uncap.p50_us == period);
+    }
+
+    // BL-6 with the bounded queue: the statistics are of PresentX calls, so a frame replaced in a full queue (never
+    // shown) still counts as a present, with its real present-to-present interval; the replacement adds no interval,
+    // removes none, and the frames that are shown keep their vblanks. Latency 1, so every extra present replaces.
+    {
+        auto near = [](double a, double b) { return (a > b ? a - b : b - a) < 1e-6; };
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 1));
+        clock.advance_us(period);  // origin 1
+        std::uint64_t tok1 = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &tok1) == pacer_hr::ok && tok1 == 1);
+        clock.advance_us(1000);
+        pacer.commit_present_token(tok1, 1);  // latency 1000; queued for vblank 2
+        clock.advance_us(2000);
+        pacer.note_untokened_present();  // interval 2000; replaces tok1 and takes vblank 2
+        clock.advance_us(4000);
+        pacer.note_untokened_present();  // interval 4000; replaces the blank frame
+        EXPECT(pacer.frames_in_flight() == 1);
+        clock.advance_us(period - 7000);  // vblank 2, origin 2
+        EXPECT(pacer.frames_in_flight() == 0);
+        EXPECT(display_time(pacer, tok1) == no_deadline);  // replaced: never shown
+        std::uint64_t tok2 = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &tok2) == pacer_hr::ok && tok2 == 2);
+        clock.advance_us(8000);
+        pacer.commit_present_token(tok2, 1);  // interval period + 1000; latency 8000; vblank 3
+        clock.advance_us(period - 8000);
+        EXPECT(display_time(pacer, tok2) == 3 * std::uint64_t(period));
+
+        // 4 presents (2 of them replaced), 3 intervals {2000, 4000, 17000}: nearest-rank p50 4000, p95 and p99 17000.
+        const FramePacingSummary s = pacer.pacing_summary();
+        EXPECT(s.frames == 4 && s.samples == 3 && s.target_interval_us == period);
+        EXPECT(near(s.mean_us, (2000.0 + 4000.0 + period + 1000.0) / 3.0));
+        EXPECT(near(s.drift_us, s.mean_us - double(period)));
+        EXPECT(s.p50_us == 4000 && s.p95_us == period + 1000 && s.p99_us == period + 1000);
+        // Origin-to-present latencies of the tokened presents, the replaced tok1 included: {1000, 8000}.
+        EXPECT(s.latency_samples == 2 && s.latency_p50_us == 1000 && s.latency_p99_us == 8000);
     }
 
     std::printf("frame_pacer_test: all cases pass\n");

@@ -81,5 +81,38 @@ number and links nowhere now, including the two this page used to send you to: #
 - Fill in the [template](.github/pull_request_template.md): the claim, `Depends on:`, `Fixes: #N` for an issue it
   closes, what you tested, `GPUs tested:` (vendor, model, driver and OS) and whether it was AI-assisted.
 - A pull request that conflicts with `main` is labeled `needs rebase` (`tools/pr_conflict_label.py`, run on every
-  push to `main` and to the pull request, and hourly). Rebase it on `main` yourself; the label goes once it merges
-  cleanly. Reviews start with the pull requests that do.
+  push to `main` and hourly). Rebase it on `main` yourself; the label goes within the hour once it merges cleanly. Reviews start with the pull requests that do.
+
+## Maintainer quick guide
+
+How maintainers review and merge pull requests.
+
+**Before you start**
+
+- Read every comment on the pull request first. An open request from a maintainer means waiting for the author.
+- Check the pull request's head right before you act: authors often push while you review.
+
+**Is it mergeable?**
+
+- It is claimed in [the coordination issue][claims] by the pull request's author.
+- One topic, not a duplicate of another open pull request. If two fix the same thing, the better one wins.
+- A new test that fails on `main` and passes with the pull request.
+- No game data: `python -I scripts/check_no_game_data.py <files>`.
+
+**Test it yourself**
+
+- Merge `main` into the branch. Never rebase, never force-push.
+- Run the pull request's own tests, then the full suite once, and compare with plain `main`.
+- Don't wait for GitHub CI: the queue takes hours.
+
+**Then**
+
+- Ready: merge it (one pull request at a time) with a short comment saying what you tested and on which GPU.
+- Not ready: comment with each blocker, one line each.
+- A duplicate, or already in `main`: close it with a kind comment that links what landed.
+
+**Don't**
+
+- Merge your own pull request (exceptions: a fix for a regression a merge just caused, or something important).
+- Post game content (logs, screenshots, shader dumps).
+- Forget to say you used AI.

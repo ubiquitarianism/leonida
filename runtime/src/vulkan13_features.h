@@ -32,12 +32,17 @@ public:
     Vulkan13Features& operator=(const Vulkan13Features&) = delete;
 
     bool core = false;               // a Vulkan 1.3 device: the features are core
+    bool pipeline_cache_control = false;
+    bool enable_pipeline_cache_control = false;
     bool dynamic_rendering = false;  // supported, as a core feature or through VK_KHR_dynamic_rendering
     bool synchronization2 = false;   // supported, as a core feature or through VK_KHR_synchronization2
     // Optional 1.3 core features, available through VK_EXT_subgroup_size_control on a 1.2 device.
     bool subgroup_size_control = false;
     bool compute_full_subgroups = false;
     bool extended_dynamic_state = false;  // core on 1.3; on 1.2 both VK_EXT_extended_dynamic_state(2) extensions
+    // VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT, asking a pipeline cache "do you have it?" without a
+    // compile (pipeline_cache_journal.h). Core 1.3 only; a 1.2 device goes without.
+    bool pipeline_creation_cache_control = false;
 
     bool usable() const { return dynamic_rendering && synchronization2; }
 
@@ -45,17 +50,20 @@ public:
     void query(VkPhysicalDevice physical, std::uint32_t api_version, PFN_vkGetPhysicalDeviceFeatures2 features2,
                PFN_vkEnumerateDeviceExtensionProperties enumerate_extensions) {
         core = api_version >= VK_API_VERSION_1_3;
+        pipeline_cache_control=false;enable_pipeline_cache_control=false;
         dynamic_rendering = synchronization2 = subgroup_size_control = compute_full_subgroups = false;
-        extended_dynamic_state = false;
+        extended_dynamic_state = pipeline_creation_cache_control = false;
         if (!features2) return;
         if (core) {
             VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
             VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
             features2(physical, &query);
             dynamic_rendering = f13.dynamicRendering == VK_TRUE;
+            pipeline_cache_control = f13.pipelineCreationCacheControl == VK_TRUE;
             synchronization2 = f13.synchronization2 == VK_TRUE;
             subgroup_size_control = f13.subgroupSizeControl == VK_TRUE;
             compute_full_subgroups = f13.computeFullSubgroups == VK_TRUE;
+            pipeline_creation_cache_control = f13.pipelineCreationCacheControl == VK_TRUE;
             extended_dynamic_state = true;  // core in 1.3, no feature bit
             return;
         }
@@ -98,11 +106,13 @@ public:
     // Copies the flags of the device query() chose (a later query() for another candidate overwrites them).
     void choose(const Vulkan13Features& from) {
         core = from.core;
+        pipeline_cache_control=from.pipeline_cache_control;enable_pipeline_cache_control=false;
         dynamic_rendering = from.dynamic_rendering;
         synchronization2 = from.synchronization2;
         subgroup_size_control = from.subgroup_size_control;
         compute_full_subgroups = from.compute_full_subgroups;
         extended_dynamic_state = from.extended_dynamic_state;
+        pipeline_creation_cache_control = from.pipeline_creation_cache_control;
     }
 
     // The structs that enable both features, ahead of `chain`; returns their head for VkPhysicalDeviceVulkan12Features'
@@ -111,9 +121,11 @@ public:
         if (core) {
             enable13_.pNext = chain;
             enable13_.dynamicRendering = VK_TRUE;
+            enable13_.pipelineCreationCacheControl = pipeline_cache_control && enable_pipeline_cache_control ? VK_TRUE : VK_FALSE;
             enable13_.synchronization2 = VK_TRUE;
             enable13_.subgroupSizeControl = subgroup_size_control ? VK_TRUE : VK_FALSE;
             enable13_.computeFullSubgroups = compute_full_subgroups ? VK_TRUE : VK_FALSE;
+            enable13_.pipelineCreationCacheControl = pipeline_creation_cache_control ? VK_TRUE : VK_FALSE;
             return &enable13_;
         }
         if (subgroup_size_control) {

@@ -56,6 +56,12 @@ inline std::vector<std::uint32_t> memory_type_order(const VkPhysicalDeviceMemory
     return order;
 }
 
+// The size of the blocks that textures share (image_memory.h): 64 MiB, or a sixteenth of a small heap, such as the BAR
+// window of a GPU without Resizable BAR. A texture larger than an eighth of a block has its own allocation.
+inline VkDeviceSize image_block_bytes(VkDeviceSize heap) {
+    return std::min<VkDeviceSize>(VkDeviceSize(64) << 20, heap / 16) & ~VkDeviceSize(0xffff);
+}
+
 // D3D-299: true when an allocation that preferred DEVICE_LOCAL without needing host access (a texture, a default-heap
 // buffer outside the arena) got a type without it, so the GPU now reads it from system memory. A host-visible
 // allocation (the arena, an upload heap) in system memory is the memory type policy without Resizable BAR, not this.

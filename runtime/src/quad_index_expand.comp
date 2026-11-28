@@ -1,0 +1,44 @@
+// Expand the index buffer of a console quad list into triangle-list indices without reading it on the CPU
+// (quad_index_expand.h). Each quad (i0 i1 i2 i3) becomes (i0 i1 i2) (i0 i2 i3) as six 32-bit indices: both
+// triangles start at the quad's first vertex, the one a flat input is taken from.
+#version 460
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer WordsIn {
+    uint data[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer WordsOut {
+    uint data[];
+};
+layout(push_constant) uniform Params {
+    WordsIn source;      // the 4-byte aligned word that holds this dispatch's first index
+    WordsOut triangles;  // six words for each quad of this dispatch
+    uint first_half;     // 16-bit indices: 1 when the first index is the high half of its word
+    uint index_bits;     // 16 or 32
+    uint limit;          // how many of this dispatch's indices the index buffer view holds; the rest read 0
+    uint quads;
+} p;
+
+uint index_at(uint i) {
+    if (i >= p.limit) return 0u;
+    if (p.index_bits == 32u) return p.source.data[i];
+    const uint slot = i + p.first_half;
+    return (p.source.data[slot >> 1u] >> ((slot & 1u) * 16u)) & 0xffffu;
+}
+
+void main() {
+    const uint quad = gl_GlobalInvocationID.x;
+    if (quad >= p.quads) return;
+    const uint first = quad * 4u;
+    const uint i0 = index_at(first);
+    const uint i1 = index_at(first + 1u);
+    const uint i2 = index_at(first + 2u);
+    const uint i3 = index_at(first + 3u);
+    const uint target = quad * 6u;
+    p.triangles.data[target] = i0;
+    p.triangles.data[target + 1u] = i1;
+    p.triangles.data[target + 2u] = i2;
+    p.triangles.data[target + 3u] = i0;
+    p.triangles.data[target + 4u] = i2;
+    p.triangles.data[target + 5u] = i3;
+}

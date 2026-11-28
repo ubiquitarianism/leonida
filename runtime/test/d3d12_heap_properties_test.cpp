@@ -5,11 +5,14 @@
 // the node masks and DENY bits of a few committed resources; this test covers the rest. Every value is recorded,
 // with whether the call wrote its outputs (they start as a sentinel), and the two records must be the same. A
 // resource one device refuses to create is reported and its steps aren't compared. No shaders or game data. Skips
-// (77) without a Vulkan GPU or the standalone device; without a host D3D12 device only the layer's own record is
-// printed. The host runs on the layer's adapter (host_adapter.h; LEONIDA_HOST_ADAPTER picks another, "warp" WARP).
+// (77) without a Vulkan GPU or the standalone device. The layer's record is first checked on its own (layer_wrong:
+// what D3D12 documents for the call), on every host; without a host D3D12 device that is all that is checked, and so
+// it is under Wine, whose host is vkd3d and reports other heap flags (host_wine.h). The host runs on
+// the layer's adapter (host_adapter.h; LEONIDA_HOST_ADAPTER picks another, "warp" WARP).
 // Set LEONIDA_D3D49_VERBOSE=1 to print every value.
 #include "../shims/d3d12_com.h"
 #include "host_adapter.h"
+#include "host_wine.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -227,6 +230,85 @@ void run(ID3D12Device* device, Record& out) {
     }
 }
 
+// What the layer has to answer whatever the host is, checked on its record alone so that a run with no host to
+// compare with (no host device, or Wine's) still fails on a wrong answer. D3D12 documents GetHeapProperties for
+// committed and placed resources, with either output optional, and not for reserved ones. So for every committed or
+// placed resource the layer created: the call succeeds with both outputs, with the properties alone and with the
+// flags alone; Type is the heap type it was created with and, for a custom heap, so are the CPU page property and the
+// memory pool; and a call asking for one output reports what the call asking for both does, and every output asked
+// for is written. For a reserved resource the call fails. The values D3D12 derives itself (the flags a committed
+// resource reports, the node masks) are the host comparison's. Returns the number of wrong answers; `checked` counts
+// the resources looked at.
+int layer_wrong(const Record& ours, int* checked) {
+    int wrong = 0;
+    const auto find = [&](const std::string& name, std::uint64_t* value) {
+        for (std::size_t i = 0; i < ours.names.size(); ++i)
+            if (ours.names[i] == name) {
+                *value = ours.values[i];
+                return true;
+            }
+        return false;
+    };
+    const auto expect = [&](const std::string& name, std::uint64_t want, const char* why) {
+        std::uint64_t got = 0;
+        const bool found = find(name, &got);
+        if (found && got == want) return;
+        if (found)
+            std::printf("heap properties %s: the layer answers 0x%llx, 0x%llx expected (%s)\n", name.c_str(),
+                        static_cast<unsigned long long>(got), static_cast<unsigned long long>(want), why);
+        else
+            std::printf("heap properties %s: missing from the layer's record (%s)\n", name.c_str(), why);
+        ++wrong;
+    };
+    // A value from a call asking for one output: it has to be what the call asking for both gave, and the call has
+    // to have written it (the outputs start as the sentinel), which holds the other call to having written it too.
+    const auto same = [&](const std::string& one, const std::string& both) {
+        std::uint64_t a = 0, b = 0;
+        const bool found = find(one, &a) && find(both, &b);
+        if (found && a == b && std::uint32_t(a) != kSentinel) return;
+        if (found && a == b)
+            std::printf("heap properties %s: the layer did not write it, with both outputs asked for either\n",
+                        one.c_str());
+        else
+            std::printf("heap properties %s: the layer answers 0x%llx where the call with both outputs gave "
+                        "0x%llx\n", one.c_str(), static_cast<unsigned long long>(a),
+                        static_cast<unsigned long long>(b));
+        ++wrong;
+    };
+    static const char* const kPropertyFields[] = {"Type", "CPUPageProperty", "MemoryPoolPreference",
+                                                  "CreationNodeMask", "VisibleNodeMask"};
+    for (const Case& c : cases()) {
+        const std::string name = c.name;
+        std::uint64_t created = 0;
+        if (!find(name + ": created", &created) || FAILED(HRESULT(std::uint32_t(created)))) continue;
+        if (c.kind == Kind::reserved) {
+            for (const char* shape : {"", ", properties only", ", flags only"}) {
+                std::uint64_t hr = 0;
+                if (find(name + shape + ": hr", &hr) && FAILED(HRESULT(std::uint32_t(hr)))) continue;
+                std::printf("heap properties %s%s: the layer answers 0x%llx for a reserved resource, a failure "
+                            "expected\n", name.c_str(), shape, static_cast<unsigned long long>(hr));
+                ++wrong;
+            }
+            continue;
+        }
+        ++*checked;
+        for (const char* shape : {"", ", properties only", ", flags only"})
+            expect(name + shape + ": hr", std::uint32_t(S_OK), "a committed or placed resource has heap properties");
+        for (const char* shape : {"", ", properties only"}) {
+            expect(name + shape + ": Type", std::uint32_t(c.props.Type), "the heap type it was created with");
+            if (c.props.Type != D3D12_HEAP_TYPE_CUSTOM) continue;
+            expect(name + shape + ": CPUPageProperty", std::uint32_t(c.props.CPUPageProperty),
+                   "the custom heap's CPU page property");
+            expect(name + shape + ": MemoryPoolPreference", std::uint32_t(c.props.MemoryPoolPreference),
+                   "the custom heap's memory pool");
+        }
+        for (const char* field : kPropertyFields)
+            same(name + ", properties only: " + field, name + ": " + field);
+        same(name + ", flags only: flags", name + ": flags");
+    }
+    return wrong;
+}
+
 }  // namespace
 
 int main() {
@@ -238,6 +320,20 @@ int main() {
     const bool verbose = GetEnvironmentVariableA("LEONIDA_D3D49_VERBOSE", nullptr, 0) > 0;
     Record ours;
     run(device.p, ours);
+    // The layer's own answers first, on every host: the comparison below needs a host, and Wine's is not one.
+    int layer_checked = 0;
+    const int layer_wrong_answers = layer_wrong(ours, &layer_checked);
+    std::printf("heap properties: the layer's answers for %d committed and placed resources checked on their own, "
+                "%d wrong\n", layer_checked, layer_wrong_answers);
+    EXPECT(layer_checked > 0);
+    EXPECT(layer_wrong_answers == 0);
+    // With no host to compare with, LEONIDA_D3D49_VERBOSE still prints what the layer recorded.
+    const auto print_ours = [&] {
+        if (!verbose) return;
+        for (std::size_t i = 0; i < ours.names.size(); ++i)
+            std::printf("heap properties %s: ours 0x%llx\n", ours.names[i].c_str(),
+                        static_cast<unsigned long long>(ours.values[i]));
+    };
 
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     const auto create_host = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
@@ -251,15 +347,17 @@ int main() {
     // No factory, or no adapter for the pass (LEONIDA_HOST_ADAPTER=warp without WARP): don't compare, rather than
     // fall back to the default adapter and compare with a GPU the layer doesn't run on.
     const bool have_adapter =
-        SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) &&
+        !hostwine::host_is_wine() && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) &&
         hostadapter::reference(factory.p, &luid, hostadapter::wanted() == "warp", &adapter.p, host_name);
     Ref<ID3D12Device> host;
     if (!have_adapter) {
         std::printf("heap properties: no host adapter to compare with; %zu values recorded, not compared\n",
                     ours.values.size());
+        print_ours();
     } else if (!create_host || FAILED(create_host(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
         std::printf("heap properties: no host D3D12 device to compare with; %zu values recorded, not compared\n",
                     ours.values.size());
+        print_ours();
     } else {
         Record theirs;
         run(host.p, theirs);

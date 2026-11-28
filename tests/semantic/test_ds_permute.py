@@ -195,6 +195,36 @@ class Wave64Halves(unittest.TestCase):
                     push_constants=VSHARP + [0] * 28, memory={})
                 self.assertEqual([memory.get(4 * k) for k in range(8)], [218, 442, 435, 239, 0, 99, 239, 232])
 
+    def test_shuffles_redirect_absent_lanes_via_ballot_select(self):
+        # Every OpGroupNonUniformShuffle in ds_permute must pass a lane ID guarded by
+        # OpSelect(OpGroupNonUniformBallotBitExtract(...), src, self_lane), matching ds_lane_read.
+        import re
+        spvs = {
+            "cs_w32": translate_text("cs_perm_guard_w32", program(CASES["identity"][0], ALL), 32),
+            "cs_w64": translate_text("cs_perm_guard_w64", program(CASES["identity"][0], ALL64, wave=64), 64),
+            "ps": support.translate_lines("ps_perm_guard", [
+                "v_mov_b32_e32 v0, 0",
+                "v_mov_b32_e32 v1, 42",
+                "ds_permute_b32 v2, v0, v1",
+                "exp mrt0 v2, v2, v2, v2 done vm",
+                "s_endpgm",
+            ]),
+        }
+        for label, spv in spvs.items():
+            with self.subTest(shader=label):
+                ballot_bits = set(re.findall(r"(%\w+)\s*=\s*OpGroupNonUniformBallotBitExtract\b", spv))
+                safe_lanes = set()
+                for m in re.finditer(r"(%\w+)\s*=\s*OpSelect\s+%uint\s+(%\w+)\s+(%\w+)\s+(%\w+)", spv):
+                    if m.group(2) in ballot_bits:
+                        safe_lanes.add(m.group(1))
+                shuffles = re.findall(r"OpGroupNonUniformShuffle\s+%uint\s+%c3\s+%\w+\s+(%\w+)", spv)
+                self.assertEqual(len(shuffles), 64)
+                for lane_id in shuffles:
+                    self.assertIn(lane_id, safe_lanes, f"{label}: unguarded shuffle lane {lane_id}")
+        # Partial wave (7 active lanes in a 32-wide subgroup): identity scatter still yields 7*lane+1.
+        got = run(spvs["cs_w32"], 7, 32)
+        self.assertEqual(got, [7 * l + 1 for l in range(7)])
+
 
 if __name__ == "__main__":
     unittest.main()

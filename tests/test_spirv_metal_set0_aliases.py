@@ -83,7 +83,7 @@ class TestFileHygiene(unittest.TestCase):
             with warnings.catch_warnings():
                 warnings.simplefilter("error", ResourceWarning)
                 counts = m.capacities()
-                self.assertEqual(len(counts), 26)
+                self.assertEqual(len(counts), 29)
                 self.assertEqual(m.capacities(good_hdr), [16, 8])
                 with self.assertRaises(SystemExit):
                     m.capacities(bad_hdr)

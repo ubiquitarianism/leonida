@@ -9,6 +9,8 @@
 // No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation
 // error fails the test.
 #include "vk_test_device.h"
+#include "d3d12_texture_uav_oracle.h"
+#include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/uav_clear.h"
@@ -74,6 +76,10 @@ int conversion_checks() {
     EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(1.0f, 0, 0, 0)) == V{0x00, 0xf0}));
     EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(0, 0, 0, 1.0f)) == V{0x0f, 0x00}));
     EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(0, 1.0f, 0.2f, 0)) == V{0x30, 0x0f}));
+    // B5G6R5, B5G5R5A1 and B4G4R4A4 as ClearUnorderedAccessViewFloat leaves them on WARP.
+    EXPECT((element(VK_FORMAT_R5G6B5_UNORM_PACK16, true, floats(0.25f, 0.75f, 0.4f, 0.6f)) == V{0xec, 0x45}));
+    EXPECT((element(VK_FORMAT_A1R5G5B5_UNORM_PACK16, true, floats(0.25f, 0.75f, 0.4f, 0.6f)) == V{0xec, 0xa2}));
+    EXPECT((element(VK_FORMAT_A4R4G4B4_UNORM_PACK16, true, floats(0.25f, 0.75f, 0.4f, 0.6f)) == V{0xb6, 0x94}));
     // Half floats round to nearest even; too large is infinity; tiny values become subnormals.
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1.0f, 0, 0, 0)) == V{0x00, 0x3c}));
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(-2.0f, 0, 0, 0)) == V{0x00, 0xc0}));
@@ -155,6 +161,9 @@ struct Clear {
     std::uint32_t mip = 0;     // texture
     std::uint32_t first_layer = 0;
     std::uint32_t layer_count = 1;
+    bool tagged_volume = false;  // encode volume_uav_flag + volume_uav_word(first_layer, layer_count)
+    bool packed_uav = false;     // also set packed_uav_flag (emulated RGB9E5)
+    std::uint32_t descriptor_depth = 0;  // override the raw 3D T# depth independently of the resource
 };
 
 struct BufferCase {
@@ -178,16 +187,18 @@ struct Harness {
     ID3D12CommandQueue* queue = nullptr;
     ID3D12Fence* fence = nullptr;
     UINT64 fence_value = 0;
-    std::byte* slots = nullptr;  // CPU descriptor heap
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_start{};
+    ID3D12DescriptorHeap* native_visible = nullptr;  // WARP needs matching CPU and GPU descriptors
     UINT step = 0;
 
-    D3D12_CPU_DESCRIPTOR_HANDLE slot(UINT i) const { return {reinterpret_cast<SIZE_T>(slots + std::size_t(i) * step)}; }
+    D3D12_CPU_DESCRIPTOR_HANDLE slot(UINT i) const { return {cpu_start.ptr + SIZE_T(i) * step}; }
 
     template<class Words>
     D3D12_CPU_DESCRIPTOR_HANDLE write(UINT i, const Words& words) const {
-        std::memset(slots + std::size_t(i) * step, 0, step);
-        std::memcpy(slots + std::size_t(i) * step, words.data(), sizeof(words));
-        return slot(i);
+        const auto cpu = slot(i);
+        std::memset(reinterpret_cast<void*>(cpu.ptr), 0, step);
+        std::memcpy(reinterpret_cast<void*>(cpu.ptr), words.data(), sizeof(words));
+        return cpu;
     }
 
     // Records with `body`, executes, waits. The result of the replay.
@@ -195,24 +206,26 @@ struct Harness {
     leonida::ReplayResult run(HRESULT& close, Body&& body) {
         Ref<ID3D12CommandAllocator> allocator;
         Ref<ID3D12GraphicsCommandList> list;
-        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) ||
-            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
-                                             IID_PPV_ARGS(&list.p))))
+        const auto type = queue->GetDesc().Type;
+        if (FAILED(device->CreateCommandAllocator(type, IID_PPV_ARGS(&allocator.p))) ||
+            FAILED(device->CreateCommandList(0, type, allocator.p, nullptr, IID_PPV_ARGS(&list.p))))
             return leonida::ReplayResult::unsupported;
+        if (native_visible) list->SetDescriptorHeaps(1, &native_visible);
         body(list.p);
         close = list->Close();
         if (FAILED(close)) return leonida::ReplayResult::success;
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
-        const auto result = rt::d3d12::last_execute_result(queue);
-        queue->Signal(fence, ++fence_value);
-        fence->SetEventOnCompletion(fence_value, nullptr);
+        const auto result = native_visible ? leonida::ReplayResult::success : rt::d3d12::last_execute_result(queue);
+        if (FAILED(queue->Signal(fence, ++fence_value)) || FAILED(fence->SetEventOnCompletion(fence_value, nullptr)))
+            return leonida::ReplayResult::unsupported;
         return result;
     }
 
     Ref<ID3D12Resource> committed(const D3D12_RESOURCE_DESC& desc, D3D12_HEAP_TYPE type) const {
         Ref<ID3D12Resource> out;
         D3D12_HEAP_PROPERTIES heap{type};
+        heap.CreationNodeMask = heap.VisibleNodeMask = 1;
         device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                                         type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
                                                                          : D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -367,19 +380,42 @@ int run_texture(Harness& h, const TextureCase& test) {
             image.width = test.width;
             image.height = test.height;
             image.depth = test.volume ? test.layers : 1;
-            image.first_layer = c.first_layer;
-            image.layer_count = c.layer_count;
+            if (c.descriptor_depth) image.depth = c.descriptor_depth;
+            image.first_layer = test.volume ? 0 : c.first_layer;
+            image.layer_count = test.volume ? 1 : c.layer_count;
             image.first_mip = c.mip;
             image.mip_count = 1;
             image.resource_mips = test.mips;
-            const auto view = h.write(i, g::encode(image));
+            auto encoded = g::encode(image);
+            if (test.volume && c.tagged_volume) {
+                encoded[4] |= g::volume_uav_flag;
+                encoded[7] = g::volume_uav_word(c.first_layer, c.layer_count) |
+                             (c.packed_uav ? g::packed_uav_flag : 0u);
+            }
+            const auto view = h.slot(i);
+            D3D12_GPU_DESCRIPTOR_HANDLE gpu_view{};
+            if (h.native_visible) {
+                const UINT depth = std::max(1u, UINT(test.layers) >> c.mip);
+                D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
+                d.Format = test.format;
+                d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                d.Texture3D = {c.mip, c.tagged_volume ? c.first_layer : 0u, c.tagged_volume ? c.layer_count : depth};
+                h.device->CreateUnorderedAccessView(texture.p, nullptr, &d, view);
+                const auto dest = h.native_visible->GetCPUDescriptorHandleForHeapStart();
+                h.device->CopyDescriptorsSimple(1, {dest.ptr + SIZE_T(i) * h.step}, view,
+                                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                gpu_view = h.native_visible->GetGPUDescriptorHandleForHeapStart();
+                gpu_view.ptr += UINT64(i) * h.step;
+            } else {
+                h.write(i, encoded);
+            }
             const auto* rects = c.rects.empty() ? nullptr : c.rects.data();
             if (c.is_float) {
                 const float v[4] = {std::bit_cast<float>(c.values[0]), std::bit_cast<float>(c.values[1]),
                                     std::bit_cast<float>(c.values[2]), std::bit_cast<float>(c.values[3])};
-                list->ClearUnorderedAccessViewFloat({0}, view, texture.p, v, UINT(c.rects.size()), rects);
+                list->ClearUnorderedAccessViewFloat(gpu_view, view, texture.p, v, UINT(c.rects.size()), rects);
             } else {
-                list->ClearUnorderedAccessViewUint({0}, view, texture.p, c.values.data(), UINT(c.rects.size()), rects);
+                list->ClearUnorderedAccessViewUint(gpu_view, view, texture.p, c.values.data(), UINT(c.rects.size()), rects);
             }
             D3D12_RESOURCE_BARRIER uav{};
             uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -391,10 +427,12 @@ int run_texture(Harness& h, const TextureCase& test) {
                 const Sub& sub = subs[s];
                 if (sub.mip != c.mip) continue;
                 if (!test.volume && (sub.layer < c.first_layer || sub.layer >= c.first_layer + c.layer_count)) continue;
+                const UINT z_begin = (test.volume && c.tagged_volume) ? c.first_layer : 0u;
+                const UINT z_end = (test.volume && c.tagged_volume) ? (c.first_layer + c.layer_count) : sub.depth;
                 std::vector<D3D12_RECT> rects_or_all = c.rects;
                 if (rects_or_all.empty()) rects_or_all.push_back({0, 0, LONG(sub.width), LONG(sub.height)});
                 for (const auto& r : rects_or_all)
-                    for (UINT z = 0; z < sub.depth; ++z)
+                    for (UINT z = z_begin; z < z_end; ++z)
                         for (LONG y = std::max<LONG>(r.top, 0); y < std::min<LONG>(r.bottom, sub.height); ++y)
                             for (LONG x = std::max<LONG>(r.left, 0); x < std::min<LONG>(r.right, sub.width); ++x)
                                 std::memcpy(&model[s][((std::size_t(z) * sub.height + y) * sub.width + x) * texel],
@@ -426,11 +464,89 @@ int run_texture(Harness& h, const TextureCase& test) {
         for (UINT z = 0; z < s.depth; ++z)
             for (UINT y = 0; y < s.height; ++y) {
                 char what[96];
-                std::snprintf(what, sizeof(what), "%s mip %u layer %u z %u row %u", test.name, s.mip, s.layer, z, y);
+                std::snprintf(what, sizeof(what), "%s %s mip %u layer %u z %u row %u",
+                              h.native_visible ? "WARP" : "Vulkan", test.name, s.mip, s.layer, z, y);
                 compare(what, static_cast<const std::uint8_t*>(data) + s.offset + (UINT64(z) * s.height + y) * s.pitch,
                         &model[i][(std::size_t(z) * s.height + y) * s.width * texel], std::size_t(s.width) * texel);
             }
     }
+    readback->Unmap(0, nullptr);
+    return 0;
+}
+
+int check_predicated_volume(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, UINT family, bool predicate_family) {
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12Fence> fence;
+    Ref<ID3D12DescriptorHeap> heap;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{type};
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2};
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    EXPECT(queue->GetDesc().Type == type);
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    Harness h;
+    h.device = device;
+    h.queue = queue.p;
+    h.fence = fence.p;
+    h.cpu_start = heap->GetCPUDescriptorHandleForHeapStart();
+    h.step = device->GetDescriptorHandleIncrementSize(heap_desc.Type);
+
+    D3D12_HEAP_PROPERTIES properties{D3D12_HEAP_TYPE_DEFAULT};
+    properties.CreationNodeMask = properties.VisibleNodeMask = 1;
+    const auto buffer = buffer_desc(8);
+    Ref<ID3D12Resource> predicate;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &buffer,
+                     D3D12_RESOURCE_STATE_PREDICATION, nullptr, IID_PPV_ARGS(&predicate.p))));
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    desc.Width = desc.Height = desc.DepthOrArraySize = 4;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    auto volume = h.committed(desc, D3D12_HEAP_TYPE_DEFAULT);
+    EXPECT(volume.p);
+    g::Image image{};
+    image.format = g::format_from_vulkan(VK_FORMAT_R8G8B8A8_UNORM);
+    image.type = g::ImageType::image_3d;
+    image.width = image.height = image.depth = 4;
+    auto words = g::encode(image);
+    const auto whole = h.write(0, words);
+    words[4] |= g::volume_uav_flag;
+    words[7] = g::volume_uav_word(1, 2);
+    const auto partial = h.write(1, words);
+    const UINT values[4] = {1, 2, 3, 4};
+    const D3D12_RECT rect{0, 0, 2, 2};
+
+    HRESULT close = E_FAIL;
+    const auto run = [&](auto&& body) {
+        close = E_FAIL;
+        return h.run(close, [&](ID3D12GraphicsCommandList* list) {
+            list->SetPredication(predicate.p, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            body(list);
+        });
+    };
+    const auto control = run([](ID3D12GraphicsCommandList* list) {
+        list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    });
+    EXPECT(close == S_OK && fence->GetCompletedValue() == h.fence_value);
+    // The predicate reducer currently belongs to the direct family. A dedicated compute queue may
+    // refuse the entire batch before replay. The shared-family compute control must reach the clear.
+    EXPECT(control == leonida::ReplayResult::success ||
+           (!predicate_family && control == leonida::ReplayResult::unsupported));
+    EXPECT(run([&](ID3D12GraphicsCommandList* list) {
+        list->ClearUnorderedAccessViewUint({0}, partial, volume.p, values, 0, nullptr);
+    }) == leonida::ReplayResult::unsupported);
+    EXPECT(close == S_OK && fence->GetCompletedValue() == h.fence_value);
+    if (type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        EXPECT(run([&](ID3D12GraphicsCommandList* list) {
+            list->ClearUnorderedAccessViewUint({0}, whole, volume.p, values, 1, &rect);
+        }) == leonida::ReplayResult::unsupported);
+        EXPECT(close == S_OK && fence->GetCompletedValue() == h.fence_value);
+    }
+    std::printf("3D UAV predication: %s family %u, predicate control %s, staged clear refused\n",
+                type == D3D12_COMMAND_LIST_TYPE_DIRECT ? "direct" : "compute", family,
+                control == leonida::ReplayResult::success ? "passed" : "refused before replay");
     return 0;
 }
 
@@ -440,6 +556,7 @@ int main() {
     if (conversion_checks()) return 1;
 
     vktest::Device d;
+    d.all_queue_types = true;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
@@ -451,6 +568,10 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.command_queues = d.queues;
+        info.compute_queues = {d.compute_queue};
+        info.compute_family = d.compute_family;
+        info.conditional_rendering = d.conditional_rendering;
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
         Ref<ID3D12CommandQueue> queue;
@@ -466,7 +587,7 @@ int main() {
         h.device = device.p;
         h.queue = queue.p;
         h.fence = fence.p;
-        h.slots = reinterpret_cast<std::byte*>(heap->GetCPUDescriptorHandleForHeapStart().ptr);
+        h.cpu_start = heap->GetCPUDescriptorHandleForHeapStart();
         h.step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         EXPECT(h.step >= sizeof(g::ImageWords));
 
@@ -569,7 +690,8 @@ int main() {
 
         const auto texture_clear = [](VkFormat format, bool is_float, std::array<std::uint32_t, 4> values,
                                       std::uint32_t mip, std::uint32_t first_layer, std::uint32_t layer_count,
-                                      std::vector<D3D12_RECT> rects = {}) {
+                                      std::vector<D3D12_RECT> rects = {}, bool tagged_volume = false,
+                                      bool packed_uav = false) {
             Clear c;
             c.format = format;
             c.is_float = is_float;
@@ -578,6 +700,8 @@ int main() {
             c.first_layer = first_layer;
             c.layer_count = layer_count;
             c.rects = std::move(rects);
+            c.tagged_volume = tagged_volume;
+            c.packed_uav = packed_uav;
             return c;
         };
         const std::vector<TextureCase> textures = {
@@ -645,8 +769,50 @@ int main() {
              {texture_clear(VK_FORMAT_B8G8R8A8_UNORM, true, floats(1.0f, 0.5f, 0.0f, 1.0f), 0, 0, 1)}},
             {"RGBA8_UNORM volume, one mip", DXGI_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, 4, 4, 2, 4, true,
              {texture_clear(VK_FORMAT_R8G8B8A8_UNORM, false, {1, 2, 3, 4}, 1, 0, 1)}},
+            {"RGBA8_UNORM volume, partial W slices, non-zero mips and rectangles", DXGI_FORMAT_R8G8B8A8_UNORM,
+             VK_FORMAT_R8G8B8A8_UNORM, 8, 8, 3, 8, true,
+             {texture_clear(VK_FORMAT_R8G8B8A8_UNORM, false, {0x11, 0x22, 0x33, 0x44}, 0, 0, 8, {}, true),
+              texture_clear(VK_FORMAT_R8G8B8A8_UNORM, true, floats(1.0f, 0.25f, 0.0f, 1.0f), 0, 2, 3, {}, true),
+              texture_clear(VK_FORMAT_R8G8B8A8_UNORM, false, {0xaa, 0xbb, 0xcc, 0xdd}, 0, 5, 3,
+                            {{-1, 1, 4, 5}, {2, 3, 12, 7}}, true),
+              texture_clear(VK_FORMAT_R8G8B8A8_UNORM, false, {0x55, 0x66, 0x77, 0x88}, 1, 1, 2, {}, true),
+              texture_clear(VK_FORMAT_R8G8B8A8_UNORM, true, floats(0.0f, 1.0f, 0.25f, 1.0f), 1, 0, 4,
+                            {{1, 1, 3, 3}}, false),
+              texture_clear(VK_FORMAT_R8G8B8A8_UNORM, false, {0xfe, 0xed, 0xfa, 0xce}, 2, 1, 1, {}, true)}},
+            {"R8_UNORM volume, tiny 1..3-byte rect payloads and partial W", DXGI_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM,
+             6, 6, 1, 4, true,
+             {texture_clear(VK_FORMAT_R8_UNORM, false, {0x22, 0, 0, 0}, 0, 0, 4, {}, true),
+              texture_clear(VK_FORMAT_R8_UNORM, false, {0x7b, 0, 0, 0}, 0, 1, 1, {{2, 2, 3, 3}}, true),
+              texture_clear(VK_FORMAT_R8_UNORM, true, floats(0.25f, 0, 0, 0), 0, 2, 2, {{1, 4, 4, 5}}, true)}},
+            {"R16_UINT volume, tiny 2-byte rect payload and partial W", DXGI_FORMAT_R16_UINT, VK_FORMAT_R16_UINT,
+             4, 4, 1, 4, true,
+             {texture_clear(VK_FORMAT_R16_UINT, false, {0x1234, 0, 0, 0}, 0, 0, 4, {}, true),
+              texture_clear(VK_FORMAT_R16_UINT, false, {0xbeef, 0, 0, 0}, 0, 2, 1, {{1, 1, 2, 2}}, true)}},
+            {"R32G32_SINT volume, 8-byte partial W and rectangles", DXGI_FORMAT_R32G32_SINT, VK_FORMAT_R32G32_SINT,
+             8, 4, 1, 4, true,
+             {texture_clear(VK_FORMAT_R32G32_SINT, false, {0x11111111u, 0x22222222u, 0, 0}, 0, 0, 4, {}, true),
+              texture_clear(VK_FORMAT_R32G32_SINT, true, floats(-7.9f, 7.9f, 0, 0), 0, 1, 2, {{1, 1, 6, 3}}, true)}},
+            {"RGBA32_UINT volume, 16-byte partial W and rectangles", DXGI_FORMAT_R32G32B32A32_UINT,
+             VK_FORMAT_R32G32B32A32_UINT, 8, 6, 2, 4, true,
+             {texture_clear(VK_FORMAT_R32G32B32A32_UINT, false, {1, 2, 3, 4}, 0, 0, 4, {}, true),
+              texture_clear(VK_FORMAT_R32G32B32A32_UINT, false, {9, 8, 7, 6}, 0, 1, 2, {{1, 1, 5, 4}}, true),
+              texture_clear(VK_FORMAT_R32G32B32A32_UINT, true, floats(2.9f, -1.0f, 1e10f, NAN), 1, 1, 1, {}, true)}},
+            {"RGBA16_SFLOAT volume, large tiled slice (> 64 KiB)", DXGI_FORMAT_R16G16B16A16_FLOAT,
+             VK_FORMAT_R16G16B16A16_SFLOAT, 128, 96, 1, 3, true,
+             {texture_clear(VK_FORMAT_R16G16B16A16_SFLOAT, false, {0x3c00, 0x4000, 0xc000, 0x3800}, 0, 0, 3, {}, true),
+              texture_clear(VK_FORMAT_R16G16B16A16_SFLOAT, true, floats(0.25f, -8.0f, 1.0f, 0.0f), 0, 1, 1, {}, true)}},
         };
         std::vector<TextureCase> all_textures = textures;
+        for (const auto depth : {2u, 8u}) {
+            // An untagged T# covers both W slices of mip 1 of a four-deep resource, regardless of its DEPTH.
+            auto clear = texture_clear(VK_FORMAT_R32_UINT, false, {97, 0, 0, 0}, 1, 0, 2);
+            clear.descriptor_depth = depth;
+            all_textures.push_back({
+                depth == 2 ? "untagged 3D T# depth 2" : "untagged 3D T# depth 8",
+                DXGI_FORMAT_R32_UINT, VK_FORMAT_R32_UINT, 4, 4, 2, 4, true,
+                {texture_clear(VK_FORMAT_R32_UINT, false, {13, 0, 0, 0}, 0, 0, 4),
+                 texture_clear(VK_FORMAT_R32_UINT, false, {31, 0, 0, 0}, 1, 0, 2), clear}});
+        }
         {
             D3D12_FEATURE_DATA_FORMAT_SUPPORT e5_support{DXGI_FORMAT_R9G9B9E5_SHAREDEXP};
             if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &e5_support, sizeof(e5_support))) &&
@@ -673,6 +839,24 @@ int main() {
                                                       {0x12345678u, 0x9abcdef0u, 0u, 0u}, 0, 0, 1, {{2, 3, 4, 5}}));
                 }
                 all_textures.push_back(std::move(e5));
+
+                TextureCase e5_vol{"R9G9B9E5_SHAREDEXP volume, partial W slices and rectangles",
+                                   DXGI_FORMAT_R9G9B9E5_SHAREDEXP, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, 8, 8, 2, 4, true,
+                                   {texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true,
+                                                  floats(0.5f, 0.25f, 0.125f, 0.0f), 0, 0, 4, {}, true, !native_storage),
+                                    texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true,
+                                                  floats(1.0f, 2.0f, 4.0f, 0.0f), 0, 1, 2, {{1, 2, 6, 5}}, true,
+                                                  !native_storage),
+                                    // Seed both mip-1 slices so skipping or widening the zero-valued Uint clear is visible.
+                                    texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true,
+                                                  floats(1.0f, 2.0f, 4.0f, 0.0f), 1, 0, 2, {}, true, !native_storage),
+                                    texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, false,
+                                                  {0x3f800000u, 0xffffffffu, 1u, 2u}, 1, 1, 1, {}, true,
+                                                  !native_storage),
+                                    texture_clear(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, true,
+                                                  floats(4.0f, 2.0f, 1.0f, 0.0f), 1, 0, 1, {{1, 1, 3, 3}}, true,
+                                                  !native_storage)}};
+                all_textures.push_back(std::move(e5_vol));
             }
         }
         {
@@ -693,6 +877,63 @@ int main() {
         for (const auto& test : all_textures)
             if (run_texture(h, test)) return 1;
 
+        // The same bounded W view (including its first and last untouched neighbors) and nonzero mip on
+        // both APIs. Submit the clear and copy on the same command-list type and compare every texel.
+        const std::array volume_parity = {
+            TextureCase{"3D Uint clear parity", DXGI_FORMAT_R32_UINT, VK_FORMAT_R32_UINT, 8, 8, 2, 8, true,
+                        {texture_clear(VK_FORMAT_R32_UINT, false, {13, 0, 0, 0}, 0, 0, 8),
+                         texture_clear(VK_FORMAT_R32_UINT, false, {31, 0, 0, 0}, 1, 0, 4),
+                         texture_clear(VK_FORMAT_R32_UINT, false, {57, 0, 0, 0}, 1, 1, 2, {}, true),
+                         texture_clear(VK_FORMAT_R32_UINT, false, {99, 0, 0, 0}, 1, 1, 2, {{1, 1, 3, 3}}, true)}},
+            TextureCase{"3D Float clear parity", DXGI_FORMAT_R32_FLOAT, VK_FORMAT_R32_SFLOAT, 8, 8, 2, 8, true,
+                        {texture_clear(VK_FORMAT_R32_SFLOAT, true, floats(0.5f, 0, 0, 0), 0, 0, 8),
+                         texture_clear(VK_FORMAT_R32_SFLOAT, true, floats(0.25f, 0, 0, 0), 1, 0, 4),
+                         texture_clear(VK_FORMAT_R32_SFLOAT, true, floats(-2.0f, 0, 0, 0), 1, 1, 2, {}, true),
+                         texture_clear(VK_FORMAT_R32_SFLOAT, true, floats(4.5f, 0, 0, 0), 1, 1, 2, {{1, 1, 3, 3}}, true)}},
+        };
+        const auto run_volume_parity = [&](Harness& target) {
+            for (const auto type : {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE}) {
+                Ref<ID3D12CommandQueue> q;
+                const D3D12_COMMAND_QUEUE_DESC desc{type};
+                EXPECT(SUCCEEDED(target.device->CreateCommandQueue(&desc, IID_PPV_ARGS(&q.p))));
+                EXPECT(q->GetDesc().Type == type);
+                Harness pass = target;
+                pass.queue = q.p;
+                for (const auto& test : volume_parity)
+                    if (run_texture(pass, test)) return 1;
+                target.fence_value = pass.fence_value;
+            }
+            return 0;
+        };
+        const auto mismatches_before_parity = mismatches;
+        EXPECT(run_volume_parity(h) == 0);
+        if (!hostwine::host_is_wine()) {
+            uav_oracle::detail::Context warp;
+            const auto status = warp.prepare_device();
+            EXPECT(status != uav_oracle::Status::failed);
+            if (status == uav_oracle::Status::ready) {
+                Ref<ID3D12DescriptorHeap> cpu, visible;
+                Ref<ID3D12Fence> host_fence;
+                auto hd = heap_desc;
+                EXPECT(SUCCEEDED(warp.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&cpu.p))));
+                hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+                EXPECT(SUCCEEDED(warp.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&visible.p))));
+                EXPECT(SUCCEEDED(warp.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&host_fence.p))));
+                Harness host;
+                host.device = warp.device.Get();
+                host.fence = host_fence.p;
+                host.cpu_start = cpu->GetCPUDescriptorHandleForHeapStart();
+                host.native_visible = visible.p;
+                host.step = host.device->GetDescriptorHandleIncrementSize(hd.Type);
+                EXPECT(run_volume_parity(host) == 0);
+                EXPECT(mismatches == mismatches_before_parity);
+                std::printf("3D UAV clear parity: Vulkan (direct family %u, compute family %u) and WARP "
+                            "direct/compute Uint/Float readbacks matched\n", d.family, d.compute_family);
+            } else {
+                std::puts("3D UAV clear WARP comparison skipped: WARP unavailable");
+            }
+        }
+
         // Refused while recording (Close says E_INVALIDARG): no values, an empty slot, no resource.
         {
             Ref<ID3D12Resource> buffer = h.committed(buffer_desc(256), D3D12_HEAP_TYPE_DEFAULT);
@@ -703,7 +944,7 @@ int main() {
                 return close;
             };
             const auto good = h.write(0, buffer_view(buffer->GetGPUVirtualAddress(), whole(64)));
-            std::memset(h.slots + h.step, 0, h.step);
+            std::memset(reinterpret_cast<void*>(h.slot(1).ptr), 0, h.step);
             EXPECT(check([&](ID3D12GraphicsCommandList* l) {
                 l->ClearUnorderedAccessViewUint({0}, good, buffer.p, nullptr, 0, nullptr);
             }) == E_INVALIDARG);
@@ -719,7 +960,7 @@ int main() {
             }) == E_INVALIDARG);
 
             // Refused at execution, before anything is submitted: a buffer view of a texture, a texture view of a
-            // buffer, a mip the texture does not have, a buffer view past the end, a rectangle clear of a volume.
+            // buffer, a mip the texture does not have, and a buffer view past the end.
             D3D12_RESOURCE_DESC desc{};
             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             desc.Width = desc.Height = 4;
@@ -750,7 +991,7 @@ int main() {
             const auto replay = [&](auto&& body) {
                 HRESULT close = E_FAIL;
                 const auto result = h.run(close, body);
-                return close == S_OK ? result : leonida::ReplayResult::success;
+                return close == S_OK ? result : leonida::ReplayResult::list_open;
             };
             EXPECT(replay([&](ID3D12GraphicsCommandList* l) {
                 l->ClearUnorderedAccessViewUint({0}, good, texture.p, values, 0, nullptr);
@@ -764,9 +1005,47 @@ int main() {
             EXPECT(replay([&](ID3D12GraphicsCommandList* l) {
                 l->ClearUnorderedAccessViewUint({0}, past_view, buffer.p, values, 0, nullptr);
             }) == leonida::ReplayResult::invalid_subresource);
+            // Untagged whole-volume rectangle clear now succeeds on Vulkan.
             EXPECT(replay([&](ID3D12GraphicsCommandList* l) {
                 l->ClearUnorderedAccessViewUint({0}, v_view, volume.p, values, 1, &rect);
-            }) == leonida::ReplayResult::unsupported);
+            }) == leonida::ReplayResult::success);
+            // Out-of-range 3D W slice range is refused at execution as invalid_subresource.
+            auto bad_w = g::encode(image);
+            bad_w[4] |= g::volume_uav_flag;
+            bad_w[7] = g::volume_uav_word(2, 3);  // 2 + 3 > 4
+            const auto bad_w_view = h.write(6, bad_w);
+            EXPECT(replay([&](ID3D12GraphicsCommandList* l) {
+                l->ClearUnorderedAccessViewUint({0}, bad_w_view, volume.p, values, 0, nullptr);
+            }) == leonida::ReplayResult::invalid_subresource);
+            auto part_w = g::encode(image);
+            part_w[4] |= g::volume_uav_flag;
+            part_w[7] = g::volume_uav_word(1, 2);
+            const auto part_w_view = h.write(7, part_w);
+            for (auto type : {D3D12_COMMAND_LIST_TYPE_COPY, D3D12_COMMAND_LIST_TYPE_BUNDLE}) {
+                Ref<ID3D12CommandAllocator> allocator;
+                Ref<ID3D12GraphicsCommandList> list;
+                EXPECT(SUCCEEDED(device->CreateCommandAllocator(type, IID_PPV_ARGS(&allocator.p))));
+                EXPECT(SUCCEEDED(device->CreateCommandList(0, type, allocator.p, nullptr, IID_PPV_ARGS(&list.p))));
+                list->ClearUnorderedAccessViewUint({0}, part_w_view, volume.p, values, 1, &rect);
+                EXPECT(list->Close() == E_INVALIDARG);
+            }
+        }
+        if (d.conditional_rendering) {
+            EXPECT(check_predicated_volume(device.p, D3D12_COMMAND_LIST_TYPE_DIRECT, d.family, true) == 0);
+            EXPECT(check_predicated_volume(device.p, D3D12_COMMAND_LIST_TYPE_COMPUTE, d.compute_family,
+                                          d.compute_family == d.family) == 0);
+            if (d.compute_family != d.family) {
+                // Exercise the COMPUTE-list clear guard after a successful predicate capture, even on
+                // devices where the regular compute queue cannot use the direct-family predicate reducer.
+                auto shared = info;
+                shared.compute_family = d.family;
+                shared.compute_queues = {d.queue};
+                Ref<ID3D12Device> shared_device;
+                EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(shared, IID_PPV_ARGS(&shared_device.p))));
+                EXPECT(check_predicated_volume(shared_device.p, D3D12_COMMAND_LIST_TYPE_COMPUTE, d.family, true) == 0);
+            }
+        } else {
+            std::puts("3D UAV GPU predication checks skipped: VK_EXT_conditional_rendering unavailable");
         }
     }
 

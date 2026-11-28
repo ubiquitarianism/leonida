@@ -51,6 +51,25 @@ class AssembleSpirv(unittest.TestCase):
             self.assertEqual(f.read(4), b"\x03\x02\x23\x07")  # the SPIR-V magic, little-endian
         self.assertEqual([n for n in os.listdir(out_dir or ".") if n.endswith(".tmp")], [], "the staging file is removed")
 
+    @unittest.skipUnless(shutil.which("spirv-opt"), "needs spirv-opt")
+    def test_compact_binary_before_publish(self):
+        body = MINIMAL_CS.replace("%fn = OpTypeFunction", "%uint = OpTypeInt 32 0\n"
+                                 "%seven = OpConstant %uint 7\n%fn = OpTypeFunction")
+        body = body.replace("OpReturn", "%dead = OpIAdd %uint %seven %seven\nOpReturn")
+        with tempfile.TemporaryDirectory(prefix=MARK) as folder:
+            sa = os.path.join(folder, "input.spvasm")
+            sv = os.path.join(folder, "out.spv")
+            with open(sa, "w", encoding="utf-8", newline="\n") as f:
+                f.write(body)
+            for compact in (False, True):
+                result = rdna2spirv.assemble_spirv(sa, sv, compact=compact)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if compact:
+                    self.assertLess(os.path.getsize(sv), original_size)
+                else:
+                    original_size = os.path.getsize(sv)
+            self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(folder)))
+
     def test_a_folder_outside_the_code_page(self):
         # Before: spirv-as got '...\shaders-?\cs_min.spvasm' and failed with "file does not exist".
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,15 +103,21 @@ class NativeFolder(unittest.TestCase):
         with patch.object(run_gpu_tests.os, "name", "posix"):
             self.assertEqual(run_gpu_tests.native_folder("/tmp/work-" + MARK), "/tmp/work-" + MARK)
 
+    def test_a_utf8_code_page_keeps_non_ascii_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "leonida_gpu_work_" + MARK)
+            os.makedirs(work)
+            self.assertEqual(run_gpu_tests.native_folder(work, ansi="utf-8"), work)
+
     @unittest.skipUnless(os.name == "nt", "8.3 short names are a Windows thing")
     def test_a_folder_outside_the_code_page_gets_its_short_name_or_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             work = os.path.join(tmp, "leonida_gpu_work_" + MARK)
             os.makedirs(work)
-            native = run_gpu_tests.native_folder(work)
+            native = run_gpu_tests.native_folder(work, ansi="cp1252")
             if native is None:
                 self.skipTest("this volume keeps no 8.3 short names (the error path is tested below)")
-            native.encode("mbcs")  # raises if the short name still has a character the code page lacks
+            native.encode("cp1252")  # raises if the short name still has a character the code page lacks
             self.assertNotIn(MARK, native)
             self.assertTrue(os.path.samefile(native, work))
 

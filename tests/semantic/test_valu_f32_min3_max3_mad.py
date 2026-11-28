@@ -12,8 +12,8 @@ plain-Python IEEE-754 binary32 / RDNA2 ISA reference oracle (stdlib only, no gam
 Observed translator / interpreter findings (kept out of failing assertions and documented here):
   1. v_min3_f32 / v_max3_f32 with NaN operands: tools/rdna2spirv.py emits GLSL.std.450 NMin / NMax, which give the
      other operand for a NaN, as RDNA2 hardware does. Those rows are asserted in tests/semantic/
-     test_float_nan_fract.py; NaN inputs stay out of the value assertions here (clamp-on-NaN is still FClamp, which
-     spirv_mini_interp.py rejects). NaN semantics are tested on v_mad_f32, v_fmac_f32, and v_mad_legacy_f32.
+     test_float_nan_fract.py; NaN inputs stay out of the value assertions here (clamp-on-NaN, which gives +0, is
+     checked in test_vop3_clamp_nan.py). NaN semantics are tested on v_mad_f32, v_fmac_f32, and v_mad_legacy_f32.
   2. v_min3_f32 / v_max3_f32 signed-zero ties: RDNA2 hardware orders -0.0 below +0.0 (measured on an AMD Radeon
      RX 6800: min(+0, -0) = -0 and max(+0, -0) = +0 in either operand order), and spirv_mini_interp.py's NMin / NMax
      do the same, so every zero triple asserts exact bit patterns.

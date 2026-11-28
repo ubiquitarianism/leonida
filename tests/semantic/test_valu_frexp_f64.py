@@ -32,6 +32,12 @@ Architecture:
   - Modifiers:
       * Input modifiers on S0: abs (|S0|), neg (-S0).
       * Output modifiers on mantissa: clamp (clamps to [0.0, 1.0]), omod (mul:2, mul:4, div:2).
+
+The translator check at the end of this file (TranslatorMatchesOracle): this oracle quiets a signalling NaN and
+applies mul:2 / mul:4 / div:2 to the mantissa, which is RDNA2's behaviour under IEEE=1 (and denorm_mode_16_64=0).
+In the game's MODE (IEEE 0, denorm_mode_16_64 3) the hardware passes a signalling NaN through unchanged and ignores
+those output modifiers (docs/design.md, the v_frexp_mant_f64 row, measured on gfx1036), and so does the translator;
+the class compares the two where they agree and pins those two measured behaviours.
 """
 
 from fractions import Fraction
@@ -1566,6 +1572,67 @@ class TestValuFrexpF64Oracle(unittest.TestCase):
         self.assertEqual(bits_to_f64(ref_frexp_mant_f64(ONE_F64, omod="mul:4")), 2.0)
         # 0.5 / 2 = 0.25
         self.assertEqual(bits_to_f64(ref_frexp_mant_f64(ONE_F64, omod="div:2")), 0.25)
+
+
+# ==============================================================================
+# The translator: tools/rdna2spirv.py's output, run in tests/spirv_interp.py, against this file's oracle
+# ==============================================================================
+import os as _os  # noqa: E402
+import sys as _sys  # noqa: E402
+
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import f64_translate as ft  # noqa: E402
+
+def _frexp_inputs():
+    """Normals, subnormals, zeros, infinities and quiet NaNs, both signs."""
+    words = [ft.f64_bits(x) for x in (1.0, 2.0, 3.0, 0.75, 0.1, 123.456, 1e300, 1e-300, 1.7976931348623157e308,
+                                      2.2250738585072014e-308)]
+    words += [0x0000000000000000, 0x0000000000000001, 0x000FFFFFFFFFFFFF, 0x0008000000000000,
+              0x7FF0000000000000, 0x7FF8000000000000, 0x7FF8000012345678]
+    return [w | sign for w in words for sign in (0, 1 << 63)]
+
+
+SNANS = (0x7FF0000000000001, 0xFFF6208167C66911)   # signalling NaNs, both signs
+
+class TranslatorMatchesOracle(unittest.TestCase):
+    """The translated v_frexp_mant_f64 gives ref_frexp_mant_f64's word where the oracle models the game's MODE, and the
+    measured word where it does not (see the module docstring)."""
+
+    def mant(self, word, src="v[2:3]", mods=""):
+        return ft.run_f64("v_frexp_mant_f64", word, src=src, mods=mods)
+
+    def test_matches_the_oracle(self):
+        for word in _frexp_inputs():
+            with self.subTest(word=hex(word)):
+                self.assertEqual(hex(self.mant(word)), hex(ref_frexp_mant_f64(word)))
+
+    def test_source_modifiers_and_clamp(self):
+        for x in (3.0, 0.75, 1e-300):
+            word = ft.f64_bits(-x)
+            for src, mods, kw in (("-v[2:3]", "", dict(neg_src0=True)), ("|v[2:3]|", "", dict(abs_src0=True)),
+                                  ("v[2:3]", " clamp", dict(clamp=True)), ("-v[2:3]", " clamp", dict(neg_src0=True, clamp=True))):
+                with self.subTest(word=hex(word), src=src, mods=mods):
+                    self.assertEqual(hex(self.mant(word, src, mods)), hex(ref_frexp_mant_f64(word, **kw)))
+
+    def test_signalling_nan_passes_through(self):
+        # Measured on gfx1036 under IEEE 0 (docs/design.md); the oracle quiets it, as IEEE=1 would.
+        for word in SNANS:
+            with self.subTest(word=hex(word)):
+                self.assertEqual(hex(self.mant(word)), hex(word))
+
+    def test_output_multipliers_are_ignored(self):
+        # Measured on gfx1036 under denorm_mode_16_64 3 (docs/design.md); the oracle scales the mantissa.
+        for x in (-3.0, 0.75, 123.456):
+            word = ft.f64_bits(x)
+            for mods in (" mul:2", " mul:4", " div:2"):
+                with self.subTest(word=hex(word), mods=mods):
+                    self.assertEqual(hex(self.mant(word, mods=mods)), hex(self.mant(word)))
+
+    def test_exponent_matches_the_oracle(self):
+        for word in _frexp_inputs() + list(SNANS):
+            with self.subTest(word=hex(word)):
+                self.assertEqual(hex(ft.run_f64("v_frexp_exp_i32_f64", word, wide=False)),
+                                 hex(ref_frexp_exp_i32_f64(word) & 0xFFFFFFFF))
 
 
 if __name__ == "__main__":

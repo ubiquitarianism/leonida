@@ -8,9 +8,32 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <optional>
 #include <span>
 
 namespace leonida {
+
+constexpr std::uint32_t queue_family_timestamp_bits(std::span<const std::uint32_t> bits, std::uint32_t family) {
+    return family < bits.size() ? bits[family] : 0;
+}
+
+// A copy queue can lease from either family. Caller-owned devices may supply only the graphics queue.
+constexpr bool copy_queue_timestamp_families_supported(std::span<const std::uint32_t> bits,
+                                                       std::uint32_t graphics,
+                                                       std::optional<std::uint32_t> dedicated_copy) {
+    return queue_family_timestamp_bits(bits, graphics) != 0 &&
+           (!dedicated_copy || queue_family_timestamp_bits(bits, *dedicated_copy) != 0);
+}
+
+// The device's distinct family indices. An object used on more than one family keeps its contents
+// across fenced D3D12 queue handoffs without explicit Vulkan ownership transfers.
+template<typename CreateInfo>
+void share_across_queue_families(CreateInfo& create, std::span<const std::uint32_t> families) {
+    if (families.size() < 2) return;
+    create.sharingMode = VK_SHARING_MODE_CONCURRENT;
+    create.queueFamilyIndexCount = static_cast<std::uint32_t>(families.size());
+    create.pQueueFamilyIndices = families.data();
+}
 
 // Queue families for D3D12's three queue types. Direct needs graphics. Compute prefers a family with compute and no
 // graphics (async compute), copy one with transfer and neither (a DMA engine); each falls back to a more capable

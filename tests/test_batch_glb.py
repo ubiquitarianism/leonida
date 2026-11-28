@@ -57,10 +57,33 @@ class TestBatchGlb(unittest.TestCase):
                         [sys.executable, "-I", os.path.join(TOOLS, "batch_glb.py"), source, output],
                         capture_output=True, text=True, errors="replace", check=False,
                     )
-                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.returncode, 2)
                     self.assertTrue(result.stderr.startswith("ERROR: "), result.stderr)
                     self.assertIn(error, result.stderr)
                     self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def test_cli_exit_status_follows_the_docstring(self) -> None:
+        script = os.path.join(TOOLS, "batch_glb.py")
+        with tempfile.TemporaryDirectory() as root:
+            empty = os.path.join(root, "empty")
+            broken = os.path.join(root, "broken")
+            os.mkdir(empty)
+            os.mkdir(broken)
+            with open(os.path.join(broken, "broken.obj"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("o broken\nf 1 2 3\n")
+
+            cases = [
+                ("empty input folder: no model failed", [empty, os.path.join(root, "out_empty")], 0),
+                ("one model failed", [broken, os.path.join(root, "out_broken")], 1),
+                ("usage error", ["--bogus"], 2),
+            ]
+            for label, args, expected in cases:
+                with self.subTest(case=label):
+                    result = subprocess.run(
+                        [sys.executable, "-I", script, *args],
+                        capture_output=True, text=True, errors="replace", check=False,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
     def test_cli_rejects_invalid_jobs_and_max_tex_size(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -244,6 +267,31 @@ class TestBatchGlb(unittest.TestCase):
                     expected = [] if embedded else [(str(obj), str(root / "paint.png"),
                                                      "matching primitives have no texture coordinates")]
                     self.assertEqual(stats["dropped_textures"], expected)
+
+    def test_preferred_png_and_same_stem_dds_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, out, textures = root / "in", root / "out", root / "textures"
+            source.mkdir()
+            textures.mkdir()
+            (source / "car.obj").write_bytes(
+                b"v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\n"
+                b"usemtl paint\nf 1/1 2/2 3/3\n")
+            dds = _create_minimal_bc1_dds()
+            fallback = dds_png.dds_to_png_bytes(dds)
+            preferred = dds_png.dds_to_png_bytes(_create_minimal_bc1_dds(0x001F))
+            (textures / "paint.dds").write_bytes(dds)
+            for label, png, expected, dropped in (
+                ("valid_png", preferred, preferred, []),
+                ("empty_png", b"", fallback, ["paint.png"]),
+                ("truncated_png", preferred[:24], fallback, ["paint.png"]),
+            ):
+                with self.subTest(case=label):
+                    (textures / "paint.png").write_bytes(png)
+                    stats = batch_glb.batch_convert(str(source), str(out), texture_dir=str(textures))
+                    self.assertEqual(stats["succeeded"], 1)
+                    self.assertIn(expected, (out / "car.glb").read_bytes())
+                    self.assertEqual([Path(p).name for _, p, _ in stats["dropped_textures"]], dropped)
 
     def test_batch_convert_with_dds_texture(self) -> None:
         with tempfile.TemporaryDirectory() as in_dir, \

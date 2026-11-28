@@ -91,6 +91,11 @@ class BuildUnderFallbackTest(unittest.TestCase):
                 self.assertIn("ps_ij_computed", printed)
                 self.assertIn("PerVertexKHR", printed)
 
+    def test_missing_mullit_fixture_is_not_accepted_as_a_build_target(self):
+        status, printed = self.run_build(["ps_mullit"], {})
+        self.assertEqual(status, "Unknown test shaders: ps_mullit", printed)
+        self.assertEqual(self.asked, [])
+
     def test_the_whole_list_builds_under_a_fallback(self):
         # Before: "Translation did not produce validated SPIR-V for: ps_ij_computed", and an empty <out>/spirv.
         status, printed = self.run_build([], {"LEONIDA_F16_INTERP_FALLBACK": "1"})

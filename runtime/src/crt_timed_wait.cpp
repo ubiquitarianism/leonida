@@ -25,7 +25,9 @@ extern "C" {
 // absolute, in TIME_UTC seconds and nanoseconds, and the result uses _Thrd_result's values (0, or 2 on timeout).
 __declspec(dllimport) int __cdecl _Cnd_timedwait(_Cnd_t, _Mtx_t, const _timespec64*) noexcept;
 
-_Thrd_result __stdcall _Cnd_timedwait_for_unchecked(_Cnd_t cond, _Mtx_t mtx, unsigned int ms) noexcept {
+namespace {
+
+_Thrd_result timedwait_for_impl(_Cnd_t cond, _Mtx_t mtx, unsigned int ms, bool unchecked) noexcept {
     _timespec64 deadline{};
     if (_timespec64_get(&deadline, TIME_UTC) != TIME_UTC) deadline = {};
     deadline.tv_sec += ms / 1000;
@@ -34,13 +36,32 @@ _Thrd_result __stdcall _Cnd_timedwait_for_unchecked(_Cnd_t cond, _Mtx_t mtx, uns
         deadline.tv_sec += 1;
         deadline.tv_nsec -= 1000000000L;
     }
-    // A spurious or early return is allowed ("unchecked"): the STL's callers check the clock themselves.
-    return static_cast<_Thrd_result>(_Cnd_timedwait(cond, mtx, &deadline));
+    // Preserve the caller's LastError across the wait while detecting OS timer timeouts cleanly.
+    const DWORD saved_error = GetLastError();
+    SetLastError(ERROR_SUCCESS);
+    const auto res = static_cast<_Thrd_result>(_Cnd_timedwait(cond, mtx, &deadline));
+    const DWORD wait_error = GetLastError();
+    SetLastError(saved_error);
+    // msvcp140's _Cnd_timedwait checks _Xtime_diff_to_millis2(target, &now) == 0 after SleepConditionVariableSRW
+    // returns FALSE/ERROR_TIMEOUT, so an OS timer wake even <1 ms before `deadline` turns into _Thrd_result::_Success.
+    // STL wait_for/wait_until callers treat _Success from _Cnd_timedwait_for_unchecked as a notification/spurious
+    // wake (cv_status::no_timeout) instead of looping until steady_clock reaches the target; report _Timedout here
+    // so the caller checks steady_clock and waits for the remaining time.
+    if (unchecked && res == _Thrd_result::_Success && wait_error == ERROR_TIMEOUT) {
+        return _Thrd_result::_Timedout;
+    }
+    return res;
+}
+
+}  // namespace
+
+_Thrd_result __stdcall _Cnd_timedwait_for_unchecked(_Cnd_t cond, _Mtx_t mtx, unsigned int ms) noexcept {
+    return timedwait_for_impl(cond, mtx, ms, true);
 }
 
 // Not declared by the 14.4x headers, but defined by the same member: keep a caller of the older name off it too.
 _Thrd_result __stdcall _Cnd_timedwait_for(_Cnd_t cond, _Mtx_t mtx, unsigned int ms) noexcept {
-    return _Cnd_timedwait_for_unchecked(cond, mtx, ms);
+    return timedwait_for_impl(cond, mtx, ms, false);
 }
 
 void __cdecl _Smtx_lock_exclusive(_Smtx_t* lock) noexcept {

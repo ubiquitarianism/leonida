@@ -2,7 +2,8 @@
 // (IDXGISwapChain2::SetMaximumFrameLatency, GetMaximumFrameLatency, GetFrameLatencyWaitableObject,
 // Present, Present(DXGI_PRESENT_TEST), ResizeBuffers).
 // Compares Leonida's Vulkan-backed DXGI shim directly against live Windows host d3d12.dll / dxgi.dll
-// when available, and validates all contracts independently.
+// when available, and validates all contracts independently. Under Wine the host suite is skipped (host_wine.h: its
+// dxgi faults on GetMaximumFrameLatency(null)) and the layer's own contracts are still checked.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (Core + Synchronization Validation).
 #ifndef VK_USE_PLATFORM_WIN32_KHR
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -11,6 +12,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/dxgi_com.h"
 #include "../src/vulkan_device_filter.h"
+#include "host_wine.h"
 #include "vulkan_loader.h"
 #include "window_station.h"
 
@@ -795,7 +797,7 @@ int main() {
                                                  reinterpret_cast<void*>(GetProcAddress(host_dxgi, "CreateDXGIFactory2")))
                                            : nullptr;
     bool compared_host = false;
-    if (create_host_dev && create_host_fac) {
+    if (create_host_dev && create_host_fac && !hostwine::host_is_wine()) {
         IDXGIFactory4* hfac = nullptr;
         ID3D12Device* hdev = nullptr;
         ID3D12CommandQueue* hq = nullptr;

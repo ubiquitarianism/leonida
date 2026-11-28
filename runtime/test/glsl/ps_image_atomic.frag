@@ -19,6 +19,6 @@ layout(push_constant) uniform UserData {
 layout(set = 0, binding = 4, r32ui) uniform uimage2D counters[];
 
 void main() {
-    const uint before = imageAtomicMax(counters[0], ivec2(gl_FragCoord.xy), pc.s[0]);
+    const uint before = imageAtomicMax(counters[0], ivec2(gl_FragCoord.xy), pc.s[8]);
     target = vec4(color.rgb, float(before & 1u));
 }

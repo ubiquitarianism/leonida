@@ -3,12 +3,14 @@
 // corrupt blobs, the other device's serialized blob, the null-output capability check and other interfaces, and on
 // an empty library StorePipeline / LoadComputePipeline / LoadGraphicsPipeline / LoadPipeline with null, empty and
 // unknown names and null PSOs, descriptions or outputs, and Serialize with null, short and long buffers. Every HRESULT
-// is recorded, with whether the output pointer was written; the two records must be the same, step by step. The
-// serialized size and bytes are each device's own format and are not compared. A step the host runtime faults on is
-// reported and not compared. No shaders or game data. Skips (77) without a Vulkan GPU; without a host D3D12 device
+// and output pointer state are recorded. The public argument checks must agree step by step. Serialized sizes and
+// the result of changing a trailing byte are reported for each device's own format. Host faults are reported
+// separately. No shaders or game data. Skips (77) without a Vulkan GPU. Without a host D3D12 device,
 // only the layer's own record is printed. Set LEONIDA_D3D49_VERBOSE=1 to print every step.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
+
+#include <dxgi1_4.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -105,7 +107,9 @@ const Step kSteps[] = {
          longer.resize(longer.size() + 64, 0);
          return create(c, longer.data(), longer.size());
      }},
-    {"create: its own blob, last byte flipped", [](Context& c) {
+    // The layer's empty LPL1 library contains only the header, so its last byte is in the reserved field.
+    // The native library has its own driver-specific layout.
+    {"create: its own blob, last byte flipped [own format]", [](Context& c) {
          std::vector<std::uint8_t> flipped(c.own);
          flipped.back() ^= 0xFF;
          return create(c, flipped.data(), flipped.size());
@@ -268,6 +272,21 @@ ID3D12Device1* create_host() {
     return host;
 }
 
+// The native default adapter can differ from the Vulkan device selected by LEONIDA_VK_DEVICE.
+void report_host_adapter(ID3D12Device1* host) {
+    const LUID luid = host->GetAdapterLuid();
+    Ref<IDXGIFactory4> factory;
+    Ref<IDXGIAdapter1> adapter;
+    DXGI_ADAPTER_DESC1 desc{};
+    char name[3 * _countof(desc.Description)]{};
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) &&
+        SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter.p))) &&
+        SUCCEEDED(adapter->GetDesc1(&desc)))
+        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name), nullptr, nullptr);
+    std::printf("host D3D12 adapter: %s, LUID %08lx:%08lx\n", name[0] ? name : "(name unavailable)",
+                static_cast<DWORD>(luid.HighPart), luid.LowPart);
+}
+
 // Step `index` on the host, in a child process (this executable with --host-step) with a fresh device: a call the
 // host runtime faults on (Serialize(nullptr, n)) leaves it broken, and in-process the next call failed fast, which no
 // exception handler survives.
@@ -366,6 +385,7 @@ int main(int argc, char** argv) {
             EXPECT(empty_library(device.p, library, ours_blob));
         }
         if (host.p) {
+            report_host_adapter(host.p);
             Ref<ID3D12PipelineLibrary1> library;
             if (!empty_library(host.p, library, host_blob)) host.reset();  // no pipeline libraries on this host
         }

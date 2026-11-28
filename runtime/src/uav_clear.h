@@ -91,6 +91,10 @@ inline constexpr Layout layouts[] = {
     {VK_FORMAT_R16_UNORM, Kind::unorm, 2, {{{0, 16}, {}, {}, {}}}},
     // A4B4G4R4_UNORM: typed UAVs are the driver's call (WARP has them, AMD's D3D12 driver doesn't).
     {VK_FORMAT_R4G4B4A4_UNORM_PACK16, Kind::unorm, 2, {{{12, 4}, {8, 4}, {4, 4}, {0, 4}}}},
+    // B5G6R5, B5G5R5A1 and B4G4R4A4_UNORM, likewise (WARP has all three).
+    {VK_FORMAT_R5G6B5_UNORM_PACK16, Kind::unorm, 2, {{{11, 5}, {5, 6}, {0, 5}, {}}}},
+    {VK_FORMAT_A1R5G5B5_UNORM_PACK16, Kind::unorm, 2, {{{10, 5}, {5, 5}, {0, 5}, {15, 1}}}},
+    {VK_FORMAT_A4R4G4B4_UNORM_PACK16, Kind::unorm, 2, {{{8, 4}, {4, 4}, {0, 4}, {12, 4}}}},
     {VK_FORMAT_R16_SNORM, Kind::snorm, 2, {{{0, 16}, {}, {}, {}}}},
     {VK_FORMAT_R16_UINT, Kind::uint, 2, {{{0, 16}, {}, {}, {}}}},
     {VK_FORMAT_R16_SINT, Kind::sint, 2, {{{0, 16}, {}, {}, {}}}},

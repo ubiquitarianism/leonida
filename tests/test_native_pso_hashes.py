@@ -1,4 +1,6 @@
 """tools/native_pso_hashes.py on hand-built DXBC containers and indexes: no game data."""
+import contextlib
+import io
 import json
 import os
 import struct
@@ -67,6 +69,14 @@ class NativePsoHashesTest(unittest.TestCase):
             self.assertEqual(build.call_count, 2)
             self.assertEqual(self.read(), [tool.HEADER])
 
+    def test_translation_index_with_utf8_bom_is_accepted(self):
+        digest = bytes(range(16))
+        self.put("one", container(digest))
+        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8-sig", newline="\n") as f:
+            json.dump({"one": {"stage": "vs", "fssm_sha256": "a" * 64}}, f)
+        self.assertEqual(tool.build(self.dxbc, self.spirv),
+                         {digest.hex(): ("vs", "../dxbc/one.dxbc")})
+
     def test_replacing_one_container_refreshes_the_digest(self):
         self.index({"one": {"stage": "ps", "fssm_sha256": "a" * 64}})
         self.put("one", container(bytes(16)))
@@ -126,6 +136,13 @@ class NativePsoHashesTest(unittest.TestCase):
         self.assertEqual(tool.main(["x", self.dxbc, self.spirv]), 1)
         self.assertEqual(tool.main(["x"]), 2)
 
+    def test_help_exits_zero(self):
+        for flag in ("-h", "--help"):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(tool.main(["x", flag]), 0)
+            self.assertIn("native_hashes.txt", out.getvalue())
+
     def test_a_shared_digest_requires_the_same_stage(self):
         shared = container(bytes([9]) * 16)
         self.put("one", shared)
@@ -134,6 +151,21 @@ class NativePsoHashesTest(unittest.TestCase):
                     for name, stage in (("one", "vs"), ("two", "ps"))})
         with self.assertRaises(tool.DigestClash):
             tool.build(self.dxbc, self.spirv)
+
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(path, mode, *args, **kwargs):
+            chmod_calls.append((str(path), mode))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(tool.os, "replace", side_effect=OSError("replace failed")), \
+             mock.patch.object(tool.os, "chmod", side_effect=track_chmod):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                tool.write(self.spirv, {"key": ("vs", "path")})
+
+        self.assertTrue(any(mode == 0o600 for _, mode in chmod_calls), chmod_calls)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,8 @@ For an index entry with `lds_bytes`, the checker compares the reported workgroup
 limit counts as a module failure before Vulkan receives the shader. Older indexes without this field still use the
 normal driver check. Mesh pipelines on devices without mesh shader support still use the existing feature skip.
 
+Build with `make_game.py --stages shaders --compact-spirv` to run SPIRV-Tools local load elimination, redundant value elimination and dead-code elimination before validation. The same flag works on `tools/rdna2spirv.py` and `scripts/translate_pipeline_compute.py`. It preserves stage interfaces, descriptor bindings and specialization constants. Omit the flag for an unoptimized comparison. On NVIDIA use separate empty pipeline caches and set `__GL_SHADER_DISK_CACHE=0` for both arms. Use one pipeline per checker process with `--jobs 1 --slow 0` for per-module timings.
+
 ## Options
 
 `vk_pipeline_check <spirv dir> [cache.bin] [options]`
@@ -254,10 +256,12 @@ acceptance only.
 
 A SPIR-V module larger than 4 MiB is "large". [#884](https://github.com/ItsNotRexed/Leonida/issues/884)
 showed why that matters: several compiles that each needed gigabytes of host RAM ran at the same time. Large
-modules now share a memory budget (`runtime/test/large_module_gate.h`): each one reserves 512 bytes of RAM per
+modules now share a memory budget (`runtime/src/large_module_gate.h`): each one reserves 512 bytes of RAM per
 SPIR-V byte, and they enter the driver while their reservations fit three quarters of the memory available when
 the run starts, up to `--jobs` of them. One large module always gets in when none is compiling, so a module
-bigger than the whole budget still compiles, alone among the large ones. Small modules are never held back. On
+bigger than the whole budget still compiles, alone among the large ones. Small modules are never held back, and a
+large module that doesn't fit yet doesn't hold its thread: it goes back in the queue and the thread takes the next
+module. The oldest one put back gets in first once it fits, and no later large module passes it. On
 Linux the budget is the smaller of `MemAvailable` and the room under the cgroup v2 `memory.max` of the process and
 every cgroup above it (a container, or `systemd-run -p MemoryMax=...`); on Windows it is `ullAvailPhys`. Where
 neither can be read, every large module compiles alone, as before. After each large module, glibc builds call
@@ -438,6 +442,35 @@ vk_pipeline_check path/to/spirv sample.cache --cache-feedback
 On Windows with an RTX 5090 (driver 621.14), a synthetic three-compute, one-vertex and one-pixel
 sample reported zero application-cache hits on its first run and five on the seeded run. On Mesa
 llvmpipe the same five pipelines succeeded both times and neither run reported a hit.
+
+### The cache and the runtime's device
+
+The runtime seeds its `VkPipelineCache` from the cache this tool saves, so a pipeline hits there only when the
+driver gives it the same cache key in both programs. Measured on Windows with an RX 9070 XT (driver
+32.0.32029.2010) and one synthetic compute shader, reading the application-cache-hit bit:
+
+- `robustBufferAccess`, `scalarBlockLayout` and `robustImageAccess` are each part of the key. The first two are
+  disabled on both devices; the runtime's device enables supported core image robustness for storage views, and so
+  does the checker. Nothing else that differs between the two devices changed the key on RX 9070 XT: the checker's
+  other features, the runtime's extensions, the application name.
+- On Windows 11 with an Intel RaptorLake-S iGPU, clearing those three features alone makes the checker's cache hit
+  on the runtime's device. On an NVIDIA GeForce RTX 5060 Laptop GPU (driver 621.24), NVIDIA also hashes
+  `VK_EXT_mesh_shader` (with `meshShaderQueries` enabled, matching the runtime since `#577`) and
+  `VK_KHR_maintenance8` into the pipeline cache key even for compute shaders, so the checker enables both whenever
+  supported and keeps `meshShaderQueries` on.
+- On a Windows RTX 5070 Ti (617.42), a compute-only seed missed with mesh features omitted and hit with the supported mesh and mesh-query features enabled on both devices. The shader, push constants and pipeline layout were identical. Cache-producing runs request this device configuration for every selected shader batch.
+- On Windows with an AMD Radeon RX 7900 XT, `VK_EXT_transform_feedback` (with `transformFeedback` enabled, and
+  `geometryStreams` when the device offers it) is part of the key: the runtime enables it whenever the extension is
+  present (D3D-302), so the checker enables it too. Without it, `pipeline_cache_seed` failed 3 of 3 on that GPU and
+  passed 3 of 3 on `main`. NVIDIA leaves it out of the key, which is why it did not show up on the RTX 3080 Ti.
+- The executable's file name is part of the key; its folder is not. A copy of the checker under another name
+  misses the cache the original wrote, and the runtime's device hits the checker's cache only from a program
+  with the checker's file name. So on this driver a cache written by `vk_pipeline_check.exe` does not hit in
+  `gta6rt.exe`, and one written by a copy of the checker named `gta6rt.exe` does.
+
+The `pipeline_cache_seed` test embeds a synthetic minimal compute shader and runs a copy of the checker under the
+test program's own file name, then creates the same pipeline on the runtime's device from the saved cache. It is
+skipped where the driver reports no hit even for a cache the device wrote itself, as llvmpipe does.
 
 ## Wave64-emulated corpus (`--wave64-emulate`)
 

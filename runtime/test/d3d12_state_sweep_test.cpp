@@ -51,7 +51,73 @@ struct Case {
     UINT8 clear_stencil = 0;
     UINT8 stencil_ref = 0;
     float blend_factor[4] = {0.3f, 0.6f, 0.9f, 0.1f};
+    // A pipeline state stream with a DEPTH_STENCIL2 subobject (ID3D12Device2::CreatePipelineState) instead of
+    // CreateGraphicsPipelineState: `face_masks` gives each face its own read and write mask. With `back_ref` set
+    // the draw takes ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef(stencil_ref, back_ref).
+    bool stream = false;
+    UINT8 front_read = 0xff, front_write = 0xff, back_read = 0xff, back_write = 0xff;
+    int back_ref = -1;
 };
+
+// One pipeline state stream subobject as d3dx12.h declares it (CD3DX12_PIPELINE_STATE_STREAM_SUBOBJECT). The
+// alignment pads some of them, which is the point (C4324).
+#pragma warning(push)
+#pragma warning(disable : 4324)
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename Inner>
+struct alignas(void*) Subobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+    Inner inner;
+};
+#pragma warning(pop)
+
+// The graphics description `pd` as a stream, its depth-stencil state as DEPTH_STENCIL2 with per-face masks.
+HRESULT create_stream_pso(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd, const Case& c,
+                          ID3D12PipelineState** out) {
+    ID3D12Device2* device2 = nullptr;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device2)))) return E_NOINTERFACE;
+    const D3D12_DEPTH_STENCIL_DESC& ds = pd.DepthStencilState;
+    const auto face = [](const D3D12_DEPTH_STENCILOP_DESC& f, UINT8 read, UINT8 write) {
+        return D3D12_DEPTH_STENCILOP_DESC1{f.StencilFailOp, f.StencilDepthFailOp, f.StencilPassOp, f.StencilFunc, read,
+                                           write};
+    };
+    D3D12_DEPTH_STENCIL_DESC2 ds2{};
+    ds2.DepthEnable = ds.DepthEnable;
+    ds2.DepthWriteMask = ds.DepthWriteMask;
+    ds2.DepthFunc = ds.DepthFunc;
+    ds2.StencilEnable = ds.StencilEnable;
+    ds2.FrontFace = face(ds.FrontFace, c.front_read, c.front_write);
+    ds2.BackFace = face(ds.BackFace, c.back_read, c.back_write);
+    D3D12_RT_FORMAT_ARRAY formats{};
+    formats.NumRenderTargets = pd.NumRenderTargets;
+    std::memcpy(formats.RTFormats, pd.RTVFormats, sizeof(formats.RTFormats));
+    struct {
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2, D3D12_DEPTH_STENCIL_DESC2> depth;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> rtvs;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> dsv;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> samples;
+    } stream{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, pd.pRootSignature},
+             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, pd.VS},
+             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, pd.PS},
+             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, pd.BlendState},
+             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, pd.SampleMask},
+             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, pd.RasterizerState},
+             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2, ds2},
+             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, pd.PrimitiveTopologyType},
+             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, formats},
+             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, pd.DSVFormat},
+             {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, pd.SampleDesc}};
+    const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+    const HRESULT hr = device2->CreatePipelineState(&desc, IID_PPV_ARGS(out));
+    device2->Release();
+    return hr;
+}
 
 constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
 
@@ -100,7 +166,8 @@ Result run(ID3D12Device* device, const Case& c, const Programs& p) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
     base_state(pd, c, root.p, p);
     Ref<ID3D12PipelineState> pso;
-    r.pso = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p));
+    r.pso = c.stream ? create_stream_pso(device, pd, c, &pso.p)
+                     : device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p));
     if (FAILED(r.pso)) return r;
 
     D3D12_RESOURCE_DESC cd{};
@@ -172,7 +239,13 @@ Result run(ID3D12Device* device, const Case& c, const Programs& p) {
     list->SetGraphicsRootSignature(root.p);
     list->SetPipelineState(pso.p);
     list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-    list->OMSetStencilRef(c.stencil_ref);
+    if (c.back_ref >= 0) {
+        Ref<ID3D12GraphicsCommandList8> list8;
+        if (FAILED(list->QueryInterface(IID_PPV_ARGS(&list8.p)))) return r;
+        list8->OMSetFrontAndBackStencilRef(c.stencil_ref, UINT(c.back_ref));
+    } else {
+        list->OMSetStencilRef(c.stencil_ref);
+    }
     list->OMSetBlendFactor(c.blend_factor);
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
@@ -429,6 +502,36 @@ std::vector<Case> build_cases() {
         };
         cases.push_back(std::move(c));
     }
+    // DEPTH_STENCIL2: each face compares with its own read mask and writes through its own write mask, and with
+    // OMSetFrontAndBackStencilRef against its own reference. Stored 0xa5; a pass replaces, a fail inverts.
+    struct Masks {
+        const char* name;
+        UINT8 front_read, front_write, back_read, back_write;
+    };
+    for (const Masks& m : {Masks{"same", 0x0f, 0x3c, 0x0f, 0x3c}, Masks{"split", 0x0f, 0x3c, 0xf0, 0xc3},
+                           Masks{"front only", 0xff, 0x00, 0x0f, 0xff}, Masks{"back only", 0x0f, 0xff, 0xff, 0x00}})
+        for (int back_ref : {-1, 0xa3})
+            for (bool flipped : {false, true}) {
+                Case c;
+                c.name = std::string("stencil per-face masks ") + m.name + (back_ref < 0 ? ", one ref" : ", two refs") +
+                         (flipped ? ", back-facing" : ", front-facing");
+                c.clear_stencil = 0xa5;
+                c.stencil_ref = 0x35;
+                c.back_ref = back_ref;
+                c.stream = true;
+                c.front_read = m.front_read;
+                c.front_write = m.front_write;
+                c.back_read = m.back_read;
+                c.back_write = m.back_write;
+                c.state = [=](D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd) {
+                    pd.RasterizerState.FrontCounterClockwise = flipped;
+                    pd.DepthStencilState.StencilEnable = TRUE;
+                    pd.DepthStencilState.FrontFace = pd.DepthStencilState.BackFace = {
+                        D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_REPLACE,
+                        D3D12_COMPARISON_FUNC_EQUAL};
+                };
+                cases.push_back(std::move(c));
+            }
     return cases;
 }
 

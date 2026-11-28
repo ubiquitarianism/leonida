@@ -64,6 +64,16 @@ Since the library-loader shims (`runtime/shims/library_loader.cpp`), a module's 
 
 The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetCommandLineA/W` the same way: through `kernel32`, `kernelbase`, and `api-ms-win-core-processthreads-l1-1-0` and `api-ms-win-core-processenvironment-l1-1-0`, the sets the API-set umbrella libraries (`OneCore_apiset.lib`, `mincore.lib`) bind them to. `vcomp140.dll` imports `ExitProcess` from the first of these. The UCRT's `_get_narrow_winmain_command_line` and `_get_wide_winmain_command_line` are served too, so a `WinMain` executable gets the game's command line as `lpCmdLine`. `abort()` raises `SIGABRT` when the guest installed a handler (the guest's `signal()` import binds to the host CRT, so its table is the one raised here); with the default or ignore disposition, or a handler that returns, the run still ends with code 3. `run_tiny_game_abort_exit_codes` compares that with a native run of the stand-in image. The table above is `gta6rt --dry-run` on each DLL at the commit that added this paragraph.
 
+The lifecycle shim (`runtime/shims/lifecycle.cpp`) serves `RegisterAppStateChangeNotification` and
+`UnregisterAppStateChangeNotification` under `api-ms-win-core-psm-appnotify-l1-1-0`, `-l1-1-1` and `kernelbase.dll`, and
+`CreateWindowExW`/`CreateWindowExA` under `user32.dll` and the two `ext-ms-win-rtcore-ntuser-window-l1-1-*` sets, and
+`CreateWindowExA` under `ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0`. The title's import table names
+`RegisterAppStateChangeNotification` from `api-ms-win-core-psm-appnotify-l1-1-0` and `CreateWindowExA` from that ANSI
+set (`tools/pe_inspect.py`). Only the title's first top-level window (no parent, not a child, not a tool window) is fitted to the work area and hooked: its
+`SC_CLOSE` runs the registered suspend callbacks with `quiesced` TRUE under the registration lock, then the run ends
+through the title's own `ExitProcess`, so the host finishes its cleanup. A 1 s deadline ends the run the same way if the
+callbacks have not returned.
+
 The shims added since account for the rest of the difference from the first version of the table. The UCRT's `_configure_narrow_argv`, `_configure_wide_argv`, `__p___argc`, `__p___wargv` and `abort` are served by `runtime/shims/process.cpp`, which is why almost every DLL gained one or two. The file-system calls listed in *Console paths and the write overlay* below (`CreateFile2`, `CopyFile2`, `CreateDirectoryW`, `FindFirstFileExW`, `SetFileAttributesW` and the rest) account for `msvcp140.dll`, `vcomp140.dll`, `Bink2Scarlett.dll`'s `CreateFile2` and part of the two HTTP clients. `winhttp.dll` is a module the shims own (*WinHTTP offline* below), so every `WinHttp*` import binds to it: 15 in `libHttpClient.GDK.dll` (all 16 but `WinHttpCrackUrl`) and 15 in `XCurl.dll` (all but `WinHttpQueryOption`). That is why the two HTTP clients moved the most: 11 to 26 and 9 to 24 shim imports.
 
 The UCRT argv configuration imports honor the executable's startup mode. Each run starts with `argc == 0` and
@@ -160,18 +170,26 @@ policy "other" (none is counted as returning an `HRESULT`), and they come from s
 | `xg_xs.dll` | 2: `XGCreateTextureComputer`, `XGSuggestSwizzleMode` | texture layout computation |
 | `XCRDAPI.dll` | 1: `DStorageGetFactory` | DirectStorage |
 | `chad.dll` | 5: `XDspActivate`, `XDspConnectWithMaximumStreamLimit`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand` | the audio DSP |
-| `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit |
+| `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit (Opus decode when `runtime/opus_decoder` is built) |
 | `AcpHal.dll` | 9: `AcpHalAllocateShapeContexts`, `AcpHalCreate`, `AcpHalReleaseShapeContexts`, `ApuAlloc`, `ApuCreateHeap`, `ApuFree`, `ApuIsVirtualAddressValid`, `ApuMapApuAddress`, `ApuMapVirtualAddress` | the audio hardware layer |
 
 The game executable imports two functions from `xg_xs.dll`, the console's texture layout library:
 `XGSuggestSwizzleMode` (2 call sites, in the helper that fills a texture description) and `XGCreateTextureComputer`
-(4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable). The runtime has no model of the console
-resource layout, so `runtime/shims/xg_xs.cpp` computes none: both return `E_NOTIMPL` and write no layout. Two of the
-four `XGCreateTextureComputer` callers ignore the HRESULT and call through the object at once, so the shim still stores
-a static object in the out pointer; its slot 1 (read as `Release`) does nothing, and every other slot up to 31 logs its
-index and caller once and returns `E_NOTIMPL` without writing its arguments. The call shapes and the reasoning are at
-the top of the file; `xg_xs_test` covers them. Textures whose layout the game asks for are therefore not laid out yet.
-The table above was measured before this shim and still lists these two as unimplemented; they are served now.
+(4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable). `runtime/shims/xg_xs.cpp` answers them
+from a model of the console's texture layouts, `runtime/src/console_texture_layout.h` (AMD addrlib's GFX10 rules for
+the linear, 256 B, 4 KiB and 64 KiB modes: block shapes, mip tails, the micro tile patterns, a separate stencil plane),
+ported with the computer's method table and layout structure from Marvisak/VIctory (GPL-3.0-or-later, `xg.rs` and `texture.rs`
+at `d2a4bae1f`). `XGSuggestSwizzleMode` writes `0x100 | mode` (linear for 1D, `64KB_Z_X` for depth, `64KB_R_X` for
+render targets, else `4KB_S`); the computer fills the layout (slot 2), gives an element's offset (slot 6), copies a
+subresource into (slot 8) and out of (slot 9) tiled memory, and reports the 64 KiB tiling (slot 10). Not modelled:
+compression metadata planes, and addressing or copies for the pipe/bank XOR modes and MSAA (`E_NOTIMPL`). A description
+it cannot lay out still gets a computer in the out pointer with `E_INVALIDARG`, because two of the four callers ignore
+the HRESULT and call through the object at once; that object answers every slot with `E_NOTIMPL` and writes nothing.
+`xg_xs_test` covers the model (hand-checked addresses, mip tails, a bijection and round trip over every element) and the
+shim's slots. The table above was measured before this shim and still lists these two as unimplemented; they are served
+now.
+Set `LEONIDA_XG_TRACE=1` to log the first 1024 calls per entry point; the source notes are in
+[xg_xs_THIRD_PARTY.md](../runtime/shims/xg_xs_THIRD_PARTY.md).
 
 Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
@@ -184,6 +202,22 @@ The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so
 again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 30
 unimplemented imports is reached by the TLS callbacks or the `DllMain`s.
 
+The executable's audio imports `xapu.dll` (`XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`,
+`XApuEnqueueCommand`, `XApuGetResultCount`) are served by `runtime/shims/xapu_queue.cpp`; `chad.dll`
+(`XDspActivate`, `XDspConnectWithMaximumStreamLimit`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`) by
+`runtime/shims/xapu_chad.cpp`. The shapes were read statically from the executable's call sites: one each, four for
+`XApuEnqueueCommand`. `XApuConnect` reads the title's 24-byte `ConnectInput` (process 1 = Opus at 48 kHz, stream
+count, commands per stream, a shared buffer, options) and returns `{shared buffer, result event}`; it never writes the
+input. Activate, process, deactivate and reset commands are copied from the title's stack command, and each queues one
+result in order. A process command decodes its Opus packet through `runtime/opus_decoder` (Rust over the BSD-3-Clause
+`opus-pure`) into the slot's output, honouring first frame, frame count, output length and the deinterleaved option;
+without the crate the result carries the table-of-contents frame count and silence. The layouts follow Marvisak/VIctory
+`crates/victory-hle/src/modules/apu.rs` (GPL-3.0-or-later). `XDspActivate` writes its two outputs as pointers to zeroed
+memory, which the title reads as "command done" after each `XDspSubmitCommand`; the DSP stays silent. `xapu_chad_test`
+covers the layouts, the queue and the silent path; `xapu_opus_test` the decoded path. With `--trace`, the first call of
+each, and the first command of each type, is an `audio_queue` event.
+The table above was measured before this shim and still lists these ten as unimplemented; they are served now. The call shapes agree with `docs/audio_hal_exe_calls.md`, which was measured with `tools/import_call_sites.py`.
+
 What this does not show: `--run` has not been run, so the entry point has not been called and no import is known to be
 reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
 that name exists), and an unimplemented import stops the run only if the title calls it
@@ -192,6 +226,58 @@ functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo
 outbound and name-resolution calls among them, loopback only (see the Winsock2 section below), and the remaining
 imports bind to the host's. `winhttp.dll` is served by the offline shim, which opens none. Known gap: `dnsapi.dll`
 (`DnsQuery*`) is not shimmed, so a title that calls it reaches the host's resolver.
+
+## Audio hardware (`AcpHal.dll`)
+
+The game executable imports nine functions from `AcpHal.dll`, the console's audio hardware layer.
+`runtime/shims/acphal.cpp` serves them; the argument shapes come from a static read of the executable's call sites
+(one thunk per import, 16 call sites in all), and the names of the parameters and object slots are hypotheses.
+`ApuCreateHeap` reserves one block of ordinary memory for both sizes it is given, `ApuAlloc` and `ApuFree` manage it
+first fit, and an APU address is a fixed 32-bit base plus the offset in it, so `ApuMapVirtualAddress` and
+`ApuMapApuAddress` are arithmetic and `ApuIsVirtualAddressValid` checks a live block and the alignment.
+`AcpHalAllocateShapeContexts` fills zeroed 64-byte contexts per count, and `AcpHalCreate` returns an object whose
+calls succeed and do nothing: there is no audio processor, so the game gets no sound from this path. Its boot checks
+fail hard, which is why every call succeeds. `acphal_test` covers the call shapes.
+The table under [The retail executable](#the-retail-executable-rt-5) was measured before this shim and still lists these nine as unimplemented; they are served now.
+
+## Audio output off the console (WASAPI)
+
+Off the console the title's sound goes out through WASAPI, not through the `AcpHal` path above: it creates an
+`MMDeviceEnumerator` with `CoCreateInstance` (one call, `CLSCTX_ALL`, `IID_IMMDeviceEnumerator`), asks it for the
+default render endpoint and activates `ISpatialAudioClient` on it (measured: the first interface the title asks the
+device for). A console always has an output. A host with none
+answers `GetDefaultAudioEndpoint(eRender, ...)` with `0x80070490` (`ERROR_NOT_FOUND`), and the title's device start
+then takes an error path that leaves its own output-device lock held by a job worker: the audio engine never mixes, a
+main-thread command buffer fills up, and the title stops on an `int3` about 47 s into the boot (measured under Wine with
+its audio drivers disabled; refusing the enumerator itself stops it the same way, and a host null sink removes the stop).
+
+So `CoCreateInstance` of that class goes to `runtime/shims/silent_audio.cpp` (hooked in `shims/com_shim.cpp`). When
+the host's enumerator has a default render endpoint it is returned unchanged. When it has none, or cannot be made, or
+`LEONIDA_AUDIO=silent` is set, the title gets an enumerator whose render answers are a **silent output endpoint** of the
+runtime's own: `GetDefaultAudioEndpoint(eRender)`, `EnumAudioEndpoints(eRender)` (active devices) and `GetDevice` with
+its ID give an active `IMMDevice` whose property store has a friendly name and the device format; `Activate` gives
+`ISpatialAudioClient`, `ISpatialAudioClient2`, `IAudioClient`, `IAudioClient2` or `IAudioClient3` (any other interface
+is `E_NOINTERFACE`, logged once). The spatial client has a 7.1 bed of static objects and no dynamic objects, as an
+endpoint with no spatial sound format turned on; its objects are mono 48 kHz float, and its
+`ISpatialAudioObjectRenderStream` signals the stream's event every 10 ms pass (480 frames) while it runs and hands
+each object a scratch buffer between `BeginUpdatingAudioObjects` and `EndUpdatingAudioObjects`. The client
+takes any PCM or float format in shared mode (event-driven or polled), and `GetService` gives `IAudioRenderClient`
+(a scratch buffer), `IAudioClock`, `ISimpleAudioVolume` and `IAudioStreamVolume`. A clock consumes the written frames
+in real time, so `GetCurrentPadding` drains, and an event-driven stream's event is signalled every 10 ms period
+while it runs, so a title that paces its mixer on the event keeps running. Capture questions keep the host's answer
+(with `LEONIDA_AUDIO=silent` the host's enumerator is only made when one comes). Endpoint notification callbacks are
+accepted and never called. Nothing opens or touches a host audio device, and every sample is discarded. The first
+silent device handed out prints one `[rt] audio: serving the silent output endpoint (<reason>)` line, the reason being
+the host's failed call or `LEONIDA_AUDIO=silent`.
+
+The mix format is 48 kHz, 32-bit float, 7.1 (eight channels, mask `0x63F`). 48 kHz float is the shared-mode
+format of the Windows audio engine and of the console's. 7.1 is the console's case, and a hypothesis, not measured
+here: the console's system mixer takes a 7.1 bed whatever output is plugged in and downmixes it for stereo, so a
+console title is built for eight channels, where stereo would be the usual answer of a PC with headphones. The stream
+itself takes any channel count, so a title that asks for fewer is not refused. `silent_audio_test`
+covers the enumerator over stand-in hosts with and without an endpoint and with none, a render stream run for a
+few periods with its event and padding checked, a spatial stream run for ten passes, and the `CoCreateInstance` hook
+with `LEONIDA_AUDIO=silent`.
 
 ## Console paths and the write overlay
 
@@ -206,10 +292,17 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   passed to the host unchanged. `--game-dir` defaults to the image's folder. `gta6rt` makes it and `--overlay`
   absolute at startup, so a bare image name (`gta6rt --run game.exe` from the game folder) and a relative folder
   both keep naming the same place after the title changes its current directory (CTest `run_tiny_game_dir`).
-  `G:\` is the same folder as `GAME:`, and `T:\` is a scratch folder, `<overlay>\.gta6rt-temp`, that `GAME:` does
-  not see (RT-218; the other console layers map those two drives this way, and only the executable can say which
-  spelling GTA VI uses). A path under `--game-dir` or the overlay is always a host path, so a package that sits on
-  a host drive `G:` keeps working, and with no folders configured `G:` and `T:` stay host drives.
+  `G:\` is the same folder as `GAME:`, and `T:\` is a scratch folder that `GAME:` does not see (RT-218; the other
+  console layers map those two drives this way, and only the executable can say which spelling GTA VI uses). Each
+  process has its own, `<overlay>\.gta6rt-temp\<YYYYMMDD-HHMMSS-mmm>-pid<id>` (start time in UTC and process id,
+  `rt::fs::scratch_dir()`, named on the startup line), as the console's temporary drive is empty at launch and
+  shared with no other run: with one folder for all runs, a `CREATE_NEW` of a name an earlier run left failed with
+  `ERROR_FILE_EXISTS` (old upstream issue 7913). `rt::fs::reserve_unique_dir` reserves it once per overlay with a
+  create-only `CreateDirectoryW`; a name that already exists (a reused process id in the same millisecond) is skipped
+  for `-2`, `-3`, ... up to 1000 names, after which `T:` paths fail with `ERROR_INVALID_NAME` and the reason is
+  printed once. Earlier runs' folders are kept, never reused, and `T:\..` cannot reach them. A path under
+  `--game-dir` or the overlay is always a host path, so a package that sits on a host drive `G:` keeps working, and
+  with no folders configured `G:` and `T:` stay host drives.
   `T:\` is a drive root like `GAME:\`: its folder is made on the first `T:` call, so it is a folder before anything
   is written there, and removing or moving it fails with `ERROR_ACCESS_DENIED`.
 - An open that can write, and `DeleteFile`, use the overlay: `--overlay DIR`, default `<game-dir>\overlay`. A
@@ -233,7 +326,9 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   package has, fails with `ERROR_ALREADY_EXISTS`; a missing parent with `ERROR_PATH_NOT_FOUND`.
 - `RemoveDirectory*` needs the folder empty in the title's view (`ERROR_DIR_NOT_EMPTY` otherwise). An overlay folder is
   removed; a package folder is hidden by a `.gta6rt-dir` marker inside its marker folder, and stays on disk. A marker
-  folder on its own (left by a file deleted below it) does not hide anything.
+  folder on its own (left by a file deleted below it) does not hide anything. A remove and a write-open or
+  `CreateDirectory*` inside the folder on another thread are ordered as on the host: one goes first, and the create
+  fails with `ERROR_PATH_NOT_FOUND` or the remove with `ERROR_DIR_NOT_EMPTY`, never both succeeding.
 - `MoveFile*` writes the destination in the overlay. A package file is copied there and its old name deleted by a
   marker; an overlay file or an overlay-only folder is renamed. An existing destination needs
   `MOVEFILE_REPLACE_EXISTING` even when only the package has it. Moving a package folder fails with
@@ -257,12 +352,51 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   when its folder is missing, was removed, or is a file, and creates nothing (`T:` is the exception: a create there
   makes its parent folders); `FindFirstFile` fails the same way for a
   listing inside such a folder (a pattern that matches nothing in a folder that exists is still
-  `ERROR_FILE_NOT_FOUND`, and a listing directly below a file is `ERROR_DIRECTORY`, as on the host).
+  `ERROR_FILE_NOT_FOUND`, and a listing directly below a file is `ERROR_DIRECTORY`, as on the host). `DeleteFile*`,
+  `RemoveDirectory*`, `SetFileAttributes*` and the source of `MoveFile*` answer a name inside such a folder with
+  `ERROR_PATH_NOT_FOUND` too, and a missing name in a folder that exists with `ERROR_FILE_NOT_FOUND`, as on the host.
 - `MoveFile*` onto the same name succeeds and changes nothing. A rename that changes only the case renames the overlay
   entry; a package file gets an overlay copy under the new spelling, and a package folder is refused like any other
   move of one.
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
+
+## Console identity in the registry
+
+GTA VI does not only ask `XSystemGetDeviceType` which console it runs on. Code linked into the executable opens
+`HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\OEM`, reads the `DWORD` value `ConsoleMode`
+(`0x64` Series X, `0x60` Series S) and closes the key. A missing value means a PC, and a PC takes the PC memory
+budgets and resolution, so without an answer the title does not run as the console build. It decides the console
+model, and with it the back buffer size (1920x1080 for Series S, 3840x2160 for Series X).
+
+Measured with `tools/pe_inspect.py` on the retail 1.0.2.1 package:
+
+| Module | Imports | From |
+|---|---|---|
+| `game_scarlett_master.exe` | `RegOpenKeyW`, `RegQueryValueExW`, `RegCloseKey` | `ADVAPI32.dll` |
+| `libHttpClient.GDK.dll` | the same three and `RegOpenKeyExW` | `ADVAPI32.dll` |
+| `XCurl.dll` | `RegOpenKeyExW`, `RegQueryValueExW`, `RegCloseKey`; `RegOpenKeyW` | `api-ms-win-core-registry-l1-1-0.dll`; `-l2-1-0.dll` |
+
+Before `runtime/shims/console_registry.cpp` the loader bound all of them to the host's advapi32 (`pe_inspect` labels
+them `shim` only because it ran on Linux, with no `System32` to find them in). Under Proton the lead wrote the value
+into the Wine prefix; on a Windows PC the key does not exist and writing it needs administrator rights.
+
+`console_registry.cpp` now serves the four functions under `advapi32.dll` and the registry API sets. It answers only
+`HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM` / `ConsoleMode`, with a pseudo key; every other key,
+value and handle goes to the host's advapi32 unchanged. It follows the `RegQueryValueExW` contract for the value:
+`REG_DWORD` is reported when the type pointer is set, a null data pointer is a size query (4 bytes), a buffer under
+4 bytes gives `ERROR_MORE_DATA` with the size, and a data pointer without a size is `ERROR_INVALID_PARAMETER`.
+
+One setting drives both answers (`runtime/shims/console_identity.h`): `LEONIDA_DEVICE_TYPE` 6 gives `ConsoleMode`
+`0x60`, 7 (also the default) gives `0x64`, 8 (devkit) gives `0x68`. For the types that have no value (0, 1, 2 to 5) the
+key is not ours and the host registry answers, so a missing key stays missing, as on a PC. The first answer of each
+value is logged once: `[rt] registry: ConsoleMode answered 0x64 (LEONIDA_DEVICE_TYPE=7)`. `advapi32.dll` is a host
+module in `rt::shims::owns_dll`: `LoadLibrary("advapi32.dll")` still returns the real module.
+
+Credit: the pseudo key design and the value numbers follow VIctory `crates/victory-hle/src/modules/xsystem.rs`
+(`mod device_type`, GPL-3.0-or-later, commit 2849477); `0x68` for the devkit follows xbox-emulator
+`crates/compat/xpal` and `compat-common/src/gdk/hook.rs` (GPL-3.0, commit 0284e83). The test is
+`runtime/test/console_registry_test.cpp` (`ctest -R console_registry`).
 
 ## When an unimplemented import is called
 
@@ -288,28 +422,51 @@ families are not listed. The sources are the Microsoft Learn pages for the D3D12
 (`gaming/gdk/docs/reference/system/<family>/functions/<name>`); `D3D12XboxCreateDevice` is matched by name from the
 measurement in `d3d12_vulkan.md`, because its page could not be found.
 
+### Delay imports and thread events: where the loader differs from Windows
+
+- **Delay imports are bound eagerly.** `Loader::bind_imports` (`runtime/src/pe_loader.cpp`) binds the delay-import
+  table at load time, like the import table, so `--dry-run` shows the whole import surface. A delay-loaded DLL or
+  function that nothing serves becomes an unimplemented thunk, which follows `LEONIDA_UNIMPLEMENTED` at its first
+  call (return 0 by default). On Windows the delay-load helper raises `0xC06D007E` (module not found) or
+  `0xC06D007F` (procedure not found) at that call instead, and a title can catch it and take a fallback; that fallback
+  never runs here. `--trace` writes a `delay_import_unimplemented` event (`module`, `import`) for each such import
+  when the image is loaded.
+- **Thread events reach TLS callbacks in TLS slot order.** A new thread's `DLL_THREAD_ATTACH` runs the mapped
+  modules' TLS callbacks in the order of their TLS slots (`DLL_THREAD_DETACH` in reverse). A module takes the lowest
+  free slot when it is mapped, before its imports are loaded, so the executable's callbacks run before those of the
+  DLLs it imports; a slot freed by an unloaded module goes to the next one. Windows does not document its order, so a
+  title that depends on DLL-first order would see a difference here. Mapped DLLs' `DllMain` gets no thread events
+  (`runtime/README.md`, PE loader).
+
 ## Run-time loaded modules
 
 Not every console module is reached through an import table. `libHttpClient.GDK.dll` and `XCurl.dll` both use the
 GDK runtime, but `dumpbin /imports` shows **no import of `xgameruntime.dll`** in either. Both carry the wide string
 `xgameruntime.dll` and the ASCII names `InitializeApiImpl`, `InitializeApiImplEx`, `InitializeApiImplEx2`,
-`QueryApiImpl` and `UninitializeApiImpl`, next to a statically linked `XGameRuntimeInitialize`. So `xgameruntime.lib`'s
-thunks `LoadLibraryW` the runtime and `GetProcAddress` those five names at run time. xodus-gaming/xgameruntime-docs
+`QueryApiImpl`, `UninitializeApiImpl` and `XErrorReport` (one block of strings in each DLL), next to a statically
+linked `XGameRuntimeInitialize`. So `xgameruntime.lib`'s thunks `LoadLibraryW` the runtime and `GetProcAddress` those
+six names at run time. A runtime without `XErrorReport` is refused before any initializer is called: with only the
+five entry points served, the package's own libHttpClient `HCInitialize` returned `0x89240101`
+(`E_GAMERUNTIME_DLL_NOT_FOUND`) and XCurl's `curl_global_init` returned `CURLE_FAILED_INIT`, both called through
+`gta6rt --run` by a stand-in program that loads the two DLLs from the package. xodus-gaming/xgameruntime-docs
 (GPL-3.0) documents the same mechanism for PC GDK titles: `InitializeApiImplEx2` is what
 `XGameRuntimeInitialize[WithOptions]` calls, and `QueryApiImpl` hands out the runtime's COM classes, whose methods
 mostly correspond one to one to the `xgameruntime.lib` functions. The executable is very likely linked the same way.
 
 Bound to the host, those calls would load the PC's Gaming Services runtime, or fail, and never reach the offline
 shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
-shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `xg_xs.dll`, `gameinput.dll`)
-with a pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
+shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `xg_xs.dll`, `gameinput.dll`, and the
+DirectStorage modules `dstorage_xs.dll`, `xcrdapi.dll` and `dstorage.dll`, [directstorage.md](directstorage.md)) with a
+pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
-`runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,
-`XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`, `XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl`
-(below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`, `XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`,
-`XDisplayImpl`, `XUserDeviceImpl`, `XAccessibilityImpl` and `XLauncherImpl` from xgameruntime-docs' layout (below); for any other class it logs
+`runtime/shims/xgameruntime.cpp` serves the five entry points and `XErrorReport(HRESULT, const char*)`, the same
+function as `IXErrorImpl` slot 3 (below), so a report reaches the callback `XErrorSetCallback` set either way. The
+initializers succeed offline and log the GDK version and mode once. `QueryApiImpl` serves `XThreadingImpl`,
+`XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`, `XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`,
+`XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl` (below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`,
+`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl`, `XUserDeviceImpl`, `XAccessibilityImpl` and
+`XLauncherImpl` from xgameruntime-docs' layout (below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the classes `xgameruntime.cpp` serves slot by slot.
@@ -320,7 +477,8 @@ the api-set binding `XCurl.dll` uses, and calls the classes `xgameruntime.cpp` s
 pointers to 64-bit locals (the result is not read), compares the pair with the one it saw last and keeps it. On the
 host that load would find a PC's Gaming Services runtime, which bypasses the offline classes, or nothing, in which
 case XCurl returns `0x87E00196`. The shims own `gameplatformservices.dll` too: its `QueryApiImpl` is the offline
-one, and `GetApiVersionImpl(uint64_t*, uint64_t*)` writes the same two values every time.
+one, and `GetApiVersionImpl(uint64_t*, uint64_t*)` writes the same two values every time. `curl_global_init` also
+asks that module for `InitializeApiImpl`, which is not served; the call succeeds without it.
 
 ### Class layouts, measured
 
@@ -341,7 +499,7 @@ count and width, the function at that position of xgameruntime-docs' "Layout" li
 | `XNetworkingImpl` (`IXNetworkingImpl2`, slots 3-20) | 11-17 (`XCurl.dll`), 3-20 (`libHttpClient.GDK.dll`, each in its documented argument shape, e.g. 18-20 (enum, u64 pointer / u64 / pointer)) | the Utf16 `XNetworkingQuerySecurityInformationForUrl*` trio, `XNetworkingVerifyServerCertificate`, `XNetworkingGetConnectivityHint`, `XNetworkingRegister/UnregisterConnectivityHintChanged` (pointer, bool). Served offline, asked for with `IXNetworkingImpl2`'s id |
 | `XSystemImpl` (`IXSystemImpl5`, slots 3-8 known) | 3-8 (`libHttpClient.GDK.dll`) | 3-5 `XSystemGetConsoleId` / `GetXboxLiveSandboxId` / `GetAppSpecificDeviceId` (size, pointer, pointer each), 6 `XSystemHandleTrack` (two pointers, IXSystemImpl3), 7 `XSystemIsHandleValid` (pointer), 8 `XSystemAllowFullDownloadBandwidth` (bool, IXSystemImpl4); IXSystemImpl2 and 5 add no known method. Served offline |
 | `XPersistentLocalStorageImpl` (`IXPersistentLocalStorageImpl3`, slots 3-8) | none called (the table of ids only) | slots 3-7 are `XPersistentLocalStorageGetPathSize` / `GetPath` / `GetSpaceInfo` / `PromptUserForSpaceAsync` / `PromptUserForSpaceResult`, slot 8 `XPersistentLocalStorageMountForPackage` (IXPersistentLocalStorageImpl3). Slots from the public xgameruntime-docs and Wine IDL, not measured in a caller. Served offline: the folder is `<overlay>\.gta6rt-persistent`, which `GAME:` does not see, the quota is the 2048 MB of `MicrosoftGame.Config`, a prompt for space the quota holds succeeds, and `MountForPackage` is `E_NOTIMPL` |
-| `XPackageImpl` (`IXPackageImpl3`) | 3-19, 22, 24-27, 30, 32-34, 37-40 (`libHttpClient.GDK.dll`) | slots 3-34 are IXPackageImpl's 32 entries, 35-38 IXPackageImpl2's 4, 39-40 IXPackageImpl3's 2. Served offline: 3 identifier, 4 packaged process, 11 user locale, 24-26 mount path size / path / close; the rest log once and return `E_NOTIMPL` |
+| `XPackageImpl` (`IXPackageImpl3`, `IXPackageImpl4`) | 3-19, 22, 24-27, 30, 32-34, 37-40 (`libHttpClient.GDK.dll`); 3-7, 9, 12, 14, 16-19, 25, 26, 34, 37-39 (the retail executable, as `IXPackageImpl4`) | slots 3-34 are IXPackageImpl's 32 entries, 35-38 IXPackageImpl2's 4, 39-40 IXPackageImpl3's 2, 41 IXPackageImpl4's `XPackageGetPackageKind`. Served offline: 3 identifier, 4 packaged process, 5-10 installation monitor (create, close, progress complete, no update, progress registration, unregister), 11 user locale, 12-19 chunks of the fully installed package (every selector Ready, declared languages enumerated, install order / install / async install complete at once with a monitor, 0-byte download estimate, uninstall accepted with nothing removed; ported from VIctory's xpackage.rs), 22 unregister installed, 23-26 mount / path size / path / close, 34 uninstall package, 37-38 mount with UI (a mapped content package mounts, any other completes with `E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER`), 39 `XPackageEnumeratePackages` (S_OK, the callback never runs: no content packages to list; VIctory answers the title's call the same way); the rest log once and return `E_NOTIMPL` |
 | `XGameImpl` (`IXGameImpl3`, slots 3-5) | none in the package's DLLs (`libHttpClient.GDK.dll` holds its id only in the linked id table); the executable's requests are unmeasured | from the xgameruntime IDL: 3 `XGameGetXboxTitleId` (pointer), 4 `XLaunchNewGame` (two strings and a user handle, `void`), 5 `XLaunchRestartOnCrash` (string, u32). Served offline: the title id is `MicrosoftGame.Config`'s `<TitleId>` (`E_FAIL` without one), a new game launch is logged and ignored, a crash restart succeeds with nothing registered |
 
 **Two layout sources, and where they differ.** Besides xgameruntime-docs (GPL; facts only), the LGPL
@@ -387,8 +545,11 @@ trio (23-25). What the slots must answer is still **not measured**; that is the 
 - **Validity:** handles are looked up in a live set, never read, so a closed or foreign pointer is refused without
   touching its memory, and a double close does nothing. Unregistering a change callback is never pending, so it
   returns true for any token. `XUserIsStoreUser` is true, as documented for console.
+- **First calls:** every served slot writes one `[rt] xgameruntime: XUser <name> first call: ...` line with its
+  arguments and answer (`XUserGetGamertag` one per component, with the text it returned), so a boot log shows whether
+  the title added its user and read the gamertag its player-select prompt shows.
 
-`xgameruntime_user_test` calls every served slot with the documented arguments.
+`xgameruntime_user_test` calls every served slot with the documented arguments and reads back the first-call lines.
 
 `XGameSaveImpl` (`runtime/shims/xgameruntime_gamesave.cpp`) is served from the same layout, also **not measured**:
 - **Interfaces:** the class id doubles as `IXGameSaveImpl`'s; `IXGameSaveImpl2` (adds the three `XGameSaveFiles`
@@ -408,7 +569,16 @@ trio (23-25). What the slots must answer is still **not measured**; that is the 
   and `XGameSaveGetContainerInfo` of a missing container returns `S_OK` without a callback. `syncOnDemand` is
   ignored: nothing syncs offline.
 
-`xgameruntime_gamesave_test` drives every slot against a temporary `LEONIDA_SAVE_DIR`.
+`LEONIDA_TRACE_XGAMESAVE=1` logs every call of these slots as one `[rt] xgamesave:` line on stderr, with the
+milliseconds since the process started and the thread: the handles, container and blob names, sizes and
+HRESULT, never the blob contents. An async call (`InitializeProvider`, `GetRemainingQuota`, `DeleteContainer`,
+`ReadBlobData`, `SubmitUpdate`, `FilesGetFolderWithUi`) logs four more lines: `schedule` when `XAsyncSchedule` is
+called, `run` when the work starts on the title's queue (`waited=` is the gap), `complete` with its HRESULT and
+the `...Result` call that collects it. A job that waits behind a stalled queue, or a result the title never
+collects, then shows in a run's log. Unset, nothing is logged beyond the one line when the provider opens.
+
+`xgameruntime_gamesave_test` drives every slot against a temporary `LEONIDA_SAVE_DIR`. With the trace on, it
+checks the lines of a write and a read.
 
 `XStoreImpl` (`runtime/shims/xgameruntime_store.cpp`), from the same layout; the game-license struct is measured
 on the executable, the rest is not:

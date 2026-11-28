@@ -124,8 +124,6 @@ def cs_fssm_extra(path):
 
 
 def shader_source(name):
-    if name == "ps_mullit":
-        return "../../../tests/semantic/fixtures/ps_mullit"
     return "vs_clip" if name in CLIP_CASES else name
 
 
@@ -200,6 +198,10 @@ def translate_tests(work, names):
     # 128-byte push constants: the tail in a set-1 uniform block. The values the test programs accept (vk_pc_tail.h).
     if (os.environ.get("LEONIDA_PC_TAIL_UBO") or "").strip().lower() in ("1", "true", "yes", "on"):
         cmd.append("--pc-tail-ubo")
+    # The descriptor-table entry layout: tagged (the default) is what the runtime fills. plain is the old one, for a
+    # module translated before the kind word existed (and for the runtime test that must show the old behaviour).
+    if os.environ.get("LEONIDA_DESCRIPTOR_TABLE"):
+        cmd += ["--descriptor-table", os.environ["LEONIDA_DESCRIPTOR_TABLE"]]
     return subprocess.run(cmd).returncode
 
 
@@ -216,8 +218,7 @@ def main():
     out = Path(sys.argv[1])
     available = sorted({p.stem for p in Path(HERE).glob("*.asm")} | CLIP_CASES.keys())
     names = sys.argv[2:] or available
-    # mullit_readback.py uses the CPU semantic fixture as an explicit build target.
-    unknown = sorted(set(names) - set(available) - {"ps_mullit"})
+    unknown = sorted(set(names) - set(available))
     if unknown:
         sys.exit("Unknown test shaders: " + ", ".join(unknown))
     skipped = [n for n in names if n.startswith("ms_")]

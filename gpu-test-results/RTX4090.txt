@@ -1,0 +1,37 @@
+GPU:        NVIDIA GeForce RTX 4090 (Ada / AD102, PCI 10de:2684), subgroup 32..32
+Driver:     NVIDIA 591.86 (proprietary), Vulkan 1.4.325
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32)
+OS:         Windows 11 Pro, build 26200
+Commit:     ed94fbef9888f6d30970d1426d544581c2baca32 (main, 2026-11-25)
+Tools:      llvm-mc 21.1.8 (native, built by scripts\build_llvm_mc.ps1), SPIRV-Tools v2026.4 (Vulkan SDK
+            1.4.363.0), CMake 4.4.5 + Ninja 1.13.0, MSVC 14.44.35207 (VS 2022 Community, cl 19.44.35222,
+            Windows SDK 10.0.26100.0), Python 3.11.9
+run_gpu_tests.py: 273 shaders: 273 translated, 273 pass spirv-val
+            native:                 209/263 passed, 53 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1:  243/263 passed, 19 skipped, 1 failed
+Failed:     cs_imgatomic_ext, in both runs: "6 of 64 sint words differ; first word 32: got 0x0badf00d,
+            expected 0x00000101". Deterministic, the same words in 5 of 5 further runs with
+            --filter cs_imgatomic_ext. This is the fixture's volume T# key, not the device: with the
+            one-file change of #1518 (GPU-IMG-ATOMIC-EXT-VOLUME-TAG) checked out over this commit,
+            cs_imgatomic, cs_imgatomic3d and cs_imgatomic_ext pass 3/3 native and 3/3 emulated here.
+Skipped:    native: 33 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this
+            device" and 1 "cannot require a 64-wide fragment subgroup" (the wave64 fixtures, which the
+            emulated run covers), plus the 18 "run by d3d12_*_test / w64_graphics.py" cases.
+            Emulated: the same 18, plus the 64-wide fragment one.
+Notes:
+- First record of this card. The driver is older than the 621.x of the other Ada records
+  (RTX4070.txt, RTX4070Ti.txt, RTX4080.txt); the counts are the same as the RTX 3060 Ti rerun on
+  3f81d46ac (209/263 and 243/263, the same single failure).
+- Built with scripts\build_runtime.ps1 (CMake + Ninja, RelWithDebInfo), with VULKAN_SDK set and the
+  Vulkan SDK's Bin folder and llvm-mc on PATH. The only GPU in the machine, so no LEONIDA_VK_DEVICE;
+  the run prints "device: NVIDIA GeForce RTX 4090 (subgroup 32..32)".
+- A first build, started while the llvm-mc build was still running, stopped on an internal compiler
+  error (C1001, cl.exe exit 0xC0000005) in runtime\shims\xgameruntime_user.cpp for the
+  xgameruntime_offline_test target. The same command built all 302 programs on the second try with
+  nothing else running, so it is recorded here as not reproduced, not as a finding.
+- ctest, the D3D12 tests and w64_graphics.py were not run in this pass; this file covers
+  run_gpu_tests.py only, one full run of each mode.
+- Nothing here quotes the executable or any other game file; the shaders are the synthetic RDNA2
+  programs in runtime/test/shaders.
+- AI-assisted (Claude Code): built main and ran run_gpu_tests.py native and emulated. No game files,
+  nothing online.
