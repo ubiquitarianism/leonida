@@ -1,0 +1,30 @@
+#version 460
+// Reads one texel of each of many images through the bindless set 0 (src/vulkan_bindless.h), for
+// vk_bindless_dimensions_test: thread i reads the image at index indices[i] of the sampled array of one dimension
+// (pc.dimension: 0 1D, 1 2D array, 2 3D; bindings 5, 3 and 6, as tools/rdna2spirv.py declares them) and writes the
+// texel's red channel, as bits, to result[i]. One thread per workgroup, so each index is dynamically uniform and
+// the test needs no non-uniform indexing feature.
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 1) in;  // one image per workgroup: the index is uniform there
+
+layout(push_constant) uniform Pass { uint dimension; uint count; } pc;
+
+layout(set = 0, binding = 3) uniform texture2DArray layers[];
+layout(set = 0, binding = 5) uniform texture1D lines[];
+layout(set = 0, binding = 6) uniform texture3D volumes[];
+
+layout(set = 1, binding = 0, std430) writeonly buffer Result { uint result[]; };
+layout(set = 1, binding = 1, std430) readonly buffer Indices { uint indices[]; };
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    const uint index = indices[i];
+    float red;
+    if (pc.dimension == 0) red = texelFetch(lines[index], 0, 0).r;
+    else if (pc.dimension == 1) red = texelFetch(layers[index], ivec3(0), 0).r;
+    else red = texelFetch(volumes[index], ivec3(0), 0).r;
+    result[i] = floatBitsToUint(red);
+}

@@ -5,7 +5,9 @@
 // `python -I tools/xdxr_bvh.py check-build <out dir>` (ctest: xbox_bvh_builder + xbox_bvh_builder_check), which
 // checks the records and traces rays against brute force. Also checked: the shim's prebuild sizes are the layer's,
 // an element asking for offline statistics is skipped and leaves its destination untouched, a non-empty XDXR stream
-// is accepted, rehydration answers E_NOTIMPL, and builders are released.
+// is accepted, rehydration rebuilds from geometry with S_OK (with the title's scratch, with none, and two elements of
+// one batch without scratch, which the shim gives regions of their own; their structures go to check-build too) and
+// refuses a source-only element, and builders are released.
 //
 //   xbox_bvh_builder_test <out dir>        the shim
 //   xbox_bvh_builder_test --console        run with LEONIDA_BVH_BUILDER=console: nothing is registered
@@ -373,11 +375,96 @@ int main(int argc, char** argv) {
     list->CopyBufferRegion(compacted_rb.p, 0, compacted.p, 0, post[0]);
     if (!submit()) return fail("the compaction did not complete");
 
-    // ---- RehydrateRaytracingAccelerationStructureBatched2X: not implemented yet ----
+    // ---- RehydrateRaytracingAccelerationStructureBatched2X: rebuilds from geometry ----
+    Ref<ID3D12Resource> rehydrated_as, rehydrated_rb;
+    if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, blas_info.ResultDataMaxSizeInBytes, as_state, uav,
+                           rehydrated_as.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, blas_info.ResultDataMaxSizeInBytes,
+                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, rehydrated_rb.put())))
+        return fail("rehydrated buffers", hr);
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for rehydrate");
+
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC rehydrate_desc{};
+    rehydrate_desc.DestAccelerationStructureData = rehydrated_as->GetGPUVirtualAddress();
+    rehydrate_desc.Inputs = blas_inputs;
+    rehydrate_desc.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
     const UINT64 source = blas->GetGPUVirtualAddress();
-    check(rehydrate(builder, list.p, 1, &rehydrate_desc, &source) == E_NOTIMPL,
-          "RehydrateRaytracingAccelerationStructureBatched2X answers E_NOTIMPL (stage 2)");
+
+    check(rehydrate(builder, nullptr, 1, &rehydrate_desc, &source) == E_INVALIDARG,
+          "RehydrateRaytracingAccelerationStructureBatched2X rejects null list");
+    check(rehydrate(builder, list.p, 1, nullptr, &source) == E_INVALIDARG,
+          "RehydrateRaytracingAccelerationStructureBatched2X rejects null descs");
+    check(rehydrate(builder, list.p, 0, nullptr, nullptr) == S_OK,
+          "RehydrateRaytracingAccelerationStructureBatched2X with count 0 returns S_OK");
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC source_only_desc{};
+    source_only_desc.DestAccelerationStructureData = rehydrated_as->GetGPUVirtualAddress();
+    check(rehydrate(builder, list.p, 1, &source_only_desc, &source) == E_NOTIMPL,
+          "RehydrateRaytracingAccelerationStructureBatched2X refuses source-only stream without geometry");
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC empty_desc{};
+    check(rehydrate(builder, list.p, 1, &empty_desc, nullptr) == S_OK,
+          "RehydrateRaytracingAccelerationStructureBatched2X logs and skips empty structure");
+
+    check(rehydrate(builder, list.p, 1, &rehydrate_desc, &source) == S_OK,
+          "RehydrateRaytracingAccelerationStructureBatched2X rebuilds BLAS and returns S_OK");
+
+    // The title passes ScratchAccelerationStructureData = 0: the shim supplies scratch. Each of these builds has a
+    // destination of its own, read back below, so a build the shim skipped fails its check.
+    Ref<ID3D12Resource> zero_scratch_as, zero_scratch_rb;
+    if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, blas_info.ResultDataMaxSizeInBytes, as_state, uav,
+                           zero_scratch_as.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, blas_info.ResultDataMaxSizeInBytes,
+                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, zero_scratch_rb.put())))
+        return fail("zero-scratch buffers", hr);
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC zero_scratch_desc = rehydrate_desc;
+    zero_scratch_desc.DestAccelerationStructureData = zero_scratch_as->GetGPUVirtualAddress();
+    zero_scratch_desc.ScratchAccelerationStructureData = 0;
+    check(rehydrate(builder, list.p, 1, &zero_scratch_desc, &source) == S_OK,
+          "RehydrateRaytracingAccelerationStructureBatched2X supplies scratch when ScratchAccelerationStructureData == 0");
+
+    // Two elements of one batch, both without scratch, and no barrier between them (the title puts none): each needs
+    // a scratch region of its own. The second element has half the triangles, and asks for PERFORM_UPDATE with a
+    // source, as the title's dehydrated stream would be: a rehydrate builds it afresh all the same.
+    const UINT pair_tris[2] = {tris, tris / 2};
+    D3D12_RAYTRACING_GEOMETRY_DESC pair_geometry[2] = {geometry, geometry};
+    pair_geometry[1].Triangles.VertexCount = pair_tris[1] * 3;
+    Ref<ID3D12Resource> pair_as[2], pair_rb[2];
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC pair_desc[2]{};
+    for (int i = 0; i < 2; ++i) {
+        if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, blas_info.ResultDataMaxSizeInBytes, as_state, uav,
+                               pair_as[i].put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, blas_info.ResultDataMaxSizeInBytes,
+                               D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, pair_rb[i].put())))
+            return fail("batch-of-two buffers", hr);
+        pair_desc[i].DestAccelerationStructureData = pair_as[i]->GetGPUVirtualAddress();
+        pair_desc[i].Inputs = blas_inputs;
+        pair_desc[i].Inputs.pGeometryDescs = &pair_geometry[i];
+    }
+    pair_desc[1].Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+    pair_desc[1].SourceAccelerationStructureData = source;
+    check(rehydrate(builder, list.p, 2, pair_desc, nullptr) == S_OK,
+          "RehydrateRaytracingAccelerationStructureBatched2X builds a batch of two elements without scratch");
+
+    list->ResourceBarrier(1, &barrier);
+    list->CopyBufferRegion(rehydrated_rb.p, 0, rehydrated_as.p, 0, blas_info.ResultDataMaxSizeInBytes);
+    list->CopyBufferRegion(zero_scratch_rb.p, 0, zero_scratch_as.p, 0, blas_info.ResultDataMaxSizeInBytes);
+    for (int i = 0; i < 2; ++i)
+        list->CopyBufferRegion(pair_rb[i].p, 0, pair_as[i].p, 0, blas_info.ResultDataMaxSizeInBytes);
+    if (!submit()) return fail("the rehydrate build did not complete");
+    auto header_units = [](ID3D12Resource* rb) {
+        void* p = nullptr;
+        std::uint32_t units = 0;
+        if (SUCCEEDED(rb->Map(0, nullptr, &p))) {
+            std::memcpy(&units, static_cast<char*>(p) + 4, 4);
+            rb->Unmap(0, nullptr);
+        }
+        return units;
+    };
+    check(header_units(rehydrated_rb.p) > 0, "the rehydrated structure has non-zero totalSizeIn64BNodes header");
+    check(header_units(zero_scratch_rb.p) > 0, "the structure rehydrated without the title's scratch was built");
+    check(header_units(pair_rb[0].p) > 0 && header_units(pair_rb[1].p) > 0,
+          "both elements of the batch without scratch were built");
 
     // ---- dump for xdxr_bvh.py check-build ----
     auto dump = [&](ID3D12Resource* rb, UINT64 size, const std::string& name, const std::string& json) {
@@ -391,15 +478,18 @@ int main(int argc, char** argv) {
         rb->Unmap(0, nullptr);
         return ok;
     };
-    std::string triangles = "[";
-    for (UINT t = 0; t < tris; ++t) {
-        triangles += t ? ",\n  [" : "\n  [";
-        for (int k = 0; k < 3; ++k)
-            triangles += (k ? ", [" : "[") + num(soup[9 * t + 3 * k]) + ", " + num(soup[9 * t + 3 * k + 1]) + ", " +
-                         num(soup[9 * t + 3 * k + 2]) + "]";
-        triangles += ", 0, " + std::to_string(t) + "]";
-    }
-    triangles += "]";
+    auto triangle_list = [&](UINT count) {
+        std::string out = "[";
+        for (UINT t = 0; t < count; ++t) {
+            out += t ? ",\n  [" : "\n  [";
+            for (int k = 0; k < 3; ++k)
+                out += (k ? ", [" : "[") + num(soup[9 * t + 3 * k]) + ", " + num(soup[9 * t + 3 * k + 1]) + ", " +
+                       num(soup[9 * t + 3 * k + 2]) + "]";
+            out += ", 0, " + std::to_string(t) + "]";
+        }
+        return out + "]";
+    };
+    const std::string triangles = triangle_list(tris);
     check(dump(blas_rb.p, blas_info.ResultDataMaxSizeInBytes, "shim_blas",
                "{\"kind\": \"blas\", \"address\": " + std::to_string(blas->GetGPUVirtualAddress()) +
                    ", \"triangles\": " + triangles + "}\n"),
@@ -419,6 +509,18 @@ int main(int argc, char** argv) {
                "{\"kind\": \"blas\", \"address\": " + std::to_string(compacted->GetGPUVirtualAddress()) +
                    ", \"triangles\": " + triangles + "}\n"),
           "the BLAS compacted through the shim is written for check-build");
+    check(dump(zero_scratch_rb.p, blas_info.ResultDataMaxSizeInBytes, "shim_blas_rehydrated_zero_scratch",
+               "{\"kind\": \"blas\", \"address\": " + std::to_string(zero_scratch_as->GetGPUVirtualAddress()) +
+                   ", \"triangles\": " + triangles + "}\n"),
+          "the BLAS rehydrated with the shim's scratch is written for check-build");
+    for (int i = 0; i < 2; ++i) {
+        const std::string name = "shim_blas_rehydrated_batch" + std::to_string(i);
+        check(dump(pair_rb[i].p, blas_info.ResultDataMaxSizeInBytes, name,
+                   "{\"kind\": \"blas\", \"address\": " + std::to_string(pair_as[i]->GetGPUVirtualAddress()) +
+                       ", \"triangles\": " + triangle_list(pair_tris[i]) + "}\n"),
+              i ? "the batch's second element (its own scratch region) is written for check-build"
+                : "the batch's first element (its own scratch region) is written for check-build");
+    }
 
     // ---- the destructor releases the builder ----
     destruct(builder);

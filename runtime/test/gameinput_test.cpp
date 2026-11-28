@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -168,6 +169,17 @@ DWORD g_reading_sleep_ms = 0;  // makes on_reading slow, for the Dispatch quota 
 SDL_Joystick* g_requeue_pad = nullptr;  // set: on_reading queues one more reading from inside the callback
 bool g_requeue_down = false;
 
+// A reading callback that cancels itself with GAMEINPUT_CURRENT_CALLBACK_TOKEN_VALUE on its first call.
+IGameInput* g_self_input = nullptr;
+bool g_self_stop = false;    // StopCallback instead of UnregisterCallback
+bool g_self_result = false;  // what UnregisterCallback returned inside the callback
+int g_self_calls = 0;
+void CALLBACK on_self_cancel(GameInputCallbackToken, void*, IGameInputReading*, bool) {
+    if (++g_self_calls != 1) return;
+    if (g_self_stop) g_self_input->StopCallback(kCurrentCallbackToken);
+    else g_self_result = g_self_input->UnregisterCallback(kCurrentCallbackToken, 0);
+}
+
 void CALLBACK on_reading(GameInputCallbackToken, void*, IGameInputReading* reading, bool) {
     if (reading) ++g_reading_events;
     if (g_reading_sleep_ms) Sleep(g_reading_sleep_ms);
@@ -231,6 +243,11 @@ bool fake_focus() { return g_focus; }
 int g_cursor_x = 0, g_cursor_y = 0;
 bool fake_cursor(int* x, int* y) {
     *x = g_cursor_x;
+    *y = g_cursor_y;
+    return true;
+}
+bool fake_cursor_with_offset(int* x, int* y) {
+    *x = g_cursor_x + 4096;
     *y = g_cursor_y;
     return true;
 }
@@ -777,6 +794,27 @@ void test_keyboard_pad_sticks(IGameInput* input, IGameInputDevice* kb) {
     check(rt::gameinput::config().mouse_sensitivity == 1.0f && rt::gameinput::config().ds_trigger_gain == 1.0f,
           "keyboard pad: mouse sensitivity defaults to 1 and leaves the trigger gain alone");
 
+    g_cursor_x += 3'000'000;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, 1),
+          "keyboard pad: a positive jump beyond LONG_MAX axis units stays full right");
+    g_cursor_x -= 3'000'000;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, -1),
+          "keyboard pad: a negative jump beyond LONG_MIN axis units stays full left");
+
+    const int prior_x = g_cursor_x;
+    g_cursor_x = std::numeric_limits<int>::max() - 1;
+    rt::gameinput::poll();
+    settle();
+    g_cursor_x = std::numeric_limits<int>::min() + 2;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, 4096 / 32767.0f),
+          "keyboard pad: the raw cursor counter wrap moves four counts right");
+    g_cursor_x = prior_x;
+    rt::gameinput::poll();
+    settle();
+
     g_keys[VK_RBUTTON] = true;
     rt::gameinput::poll();
     st = pad_state(input, kb);
@@ -805,6 +843,19 @@ void test_keyboard_pad_sticks(IGameInput* input, IGameInputDevice* kb) {
     g_focus = true;
     rt::gameinput::poll();
     check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: no mouse jump when focus returns");
+
+    rt::gameinput::set_cursor_source(fake_cursor_with_offset);
+    rt::gameinput::poll();
+    check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: a new cursor source sets a baseline");
+    g_cursor_x += 4;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, 4096 / 32767.0f),
+          "keyboard pad: motion from the new cursor source reaches the stick");
+    rt::gameinput::set_cursor_source(fake_cursor);
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, 3584 / 32767.0f),
+          "keyboard pad: changing cursor source lets previous motion decay without a jump");
+    settle();
 }
 
 // Runs with no other pad connected and the device callback from main still registered.
@@ -1734,6 +1785,65 @@ void test_buffered_gamepad_input(IGameInput* input) {
 
 }  // namespace
 
+// A pad plugged in after the title started, with the title holding a dispatcher (RT-GAMEINPUT-LATE-PAD). The title
+// registers its device callback with no pad present, a first pad arrives and is moved on every poll (the keyboard pad's
+// mouse stick), and the title runs one queued item a frame (Dispatch(0)). No reading callback is registered, so those
+// readings are work no callback wants: they must not queue ahead of the second pad's connect event.
+void test_late_pad_behind_dispatcher(IGameInput* input) {
+    check(rt::gameinput::connected_count() == 0, "late pad: nothing connected at the start");
+    IGameInputDispatcher* dispatcher = nullptr;
+    check(input->CreateDispatcher(&dispatcher) == S_OK && dispatcher, "late pad: CreateDispatcher");
+    if (!dispatcher) return;
+    GameInputCallbackToken token = 0;
+    check(input->RegisterDeviceCallback(nullptr, GameInputKindGamepad, GameInputDeviceConnected,
+                                        GameInputBlockingEnumeration, nullptr, on_device, &token) == S_OK,
+          "late pad: RegisterDeviceCallback with no pad present");
+    const auto connects_to_us = [&](IGameInputDevice** last) {
+        size_t n = 0;
+        for (const DeviceEvent& e : g_device_events)
+            if (e.token == token && e.previous == GameInputDeviceNoStatus && (e.current & GameInputDeviceConnected)) {
+                ++n;
+                if (last) *last = e.device;
+            }
+        return n;
+    };
+    Pad first, late;
+    attach(first, "Leonida virtual Xbox pad", 0x045E, 0x0B12, true);
+    rt::gameinput::poll();
+    while (dispatcher->Dispatch(0)) {}
+    check(connects_to_us(nullptr) == 1, "late pad: the first pad's connect reaches the callback");
+
+    int16_t x = 0;
+    const auto frame = [&] {  // four polls with the first pad's stick moving, then one item dispatched
+        for (int i = 0; i < 4; ++i) {
+            x = static_cast<int16_t>(x == 8000 ? -8000 : 8000);
+            SDL_SetJoystickVirtualAxis(first.js, SDL_GAMEPAD_AXIS_RIGHTX, x);
+            rt::gameinput::poll();
+        }
+        dispatcher->Dispatch(0);
+    };
+    for (int f = 0; f < 50; ++f) frame();
+    attach(late, "Leonida virtual DualSense", 0x054C, 0x0CE6, false, true);
+    for (int f = 0; f < 10 && connects_to_us(nullptr) < 2; ++f) frame();
+    IGameInputDevice* late_dev = nullptr;
+    check(connects_to_us(&late_dev) == 2 && late_dev && late_dev->GetDeviceInfo()->vendorId == 0x054C,
+          "late pad: a pad connected later reaches the callback within a few frames");
+    if (late_dev && late.js) {
+        SDL_SetJoystickVirtualButton(late.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+        rt::gameinput::poll();
+        IGameInputReading* r = current(input, late_dev);
+        check(buttons_of(r) & GameInputGamepadA, "late pad: its A press reads through the device it was handed");
+        if (r) r->Release();
+    }
+    input->UnregisterCallback(token, 0);
+    while (dispatcher->Dispatch(UINT64_MAX)) {}
+    dispatcher->Release();
+    detach(first);
+    detach(late);
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "late pad: both pads closed");
+}
+
 int main(int argc, char** argv) {
     // Only virtual pads: no real controller on the test machine may show up.
     for (const char* hint : {SDL_HINT_JOYSTICK_HIDAPI, SDL_HINT_JOYSTICK_RAWINPUT, SDL_HINT_JOYSTICK_WGI,
@@ -1759,10 +1869,12 @@ int main(int argc, char** argv) {
     check(create(&input) == S_OK && input, "GameInputCreate returns an instance");
     if (argc == 2 && std::strcmp(argv[1], "--input-script") == 0) {
         if (!input) return 1;
-        // Only the X after byte 63 is due now. Its later entry must not cancel it.
+        // Only the X after byte 63 and the Y held 0.6 s are due now. X's later entry must not cancel it; the
+        // malformed holds at the end hold nothing.
         set_env("LEONIDA_INPUT_SCRIPT",
                 "start@3600,start@3600,start@3600,start@3600,start@3600,start@3600, X@0 \t,x@3600,"
-                "unknown@0,a@,a@x,,a@-0.1,a@nan,a@inf,a@1e999,a@0tail, ,");
+                "unknown@0,a@,a@x,,a@-0.1,a@nan,a@inf,a@1e999,a@0tail, ,y@0:0.6,"
+                "a@0:0,a@0:-1,a@0:,a@0:x,a@0:inf,a@0:601,a@0:1tail");
         set_env("LEONIDA_KEYBOARD_PAD", "1");
         rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
         rt::gameinput::set_cursor_source(fake_cursor);
@@ -1771,20 +1883,32 @@ int main(int argc, char** argv) {
         rt::gameinput::reload_config();
         rt::gameinput::poll();
         const auto buttons = pad_state(input, nullptr).buttons;
-        const auto expected = GameInputGamepadX | GameInputGamepadB;
-        check((buttons & expected) == expected, "long script: the spaced X after byte 63 and the physical B are held");
+        const auto expected = GameInputGamepadX | GameInputGamepadB | GameInputGamepadY;
+        check((buttons & expected) == expected,
+              "long script: the spaced X after byte 63, the held Y and the physical B are held");
         check((buttons & ~expected) == 0, "malformed script entries hold no extra buttons");
         g_focus = false;
         set_env("LEONIDA_INPUT_SCRIPT", "y@0");
         rt::gameinput::reload_config();
         rt::gameinput::poll();
-        check(pad_state(input, nullptr).buttons == GameInputGamepadX,
-              "scripted X survives focus loss; reload does not replace it with Y");
+        check(pad_state(input, nullptr).buttons == (GameInputGamepadX | GameInputGamepadY),
+              "scripted X and Y survive focus loss; reload does not replace the script with y@0");
         Sleep(350);
         g_focus = true;
         rt::gameinput::poll();
+        // A scripted press lasts its hold (300 ms, or button@seconds:hold) and then until the title has read the pads
+        // six times since it began (update_keyboard_pad: kReads), so a title that polls slowly still sees it. Each
+        // pad_state() is one GetCurrentReading, and this is the third since X and Y began.
+        check(pad_state(input, nullptr).buttons == (GameInputGamepadX | GameInputGamepadB | GameInputGamepadY),
+              "long script: past its 300 ms X is still held while the title has read the pads fewer than six times");
+        for (int i = 0; i < 6; ++i) pad_state(input, nullptr);
+        rt::gameinput::poll();
+        check(pad_state(input, nullptr).buttons == (GameInputGamepadB | GameInputGamepadY),
+              "long script: X ends once the title has read it, y@0:0.6 is still held for its time, the key stays held");
+        Sleep(400);
+        rt::gameinput::poll();
         check(pad_state(input, nullptr).buttons == GameInputGamepadB,
-              "long script: the timed press ends while the physical key stays held");
+              "long script: Y is released after its 0.6 s hold, the title having read it six times");
         input->Release();
         std::printf("%d checks, %d failures\n", g_checks, g_failures);
         return g_failures ? 1 : 0;
@@ -2131,6 +2255,32 @@ int main(int argc, char** argv) {
     if (wait) CloseHandle(wait);
     if (dispatcher) dispatcher->Release();
 
+    // ---- GAMEINPUT_CURRENT_CALLBACK_TOKEN_VALUE: the running callback inside one, nothing outside ----
+    // Measured on the host's GameInput (0.2309, Windows 11): UnregisterCallback(CURRENT) inside a callback returns
+    // true and removes it; outside a callback it returns false.
+    check(!input->UnregisterCallback(kCurrentCallbackToken, 0), "current token: UnregisterCallback outside a callback is false");
+    input->StopCallback(kCurrentCallbackToken);  // outside a callback: names nothing, stops nothing
+    g_self_input = input;
+    for (bool stop : {false, true}) {
+        g_self_stop = stop;
+        g_self_calls = 0;
+        g_self_result = false;
+        GameInputCallbackToken self_token = 0;
+        check(input->RegisterReadingCallback(dev, GameInputKindGamepad, 0.0f, nullptr, on_self_cancel, &self_token) == S_OK,
+              "current token: register the self-cancelling callback");
+        for (bool down : {true, false, true, false}) {  // four changes: without the token a callback sees several
+            SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_NORTH, down);
+            rt::gameinput::poll();
+        }
+        check(g_self_calls == 1, stop ? "current token: StopCallback inside the callback stops it (one call for four changes)"
+                                      : "current token: UnregisterCallback inside the callback removes it (one call for four changes)");
+        if (stop)
+            check(input->UnregisterCallback(self_token, 0), "current token: the stopped callback stays registered");
+        else
+            check(g_self_result && !input->UnregisterCallback(self_token, 0),
+                  "current token: UnregisterCallback returned true and the real token is gone");
+    }
+
     // ---- unplug and replug ----
     const size_t events_before_unplug = g_device_events.size();
     detach(xbox);
@@ -2336,6 +2486,7 @@ int main(int argc, char** argv) {
     test_raw_hid(input);
     test_raw_report_during_reconnect(input);
     test_buffered_gamepad_input(input);
+    test_late_pad_behind_dispatcher(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

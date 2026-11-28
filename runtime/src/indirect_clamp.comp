@@ -9,9 +9,19 @@
 // charging the list budget. The command list charges its work (vertices, indices, or groups * 64) against 2^27 units with
 // an atomic CAS, so thousands of garbage records cannot run for seconds either.
 //
+// A draw record of 2^23 vertices (or indices) an instance or more is a slot the title has not filled, not a draw: it
+// runs empty and charges nothing, so a few of them cannot use up the list budget and empty every real draw after them
+// (RT-INDIRECT-DRAW-UNFILLED-COUNT; a census in codec-d/cool_fox's fork of VIctory found 90 records of 2^24 in one
+// list, its docs/findings.md and crates/victory-gpu/src/indirect.rs; no code of it is used).
+//
 // The bounds cut legitimate work beyond them, so they are generous: 2^24 vertices (or indices), 2^26 vertex instances,
-// 65 535 groups per dimension, 2^20 groups per dispatch, and mesh dispatches charged 128 threads per group. The
-// console's mesh dispatch is one-dimensional; the output uses one group in y and z.
+// the device's own maxComputeWorkGroupCount per dimension for a dispatch (65 535 for a mesh dispatch), 2^20 groups per
+// dispatch, and mesh dispatches charged 128 threads per group. The console's mesh dispatch is one-dimensional; the
+// output uses one group in y and z.
+//
+// A dispatch is bounded by the device's limit, not by Vulkan's guaranteed minimum of 65 535: NVIDIA, for one, allows
+// 2^31 - 1 groups in x, and a fixed 65 535 cut a one-dimensional dispatch of more groups short, so the groups
+// past it never ran and their output stayed stale (blocky patches; idea from codec-d/cool_fox docs/findings.md).
 #version 460
 #extension GL_EXT_buffer_reference : require
 layout(local_size_x = 64) in;
@@ -35,13 +45,19 @@ layout(push_constant) uniform Params {
     uint first_record;   // the record index this chunk starts at
     uint max_records;    // max_command_count of the ExecuteIndirect call
     uint flags;          // bit 0: counted; bits 1..16: optional per-dispatch group budget
+    uint max_x;          // the device's maxComputeWorkGroupCount: a dispatch's x, y and z run up to these
+    uint max_y;          // (three words, not a uvec3, whose 16-byte alignment would move it past the C++ struct)
+    uint max_z;
+    uint reserved;
 } p;
 
 // One ExecuteIndirect batch's limits. A record that asks for more runs empty instead of for seconds.
 const uint max_vertices = 1u << 24u;          // vertices or indices in one draw
+const uint unfilled_draw = 1u << 23u;         // vertices or indices an instance from which a draw record is unfilled
 const uint max_vertex_instances = 1u << 26u;  // vertex (or index) count times instance count
-const uint max_group_dimension = 65535u;      // groups in x, y or z
+const uint max_mesh_dimension = 65535u;       // groups in a mesh dispatch's x (dispatches: p.max_x, y, z)
 const uint max_groups = 1u << 20u;            // groups in one dispatch or mesh dispatch
+const uint narrow_groups = 65535u;            // the x a dispatch record was cut at before, for the counters
 const uint budget = 1u << 27u;                // work in the whole command list: vertices, indices, or groups * 64
 
 // Charges `cost` units to the batch's budget. Saturating: a record that no longer fits runs empty, so the batch never
@@ -101,7 +117,8 @@ void main() {
         // A draw or an indexed draw: count, instances, then the two (or three) locations, copied as they are.
         const uint count = p.arguments.data[src];
         const uint instances = p.arguments.data[src + 1u];
-        uint index_count = min(count, max_vertices);
+        // An unfilled record (a count of 2^23 or more) runs empty, free: cost 0, so it leaves the budget alone.
+        uint index_count = count >= unfilled_draw ? 0u : min(count, max_vertices);
         uint instance_count = min(instances, max_vertex_instances / max(index_count, 1u));
         if (index_count == 0u) instance_count = 0u;
         clamped = index_count != count || instance_count != instances ? 1u : 0u;
@@ -112,25 +129,46 @@ void main() {
         words[3] = p.arguments.data[src + 3u];
         if (p.kind == 1u) words[4] = p.arguments.data[src + 4u];
     } else {
-        // A dispatch or a mesh dispatch: three group counts. x * y fits 32 bits (each is at most 65 535); the whole
-        // group count may not, so an oversized product runs empty.
+        // A dispatch or a mesh dispatch: three group counts, each bounded by the device's limit. A product past
+        // max_groups runs empty; it is checked by division, because x alone may be up to 2^32 - 1.
         const uint asked_x = p.arguments.data[src];
         const uint asked_y = p.arguments.data[src + 1u];
         const uint asked_z = p.arguments.data[src + 2u];
-        uint x = min(asked_x, max_group_dimension);
-        uint y = min(asked_y, max_group_dimension);
-        uint z = min(asked_z, max_group_dimension);
+        if (p.kind == 3u) {
+            // Before the clamp: how many mesh records ask for more than one group in y or z, and the largest y and z
+            // asked (stats words 8-11), which y = z = 1 below would cut.
+            atomicAdd(p.stats.data[8], 1u);
+            if (asked_y > 1u || asked_z > 1u) {
+                atomicAdd(p.stats.data[9], 1u);
+                atomicMax(p.stats.data[10], asked_y);
+                atomicMax(p.stats.data[11], asked_z);
+            }
+        }
+        const uvec3 limit = p.kind == 3u ? uvec3(max_mesh_dimension, 1u, 1u) : max(uvec3(p.max_x, p.max_y, p.max_z), uvec3(1u));
+        uint x = min(asked_x, limit.x);
+        uint y = min(asked_y, limit.y);
+        uint z = min(asked_z, limit.z);
         if (p.kind == 3u) { y = 1u; z = 1u; }
+        // A dispatch past the device's limit in some dimension, cut there (stats word 14).
+        const bool past_device = p.kind != 3u && (x != asked_x || y != asked_y || z != asked_z);
         const uint groups = p.flags >> 1u;
         if (groups != 0u && x != 0u && y != 0u && z != 0u) {
             x = min(x, groups);
             y = min(y, groups / x);
             z = min(z, groups / x / y);
         }
-        if (z != 0u && x * y > max_groups / z) {
+        if (x != 0u && y != 0u && z != 0u && (x > max_groups || y > max_groups / x || z > max_groups / x / y)) {
             x = 0u;
             y = 0u;
             z = 0u;
+        }
+        if (p.kind != 3u) {
+            // Dispatch records (stats words 12-15): those that run wider than 65 535 groups in x, the widest x that
+            // runs, those cut at the device's limits (and still run), and all of them.
+            atomicAdd(p.stats.data[15], 1u);
+            if (x > narrow_groups) atomicAdd(p.stats.data[12], 1u);
+            atomicMax(p.stats.data[13], x);
+            if (past_device && x != 0u) atomicAdd(p.stats.data[14], 1u);
         }
         clamped = x != asked_x || y != asked_y || z != asked_z ? 1u : 0u;
         cost = x * y * z * (p.kind == 3u ? 128u : 64u);

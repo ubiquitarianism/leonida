@@ -15,7 +15,7 @@ def module(lanes, limit, structured=True):
     with patch.object(rdna2spirv, "LOOP_LIMIT", limit):
         text, gen = _translate_cs("cs_guard", lines, threads=lanes, emulate=lanes == 64, structured=structured)
     assert gen.wave64 == (lanes == 64) and gen.emulate == (lanes == 64)
-    return text
+    return text, gen.control_flow
 
 
 def execute(text, lanes, bound):
@@ -31,20 +31,36 @@ class LoopGuardTests(unittest.TestCase):
     def test_finite_and_nonterminating(self):
         for lanes in (32, 64):
             with self.subTest(lanes=lanes):
-                plain, guarded = module(lanes, 0), module(lanes, 16)
+                (plain, plain_flow), (guarded, flow) = module(lanes, 0), module(lanes, 16)
+                # A single-wave emulated program keeps the structured form (no round fallback for `inline_all`).
+                expected_flow = "structured" if lanes == 32 else "emulated wave64 structured"
+                self.assertEqual((plain_flow, flow), (expected_flow, expected_flow))
                 self.assertNotIn("%loop_guard_", plain)
                 self.assertIn("%loop_guard_", guarded)
                 self.assertEqual(execute(plain, lanes, 6), [6] * lanes)
                 self.assertEqual(execute(guarded, lanes, 6), [6] * lanes)
                 self.assertEqual(execute(guarded, lanes, 1), [32] * lanes)
 
+    def test_round_budget_uses_the_scheduler_exit(self):
+        text, flow = module(64, 16, structured=False)
+        self.assertEqual(flow, "emulated wave64 rounds")
+        # Counters and synchronization execute on the final round too. The guard
+        # augments the scheduler's termination condition at its original branch.
+        tail = text.split("%x_ran = OpLabel", 1)[1].split("%loop_exit = OpLabel", 1)[0]
+        counters, latch = tail.split("%loop_cont = OpLabel")
+        self.assertIn("OpAtomicIAdd", counters)
+        self.assertTrue(counters.rstrip().endswith("OpBranch %loop_cont"))
+        self.assertLess(latch.index("OpControlBarrier"), latch.index("%x_fin ="))
+        self.assertRegex(latch, r"OpLogicalOr %bool %x_fin (%loop_guard_\w+_full)")
+        self.assertRegex(latch, r"OpBranchConditional %loop_guard_\w+_take %loop_exit %loop_head\s*$")
+
     def test_dispatch_loop_also_stops(self):
         for lanes in (32, 64):
             with self.subTest(lanes=lanes):
-                guarded = module(lanes, 16, structured=False)
+                guarded, _ = module(lanes, 16, structured=False)
                 self.assertEqual(execute(guarded, lanes, 6), [6] * lanes)
                 words = execute(guarded, lanes, 1)
-                self.assertTrue(all(0 < v <= 32 and v % 2 == 0 for v in words))
+                self.assertEqual(words, [30] * lanes)
 
 
     def test_inner_budget_resets_on_each_entry(self):

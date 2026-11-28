@@ -183,7 +183,7 @@ public:
             std::error_code created;
             std::filesystem::create_directories(capture_dir_, created);
             capture_to_disk_ = true;
-            capture_ = true;  // the swapchain needs TRANSFER_SRC, and every frame copies into a staging buffer
+            capture_ = true;  // provision TRANSFER_SRC and staging; disk-only copies follow the requested cadence
             if (const char* every = std::getenv("LEONIDA_CAPTURE_EVERY")) capture_every_ = std::max(1, std::atoi(every));
             if (const char* limit = std::getenv("LEONIDA_CAPTURE_LIMIT")) capture_limit_ = std::max(1, std::atoi(limit));
             std::fprintf(stderr, "[rt] present: capture on: every %d presented frame(s), at most %d, into %s\n",
@@ -212,6 +212,7 @@ public:
         const VkDevice device = context_.device();
         {
             std::lock_guard lock(context_.submit_mutex());
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
             context_.observe_result(vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle (present)");
             // A WSI layer may perform a device-wide idle while destroying the swapchain.
             // Keep that implicit idle serialized with submits from every context queue.
@@ -348,15 +349,9 @@ public:
     // Call before the first present.
     bool enable_capture() {
         std::lock_guard lock(present_mutex_);
-        if (!ok_) return false;
         splash_capture_only_ = false;
-        capture_ = true;
-        stale_ = true;
-        if (!recreate(vsync_, swapchain_srgb_, swapchain_hdr_req_) || (swapchain_ && !capture_buffer_)) {
-            capture_ = false;
-            return false;
-        }
-        return true;
+        continuous_readback_ = enable_capture_storage();
+        return continuous_readback_;
     }
 
     // Present the shell image immediately. Keep it on screen until the window has a non-black title frame.
@@ -365,7 +360,7 @@ public:
     // The last presented frame as the swapchain stores it (4 bytes a texel, rows tightly packed, format() order).
     // Waits for the frame to finish. False when nothing was presented since enable_capture(), after a present
     // that was skipped because the window is minimised (it returned VK_SUCCESS but showed nothing), until the next
-    // frame that is shown (the frame before it is not what the window was last asked to show), or when the wait fails.
+    // frame that is shown, on an unsampled disk-only present, or when the wait fails.
     bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format) {
         std::lock_guard lock(present_mutex_);
         if (!capture_ || !capture_ptr_ || !captured_) return false;
@@ -416,6 +411,19 @@ public:
     }
 
 private:
+    // Called with present_mutex_ held. Reserving staging for the splash or rare disk samples
+    // is distinct from promising the caller a copy of every frame through read_back().
+    bool enable_capture_storage() {
+        if (!ok_) return false;
+        capture_ = true;
+        stale_ = true;
+        if (!recreate(vsync_, swapchain_srgb_, swapchain_hdr_req_) || (swapchain_ && !capture_buffer_)) {
+            capture_ = false;
+            return false;
+        }
+        return true;
+    }
+
     bool should_abort() {
         std::function<bool()> abort;
         {
@@ -507,14 +515,13 @@ private:
         if ((binding || planes) && !(format_features(format_) & VK_FORMAT_FEATURE_BLIT_DST_BIT))
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         if (planes && !prepare_compose()) return VK_ERROR_FORMAT_NOT_SUPPORTED;
-        auto& vk = context_.vk;
         const VkDevice device = context_.device();
         Frame& frame = frames_[frame_index_ % frames_.size()];
         if (const VkResult waited = context_.observe_result(
                 vkWaitForFences_(device, 1, &frame.done, VK_TRUE, UINT64_MAX), "vkWaitForFences (present)");
             waited != VK_SUCCESS)
             return stop(waited);
-        // Every submit copies into the same mapped buffer, even if its frame is outside the disk capture stride.
+        // Drain the preceding disk sample before reusing its fence or advancing its metadata.
         if (const VkResult r = finish_pending_capture(); r != VK_SUCCESS) return stop(r);
 
         std::uint32_t image = 0;
@@ -537,6 +544,15 @@ private:
         // An out-of-date retry above may have given the swapchain another extent: the compose target follows it.
         if (planes && !prepare_compose()) return give_back(frame, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
+        // The ordinal counts accepted presents, not submissions or deferred requests. Decide after
+        // draining the previous disk sample and any acquire/recreate retry; an unshown attempt consumes no slot.
+        const bool disk_sample = capture_to_disk_ && capture_written_ < capture_limit_ &&
+                                 presented_ % std::uint64_t(capture_every_) == 0;
+        const bool inspect = splash_owner_ && capture_ptr_;
+        // Merely allocating a temporary splash buffer does not require a copy. In particular, a minimized
+        // initial splash can return before taking ownership; later ordinary frames must not become continuous.
+        const bool copy_frame = capture_buffer_ && ((capture_ && (disk_sample || continuous_readback_ || inspect)) || dump_.due(presented_));
+        captured_ = false;  // never expose a stale sample after an unsampled or unshown frame
         bool recorded = false;
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
         bool rollback_source = false;
@@ -561,7 +577,8 @@ private:
                         plane_rollbacks[i].tracked = context_.tracker_.tracked(plane_rollbacks[i].id);
                         if (plane_rollbacks[i].tracked) plane_rollbacks[i].layout = context_.tracker_.layout(plane_rollbacks[i].id, 0);
                     }
-                    recorded = record_planes(frame, std::uint32_t(frame_index_ % frames_.size()), current, *planes, image);
+                    recorded = record_planes(frame, std::uint32_t(frame_index_ % frames_.size()), current, *planes,
+                                             image, copy_frame);
                 }
             }
         } else if (binding) {
@@ -574,11 +591,11 @@ private:
                 tracker_lock.lock();
                 rollback_source = context_.tracker_.tracked(source);
                 if (rollback_source) prev_layout = context_.tracker_.layout(source, 0);
-                record(frame.commands, *current, source, image, source_rect);
+                record(frame.commands, *current, source, image, source_rect, copy_frame);
                 recorded = true;
             }
         } else {
-            record_blank(frame.commands, image);
+            record_blank(frame.commands, image, copy_frame);
             recorded = true;
         }
         const auto rollback = [&] {
@@ -624,7 +641,6 @@ private:
         const bool tearing = false;
         (void)tear;
 #endif
-        const bool inspect = splash_owner_ && capture_ptr_;
         bool show_title = false;
         if (inspect) {
             submit_info.signalSemaphoreCount = 0;  // signal ready only after choosing the image the window will show
@@ -633,7 +649,11 @@ private:
         VkResult submitted, result = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
-            submitted = context_.observe_result(vk.vkQueueSubmit(queue_, 1, &submit_info, frame.done),
+            // One turn of the compile gate for the submit and the present after it: no pipeline create enters the
+            // driver between the two (queue_submit's own turn nests inside this one). Not a probe: it also covers
+            // finish_startup_frame's fence wait and the present; the nested turn probes the vkQueueSubmit alone.
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
+            submitted = context_.observe_result(context_.queue_submit(queue_, 1, &submit_info, frame.done),
                                                 "vkQueueSubmit (present)");
             if (submitted == VK_SUCCESS) context_.note_image_work_locked();
             if (submitted != VK_SUCCESS) rollback();
@@ -674,14 +694,12 @@ private:
                 last_tore_ = true;
                 ++tear_presents_;
             }
-            if (capture_to_disk_ && capture_ && capture_ptr_ && capture_written_ < capture_limit_ &&
-                (presented_ - 1) % std::uint64_t(capture_every_) == 0)
-                pending_capture_ = frame.done;
-        }
-        if (capture_ && capture_ptr_) {
-            captured_ = true;
-            captured_extent_ = extent_;
-            captured_format_ = format_;
+            if (copy_frame && capture_ptr_) {  // a temporary splash-only allocation may have just been released
+                captured_ = true;
+                captured_extent_ = extent_;
+                captured_format_ = format_;
+                if (disk_sample) pending_capture_ = frame.done;
+            }
         }
         if (result == VK_ERROR_SURFACE_LOST_KHR) {
             // The surface was lost during the present (display disconnected, a driver reset of the window's
@@ -913,7 +931,7 @@ private:
         VkResult submitted;
         {
             std::lock_guard lock(context_.submit_mutex());
-            submitted = context_.observe_result(vk.vkQueueSubmit(queue_, 1, &submit_info, probe_fence_),
+            submitted = context_.observe_result(context_.queue_submit(queue_, 1, &submit_info, probe_fence_),
                                                 "vkQueueSubmit (present probe)");
             if (submitted == VK_SUCCESS) context_.note_image_work_locked();
         }
@@ -1034,7 +1052,7 @@ private:
         VkResult submitted;
         {
             std::lock_guard lock(context_.submit_mutex());
-            submitted = context_.observe_result(context_.vk.vkQueueSubmit(queue_, 1, &submit_info, frame.done),
+            submitted = context_.observe_result(context_.queue_submit(queue_, 1, &submit_info, frame.done),
                                                 "vkQueueSubmit (return present image)");
         }
         if (submitted != VK_SUCCESS) return stop(failure);
@@ -1066,6 +1084,7 @@ private:
         const VkDevice device = context_.device();
         {
             std::lock_guard lock(context_.submit_mutex());
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
             // The old swapchain's images and semaphores may still be in use.
             context_.observe_result(vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle (present)");
             release(swapchain_);
@@ -1079,7 +1098,7 @@ private:
     }
 
     void record(VkCommandBuffer commands, const ResourceBinding& binding, ResourceId source, std::uint32_t image,
-                const PresentRect* source_rect) {
+                const PresentRect* source_rect, bool copy_frame) {
         auto& vk = context_.vk;
         const ReplayFunctions& fn = context_.replay_;
         vk.vkResetCommandBuffer(commands, 0);
@@ -1122,7 +1141,7 @@ private:
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                         sw == dw && sh == dh ? VK_FILTER_NEAREST : blit_filter(binding.format));
 
-        finish_image(commands, image);
+        finish_image(commands, image, copy_frame);
         for (const auto& piece : pieces)
             detail::image_barrier(fn, commands, binding, piece.range, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                   piece.layout, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, any,
@@ -1156,6 +1175,7 @@ private:
             return true;
         {
             std::lock_guard lock(context_.submit_mutex());
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
             // The old target may still be in use.
             context_.observe_result(context_.vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle (present)");
         }
@@ -1166,7 +1186,7 @@ private:
     // Records the composition of `planes` and its copy to swapchain image `image`. False, with nothing recorded and the
     // tracker untouched, when a view cannot be made. The caller holds the resource and tracker locks.
     bool record_planes(Frame& frame, std::uint32_t slot, const std::array<ResourceBinding, 2>& current,
-                       const PresentPlanes& planes, std::uint32_t image) {
+                       const PresentPlanes& planes, std::uint32_t image, bool copy_frame) {
         auto& vk = context_.vk;
         const ReplayFunctions& fn = context_.replay_;
         if (composer_->target() == VK_NULL_HANDLE || composer_->extent().width != extent_.width ||
@@ -1254,7 +1274,7 @@ private:
         blit.dstOffsets[1] = {std::int32_t(extent_.width), std::int32_t(extent_.height), 1};
         vkCmdBlitImage_(commands, composer_->target(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images_[image],
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
-        finish_image(commands, image);
+        finish_image(commands, image, copy_frame);
         for (std::uint32_t i = 0; i < planes.count; ++i) {
             if (i == 1 && same) continue;
             for (const auto& piece : pieces[i])
@@ -1291,7 +1311,7 @@ private:
     }
 
     // Clears the swapchain image to opaque black.
-    void record_blank(VkCommandBuffer commands, std::uint32_t image) {
+    void record_blank(VkCommandBuffer commands, std::uint32_t image, bool copy_frame) {
         auto& vk = context_.vk;
         const ReplayFunctions& fn = context_.replay_;
         vk.vkResetCommandBuffer(commands, 0);
@@ -1304,18 +1324,18 @@ private:
                               VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         const VkClearColorValue black{{0.0f, 0.0f, 0.0f, 1.0f}};
         vkCmdClearColorImage_(commands, images_[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
-        finish_image(commands, image);
+        finish_image(commands, image, copy_frame);
         vk.vkEndCommandBuffer(commands);
     }
 
     // The swapchain image is written (TRANSFER_DST): optionally copy it to the capture buffer, then hand it to
     // the presentation engine.
-    void finish_image(VkCommandBuffer commands, std::uint32_t image) {
+    void finish_image(VkCommandBuffer commands, std::uint32_t image, bool copy_frame) {
         const ReplayFunctions& fn = context_.replay_;
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         VkImageLayout layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         VkAccessFlags access = VK_ACCESS_TRANSFER_WRITE_BIT;
-        if (capture_buffer_ && (capture_ || dump_.due(presented_))) {
+        if (copy_frame) {
             // Two frames may be in flight and share `capture_buffer_`: serialize the prior frame's capture copy
             // before overwriting it, while moving this frame's swapchain image to TRANSFER_SRC.
             VkBufferMemoryBarrier capture_waw{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
@@ -1512,6 +1532,7 @@ private:
         const VkDevice device = context_.device();
         {
             std::lock_guard lock(context_.submit_mutex());
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
             // The old swapchain's images and semaphores may still be in use.
             context_.observe_result(vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle (present)");
         }
@@ -1819,6 +1840,7 @@ private:
     bool capture_ = false;
     present_dump::PresentDump dump_;
     bool dump_pq_ = false;
+    bool continuous_readback_ = false;  // explicit enable_capture(), independent of disk sampling
     VkBuffer capture_buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory capture_memory_ = VK_NULL_HANDLE;
     VkDeviceSize capture_size_ = 0;

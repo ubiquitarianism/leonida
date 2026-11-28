@@ -9,7 +9,7 @@
 // The decision is a pure function of the variable's text and the two limits, so it is tested without a GPU
 // (arena_size_test). It depends only on the Vulkan headers.
 
-#include <vulkan/vulkan_core.h>
+#include "vulkan_memory.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -21,6 +21,9 @@ constexpr VkDeviceSize kArenaMiB = VkDeviceSize(1) << 20;
 constexpr VkDeviceSize kArenaDefaultMiB = 256;
 constexpr VkDeviceSize kArenaMinMiB = 16;
 constexpr VkDeviceSize kArenaMaxMiB = 4095;
+constexpr VkMemoryPropertyFlags kArenaRequiredMemory =
+    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+constexpr VkMemoryPropertyFlags kArenaPreferredMemory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 // The device's limits; 0 is "not known", which caps nothing.
 struct ArenaLimits {
@@ -43,6 +46,7 @@ enum ArenaCap : unsigned {
     arena_cap_none = 0,
     arena_cap_buffer = 1,      // maxBufferSize
     arena_cap_allocation = 2,  // maxMemoryAllocationSize
+    arena_cap_bar = 4,         // the largest size whose buffer may use DEVICE_LOCAL | HOST_VISIBLE memory
 };
 
 struct ArenaSize {
@@ -82,12 +86,37 @@ inline ArenaSize decide_arena_size(const char* env, const ArenaLimits& limits, V
 
 // The Vulkan names of the limits in `capped`, for the log line.
 inline const char* arena_cap_name(unsigned capped) {
+    if (capped & arena_cap_bar) return "Resizable BAR memory types for a buffer that large";
     switch (capped) {
         case arena_cap_buffer: return "maxBufferSize";
         case arena_cap_allocation: return "maxMemoryAllocationSize";
         case arena_cap_buffer | arena_cap_allocation: return "maxBufferSize and maxMemoryAllocationSize";
         default: return "no limit";
     }
+}
+
+constexpr VkDeviceSize kArenaBarStep = 16 * kArenaMiB;
+
+// Apply the same memory-type eligibility checks as the arena allocation, requiring its preferred device-local type.
+inline bool device_local_arena_fits(const VkPhysicalDeviceMemoryProperties& memory,
+                                   const VkMemoryRequirements& requirements) {
+    return !memory_type_order(memory, requirements.memoryTypeBits, kArenaRequiredMemory | kArenaPreferredMemory,
+                              0, requirements.size).empty();
+}
+
+// With Resizable BAR the arena belongs in VRAM the CPU can write. A driver can leave those memory types out of a
+// large buffer's memoryTypeBits: on an RTX 5070 Ti (NVIDIA 617.42, Windows 11) a 4,090 MiB buffer may use the
+// DEVICE_LOCAL | HOST_VISIBLE type and a 4,092 MiB one may not, so LEONIDA_ARENA_MB=4096 (4,095 MiB) put the whole
+// arena in system memory. `fits(bytes)` says whether a buffer of that size may use such a type. Returns the size to
+// create: `bytes` when it fits (or when nothing in reach does), else the largest size below it, in 16 MiB steps
+// and losing at most an eighth, that fits.
+template <class Fits>
+VkDeviceSize device_local_arena_bytes(VkDeviceSize bytes, Fits fits) {
+    if (fits(bytes)) return bytes;
+    const VkDeviceSize floor = std::max(bytes - bytes / 8, kArenaMinMiB * kArenaMiB);
+    for (VkDeviceSize size = bytes / kArenaBarStep * kArenaBarStep; size >= floor && size > 0; size -= kArenaBarStep)
+        if (size < bytes && fits(size)) return size;
+    return bytes;
 }
 
 }  // namespace leonida

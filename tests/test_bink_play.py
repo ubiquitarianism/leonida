@@ -1,5 +1,6 @@
 """tools/bink_play.py: name matching and the name-table cache. Synthetic names only, no game files."""
 import sys
+from io import StringIO
 import tempfile
 import threading
 import unittest
@@ -30,6 +31,19 @@ class ListTest(unittest.TestCase):
                     rc = bink_play.main(["--game-dir", "synthetic", "--list", query])
                     self.assertEqual(rc, 0)
                     self.assertEqual(stdout.getvalue(), "Clips/Demo.bk2  640x480, 24 frames\n")
+
+
+class PlayerDiscoveryTest(unittest.TestCase):
+    def test_find_exe_in_cmake_configurations(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(bink_play, "HERE", Path(tmp) / "tools"):
+            build = Path(tmp) / "runtime" / "build"
+            for config in ("MinSizeRel", "Debug", "RelWithDebInfo", "Release", ""):
+                with self.subTest(config=config):
+                    exe = build / config / "bink_play.exe"
+                    exe.parent.mkdir(parents=True, exist_ok=True)
+                    exe.touch()
+                    self.assertEqual(bink_play.find_exe(None), exe)
+            self.assertEqual(bink_play.find_exe("my-player.exe"), Path("my-player.exe"))
 
 
 class PickTest(unittest.TestCase):
@@ -175,6 +189,126 @@ class CacheTest(unittest.TestCase):
                     worker.join()
             self.assertEqual(got, {"first": "Stinger/first.bk2", "second": "Stinger/second.bk2"})
             self.assertEqual(sorted(p.name for p in (d / "cache").iterdir()), ["bink_names.csv"])
+
+    def test_load_names_closes_mkstemp_fd_on_open_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            archive, mount = d / "movies.rpf", d / "common.rpf"
+            archive.write_bytes(b"x" * 16)
+            mount.write_bytes(b"y")
+            closed = []
+            real_close = bink_play.os.close
+
+            def track_close(fd):
+                closed.append(fd)
+                return real_close(fd)
+
+            def fake_names(argv):
+                out = Path(argv[argv.index("--out") + 1])
+                out.write_text("source,offset,size,path,confidence,width,height,frames\n"
+                               "movies.rpf,4096,10,Stinger/INTRO_A.bk2,anchored,3840,2160,450\n", encoding="utf-8")
+                return 0
+
+            with mock.patch.object(bink_play, "cache_path", return_value=d / "cache" / "bink_names.csv"), \
+                 mock.patch.object(bink_play.bink_names, "main", side_effect=fake_names), \
+                 mock.patch("bink_play.open", side_effect=OSError("open failure")), \
+                 mock.patch("bink_play.os.close", side_effect=track_close):
+                with self.assertRaises(OSError):
+                    bink_play.load_names(archive, mount)
+            self.assertTrue(len(closed) > 0)
+
+    def test_load_names_restores_write_mode_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            archive, mount = d / "movies.rpf", d / "common.rpf"
+            archive.write_bytes(b"x" * 16)
+            mount.write_bytes(b"y")
+            chmod_calls = []
+            real_chmod = bink_play.os.chmod
+
+            def track_chmod(p, mode, **kwargs):
+                chmod_calls.append((p, mode))
+                return real_chmod(p, mode, **kwargs)
+
+            def fake_names(argv):
+                out = Path(argv[argv.index("--out") + 1])
+                out.write_text("source,offset,size,path,confidence,width,height,frames\n"
+                               "movies.rpf,4096,10,Stinger/INTRO_A.bk2,anchored,3840,2160,450\n", encoding="utf-8")
+                return 0
+
+            with mock.patch.object(bink_play, "cache_path", return_value=d / "cache" / "bink_names.csv"), \
+                 mock.patch.object(bink_play.bink_names, "main", side_effect=fake_names), \
+                 mock.patch("bink_play.os.replace", side_effect=OSError("replace failed")), \
+                 mock.patch("bink_play.os.chmod", side_effect=track_chmod):
+                with self.assertRaises(OSError):
+                    bink_play.load_names(archive, mount)
+            self.assertTrue(any(mode == 0o600 for p, mode in chmod_calls))
+
+
+class NoCacheTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.archive = self.directory / "streams.csv"
+        self.mount = self.directory / "mount.xml"
+        self.archive.write_text("source,offset,size,width,height,frames\nsample,32,64,16,16,2\n",
+                                encoding="utf-8", newline="\n")
+        self.mount.write_text("<filename>$(common)/movies/synthetic.bk2</filename>",
+                              encoding="utf-8", newline="\n")
+        self.cache = self.directory / "cache" / "names.csv"
+        self.expected = [("synthetic.bk2", 32, "16", "16", "2")]
+
+    def test_cli_lists_without_accessing_an_unusable_cache_directory(self):
+        self.cache.parent.write_bytes(b"unrelated file, not a directory")
+        with mock.patch.object(bink_play, "cache_path", return_value=self.cache), \
+                mock.patch.object(sys, "stdout", new_callable=StringIO) as stdout:
+            rc = bink_play.main(["--game-dir", str(self.directory), "--archive", self.archive.name,
+                                 "--mount", self.mount.name, "--no-cache", "--list"])
+        self.assertEqual(rc, 0)
+        self.assertIn("synthetic.bk2  16x16, 2 frames", stdout.getvalue().splitlines())
+        self.assertEqual(self.cache.parent.read_bytes(), b"unrelated file, not a directory")
+
+    def test_no_cache_does_not_create_a_persistent_cache_directory(self):
+        with mock.patch.object(bink_play, "cache_path", return_value=self.cache):
+            self.assertEqual(bink_play.load_names(self.archive, self.mount, use_cache=False), self.expected)
+        self.assertFalse(self.cache.parent.exists())
+
+    def test_existing_cache_is_untouched_and_temporary_report_is_removed(self):
+        self.cache.parent.mkdir()
+        self.cache.write_bytes(b"existing cache must remain unchanged")
+        reports = []
+        real_names = bink_play.bink_names.main
+
+        def generate(argv):
+            reports.append(Path(argv[argv.index("--out") + 1]))
+            return real_names(argv)
+
+        with mock.patch.object(bink_play, "cache_path", return_value=self.cache) as cache_path, \
+                mock.patch.object(bink_play.bink_names, "main", side_effect=generate):
+            self.assertEqual(bink_play.load_names(self.archive, self.mount, use_cache=False), self.expected)
+        cache_path.assert_not_called()
+        self.assertEqual(self.cache.read_bytes(), b"existing cache must remain unchanged")
+        self.assertEqual(list(self.cache.parent.iterdir()), [self.cache])
+        self.assertEqual(len(reports), 1)
+        self.assertFalse(reports[0].exists())
+
+    def test_failed_no_cache_generation_removes_temporary_report(self):
+        reports = []
+
+        def fail(argv):
+            path = Path(argv[argv.index("--out") + 1])
+            reports.append(path)
+            path.write_bytes(b"partial report")
+            raise OSError("synthetic report failure")
+
+        with mock.patch.object(bink_play, "cache_path", return_value=self.cache), \
+                mock.patch.object(bink_play.bink_names, "main", side_effect=fail):
+            with self.assertRaisesRegex(OSError, "synthetic report failure"):
+                bink_play.load_names(self.archive, self.mount, use_cache=False)
+        self.assertEqual(len(reports), 1)
+        self.assertFalse(reports[0].exists())
+        self.assertFalse(self.cache.parent.exists())
 
 
 if __name__ == "__main__":

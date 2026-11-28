@@ -897,6 +897,47 @@ inline DescriptorHashKind majority_descriptor_hash_kind(const DescriptorHashCens
     return census.fnv1a_fmix32 > census.fnv1a ? DescriptorHashKind::fnv1a_fmix32 : DescriptorHashKind::fnv1a;
 }
 
+// Which descriptor-table entry layout the loaded modules read (descriptor_table.h, tools/rdna2spirv.py
+// --descriptor-table). A module whose meta carries `"descriptor_table": "tagged"` also reads the kind word next to
+// each index and uses it to tell which array an index belongs to; an absent key is the old plain layout, which reads
+// only the index. The runtime fills the kind word for a tagged table and leaves it alone for a plain one, so a
+// library translated before the marker (or with --descriptor-table plain) behaves exactly as it did.
+enum class DescriptorTableLayout : std::uint8_t { plain = 0, tagged = 1 };
+
+inline constexpr const char* descriptor_table_layout_name(DescriptorTableLayout layout) {
+    return layout == DescriptorTableLayout::tagged ? "tagged" : "plain";
+}
+
+struct DescriptorTableCensus {
+    std::size_t plain = 0;
+    std::size_t tagged = 0;
+    std::size_t total() const { return plain + tagged; }
+};
+
+// The tagged layout when any module reads it. The kind word is additive: a tagged module reads it and a plain
+// module ignores it (it reads the index at the same place), so one tagged module in the corpus needs the tagged
+// layout, however many plain ones there are. Counting entries would let a merged or partial index whose plain
+// modules outnumber the tagged ones hand every tagged module an all-zero kind, and every image of another
+// dimension would then fall back. No tagged module is the old plain layout.
+inline DescriptorTableLayout majority_descriptor_table_layout(const DescriptorTableCensus& census) {
+    return census.tagged > 0 ? DescriptorTableLayout::tagged : DescriptorTableLayout::plain;
+}
+
+// LEONIDA_DESCRIPTOR_TABLE=plain|tagged overrides the modules' vote. False when `value` is null, empty or not one
+// of the two layouts (an unrecognised value is ignored rather than failing startup).
+inline bool descriptor_table_layout_from_env(const char* value, DescriptorTableLayout* layout) {
+    if (!value || !*value) return false;
+    if (std::strcmp(value, "tagged") == 0) {
+        if (layout) *layout = DescriptorTableLayout::tagged;
+        return true;
+    }
+    if (std::strcmp(value, "plain") == 0) {
+        if (layout) *layout = DescriptorTableLayout::plain;
+        return true;
+    }
+    return false;
+}
+
 // LEONIDA_DESCRIPTOR_HASH=fnv1a|fnv1a_fmix32 overrides the modules' majority. False when `value` is null, empty or not
 // one of the two kinds (an unrecognised value is ignored rather than failing startup).
 inline bool descriptor_hash_kind_from_env(const char* value, DescriptorHashKind* kind) {
@@ -973,6 +1014,7 @@ public:
         bvh_count_ = 0;
         exe_count_ = 0;
         descriptor_hash_census_ = {};
+        descriptor_table_census_ = {};
         for (const char* folder : {"fspx", "fspx_gfx"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
@@ -994,6 +1036,13 @@ public:
     // LEONIDA_DESCRIPTOR_HASH names a kind.
     const DescriptorHashCensus& descriptor_hash_census() const { return descriptor_hash_census_; }
     DescriptorHashKind descriptor_hash_kind() const { return majority_descriptor_hash_kind(descriptor_hash_census_); }
+    // The entry layouts the loaded modules read, and the layout to use: tagged as soon as one module reads the kind
+    // word (it is additive, see majority_descriptor_table_layout), plain when none does. The device takes this once,
+    // before its descriptor table's first insert, unless LEONIDA_DESCRIPTOR_TABLE names a layout.
+    const DescriptorTableCensus& descriptor_table_census() const { return descriptor_table_census_; }
+    DescriptorTableLayout descriptor_table_layout() const {
+        return majority_descriptor_table_layout(descriptor_table_census_);
+    }
     // Entries loaded from <dir>/fspx/index.json and <dir>/library/index.json. A corpus of RPF containers never
     // reaches these: their programs come from FidelityFX DLLs and the pipeline library, so callers comparing reached
     // entries with size() must leave them out.
@@ -1069,6 +1118,19 @@ public:
         return all;
     }
 
+    // The module's file: <dir>/<name>.spv, or the index's spv file name when that one is missing.
+    std::filesystem::path spirv_file(const ShaderEntry& entry) const {
+        std::error_code ec;
+        auto path = dir_;
+        path += "/" + entry.name + ".spv";
+        if (!std::filesystem::exists(path, ec) && !entry.spv_file.empty()) {
+            auto alt = dir_;
+            alt += "/" + entry.spv_file;
+            return alt;
+        }
+        return path;
+    }
+
     // The size of the module's file in bytes, or 0 when it is missing: what spirv() would read, without reading it.
     std::size_t spirv_bytes(const ShaderEntry& entry) const {
         std::error_code ec;
@@ -1081,6 +1143,20 @@ public:
             size = std::filesystem::file_size(alt, ec);
         }
         return ec ? 0 : static_cast<std::size_t>(size);
+    }
+
+    // Every entry of `stage` once, in name order, from every index (an entry reachable both by its FSSM and its FSPX
+    // hash is one entry). gta6rt --precompile-pipelines builds them all.
+    std::vector<const ShaderEntry*> stage_entries(std::string_view stage) const {
+        std::map<std::pair<std::string_view, std::string_view>, const ShaderEntry*> unique;
+        for (const Entries* map : {&entries_, &fspx_entries_})
+            for (const auto& [key, list] : *map)
+                for (const ShaderEntry& e : list)
+                    if (e.stage == stage) unique.emplace(std::pair<std::string_view, std::string_view>{e.name, e.spv_file}, &e);
+        std::vector<const ShaderEntry*> out;
+        out.reserve(unique.size());
+        for (const auto& [key, e] : unique) out.push_back(e);
+        return out;
     }
 
     // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
@@ -1146,6 +1222,7 @@ private:
             bvh_count_ = 0;
             exe_count_ = 0;
             descriptor_hash_census_ = {};
+            descriptor_table_census_ = {};
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -1241,6 +1318,13 @@ private:
                 ++descriptor_hash_census_.fnv1a_fmix32;
             else
                 ++descriptor_hash_census_.fnv1a;
+            // Which entry layout this module reads (descriptor_table.h). Absent, or not a layout this runtime knows,
+            // is the old plain one.
+            if (const Json* dt = meta.find("descriptor_table");
+                dt && dt->kind == Json::Kind::string && dt->string == "tagged")
+                ++descriptor_table_census_.tagged;
+            else
+                ++descriptor_table_census_.plain;
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
@@ -1264,6 +1348,7 @@ private:
     Entries entries_;
     Entries fspx_entries_;
     DescriptorHashCensus descriptor_hash_census_;
+    DescriptorTableCensus descriptor_table_census_;
 };
 
 } // namespace leonida

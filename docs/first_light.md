@@ -70,9 +70,7 @@ python -I tools/first_light.py --check --out ~/leonida-work/first_light/out
 
 `--check` on an existing folder re-runs the harness through the same fresh path and `check_image` as the test; a
 harness that exits 0 without writing, an all-opaque image and a swapped-U/V image all exit 1. The test has
-twenty-five cases: the two package-gated draw/manifest checks, the `--check` command, four oracle fixtures, the
-mesh depth fit, a preview with non-finite readback channels, the stage files of two shaders with the same name, two
-OBJ parsing checks, seven checks of the textured path (section 6) and six CPU checks of `--camera` (section 7).
+48 cases; `python -I tests/test_first_light.py -v` prints each one.
 
 `first_light.py` carves `shaders.rpf` if the work folder does not have it, translates only the chosen pair, converts
 the OBJ to the harness's mesh file (`u32 vertex_count, u32 index_count`, `(x,y,z,u,v) f32` vertices, `u32`
@@ -140,10 +138,10 @@ The CPU oracle (`check_image`) samples the decoded `R8G8B8A8_UNORM` texture bili
 `centre_uv` and each `uv_probes` entry and requires the GPU readback to match within `0.02` (rejecting the
 magenta unbound-texture fallback and wrong-colour probes). Verified on Windows 11 with an NVIDIA GeForce RTX 3060
 (driver 621.24, Vulkan 1.4.357): **12,804/16,384 (0.781)** covered. Without `LEONIDA_FIRST_LIGHT_DIR`,
-`python -I tests/test_first_light.py -v` runs **46 tests: 42 passed, 4 skipped** (the 3 package-gated
+`python -I tests/test_first_light.py -v` runs **48 tests: 44 passed, 4 skipped** (the 3 package-gated
 `FirstLightTests` require `LEONIDA_FIRST_LIGHT_DIR`, and `test_harness_rejects_wrapped_tsharp_va_overflow` needs a
 built `vk_harness`; the 4 `OracleTests` and the other 11 `TexturedOracleTests` run without a package). With
-`LEONIDA_FIRST_LIGHT_DIR` set against a local package run (and `vk_harness` built) none of the 46 is skipped.
+`LEONIDA_FIRST_LIGHT_DIR` set against a local package run (and `vk_harness` built) none of the 48 is skipped.
 
 ```sh
 python -I tools/first_light.py --game "<package>" --work ~/leonida-work \

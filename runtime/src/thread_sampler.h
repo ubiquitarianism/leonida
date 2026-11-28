@@ -44,6 +44,9 @@ struct Sampler {
     // LEONIDA_SAMPLE_DETAIL=<id>[,<id>...]: for these threads, the 10 most frequent chains, 16 frames deep, each as a
     // share of that thread's samples (thread ids are stable from boot to boot: the title's main, render and submit).
     std::vector<DWORD> detail;
+    // LEONIDA_SAMPLE_FIND=<rva>[,<rva>...] (title function starts): which threads have the function on their stack
+    // (48 frames deep), how often, and their most frequent chain under it, every report.
+    std::vector<std::uint64_t> find;
 };
 
 // Per title thread (one with a title frame in its chain): how many samples were inside our runtime, and through which
@@ -151,6 +154,7 @@ inline DWORD WINAPI run(LPVOID parameter) {
     constexpr int kDetailFrames = 16;
     using DetailChain = std::array<std::uint64_t, kDetailFrames>;
     std::map<std::pair<DWORD, DetailChain>, std::uint64_t> detail_chains;
+    std::map<std::pair<std::uint64_t, DWORD>, std::map<DetailChain, std::uint64_t>> found;  // (rva, thread) -> chains
     std::uint64_t total = 0;
     ULONGLONG listed = 0, reported = GetTickCount64();
     const auto cpu_of = [](HANDLE h) {
@@ -205,11 +209,20 @@ inline DWORD WINAPI run(LPVOID parameter) {
                         unwind(context, deep);
                         ++detail_chains[{it->first, deep}];
                     }
-                    if (s.shims) {
+                    if (s.shims || !s.find.empty()) {
                         DeepChain deep{};
                         const int n = unwind(context, deep);
                         std::copy_n(deep.begin(), kFrames, chain.begin());
-                        count_shims(s, deep, n, moved, shim_counts[it->first]);
+                        if (s.shims) count_shims(s, deep, n, moved, shim_counts[it->first]);
+                        const auto title = reinterpret_cast<std::uint64_t>(s.title);
+                        for (const std::uint64_t rva : s.find)
+                            for (int f = 0; f < n; ++f)
+                                if (deep[f] == title + rva) {
+                                    DetailChain inner{};
+                                    std::copy_n(deep.begin(), (std::min)(kDetailFrames, n), inner.begin());
+                                    ++found[{rva, it->first}][inner];
+                                    break;
+                                }
                     } else {
                         unwind(context, chain);
                     }
@@ -299,6 +312,23 @@ inline DWORD WINAPI run(LPVOID parameter) {
             }
         }
         detail_chains.clear();
+        for (const auto& [key, chains_of] : found) {
+            std::uint64_t all = 0;
+            const DetailChain* top = nullptr;
+            std::uint64_t top_n = 0;
+            for (const auto& [c, n] : chains_of) {
+                all += n;
+                if (n > top_n) top_n = n, top = &c;
+            }
+            std::string frames;
+            for (int f = 0; top && f < kDetailFrames && (*top)[f]; ++f) frames += (f ? " < " : "") + name_of(s, (*top)[f]);
+            const auto t = threads.find(key.second);
+            std::fprintf(stderr, "[rt] sampler: find t+%llx: thread %lu %llu samples of %llu; top chain (%llu): %s\n",
+                         static_cast<unsigned long long>(key.first), key.second, static_cast<unsigned long long>(all),
+                         static_cast<unsigned long long>(t == threads.end() ? 0 : t->second.samples),
+                         static_cast<unsigned long long>(top_n), frames.c_str());
+        }
+        found.clear();
         if (s.shims) {
             // Title threads by their samples inside our runtime: where the title's own threads (its main, render and
             // Subrender workers, streaming) spend time in our shims, waiting or running.
@@ -384,6 +414,15 @@ inline void start(std::uint8_t* title, std::uint64_t title_size) {
             const unsigned long id = std::strtoul(at, &end, 10);
             if (end == at) break;
             if (id) s.detail.push_back(DWORD(id));
+            at = *end == ',' ? end + 1 : end;
+        }
+    char finds[256] = {};
+    if (const DWORD n = GetEnvironmentVariableA("LEONIDA_SAMPLE_FIND", finds, sizeof(finds)); n && n < sizeof(finds))
+        for (char* at = finds; *at;) {
+            char* end = nullptr;
+            const std::uint64_t rva = std::strtoull(at, &end, 16);
+            if (end == at) break;
+            if (rva) s.find.push_back(rva);
             at = *end == ',' ? end + 1 : end;
         }
     char shims[4] = {};

@@ -123,6 +123,61 @@ std::vector<std::uint32_t> make_16param_vs() {
     return w;
 }
 
+// Fullscreen triangle VS exporting 10 raw params (0..9) with packed f16 bits in param7.
+std::vector<std::uint32_t> make_10param_vs() {
+    constexpr std::uint32_t kBound = 45;
+    std::vector<std::uint32_t> w = {kSpirvMagic, 0x00010500u, 0, kBound, 0};
+    put_inst(w, kOpCapability, {1});
+    put_inst(w, kOpMemoryModel, {0, 1});
+    std::vector<std::uint32_t> ep = {kExecModelVertex, 24, 0x6e69616du, 0x00000000u, 8, 9};
+    for (std::uint32_t id = 31; id <= 40; ++id) ep.push_back(id);
+    put_inst_vec(w, kOpEntryPoint, ep);
+
+    put_inst(w, kOpDecorate, {8, 11, 42});  // BuiltIn VertexIndex
+    put_inst(w, kOpDecorate, {9, 11, 0});   // BuiltIn Position
+    for (std::uint32_t p = 0; p < 10; ++p) put_inst(w, kOpDecorate, {31 + p, kDecorationLocation, p});
+
+    put_inst(w, 19, {1});
+    put_inst(w, 33, {2, 1});
+    put_inst(w, kOpTypeFloat, {3, 32});
+    put_inst(w, kOpTypeVector, {4, 3, 4});
+    put_inst(w, kOpTypeInt, {5, 32, 1});
+    put_inst(w, kOpTypePointer, {6, kStorageInput, 5});
+    put_inst(w, kOpTypePointer, {7, kStorageOutput, 4});
+    put_inst(w, 20, {20});
+
+    put_inst(w, kOpConstantNull, {4, 10});
+    put_inst(w, 43, {3, 11, 0xbf800000u});
+    put_inst(w, 43, {3, 12, 0x40400000u});
+    put_inst(w, 43, {3, 13, 0x00000000u});
+    put_inst(w, 43, {3, 14, 0x3f800000u});
+    put_inst(w, 44, {4, 15, 11, 11, 13, 14});
+    put_inst(w, 44, {4, 16, 12, 11, 13, 14});
+    put_inst(w, 44, {4, 17, 11, 12, 13, 14});
+    put_inst(w, 43, {5, 18, 0u});
+    put_inst(w, 43, {5, 19, 1u});
+    put_inst(w, 43, {3, 21, 0x3a003400u});
+    put_inst(w, 43, {3, 22, 0x3c003800u});
+    put_inst(w, 44, {4, 23, 21, 22, 13, 14});
+
+    put_inst(w, kOpVariable, {6, 8, kStorageInput});
+    put_inst(w, kOpVariable, {7, 9, kStorageOutput});
+    for (std::uint32_t id = 31; id <= 40; ++id) put_inst(w, kOpVariable, {7, id, kStorageOutput});
+
+    put_inst(w, kOpFunction, {1, 24, 0, 2});
+    put_inst(w, 248, {25});
+    put_inst(w, kOpLoad, {5, 26, 8});
+    put_inst(w, 170, {20, 27, 26, 18});
+    put_inst(w, 170, {20, 28, 26, 19});
+    put_inst(w, 169, {4, 29, 28, 16, 17});
+    put_inst(w, 169, {4, 30, 27, 15, 29});
+    put_inst(w, kOpStore, {9, 30});
+    for (std::uint32_t p = 0; p < 10; ++p) put_inst(w, kOpStore, {31 + p, p == 7 ? 23u : 10u});
+    put_inst(w, kOpReturn, {});
+    put_inst(w, kOpFunctionEnd, {});
+    return w;
+}
+
 // Fragment shader reading `num_raw` raw inputs (Location 0..num_raw-1) plus decoded halves of param7 at
 // `lo_loc` and `hi_loc`, writing vec4(lo.x, hi.x, lo.y, hi.y) to MRT 0.
 std::vector<std::uint32_t> make_f16_ps(std::uint32_t num_raw, std::uint32_t lo_loc, std::uint32_t hi_loc) {
@@ -184,27 +239,38 @@ int main() {
     const auto vs_prog = fssm_program({0x56530378, 0xbf810000});
     const auto ps1_prog = fssm_program({0x50530378, 0x00000001});
     const auto ps2_prog = fssm_program({0x50530378, 0x00000002});
+    const auto vs_low_prog = fssm_program({0x56530378, 0xbf810010});
+    const auto ps_low_prog = fssm_program({0x50530378, 0x00000010});
     const auto vs_c = shader_container(vs_prog);
     const auto ps1_c = shader_container(ps1_prog);
     const auto ps2_c = shader_container(ps2_prog);
+    const auto vs_low_c = shader_container(vs_low_prog);
+    const auto ps_low_c = shader_container(ps_low_prog);
 
     const auto lib_dir = std::filesystem::temp_directory_path() / "leonida_f16_halves_gpu_test";
     std::filesystem::create_directories(lib_dir);
     write_spv(lib_dir / "vs_16p.spv", make_16param_vs());
+    write_spv(lib_dir / "vs_10p.spv", make_10param_vs());
     write_spv(lib_dir / "ps_packed.spv", make_f16_ps(15, 20, 21));
     write_spv(lib_dir / "ps_reloc.spv", make_f16_ps(14, 14, 15));
+    write_spv(lib_dir / "ps_low.spv", make_f16_ps(8, 8, 9));
     {
         std::ofstream idx(lib_dir / "index.json", std::ios::binary | std::ios::trunc);
         idx << "{\"vs_16p\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_prog)
             << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": [], "
                "\"f16_halves\": {\"0\": [28, 29], \"1\": [26, 27], \"2\": [24, 25], \"3\": [22, 23], "
                "\"4\": [20, 21], \"5\": [18, 19], \"6\": [16, 17]}},\n"
+               " \"vs_10p\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_low_prog)
+            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": [], \"f16_halves\": {}},\n"
                " \"ps_packed\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps1_prog)
             << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], "
                "\"f16_halves\": {\"7\": [20, 21]}},\n"
                " \"ps_reloc\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps2_prog)
             << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], "
-               "\"f16_halves\": {\"7\": [14, 15]}}}";
+               "\"f16_halves\": {\"7\": [14, 15]}},\n"
+               " \"ps_low\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_low_prog)
+            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], "
+               "\"f16_halves\": {\"7\": [8, 9]}}}";
     }
 
     rt::d3d12::VulkanDeviceInfo info{};
@@ -363,5 +429,151 @@ int main() {
 
     EXPECT(run_case("ps_packed (synth param7 + demote static halves)", ps1_c));
     EXPECT(run_case("ps_reloc (relocate colliding PS + VS halves to 28,29)", ps2_c));
+
+    // Verify low f16_half_top_location (14) through CreateGraphicsPipelineState and lazy build at first draw:
+    {
+        rt::d3d12::VulkanDeviceInfo low_info = info;
+        low_info.f16_half_top_location = 14;
+
+        ID3D12Device* low_inner = nullptr;
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(low_info, IID_PPV_ARGS(&low_inner))));
+        Ref<ID3D12Device> low_device;
+        EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(low_inner, __uuidof(ID3D12Device),
+                                                           reinterpret_cast<void**>(&low_device.p), false)));
+        rt::d3d12::set_device_outer(low_inner, low_device.p);
+
+        Ref<ID3D12RootSignature> low_root;
+        EXPECT(SUCCEEDED(low_device->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&low_root.p))));
+
+        // 1. Out-of-budget pipeline with 16 params rejected at CreateGraphicsPipelineState
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC oob_pd{};
+        oob_pd.pRootSignature = low_root.p;
+        oob_pd.VS = {vs_c.data(), vs_c.size()};
+        oob_pd.PS = {ps2_c.data(), ps2_c.size()};
+        oob_pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        oob_pd.SampleMask = 0xffffffffu;
+        oob_pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        oob_pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        oob_pd.RasterizerState.DepthClipEnable = TRUE;
+        oob_pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        oob_pd.NumRenderTargets = 1;
+        oob_pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        oob_pd.SampleDesc.Count = 1;
+        Ref<ID3D12PipelineState> oob_pso;
+        EXPECT(FAILED(low_device->CreateGraphicsPipelineState(&oob_pd, IID_PPV_ARGS(&oob_pso.p))));
+        std::printf("ps_oob (16 raw params rejected with top_location 14) OK\n");
+
+        // 2. In-budget pipeline (10 params, halves relocated to 13,14) created and executed lazily on draw
+        Ref<ID3D12CommandQueue> low_queue;
+        EXPECT(SUCCEEDED(low_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&low_queue.p))));
+        Ref<ID3D12CommandAllocator> low_alloc;
+        EXPECT(SUCCEEDED(low_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&low_alloc.p))));
+        Ref<ID3D12GraphicsCommandList> low_list;
+        EXPECT(SUCCEEDED(low_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, low_alloc.p, nullptr,
+                                                       IID_PPV_ARGS(&low_list.p))));
+        EXPECT(SUCCEEDED(low_list->Close()));
+        Ref<ID3D12Fence> low_fence;
+        EXPECT(SUCCEEDED(low_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&low_fence.p))));
+
+        Ref<ID3D12Resource> low_rt_res;
+        EXPECT(SUCCEEDED(low_device->CreateCommittedResource(&default_hp, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                             D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                             IID_PPV_ARGS(&low_rt_res.p))));
+        Ref<ID3D12DescriptorHeap> low_rtv_heap;
+        EXPECT(SUCCEEDED(low_device->CreateDescriptorHeap(&rtv_hd, IID_PPV_ARGS(&low_rtv_heap.p))));
+        const D3D12_CPU_DESCRIPTOR_HANDLE low_rtv_h{
+            SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(low_rtv_heap.p, 9))(low_rtv_heap.p))};
+        low_device->CreateRenderTargetView(low_rt_res.p, nullptr, low_rtv_h);
+
+        Ref<ID3D12Resource> low_rb_res;
+        EXPECT(SUCCEEDED(low_device->CreateCommittedResource(&rb_hp, D3D12_HEAP_FLAG_NONE, &rb_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&low_rb_res.p))));
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC in_pd = oob_pd;
+        in_pd.VS = {vs_low_c.data(), vs_low_c.size()};
+        in_pd.PS = {ps_low_c.data(), ps_low_c.size()};
+        Ref<ID3D12PipelineState> low_pso;
+        EXPECT(SUCCEEDED(low_device->CreateGraphicsPipelineState(&in_pd, IID_PPV_ARGS(&low_pso.p))));
+        EXPECT(SUCCEEDED(low_alloc->Reset()));
+        EXPECT(SUCCEEDED(low_list->Reset(low_alloc.p, low_pso.p)));
+        const float clear_col[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        low_list->ClearRenderTargetView(low_rtv_h, clear_col, 0, nullptr);
+        low_list->OMSetRenderTargets(1, &low_rtv_h, FALSE, nullptr);
+        const D3D12_VIEWPORT vp = {0.0f, 0.0f, float(kSize), float(kSize), 0.0f, 1.0f};
+        const D3D12_RECT sc = {0, 0, LONG(kSize), LONG(kSize)};
+        low_list->RSSetViewports(1, &vp);
+        low_list->RSSetScissorRects(1, &sc);
+        low_list->SetGraphicsRootSignature(low_root.p);
+        low_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        low_list->DrawInstanced(3, 1, 0, 0);
+
+        D3D12_RESOURCE_BARRIER to_copy{};
+        to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_copy.Transition = {low_rt_res.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        low_list->ResourceBarrier(1, &to_copy);
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = low_rb_res.p;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, kSize, kSize, 1, 256};
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = low_rt_res.p;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        low_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        D3D12_RESOURCE_BARRIER to_rt = to_copy;
+        to_rt.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        to_rt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        low_list->ResourceBarrier(1, &to_rt);
+        EXPECT(SUCCEEDED(low_list->Close()));
+
+        ID3D12CommandList* cl = low_list.p;
+        low_queue->ExecuteCommandLists(1, &cl);
+        EXPECT(SUCCEEDED(low_queue->Signal(low_fence.p, 1)));
+        EXPECT(SUCCEEDED(low_fence->SetEventOnCompletion(1, nullptr)));
+
+        void* mapped = nullptr;
+        const D3D12_RANGE read_range = {0, kSize * 256};
+        EXPECT(SUCCEEDED(low_rb_res->Map(0, &read_range, &mapped)) && mapped != nullptr);
+        const auto* px = static_cast<const std::uint8_t*>(mapped) + (kSize / 2) * 256 + (kSize / 2) * 4;
+        const int r = px[0], g = px[1], b = px[2], a = px[3];
+        low_rb_res->Unmap(0, nullptr);
+        const bool ok = std::abs(r - 64) <= 1 && std::abs(g - 191) <= 1 && std::abs(b - 128) <= 1 && a == 255;
+        if (!ok) {
+            std::fprintf(stderr, "ps_low_top_location (lazy build at first draw with top_location 14): pixel=(%d,%d,%d,%d), expected~(64,191,128,255)\n", r, g, b, a);
+            return 1;
+        }
+        std::printf("ps_low_top_location (lazy build at first draw with top_location 14): rendered pixel=(%d,%d,%d,%d) OK\n", r, g, b, a);
+
+        // Check the linked SPIR-V stage modules: with f16_half_top_location = 14, every relocated f16
+        // output/input Location must be <= 14 (specifically, relocated to 13 and 14). Without the fix,
+        // stage_words() defaulted top_location to 29 and relocated them to Location 28 & 29.
+        std::vector<std::vector<std::uint32_t>> words;
+        std::string stage_error;
+        EXPECT(rt::d3d12::pipeline_stage_words(low_pso.p, words, stage_error));
+        EXPECT(words.size() >= 2);
+        for (std::size_t s = 0; s < 2; ++s) {
+            Module mod;
+            EXPECT(mod.parse(words[s]));
+            std::uint32_t highest_loc = 0;
+            for (const auto& inst : mod.insts) {
+                if (inst.opcode == kOpDecorate && inst.words.size() >= 4 && inst.words[2] == kDecorationLocation) {
+                    highest_loc = std::max(highest_loc, inst.words[3]);
+                }
+            }
+            if (highest_loc > 14) {
+                std::fprintf(stderr, "ps_low_top_location stage %zu highest Location %u exceeds top_location 14\n",
+                             s, highest_loc);
+                return 1;
+            }
+            if (highest_loc != 14) {
+                std::fprintf(stderr, "ps_low_top_location stage %zu expected highest Location 14, got %u\n",
+                             s, highest_loc);
+                return 1;
+            }
+            std::printf("ps_low_top_location stage %zu linked SPIR-V highest Location=%u <= 14 OK\n", s, highest_loc);
+        }
+    }
+
     return 0;
 }

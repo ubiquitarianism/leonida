@@ -17,14 +17,18 @@
 // buffer V#s of a bound descriptor table before a submission. Without hooks the table only translates what was
 // added to it, so it is tested without a GPU (title_va_alias_test).
 #include <algorithm>
+#include "buffer_va_index.h"
+
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <iterator>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -42,6 +46,9 @@ public:
     // memory (an arena VA, a buffer of the layer's).
     using Resolver = bool (*)(void* context, std::uint64_t va, std::uint64_t bytes, std::uint64_t& shader_va);
     using TableScanner = void (*)(void* context, std::uint64_t table_va, std::uint32_t descriptors);
+    // Every binding resolved to a copy of the title's memory: [va, va + bytes) as they are reached at (the device keeps
+    // them for the copy back after the submission, see DeviceState::write_back_titles).
+    using Noter = void (*)(void* context, std::uint64_t va, std::uint64_t bytes);
 
     // [title_va, title_va + bytes) is reached as [shader_va, shader_va + bytes). A range that overlaps a live one
     // replaces it (the title has placed a new buffer over pages it released). False for an empty or wrapping range.
@@ -49,17 +56,83 @@ public:
         if (!bytes || title_va > UINT64_MAX - bytes) return false;
         std::unique_lock lock(mutex_);
         erase_overlapping(title_va, title_va + bytes);
+        notify(Change::added, title_va, bytes, shader_va);
         ranges_[title_va] = {title_va + bytes, shader_va};
+        by_shader_.insert(shader_va, bytes, title_va);
         count_.store(ranges_.size(), std::memory_order_release);
+        generation_.fetch_add(1, std::memory_order_release);
         return true;
     }
 
     // The two addresses of one stream-pool extent (a GPU-only alias and the CPU view of the same pages, gfxgeom
     // section 3): both name the same shader VA, so a title view carrying either resolves to the one mapping.
     bool add_twin(std::uint64_t va, std::uint64_t twin, std::uint64_t bytes, std::uint64_t shader_va) {
-        if (va == twin) return add(va, bytes, shader_va);
-        const bool first = add(va, bytes, shader_va);
-        return add(twin, bytes, shader_va) && first;
+        if (!bytes || va > UINT64_MAX - bytes || twin > UINT64_MAX - bytes) return false;
+        if (va != twin && va < twin + bytes && twin < va + bytes) return false;
+        std::unique_lock lock(mutex_);
+        if (overlaps(va, va + bytes) || (va != twin && overlaps(twin, twin + bytes))) return false;
+        decltype(ranges_) pending;
+        pending.try_emplace(va, Range{va + bytes, shader_va});
+        pending.try_emplace(twin, Range{twin + bytes, shader_va});
+        publish_pool_ranges(pending);
+        return true;
+    }
+
+    // add_twin over live ranges: every range either address's bytes overlap is replaced whole (each is told as a
+    // removal), then both are entered under one lock. For a stream-pool request that runs into the windows next to it
+    // (title_pool_cover): the new range covers each of them whole, so none of their bytes is left unanswered.
+    // `replaces(shader_va)` names the ranges the caller planned to replace; one it does not (a slot-133 buffer
+    // entered since the plan, which takes no lock of the caller's) makes it false with nothing changed, checked
+    // under the same lock as the replacement.
+    template <class Replaces>
+    bool replace_twin(std::uint64_t va, std::uint64_t twin, std::uint64_t bytes, std::uint64_t shader_va,
+                      Replaces&& replaces) {
+        if (!bytes || va > UINT64_MAX - bytes || twin > UINT64_MAX - bytes) return false;
+        if (va != twin && va < twin + bytes && twin < va + bytes) return false;
+        std::unique_lock lock(mutex_);
+        const auto planned = [&](std::uint64_t begin, std::uint64_t end) {
+            auto it = ranges_.lower_bound(begin);
+            if (it != ranges_.begin() && std::prev(it)->second.end > begin) --it;
+            for (; it != ranges_.end() && it->first < end; ++it)
+                if (!replaces(it->second.shader_va)) return false;
+            return true;
+        };
+        if (!planned(va, va + bytes) || (va != twin && !planned(twin, twin + bytes))) return false;
+        erase_overlapping(va, va + bytes);
+        if (va != twin) erase_overlapping(twin, twin + bytes);
+        decltype(ranges_) pending;
+        pending.try_emplace(va, Range{va + bytes, shader_va});
+        pending.try_emplace(twin, Range{twin + bytes, shader_va});
+        publish_pool_ranges(pending);
+        return true;
+    }
+
+    bool reuse_pool_mapping(std::uint64_t va, std::uint64_t twin, std::uint64_t want, std::uint64_t max_size,
+                            std::uint64_t& shader_va) {
+        if (!want) return false;
+        std::unique_lock lock(mutex_);
+        const auto next = ranges_.upper_bound(va);
+        if (next != ranges_.begin()) {
+            const auto existing = std::prev(next);
+            if (va < existing->second.end) {
+                if (want > existing->second.end - va) return false;
+                shader_va = existing->second.shader_va + (va - existing->first);
+                return true;
+            }
+        }
+        const auto other_next = ranges_.upper_bound(twin);
+        if (other_next == ranges_.begin()) return false;
+        const auto other = std::prev(other_next);
+        if (twin >= other->second.end) return false;
+        const auto end = next == ranges_.end() ? UINT64_MAX : next->first;
+        const auto bytes = std::min({max_size, other->second.end - twin, end - va});
+        if (bytes < want) return false;
+        const auto shader = other->second.shader_va + (twin - other->first);
+        decltype(ranges_) pending;
+        pending.try_emplace(va, Range{va + bytes, shader});
+        publish_pool_ranges(pending);
+        shader_va = shader;
+        return true;
     }
 
     // Forgets the range that starts at title_va, if it still maps to shader_va (a newer range at the same VA keeps
@@ -68,10 +141,35 @@ public:
         std::unique_lock lock(mutex_);
         const auto it = ranges_.find(title_va);
         if (it != ranges_.end() && it->second.shader_va == shader_va) {
+            notify(Change::removed, it->first, it->second.end - it->first, shader_va);
+            by_shader_.erase(shader_va, title_va);
+            note_removed(it->second.shader_va, it->second.end - it->first);
             ranges_.erase(it);
-            invalidations_.fetch_add(1, std::memory_order_release);
+            generation_.fetch_add(1, std::memory_order_release);
         }
         count_.store(ranges_.size(), std::memory_order_release);
+    }
+
+    // A copy that answered for [title_va, title_va + bytes) at shader_va went, whether or not it had a range here (a
+    // geometry copy that vsharp_address or a placed view reached through GeometryViews directly has none): what was
+    // translated through it is stale. Told as a removal is: the console heaps fix the slots that resolved through
+    // either side of it again (the listeners), and the GPU key table drops answers into shader_va (take_removed).
+    void forget_copy(std::uint64_t title_va, std::uint64_t bytes, std::uint64_t shader_va) {
+        if (!bytes) return;
+        std::unique_lock lock(mutex_);
+        for (auto it = ranges_.lower_bound(title_va); it != ranges_.end() && it->first - title_va < bytes;) {
+            if (it->second.shader_va - shader_va != it->first - title_va) {
+                ++it;
+                continue;
+            }
+            by_shader_.erase(it->second.shader_va, it->first);
+            notify(Change::removed, it->first, it->second.end - it->first, it->second.shader_va);
+            it = ranges_.erase(it);
+        }
+        count_.store(ranges_.size(), std::memory_order_release);
+        notify(Change::removed, title_va, bytes, shader_va);
+        note_removed(shader_va, bytes);
+        generation_.fetch_add(1, std::memory_order_release);
     }
 
     // The address a shader must be given for `va` from the ranges added so far: translated inside one, unchanged
@@ -112,6 +210,34 @@ public:
         out.reserve(ranges_.size());
         for (const auto& [start, range] : ranges_) out.push_back({start, range.end, range.shader_va});
     }
+    // The ranges that overlap [begin, end), in title-VA order.
+    void overlapping(std::uint64_t begin, std::uint64_t end, std::vector<Mapping>& out) const {
+        out.clear();
+        if (begin >= end || !count_.load(std::memory_order_acquire)) return;
+        std::shared_lock lock(mutex_);
+        auto it = ranges_.lower_bound(begin);
+        if (it != ranges_.begin() && std::prev(it)->second.end > begin) --it;
+        for (; it != ranges_.end() && it->first < end; ++it)
+            out.push_back({it->first, it->second.end, it->second.shader_va});
+    }
+
+    // Whether `shader_va` lies in the copy of a range added so far: an address the layer itself wrote for the title
+    // (a window, a geometry copy, a slot-133 shadow or import), which a later scan of the same descriptor sees again.
+    // A binary search over the copies' addresses (source_of_vsharp walks every range).
+    bool shader_side(std::uint64_t shader_va) const {
+        if (!count_.load(std::memory_order_acquire)) return false;
+        std::shared_lock lock(mutex_);
+        BufferVaIndex<std::uint64_t>::Hit hit{};
+        return by_shader_.find(shader_va, hit);
+    }
+
+    // Whether any range still answers from inside [shader_va, shader_va + bytes): a copy (a title window) that some
+    // address still reaches. A range entered over a live one replaces it whole (add), so a copy can be left with none.
+    bool answers_into(std::uint64_t shader_va, std::uint64_t bytes) const {
+        if (!count_.load(std::memory_order_acquire)) return false;
+        std::shared_lock lock(mutex_);
+        return by_shader_.overlaps(shader_va, bytes);
+    }
 
     // Debug-only inverse lookup. V#s retain 48 bits, so an import below heap_base wraps.
     bool source_of_vsharp(std::uint64_t base, std::uint64_t& title, std::uint64_t& available) const {
@@ -144,10 +270,12 @@ public:
     // read or write). Counted by kind: translated, or in the title's memory and left as it was.
     std::uint64_t resolve(std::uint64_t va, std::uint64_t bytes, Kind kind) {
         if (!va) return va;
-        std::uint64_t to = shader_va(va);
-        if (to != va) {
+        std::uint64_t mapped = va, available = 0;
+        const bool has_mapping = range_of(va, mapped, available) && mapped != va;
+        if (has_mapping && bytes <= available) {
             translated_[kind].fetch_add(1, std::memory_order_relaxed);
-            return to;
+            note_reached(va, bytes);
+            return mapped;
         }
         Resolver resolver;
         void* context;
@@ -156,8 +284,13 @@ public:
             resolver = resolver_;
             context = hook_context_;
         }
-        if (!resolver || !resolver(context, va, bytes, to)) return va;
+        std::uint64_t to = va;
+        if (!resolver || !resolver(context, va, bytes, to)) {
+            if (!has_mapping) return va;
+            to = mapped;
+        }
         (to != va ? translated_ : untranslated_)[kind].fetch_add(1, std::memory_order_relaxed);
+        if (to && to != va) note_reached(va, bytes);
         return to;
     }
 
@@ -165,6 +298,18 @@ public:
     // whether it is in a title range.
     void note(std::uint64_t va, Kind kind) {
         if (va && shader_va(va) != va) untranslated_[kind].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // [va, va + bytes) is reached as a copy of the title's memory: the device keeps it for the copy back.
+    void note_reached(std::uint64_t va, std::uint64_t bytes) {
+        Noter noter;
+        void* context;
+        {
+            std::lock_guard lock(hook_mutex_);
+            noter = noter_;
+            context = hook_context_;
+        }
+        if (noter) noter(context, va, bytes);
     }
 
     // Before a submission: the device rewrites the buffer V#s of the `descriptors` slots the root signature declares
@@ -208,11 +353,16 @@ public:
             it = memory_.erase(it);
         }
         memory_[begin] = end;
+        memory_generation_.fetch_add(1, std::memory_order_release);
+        notify(Change::memory_added, base, bytes, 0);
     }
     void remove_title_memory(std::uint64_t base) {
         std::unique_lock lock(memory_mutex_);
         memory_.erase(base);
+        memory_generation_.fetch_add(1, std::memory_order_release);
     }
+    // Bumped whenever title_memory_ranges() changes.
+    std::uint64_t memory_generation() const { return memory_generation_.load(std::memory_order_acquire); }
     // LOCAL DIAGNOSTIC (mem probe): every title range, [begin, end), in address order.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> title_memory_ranges() const {
         std::shared_lock lock(memory_mutex_);
@@ -307,13 +457,60 @@ public:
         hook_context_ = nullptr;
         resolver_ = nullptr;
         scanner_ = nullptr;
+        noter_ = nullptr;
     }
     // The resolver alone, for a device that scans its descriptor tables itself.
     void set_resolver(void* context, Resolver resolver) { set_hooks(context, resolver, nullptr); }
     void clear_resolver(void* context) { clear_hooks(context); }
+    // Set after set_hooks, so the hook (and its context) stays the device's: what reached a copy of the title's memory.
+    void set_noter(Noter noter) {
+        std::lock_guard lock(hook_mutex_);
+        noter_ = noter;
+    }
 
     std::size_t size() const { return count_.load(std::memory_order_acquire); }
-    std::uint64_t invalidations() const { return invalidations_.load(std::memory_order_acquire); }
+
+    // What changed, told as it happens to every listener (a device whose console heaps record what each descriptor
+    // resolved to, src/console_heap_slot_records.h): [title_va, title_va + bytes) reached at shader_va was added, or
+    // was removed or replaced (remove, an overlapping add, forget_copy: what resolved through it is stale), or title
+    // memory was added (shader_va 0: a copy may now be made for an address that had none). Called with the table's
+    // lock held, so a listener only records and never calls back into the table. remove_listener returns once no call
+    // to that listener is in progress.
+    enum class Change : unsigned { added, removed, memory_added };
+    using Listener = void (*)(void* context, Change change, std::uint64_t title_va, std::uint64_t bytes,
+                              std::uint64_t shader_va);
+    void add_listener(void* context, Listener listener) {
+        std::unique_lock lock(listener_mutex_);
+        listeners_.emplace_back(context, listener);
+    }
+    void remove_listener(void* context) {
+        std::unique_lock lock(listener_mutex_);
+        std::erase_if(listeners_, [context](const auto& l) { return l.first == context; });
+    }
+    // Bumped by every add and every removal: a copy of mappings() is current while it has not moved.
+    std::uint64_t generation() const { return generation_.load(std::memory_order_acquire); }
+    // Diagnostics (fsdraw): the title VA a shader VA was made from, the reverse of translate; a linear scan.
+    bool title_of_shader(std::uint64_t shader_va, std::uint64_t& title_va, std::uint64_t& range_va,
+                         std::uint64_t& range_bytes) const {
+        std::shared_lock lock(mutex_);
+        for (const auto& [va, r] : ranges_)
+            if (shader_va >= r.shader_va && shader_va - r.shader_va < r.end - va) {
+                title_va = va + (shader_va - r.shader_va);
+                range_va = va;
+                range_bytes = r.end - va;
+                return true;
+            }
+        return false;
+    }
+    // LEONIDA_CONSOLE_HEAP_GPU: the shader-VA ranges of the ranges removed (or replaced) since the last take, so a
+    // GPU table translated through them can drop what it derived. Nothing is kept until recording is turned on.
+    void record_removals(bool on) { record_removals_.store(on, std::memory_order_relaxed); }
+    void take_removed(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) {
+        out.clear();
+        if (!record_removals_.load(std::memory_order_relaxed)) return;
+        std::unique_lock lock(mutex_);
+        out.swap(removed_);
+    }
     void note_translation(Kind kind) { translated_[kind].fetch_add(1, std::memory_order_relaxed); }
     std::uint64_t translated(Kind kind) const { return translated_[kind].load(std::memory_order_relaxed); }
     std::uint64_t untranslated(Kind kind) const { return untranslated_[kind].load(std::memory_order_relaxed); }
@@ -324,26 +521,65 @@ private:
         std::uint64_t shader_va;  // what the range's first byte becomes
     };
 
+    void publish_pool_ranges(std::map<std::uint64_t, Range>& pending) {
+        try {
+            for (const auto& [base, range] : pending) by_shader_.insert(range.shader_va, range.end - base, base);
+        } catch (...) {
+            for (const auto& [base, range] : pending) by_shader_.erase(range.shader_va, base);
+            throw;
+        }
+        for (const auto& [base, range] : pending) notify(Change::added, base, range.end - base, range.shader_va);
+        ranges_.merge(pending);
+        count_.store(ranges_.size(), std::memory_order_release);
+        generation_.fetch_add(1, std::memory_order_release);
+    }
+
+    bool overlaps(std::uint64_t begin, std::uint64_t end) const {
+        const auto next = ranges_.lower_bound(begin);
+        return (next != ranges_.end() && next->first < end) ||
+               (next != ranges_.begin() && std::prev(next)->second.end > begin);
+    }
+
     void erase_overlapping(std::uint64_t begin, std::uint64_t end) {
         auto it = ranges_.lower_bound(begin);
         if (it != ranges_.begin()) {
             auto previous = std::prev(it);
             if (previous->second.end > begin) it = previous;
         }
-        if (it != ranges_.end() && it->first < end) invalidations_.fetch_add(1, std::memory_order_release);
-        while (it != ranges_.end() && it->first < end) it = ranges_.erase(it);
+        while (it != ranges_.end() && it->first < end) {
+            notify(Change::removed, it->first, it->second.end - it->first, it->second.shader_va);
+            by_shader_.erase(it->second.shader_va, it->first);
+            note_removed(it->second.shader_va, it->second.end - it->first);
+            it = ranges_.erase(it);
+        }
     }
 
+    // mutex_ held exclusively.
+    void note_removed(std::uint64_t shader_va, std::uint64_t bytes) {
+        if (record_removals_.load(std::memory_order_relaxed)) removed_.push_back({shader_va, bytes});
+    }
+
+    void notify(Change change, std::uint64_t title_va, std::uint64_t bytes, std::uint64_t shader_va) const {
+        std::shared_lock lock(listener_mutex_);
+        for (const auto& [context, listener] : listeners_) listener(context, change, title_va, bytes, shader_va);
+    }
+
+    mutable std::shared_mutex listener_mutex_;  // taken inside mutex_ and memory_mutex_, never the other way
+    std::vector<std::pair<void*, Listener>> listeners_;
     mutable std::shared_mutex mutex_;
     std::map<std::uint64_t, Range> ranges_;  // by title VA
+    BufferVaIndex<std::uint64_t> by_shader_;  // the same ranges by shader VA (id: the title VA); copies may overlap
     std::atomic<std::size_t> count_{0};
-    std::atomic<std::uint64_t> invalidations_{};
+    std::atomic<std::uint64_t> generation_{};
+    std::atomic<bool> record_removals_{false};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> removed_;  // (shader VA, bytes), when recorded
     std::mutex hook_mutex_;
     void* hook_context_ = nullptr;
     void* maker_context_ = nullptr;
     BufferMaker maker_ = nullptr;
     Resolver resolver_ = nullptr;
     TableScanner scanner_ = nullptr;
+    Noter noter_ = nullptr;
     void* source_context_ = nullptr;
     DescriptorSource source_ = nullptr;
     std::atomic<std::uint64_t> pulled_{0};
@@ -352,6 +588,7 @@ private:
     std::atomic<std::uint64_t> scans_{0}, scan_ns_{0}, scan_max_ns_{0};
     mutable std::shared_mutex memory_mutex_;
     std::map<std::uint64_t, std::uint64_t> memory_;  // the title's memory: base -> end
+    std::atomic<std::uint64_t> memory_generation_{};
 };
 
 // The process's table: the device's title ranges and hooks, read by the command lists and descriptor writers.
@@ -360,10 +597,23 @@ inline TitleVaAliases& title_va_aliases() {
     return aliases;
 }
 
-// One diagnostic per descriptor-writing path.
+// One diagnostic per descriptor-writing path. Called per descriptor write on the unbacked path, so the sites already
+// told (string literals: their addresses) are looked up without the lock first.
 inline void note_unbacked_view(const char* site, std::uint64_t va, std::uint64_t bytes) {
+    static std::atomic<const char*> told[8] = {};
+    for (const auto& t : told)
+        if (t.load(std::memory_order_relaxed) == site) return;
     static std::mutex mutex;
     static std::map<std::string, bool> sites;
+    {
+        std::lock_guard lock(mutex);
+        for (auto& t : told) {
+            const char* none = nullptr;
+            if (t.load(std::memory_order_relaxed) == site ||
+                t.compare_exchange_strong(none, site, std::memory_order_relaxed))
+                break;
+        }
+    }
     {
         std::lock_guard lock(mutex);
         if (!sites.emplace(site, true).second) return;

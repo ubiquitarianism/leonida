@@ -13,7 +13,7 @@ inline bool VulkanPresenter::present_splash(ResourceId source, std::shared_ptr<v
         if (!binding || !binding->image) return false;
         splash_binding_ = *binding;
     }
-    if (!capture_) splash_capture_only_ = enable_capture();
+    if (!capture_) splash_capture_only_ = enable_capture_storage();
     const auto before = presented();
     if (present(source, true) != VK_SUCCESS || presented() == before) return false;
     const Frame& frame = frames_[(frame_index_ - 1) % frames_.size()];
@@ -61,14 +61,16 @@ inline VkResult VulkanPresenter::finish_startup_frame(Frame& frame, std::uint32_
     VkSubmitInfo ready{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     ready.signalSemaphoreCount = 1;
     ready.pSignalSemaphores = &ready_[image];
-    if (show_title) return context_.vk.vkQueueSubmit(queue_, 1, &ready, VK_NULL_HANDLE);
+    if (show_title) return context_.queue_submit(queue_, 1, &ready, VK_NULL_HANDLE);
     // The acquire was consumed and the title commands finished. Overwrite the same image before presenting it.
-    record(frame.commands, splash_binding_, splash_source_, image, nullptr);
+    // The inspected copy contains the black title frame. Overwrite staging with the
+    // splash actually shown; this is the copy an active disk/readback consumer must see.
+    record(frame.commands, splash_binding_, splash_source_, image, nullptr, true);
     result = vkResetFences_(device, 1, &frame.done);
     if (result != VK_SUCCESS) return result;
     ready.commandBufferCount = 1;
     ready.pCommandBuffers = &frame.commands;
-    return context_.vk.vkQueueSubmit(queue_, 1, &ready, frame.done);
+    return context_.queue_submit(queue_, 1, &ready, frame.done);
 }
 
 }  // namespace leonida

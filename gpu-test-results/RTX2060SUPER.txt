@@ -1,56 +1,89 @@
 GPU:        NVIDIA GeForce RTX 2060 SUPER (Turing, 8 GB, PCI 10de:1f06)
-Driver:     NVIDIA 621.14 (proprietary), Vulkan 1.4.357
+Driver:     NVIDIA 621.14 (proprietary), Vulkan device API 1.4.357
 Subgroup:   32..32 (default 32)
 OS:         Windows 11 Pro, build 28000
-Commit:     d42773d0734d5fd7b3a32a1bfd536f61186322a5
+Commit:     bcaa13dad35f560748bd9b6293cd46504fe288c6
 Tools:      llvm-mc 21.1.8 (AMDGPU), SPIRV-Tools v2026.4 RC2,
-            Vulkan SDK 1.4.363.0, CMake 3.31.6-msvc6,
-            MSVC 19.44.35230.0, Python 3.12.10
+            Vulkan SDK and Khronos validation layer 1.4.363.0,
+            CMake 3.31.6-msvc6, MSVC 19.44.35230.0,
+            Windows SDK 10.0.28000.0, Python 3.12.10
 CPU:        AMD Ryzen 5 3600X
 RAM:        15.93 GiB reported
 
 run_gpu_tests.py:
-            257/257 shaders translated and passed spirv-val in both modes.
-            Native: 197/248 passed, 49 skipped, 2 failed.
-            LEONIDA_W64_EMULATE=1: 229/248 passed, 17 skipped, 2 failed.
+            273/273 shaders translated and passed spirv-val in each mode.
+            Native: 209/263 passed, 53 skipped, 1 failed.
+            LEONIDA_W64_EMULATE=1: 243/263 passed, 19 skipped, 1 failed.
+            Native + validation: 202/263 passed, 53 skipped, 8 failed.
+            Wave64 emulation + validation: 236/263 passed, 19 skipped, 8 failed.
 
-Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (both modes, #31):
-            r32 sint (sint view): 64 bad, texel(5,3) = 2071.
-            Fixture expectations are disputed; see the review on #98.
+Failed:     cs_imgatomic_ext in all four profiles:
+            6 of 64 sint words differ; first word 32:
+            got 0x0badf00d, expected 0x00000101 (matches #1518).
 
-Skipped:    Native: 32 wave64 subgroup-related skips,
-            16 cases covered by other test programs,
-            1 fragment subgroup limitation.
-            Emulated: 16 cases covered by other test programs,
-            1 fragment subgroup limitation.
+Validation-only shader failures:
+- cs_lds_atomics_ext, cs_lds_b64_cmpst, cs_lds_xchg64_ext,
+  cs_w32_fcmpswap, cs_w32_misc_ext, cs_w32_new_ops:
+  GPU-assisted shared-memory race diagnostics, zero numerical
+  mismatches in isolated retry logs (see #1352).
+- cs_pk_mul_lo_const: FAIL only with validation; the printed
+  eight words match the non-validated run. See #481 for the
+  proposed fix to the fixture's output-buffer allocation.
+  This runner's log does not retain the underlying GPUAV message.
 
-Runtime:    RelWithDebInfo, Windows native build.
-            304 registered, 286 passed, 11 skipped,
-            6 failed, 1 disabled.
+Runtime:    RelWithDebInfo, Windows native build, Ninja Multi-Config.
+            No validation: 411 registered, 394 passed, 11 skipped,
+            4 failed, 2 disabled.
+            Validation: 411 registered, 387 passed, 10 skipped,
+            12 failed, 2 disabled.
+            Disabled: gameinput, gameinput_script.
 
-Runtime failures:
-- gameinput_host: GameInputCreate returned 0x800401F0;
-  three internal checks failed.
-- d3d12_private_data: 25 mismatches across five object types.
-- d3d12_execute_indirect_validation: 49 parity cases,
-  positive GPU dispatch OK, 0 validation errors, 5 failures.
-  All five: layer=0 warp=1 hw=1 expected=0 (#337, #306).
-- d3d12_clear: R8G8B8A8_SNORM case 2 byte 24:
-  Vulkan c0, WARP c1.
-- d3d12_draw: SEGFAULT, root cause not yet established.
-- d3d12_clear_formats: 241 matched WARP, 10 differed.
-  Differences affect R8G8_SNORM, R8G8B8A8_SNORM,
-  R16G16_SNORM and R16G16B16A16_SNORM.
+Runtime failures present with and without validation:
+- gameinput_host: host DLL import resolves, GameInputCreate
+  returns 0x800401F0; three internal checks fail.
+- d3d12_private_data: 667 steps compared with host
+  (5 more the host faults on), 25 mismatches across five object types.
+- d3d12_clear: R8G8B8A8_SNORM case 2 byte 24: Vulkan c0, WARP c1.
+- d3d12_clear_formats: 246 matched WARP, 10 differed, affecting
+  R8G8_SNORM, R8G8B8A8_SNORM, R16G16_SNORM, R16G16B16A16_SNORM.
+
+Validation-only runtime failures:
+- depth24_convert, vk_command_replay, xbox_d16s8_storage,
+  d3d12_depth_stencil_uav:
+  VUID-vkCmdCopyBufferToImage-pRegions-07931.
+  depth24_convert also reports VUID-vkDestroyDevice-device-05137.
+  The first two depth-copy tests have matching reports in #1475.
+- d3d12_dxr_validation_khr, d3d12_indirect_rt,
+  d3d12_indirect_rt_upload_sysmem:
+  VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-12281.
+  Both indirect RT variants report RayQueryKHR ARRAY:
+  expected hit=1 miss=0, got hit=0 miss=0 (related: #710).
+- pipeline_cache_seed: vk_pipeline_check cache misses on the runtime
+  device, which hits its self-written cache; matches #1475.
 
 Notes:
-- ms_wave_info_s3: 4096/4096 pixels exact in both modes.
-- cs_signed_zero_nan: PASS in both modes.
+- Full six-profile run on 2026-11-25. Validation profiles requested
+  core validation, GPU-assisted validation and synchronization
+  validation; raw logs confirm GPUAV diagnostics and device selection
+  in relevant tests. Not proof that every test uses Vulkan.
+- Each initial failed test/profile pair failed all three additional
+  targeted retries (102 individual retry failures, excluding
+  runner summary records). Counts above are first-run results.
+- Refresh of #567, which tested d42773d0734d5fd7b3a32a1bfd536f61186322a5
+  on 2026-11-24.
+- cs_imgload_tfe and cs_imgload_d16_tfe now PASS in all four profiles
+  (0 bad, texel(5,3) = 71), consistent with #892.
+- d3d12_execute_indirect_validation now passes both runtime profiles:
+  51 parity cases, positive GPU dispatch OK, 0 validation errors,
+  0 failures (consistent with #1066).
+- ms_wave_info_s3: 4096/4096 pixels exact in all four GPU profiles.
+- cs_signed_zero_nan: PASS in all four GPU profiles.
 - Runtime reports upload heaps in system memory (no Resizable BAR).
-- GPU suite counts match the RTX 5070 report in #560,
-  tested on the same commit and NVIDIA driver.
-- Five additional runtime failures compared with #560.
-  The two systems have different Windows builds and hardware,
-  so the cause cannot yet be attributed to the GPU architecture.
-- Single baseline run performed on 2026-11-24.
+- The previously reported d3d12_draw SEGFAULT did not reproduce.
+- The four persistent host/runtime failures above pass on the RTX 5070
+  system on the same commit and driver; Windows builds and host
+  configurations differ. No GPU-specific cause is established.
+- Validation-specific findings are not classified as confirmed layer
+  false positives without isolated validation-setting A/B tests.
+- Synthetic tests only; no retail game execution or game data.
 - AI-assisted test automation and report preparation.
-- Synthetic tests only; no game files used.

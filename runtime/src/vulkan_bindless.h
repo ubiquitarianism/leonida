@@ -25,6 +25,14 @@
 // and samplers it adds and keeps them alive while they are in the set; this class owns only the fallbacks and the
 // table's buffer.
 //
+// The T#'s own type is the truth: the index was given out in ITS dimension's space, so a shader reading it through
+// another dimension's array (a 2D instruction on a 2D-array or cube T#, say) must not use it blindly. Every entry
+// therefore carries, next to the index, which arrays the index is bound in (descriptor_table.h's kind bits), and a
+// translated module of the tagged contract reads that word: it uses the index only in an array the entry names and
+// otherwise takes that array's fallback. For the one mismatch the hardware reads rather than drops - a 2D
+// instruction on a 2D-array or cube T#, which addresses slice 0 - add_image's MirrorViews bind a view of that slice
+// at the same index in the 2D arrays and name 2D in the kind, so the instruction finds it.
+//
 // The fallbacks stand for the console's null descriptors (a zero T#, a T# whose image the layer refused or never
 // saw): each is of the kind the instruction asks for, since the translator picks the binding by the instruction's
 // dimension and the view by the T#'s numeric class, and a miss at any of them reads zeros. On the console a store or
@@ -68,6 +76,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -230,14 +239,15 @@ struct SetLayout {
     SetLayout& operator=(const SetLayout&) = delete;
 };
 
-// What size_bindings() grows to where the device's limits allow. At 32-64 bytes a descriptor the whole set is then
-// 5-10 MiB with 153697 descriptors when all MS classes and array bindings reach their limits (an RTX 5070).
-inline constexpr std::uint32_t max_2d_images = 65536;
-// The other single-sample dimensions: a title streams far more cube maps and texture arrays (and 1D lookup
-// textures) than the 1024 and 256 of the defaults, each distinct T# of one taking its own index.
-inline constexpr std::uint32_t max_2d_array_images = 16384;
-inline constexpr std::uint32_t max_3d_images = 4096;
-inline constexpr std::uint32_t max_1d_images = 4096;
+// What size_bindings() grows the sampled array of every single-sample dimension (2D, 2D array, 3D and 1D) to where
+// the device's limits allow: one size for all of them. Which dimensions its textures have is the title's choice, and
+// an image keeps its index (one for each distinct T# of it) for as long as the texture lives, so no dimension gets
+// less room than another: a world run kept 4090 live 1D textures, the whole of the 4096 1D indices the set once
+// stopped at, while the 2D arrays had room to spare. The bound is the set's memory, not the device's descriptor
+// limits (8388606 sampled images on RADV): every element of every array is in each generation's descriptor pool,
+// used or not. At 32-64 bytes a descriptor the whole set is 10-20 MiB with 325729 descriptors when all MS classes
+// and arrays reach their limits (an RTX 5070).
+inline constexpr std::uint32_t max_images = 65536;
 inline constexpr std::uint32_t max_storage_indices = 4096;  // in each storage array, at most its dimension's images
 // A full D3D12 shader-visible sampler heap (2048) and room for literal and static S#s, within what the device can
 // create (maxSamplerAllocationCount, at least 4000) less the samplers that are not in the set.
@@ -252,7 +262,8 @@ inline constexpr std::uint32_t growth_headroom = 64;
 // standalone samplers do not, though they count in an update-after-bind pool.
 //   1. The default counts, or as much of them as the device holds: samplers, then storage, then 2D images.
 //   2. The MS pairs that fit beside them (limit_ms_bindings, which may turn classes off).
-//   3. Growth towards the maximums above, in the same order, then the 2D-array, 3D and 1D images, within
+//   3. Growth towards the maximums above, in the same order, then the 2D-array, 3D and 1D images together (one
+//      count for the three, so a device whose limits stop growth short of max_images favours none of them), within
 //      maxPerSetDescriptors. That limit only says what is sure to work (vkGetDescriptorSetLayoutSupport may allow
 //      more), so it never shrinks step 1.
 // A storage array holds the smaller of the storage count and its dimension's sampled count: add_image never
@@ -354,11 +365,23 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     const std::uint32_t creatable =
         limits.maxSamplerAllocationCount - std::min(limits.maxSamplerAllocationCount, reserved_samplers);
     grow(samplers, std::max(samplers, std::min(max_samplers, creatable)), growth_headroom, set_limit);
-    grow(images, std::max(images, max_2d_images), growth_headroom, set_limit);
+    grow(images, std::max(images, max_images), growth_headroom, set_limit);
     grow(storage, std::max(storage, max_storage_indices), growth_headroom, set_limit);
-    grow(arrays, std::max(arrays, max_2d_array_images), growth_headroom, set_limit);
-    grow(volumes, std::max(volumes, max_3d_images), growth_headroom, set_limit);
-    grow(lines, std::max(lines, max_1d_images), growth_headroom, set_limit);
+    // The other three dimensions grow as one: each gets the larger of its count so far and the shared one.
+    const std::uint32_t arrays_before = arrays, volumes_before = volumes, lines_before = lines;
+    std::uint32_t together = 0;
+    const auto set_together = [&](std::uint32_t n) {
+        arrays = std::max(arrays_before, n);
+        volumes = std::max(volumes_before, n);
+        lines = std::max(lines_before, n);
+    };
+    for (std::uint32_t high = max_images; together < high;) {
+        const std::uint32_t n = together + (high - together + 1) / 2;
+        set_together(n);
+        if (fits(growth_headroom, set_limit)) together = n;
+        else high = n - 1;
+    }
+    set_together(together);
     apply(true);
     return full;
 }
@@ -398,6 +421,8 @@ public:
     BindlessSet& operator=(const BindlessSet&) = delete;
 
     bool ok() const { return ok_; }
+    // What the set layout was made from (the pipeline journal names compute pipelines by it).
+    const BindlessFeatures& features() const { return features_; }
     bool supports_ms_class(std::uint32_t component_class) const {
         return component_class < classes && features_.ms_samples[component_class] != VK_SAMPLE_COUNT_1_BIT;
     }
@@ -461,29 +486,126 @@ public:
                                  &done, 0, nullptr, 0, nullptr);
     }
 
-    // Gives an image an index in its dimension's bindings: 0 when the dimension is full. `sampled` goes to the
+    // A second view of the same image in the 2D arrays: the slice a 2D instruction reads through a 2D-array or cube
+    // T# (its first layer). The hardware addresses such a read as slice 0, and the translated shader reads binding 0
+    // with the identity the table gives, so the runtime binds this copy at the image's own index and records that
+    // index as valid in the 2D array too (kind_sampled_bit), owned by this image (mirror_of): another dimension's
+    // image with the same slot number does not inherit it. The storage views follow the same rule when the image has
+    // them, so a 2D store or atomic lands on layer 0.
+    struct MirrorViews {
+        VkImageView sampled = VK_NULL_HANDLE;
+        VkImageLayout sampled_layout = VK_IMAGE_LAYOUT_GENERAL;
+        StorageViews storage{};
+    };
+
+    // Gives an image an index in its dimension's bindings: 0 when the dimension is full (image_refusal says why). `sampled` goes to the
     // sampled array in `sampled_layout` (the layout the image is in when shaders read it); the storage views go to
     // the storage arrays in GENERAL. For MS views, sampled_class selects the float, uint or sint sampled array.
-    // The caller maps the T# to the index with insert_key(). Takes effect at flush().
+    // `mirror` adds the same index in the 2D arrays (a 2D-array or cube image's slice 0): the slot must then be free
+    // in both index spaces. `kind_out`, when given, receives what the index is bound in (descriptor_table.h's kind
+    // bits), which the caller records with insert_key. The caller maps the T# to the index with insert_key(). Takes
+    // effect at flush().
     std::uint32_t add_image(ImageDimension dimension, VkImageView sampled, VkImageLayout sampled_layout,
-                            const StorageViews& storage = {}, std::uint32_t sampled_class = 0) {
+                            const StorageViews& storage = {}, std::uint32_t sampled_class = 0,
+                            const MirrorViews* mirror = nullptr, std::uint32_t* kind_out = nullptr) {
         const bool stores = storage.as_float || storage.as_uint || storage.as_sint || storage.r32ui;
         if (!stores && bindless::sampled_binding(dimension) == bindless::no_binding) return 0;
         if (bindless::multisampled(dimension) && (stores || !supports_ms_class(sampled_class))) return 0;
         auto& used = image_used_[std::uint32_t(dimension)];
         const std::uint32_t low_end = std::min(std::uint32_t(used.size()), storage_capacity(dimension));
-        std::uint32_t index = stores ? 0 : allocate(used, low_end, std::uint32_t(used.size()));
-        if (!index) index = allocate(used, 1, low_end);
-        if (index) write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
+        std::vector<std::uint8_t>* used_2d = nullptr;   // the mirror's index space, when there is one
+        if (mirror && dimension != ImageDimension::dim_2d && mirror->sampled) {
+            used_2d = &image_used_[std::uint32_t(ImageDimension::dim_2d)];
+            if (mirror->sampled_layout == VK_IMAGE_LAYOUT_UNDEFINED) used_2d = nullptr;
+        }
+        // A store through the array T# and one through its 2D slice both have to land on a view, so an index with
+        // storage views must be inside this dimension's storage arrays and, when the mirror has storage views too,
+        // inside the 2D arrays' (their range can be the shorter of the two).
+        const bool any_stores = stores || mirror_storage(mirror);
+        const std::uint32_t mirrored_storage_end = std::min(stores ? low_end : std::uint32_t(used.size()),
+                                                            storage_capacity(ImageDimension::dim_2d));
+        std::uint32_t index = 0;
+        if (used_2d) {
+            index = any_stores ? allocate_pair(used, *used_2d, 1, mirrored_storage_end)
+                               : allocate_pair(used, *used_2d, low_end, std::uint32_t(used.size()));
+            if (!index && !any_stores) index = allocate_pair(used, *used_2d, 1, low_end);
+            if (!index) {
+                // No shared slot: the image still gets its own dimension's slot, unmirrored (a 2D read then finds
+                // the fallback). A full array is what returns 0.
+                used_2d = nullptr;
+            }
+        }
+        if (!used_2d) {
+            index = stores ? allocate(used, 1, low_end) : allocate(used, low_end, std::uint32_t(used.size()));
+            if (!index) index = allocate(used, 1, low_end);
+        }
+        if (!index) return 0;
+        assert(!used_2d || !any_stores || index < storage_capacity(ImageDimension::dim_2d));
+        write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
+        if (index < storage_used_[std::uint32_t(dimension)].size())
+            storage_used_[std::uint32_t(dimension)][index] = stores ? 1 : 0;
+        if (used_2d) {
+            write_image(ImageDimension::dim_2d, index, mirror->sampled, mirror->sampled_layout, mirror->storage, 0);
+            used_2d->at(index) = in_use;
+            // The 2D slot is this image's mirror, and this image is its owner: the slot number alone does not say
+            // so, because every dimension's index space is dense and independent.
+            if (index < mirror_owner_.size()) {
+                mirror_owner_[index] = std::uint8_t(std::uint32_t(dimension) + 1);
+                mirror_storage_used_[index] = mirror_storage(mirror) ? 1 : 0;
+            }
+            auto& storage_2d = storage_used_[std::uint32_t(ImageDimension::dim_2d)];
+            if (index < storage_2d.size()) storage_2d[index] = mirror_storage(mirror) ? 1 : 0;
+        }
+        if (kind_out) {
+            *kind_out = kind_sampled_bit(std::uint32_t(dimension)) |
+                        (stores ? kind_storage_bit(std::uint32_t(dimension)) : 0) |
+                        (used_2d ? (kind_sampled_bit(std::uint32_t(ImageDimension::dim_2d)) |
+                                    (mirror_storage(mirror) ? kind_storage_bit(std::uint32_t(ImageDimension::dim_2d))
+                                                            : 0))
+                                 : 0);
+        }
         return index;
     }
 
-    // New views or a new layout for an index add_image returned (a texture's state changed, say).
-    void update_image(ImageDimension dimension, std::uint32_t index, VkImageView sampled, VkImageLayout sampled_layout,
-                      const StorageViews& storage = {}, std::uint32_t sampled_class = 0) {
+    // Why add_image returned 0 for an image of `dimension` (with storage views when `stores`; sampled_class for the
+    // MS dimensions): the set has no array for it; every index of its dimension is taken (array_full: in use, or
+    // removed and held until the next flush that brings the table up to date); or only the storage arrays' shorter
+    // range is, which an image with storage views needs an index in (storage_full).
+    enum class ImageRefusal { no_array, array_full, storage_full };
+    ImageRefusal image_refusal(ImageDimension dimension, bool stores, std::uint32_t sampled_class = 0) const {
+        if (!stores && bindless::sampled_binding(dimension) == bindless::no_binding) return ImageRefusal::no_array;
+        if (bindless::multisampled(dimension) && (stores || !supports_ms_class(sampled_class)))
+            return ImageRefusal::no_array;
         const auto& used = image_used_[std::uint32_t(dimension)];
-        if (index && index < used.size() && used[index] == in_use)
+        const std::size_t low_end = std::min<std::size_t>(used.size(), storage_capacity(dimension));
+        const auto storage_end = used.begin() + std::ptrdiff_t(low_end);
+        const bool storage_free = low_end > 1 && std::find(used.begin() + 1, storage_end, std::uint8_t(0)) != storage_end;
+        return stores && !storage_free && free_images(dimension) ? ImageRefusal::storage_full
+                                                                 : ImageRefusal::array_full;
+    }
+
+    // New views or a new layout for an index add_image returned (a texture's state changed, say). `mirror` is
+    // refreshed too when the image was added with one (mirror_of says whose 2D slot it is). The slot bookkeeping
+    // follows what was written, and `kind_out`, when given, receives the index's kind word afterwards for a
+    // re-insert: the table keeps the kind it was given, so a caller that adds or drops storage views re-records it.
+    void update_image(ImageDimension dimension, std::uint32_t index, VkImageView sampled, VkImageLayout sampled_layout,
+                      const StorageViews& storage = {}, std::uint32_t sampled_class = 0,
+                      const MirrorViews* mirror = nullptr, std::uint32_t* kind_out = nullptr) {
+        const auto& used = image_used_[std::uint32_t(dimension)];
+        const bool live = index && index < used.size() && used[index] == in_use;
+        if (live) {
             write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
+            const bool stores = storage.as_float || storage.as_uint || storage.as_sint || storage.r32ui;
+            if (index < storage_used_[std::uint32_t(dimension)].size())
+                storage_used_[std::uint32_t(dimension)][index] = stores ? 1 : 0;
+        }
+        if (live && mirror && mirror->sampled && mirror_of(dimension, index)) {
+            write_image(ImageDimension::dim_2d, index, mirror->sampled, mirror->sampled_layout, mirror->storage, 0);
+            if (index < mirror_storage_used_.size()) mirror_storage_used_[index] = mirror_storage(mirror) ? 1 : 0;
+            auto& storage_2d = storage_used_[std::uint32_t(ImageDimension::dim_2d)];
+            if (index < storage_2d.size()) storage_2d[index] = mirror_storage(mirror) ? 1 : 0;
+        }
+        if (kind_out) *kind_out = image_kind_at(dimension, index);
     }
 
     // Returns the index to the fallback and frees it. The caller removes the image's keys with erase_key() first.
@@ -495,7 +617,22 @@ public:
         if (!index || index >= used.size() || used[index] != in_use) return;
         write_image(dimension, index, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, {}, 0);
         used[index] = table_dirty_ ? held : 0;
+        if (index < storage_used_[std::uint32_t(dimension)].size())
+            storage_used_[std::uint32_t(dimension)][index] = 0;
         if (table_dirty_) held_images_.push_back({dimension, index});
+        // Its 2D copy goes back to the fallback as well (add_image's mirror), when this image is the one that owns
+        // that slot: another dimension's image at the same slot number has its own index space and keeps its 2D
+        // descriptor (and, if it is a 2D-array image, its own mirror there).
+        if (mirror_of(dimension, index)) {
+            auto& used_2d = image_used_[std::uint32_t(ImageDimension::dim_2d)];
+            write_image(ImageDimension::dim_2d, index, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, {}, 0);
+            used_2d[index] = table_dirty_ ? held : 0;
+            mirror_owner_[index] = 0;
+            mirror_storage_used_[index] = 0;
+            auto& storage_2d = storage_used_[std::uint32_t(ImageDimension::dim_2d)];
+            if (index < storage_2d.size()) storage_2d[index] = 0;
+            if (table_dirty_) held_images_.push_back({ImageDimension::dim_2d, index});
+        }
     }
 
     // 0 when the sampler array is full.
@@ -512,14 +649,36 @@ public:
         if (table_dirty_) held_samplers_.push_back(index);
     }
 
-    // T# and S# keys to the indices above: the table of binding 2 (descriptor_table.h). Changes reach the shaders
-    // at flush().
-    bool insert_key(const DescriptorKey& key, std::uint32_t index) {
-        const auto result = table_.insert_or_update(key.data(), index);
+    // What an index of `dimension` is bound in, from what add_image wrote: that dimension's sampled bit, its storage
+    // bit when the slot holds storage views, and the 2D bits when this image owns the slot at the same number in the
+    // 2D arrays as its mirror (mirror_of).
+    std::uint32_t image_kind_at(ImageDimension dimension, std::uint32_t index) const {
+        const auto set = [&](const std::vector<std::uint8_t>& used) {
+            return index < used.size() && used[index] != 0;
+        };
+        const std::uint32_t d = std::uint32_t(dimension);
+        std::uint32_t kind = kind_sampled_bit(d) | (set(storage_used_[d]) ? kind_storage_bit(d) : 0);
+        if (mirror_of(dimension, index)) {
+            kind |= kind_sampled_bit(std::uint32_t(ImageDimension::dim_2d));
+            if (set(mirror_storage_used_)) kind |= kind_storage_bit(std::uint32_t(ImageDimension::dim_2d));
+        }
+        return kind;
+    }
+
+    // T# and S# keys to the indices above: the table of binding 2 (descriptor_table.h). `kind` is what the index is
+    // bound in, for the modules that read it (descriptor_table.h's kind bits); a sampler's entry has none. Changes
+    // reach the shaders at flush().
+    bool insert_key(const DescriptorKey& key, std::uint32_t index, std::uint32_t kind = 0) {
+        const auto result = table_.insert_or_update(key.data(), index, kind);
         table_dirty_ |= result != DescriptorTable::InsertResult::unchanged;
         existing_entries_changed_ |= result == DescriptorTable::InsertResult::replaced ||
                                      result == DescriptorTable::InsertResult::added_with_relocation;
         return true;
+    }
+    // The T#'s own dimension, whose kind the set derives from the index it gave out (image_kind_at): a caller that
+    // knows the T#'s TYPE needs to pass no bits.
+    bool insert_key(const DescriptorKey& key, std::uint32_t index, ImageDimension dimension) {
+        return insert_key(key, index, image_kind_at(dimension, index));
     }
     // Erasing empties only the key's own slot; no other entry moves (DescriptorTable::erase), so it needs no idle.
     // The caller erases a key once no submitted work uses it (its texture is gone), like D3D12 requires.
@@ -754,6 +913,34 @@ private:
         return 0;
     }
 
+    // The first index in [begin, end) free in both arrays, marked used in the first; 0 when there is none. The
+    // second array's size bounds the range: a mirrored index must exist in it (its 2D slot).
+    static std::uint32_t allocate_pair(std::vector<std::uint8_t>& used, std::vector<std::uint8_t>& other,
+                                       std::uint32_t begin, std::uint32_t end) {
+        end = std::min(end, std::uint32_t(other.size()));
+        for (std::uint32_t i = begin; i < end; ++i) {
+            if (used[i] || other[i]) continue;
+            used[i] = 1;
+            return i;
+        }
+        return 0;
+    }
+
+    // A mirror is worth binding only when it has a view; its storage views make the 2D storage arrays valid too.
+    static bool mirror_storage(const MirrorViews* mirror) {
+        return mirror && (mirror->storage.as_float || mirror->storage.as_uint || mirror->storage.as_sint ||
+                          mirror->storage.r32ui);
+    }
+
+    // True when the 2D slot at `index` is the mirror of the image whose index is `index` in `dimension` (add_image's
+    // MirrorViews). A bare per-slot flag cannot say so: every dimension's index space is dense and independent, so
+    // the Nth image of one dimension shares its slot number with the Nth 2D-array image's mirror slot in the 2D
+    // arrays. The owner is the dimension + 1 (0: no mirror).
+    bool mirror_of(ImageDimension dimension, std::uint32_t index) const {
+        if (dimension == ImageDimension::dim_2d) return false;
+        return index < mirror_owner_.size() && mirror_owner_[index] == std::uint8_t(std::uint32_t(dimension) + 1);
+    }
+
     std::uint32_t memory_type(std::uint32_t allowed, VkMemoryPropertyFlags wanted) const {
         for (std::uint32_t i = 0; i < memory_.memoryTypeCount; ++i)
             if ((allowed & (1u << i)) && (memory_.memoryTypes[i].propertyFlags & wanted) == wanted) return i;
@@ -778,6 +965,10 @@ private:
             image_used_[d].assign(image_capacity(ImageDimension(d)), 0);
             image_used_[d][0] = 1;
         }
+        for (std::uint32_t d = 0; d < dimensions; ++d)
+            storage_used_[d].assign(image_capacity(ImageDimension(d)), 0);
+        mirror_owner_.assign(image_capacity(ImageDimension::dim_2d), 0);
+        mirror_storage_used_.assign(image_capacity(ImageDimension::dim_2d), 0);
         sampler_used_.assign(sampler_capacity(), 0);
         sampler_used_[0] = 1;
         return true;
@@ -1282,6 +1473,14 @@ private:
     VkSampler fallback_sampler_ = VK_NULL_HANDLE;
     bool fallbacks_ready_ = false;
     std::array<std::vector<std::uint8_t>, dimensions> image_used_;
+    // Which of those slots also hold storage views (add_image's `storage`), and which 2D slots hold the mirror of an
+    // image in another dimension (add_image's MirrorViews): removing that image frees the 2D slot too. insert_key
+    // reads both to say which arrays an index is bound in. mirror_owner_ says whose mirror each of those 2D slots is
+    // (dimension + 1, 0 for none) and mirror_storage_used_ whether it has storage views: the 2D slot numbers line up
+    // with another dimension's indices, so the slot alone does not identify its owner.
+    std::array<std::vector<std::uint8_t>, dimensions> storage_used_;
+    std::vector<std::uint8_t> mirror_owner_;
+    std::vector<std::uint8_t> mirror_storage_used_;
     std::vector<std::uint8_t> sampler_used_;
     std::vector<std::pair<ImageDimension, std::uint32_t>> held_images_;  // removed, not yet free (remove_image)
     std::vector<std::uint32_t> held_samplers_;

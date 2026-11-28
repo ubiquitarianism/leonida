@@ -102,6 +102,12 @@ class TestGFX10FormatMapping(unittest.TestCase):
         with self.assertRaises(ValueError):
             tex_headers.dxgi_to_gfx10(99999)
 
+    def test_shared_exponent_format_is_indexed_and_sized(self):
+        # dds_png decodes DXGI 67; without these entries the indexer drops it and tex_export --png never sees it.
+        self.assertEqual(tex_headers.DXGI[67], "R9G9B9E5_SHAREDEXP")
+        self.assertEqual(tex_headers.FMT_INFO[67], (4, 1))
+        self.assertEqual(tex_headers.calc_mip_level_bytes(3, 2, fmt=67), 24)
+
     def test_dxgi_dict_integrity(self):
         for dxgi_id, name in tex_headers.DXGI.items():
             self.assertIsInstance(dxgi_id, int)

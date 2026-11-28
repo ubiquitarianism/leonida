@@ -546,6 +546,49 @@ int test_capacity_overflow() {
     return 0;
 }
 
+// The entry's last dword is what a `descriptor_table` tagged module reads next to the index: the occupied bit and
+// the arrays the index is bound in (kind_sampled_bit / kind_storage_bit). A plain module never reads it, so a table
+// inserted without a kind must serialize exactly as before (marker, no kind bits).
+int test_kind_word() {
+    DescriptorTable table(16);
+    const DescriptorKey image = make_tsharp_key(std::array<std::uint32_t, 8>{0x00001000u, 0x00000000u, 0u, 0u,
+                                                                            0u, 0u, 0u, 0u}.data());
+    const std::uint32_t kind = kind_sampled_bit(1) | kind_storage_bit(1);
+    EXPECT(table.insert(image, 5, kind));
+    EXPECT(table.lookup(image) == 5);
+    const auto words = table.build_gpu_buffer();
+    EXPECT(words[0] == 15);
+    const std::uint32_t slot = (hash_descriptor_key(image.data(), DescriptorHashKind::fnv1a) & 15);
+    if (words[1 + slot * 10 + 8] != 5) return 1;                 // find the slot the key landed in
+    EXPECT((words[1 + slot * 10 + 9] & kSlotOccupiedMarker) != 0);
+    EXPECT((words[1 + slot * 10 + 9] & kKindMask) == kind);
+
+    // A plain entry: the marker and no kind bits, as before the marker existed.
+    const DescriptorKey plain = make_tsharp_key(std::array<std::uint32_t, 8>{0x00002000u, 0u, 0u, 0u, 0u, 0u, 0u,
+                                                                            0u}.data());
+    EXPECT(table.insert(plain, 6));
+    std::uint32_t found[10];
+    EXPECT(table.read_slot(slot, found));
+    (void)found;
+    DescriptorEntry entry{};
+    entry.kind = kSlotOccupiedMarker;
+    EXPECT(slot_occupied(entry) && slot_kind(entry) == 0);
+
+    // The same index with a new kind is a change the GPU copy needs.
+    EXPECT(table.insert_or_update(image.data(), 5, kind_sampled_bit(2)) ==
+           DescriptorTable::InsertResult::replaced);
+    EXPECT(table.insert_or_update(image.data(), 5, kind_sampled_bit(2)) ==
+           DescriptorTable::InsertResult::unchanged);
+    const auto changed = table.take_changes();
+    EXPECT(!changed.slots.empty() || changed.all);
+
+    // clear_occupied drops the marker but keeps the kind, which is what a shader reads.
+    const auto gpu = table.build_gpu_buffer(true);
+    EXPECT((gpu[1 + slot * 10 + 9] & kSlotOccupiedMarker) == 0);
+    EXPECT((gpu[1 + slot * 10 + 9] & kKindMask) == kind_sampled_bit(2));
+    return 0;
+}
+
 int main() {
     EXPECT(test_unresolvable_hash_collision() == 0);
     EXPECT(test_capacity_overflow() == 0);
@@ -565,6 +608,7 @@ int main() {
     EXPECT(test_multithreaded_insert_and_lookup() == 0);
     EXPECT(test_clear_resets_table() == 0);
     EXPECT(test_erase_and_reinsert() == 0);
+    EXPECT(test_kind_word() == 0);
 
     std::printf("descriptor_table_test: all tests passed (0 failures)\n");
     return 0;

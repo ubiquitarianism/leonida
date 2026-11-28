@@ -136,8 +136,41 @@ following each `0x40`/`0x48`/`0x60`/`0x120` call back to its receiver.
 
 So the four slots' callers are in the game executable, which the package does not contain (the
 same blocker as RT-5). Confidence for slots 8, 9, 12 and 36 stays **Open**: the table in §2.1 is
-still the SDK baseline. Once the executable is available, `tools/d3d12_iid_scan.py` run on it
-shows whether it carries these IIDs, and its call sites through them give the slots.
+still the SDK baseline.
+
+**Measured on the retail executable** (`python -I tools/d3d12_iid_scan.py`, 80 SDK IIDs read from
+the Windows SDK 10.0.26100 `d3d12.h`): the image carries 13 of them, and it carries the whole
+queue/allocator/list/fence set except the two base/second-generation names:
+
+| IID | In the executable |
+|---|---|
+| `ID3D12CommandQueue` | present |
+| `ID3D12CommandAllocator` | present |
+| `ID3D12GraphicsCommandList` | present (one slot-73 site; startup lists use the console IID below) |
+| `ID3D12Fence` | present |
+| `ID3D12CommandList` (base) | absent |
+| `ID3D12Fence1` | absent |
+
+The other carried IIDs are `ID3D12CommandSignature`, `ID3D12DescriptorHeap`, `ID3D12Device11`,
+`ID3D12PipelineState`, `ID3D12QueryHeap`, `ID3D12Resource`, `ID3D12RootSignature`,
+`ID3D12StateObject` and `ID3D12StateObjectProperties`; the image imports only
+`D3D12ConfigureVirtualMemoryX`, `D3D12SerializeVersionedRootSignature` and
+`D3D12XboxCreateDevice` from `d3d12_xs.dll`. `ID3D12Device11`
+(`{5405C344-D457-444E-B4DD-2366E45AEE39}`, `d3d12.h:24502,35748`, `.rdata` `0x1461E0638`) is the
+`riid` the executable passes to `D3D12XboxCreateDevice` (`0x14247856C` → `0x1424785B7`), which is
+why both `d3d12_iid_scan.py` and `is_device_iid` in `runtime/shims/d3d12_xs_device.cpp` recognise
+it during [retail_boot_chain.md](retail_boot_chain.md).
+
+A carried IID is necessary but not sufficient: it says the binary can ask for the interface, not
+where it does. The slots stay **Open** until a call site is followed.
+
+One console command-list IID is outside `d3d12.h`, so the scan cannot see it, and a proxy has to
+answer it rather than forward it to the PC device: `{C3827890-4024-474C-98CF-645B51DC4874}`
+(`.rdata` `0x1461E0668`), passed to Xbox device slot 73 (`CreateCommandListX`) in renderer startup
+at `0x142478B56` → `0x142478B71` ([retail_boot_chain.md](retail_boot_chain.md) §3.3,
+[#523](https://github.com/ubiquitarianism/leonida/issues/523)); the carried
+`IID_ID3D12GraphicsCommandList` (`0x1461ECFA0`) is passed to slot 73 at a separate site
+(`0x1417F6D1D` → `0x1417F6D34`).
 
 ### 2.2 Queue, allocator and fence
 

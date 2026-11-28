@@ -174,6 +174,82 @@ int queue_remap(ID3D12Device* real, ID3D12Device* proxy) {
     return 0;
 }
 
+// Queue slot 31 as a retail run takes it: no batch hook, so the queue's default adapter sends each range to xmem's
+// range callback (copy_page_mappings_fn), which mirrors a legacy-paired GPU-only destination at its CPU view. The
+// source is a GPU-only pool backed only through its CPU alias, and the title maps a page of its own at one CPU twin
+// while the remap waits behind queue work (deferred with list values, waited for without them). When the remap is
+// applied, the GPU-only pages change and the title's CPU page keeps its bytes, through the copy and the unmap after it.
+int queue_remap_default_route(ID3D12Device* real, ID3D12Device* proxy) {
+    using rt::xmem::PageBatch;
+    using rt::xmem::PageRange;
+    auto reserve = reinterpret_cast<XMemVirtualAllocFn>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    auto allocate = reinterpret_cast<XMemAllocatePhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    auto map = reinterpret_cast<XMemMapPhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    auto free_pages = reinterpret_cast<XMemFreePhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    constexpr unsigned n = 2;
+    auto window = [&](DWORD protect) {
+        return static_cast<std::uint8_t*>(reserve(nullptr, n * kPage64k, MEM_RESERVE | kXmem64kPages, 0, protect));
+    };
+    // Two pairs, each a CPU range and then the GPU-only range of its size: the pool's and the destination's.
+    auto* pool_cpu = window(PAGE_READWRITE);
+    auto* pool = window(0x801);
+    auto* cpu = window(PAGE_READWRITE);
+    auto* dst = window(0x801);
+    EXPECT(pool_cpu && pool && cpu && dst);
+    EXPECT(leonida::title_gpu_views::to_cpu(uintptr_t(pool)) == uintptr_t(pool_cpu));
+    EXPECT(leonida::title_gpu_views::to_cpu(uintptr_t(dst)) == uintptr_t(cpu));
+    std::uint64_t pages[n + 1]{}, count = n + 1;
+    EXPECT(allocate(0x280, &count, pages) && count == n + 1);
+    EXPECT(map(pool_cpu, n, pages));  // the pool's pages are mapped at its CPU alias only
+    for (unsigned i = 0; i < n; ++i) pool_cpu[i * kPage64k] = static_cast<std::uint8_t>(40 + i);
+
+    D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_COPY};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12Fence> gate;
+    EXPECT(SUCCEEDED(proxy->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue.p))));
+    EXPECT(SUCCEEDED(real->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate.p))));
+    auto* real_queue = rt::d3d12_xs::queue_proxy_real_queue(queue.p);
+    EXPECT(real_queue && SUCCEEDED(real_queue->Wait(gate.p, 1)));
+    rt::d3d12_xs::set_copy_page_mappings_hook(nullptr);  // the retail route: the default adapter
+    using Copy = HRESULT(WINAPI*)(void*, UINT, const PageBatch*, std::uintptr_t, UINT, UINT);
+    auto call = reinterpret_cast<Copy>((*reinterpret_cast<void***>(queue.p))[31]);
+    const PageRange copy_run[] = {{0, 0, n}};
+    const PageBatch copy_batch{uintptr_t(dst), 1, copy_run};
+    auto done = std::async(std::launch::async, [&] { return call(queue.p, 1, &copy_batch, uintptr_t(pool), n, 0); });
+    // While the remap waits behind the held work, the title maps a page of its own at the second CPU twin.
+    EXPECT(map(cpu + kPage64k, 1, &pages[n]));
+    cpu[kPage64k] = 77;
+    EXPECT(SUCCEEDED(gate->Signal(1)));
+    EXPECT(SUCCEEDED(done.get()));
+    EXPECT(SUCCEEDED(real_queue->Signal(gate.p, 2)));
+    HANDLE remapped = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    EXPECT(remapped && SUCCEEDED(gate->SetEventOnCompletion(2, remapped)));
+    const auto completion = WaitForSingleObject(remapped, 10000);
+    CloseHandle(remapped);
+    EXPECT(completion == WAIT_OBJECT_0);
+    EXPECT(dst[0] == 40 && dst[kPage64k] == 41);  // the GPU-only pages, found through the pool's CPU alias
+    EXPECT(cpu[0] == 40);                         // a CPU twin with no mapping of the title's follows the copy
+    EXPECT(cpu[kPage64k] == 77);                  // the title's own page is kept
+
+    // The unmap: the GPU-only pages and the mirrored twin are unmapped, the title's page stays.
+    const PageRange hole[] = {{2, 0, n}};
+    const PageBatch unmap_batch{uintptr_t(dst), 1, hole};
+    EXPECT(SUCCEEDED(call(queue.p, 1, &unmap_batch, uintptr_t(pool), n, 0)));
+    EXPECT(SUCCEEDED(real_queue->Signal(gate.p, 3)));
+    remapped = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    EXPECT(remapped && SUCCEEDED(gate->SetEventOnCompletion(3, remapped)));
+    EXPECT(WaitForSingleObject(remapped, 10000) == WAIT_OBJECT_0);
+    CloseHandle(remapped);
+    EXPECT(state_is(dst, MEM_RESERVE) && state_is(dst + kPage64k, MEM_RESERVE) && state_is(cpu, MEM_RESERVE));
+    EXPECT(cpu[kPage64k] == 77);
+
+    EXPECT(map(cpu + kPage64k, 1, nullptr) && map(pool_cpu, n, nullptr));
+    EXPECT(free_pages(n + 1, pages));
+    std::puts("queue slot 31 default route: a source through its CPU alias, a deferred copy and an unmap keep the "
+              "title's own CPU twin page");
+    return 0;
+}
+
 // What a GPU copy of `buffer` reads now (a submission: the shadows are refreshed first).
 int read_back(ID3D12Device* real, ID3D12Resource* buffer, UINT64 size, std::vector<std::uint8_t>& out) {
     D3D12_RESOURCE_DESC desc = buffer->GetDesc();
@@ -547,6 +623,7 @@ int main(int argc, char** argv) {
             failures += run(real.p, device.p, eager);
             failures += exposure_map_ranges(device.p);
             failures += queue_remap(real.p, device.p);
+            failures += queue_remap_default_route(real.p, device.p);
             failures += paired_views(real.p);
         }
     }

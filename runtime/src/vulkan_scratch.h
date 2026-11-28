@@ -44,10 +44,13 @@ public:
 
     // `usage` is what the chunks are created with. A chunk that declares VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
     // gets its device address from get() as well, and its memory must have been allocated with
-    // VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT (the allocate callback's job).
+    // VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT (the allocate callback's job). `families` keeps retired chunks shareable
+    // across queue families (graphics + async compute).
     ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate,
-                   DeviceFaultDiagnostics* diagnostics, VkBufferUsageFlags usage)
+                   DeviceFaultDiagnostics* diagnostics, VkBufferUsageFlags usage,
+                   std::vector<std::uint32_t> families = {})
         : device_(device), diagnostics_(diagnostics), allocate_(std::move(allocate)), usage_(usage),
+          families_(std::move(families)),
           addressable_((usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
         loaded_ = vk_.load(get, device, addressable_);
     }

@@ -11,15 +11,19 @@ Directory layout defaults match make_game.py / tools/rdna2spirv.py:
   <disasm_dir>/../index.json   (optional stage map; otherwise stage is inferred from filename prefix)
 """
 import argparse
+import errno
 import json
 import os
 import re
 import struct
 import sys
+import tempfile
 from collections import Counter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 import shader_ir  # noqa: E402
 from shader_meta import SGPR_RMW  # noqa: E402
@@ -64,13 +68,21 @@ def load_stage_map(disasm_dir, *, report_path=None):
     for cand in candidates:
         if os.path.isfile(cand):
             try:
-                with open(cand, encoding="utf-8") as _f:
+                with open(cand, encoding="utf-8-sig") as _f:
                     data = json.load(_f)
                 if isinstance(data, list):
-                    return {os.path.splitext(e["file"])[0]: e.get("stage", "?") for e in data if "file" in e}
+                    return {
+                        os.path.splitext(e["file"])[0]: e["stage"] if isinstance(e.get("stage"), str) else "?"
+                        for e in data
+                        if isinstance(e, dict) and isinstance(e.get("file"), str)
+                    }
                 if isinstance(data, dict):
-                    return {k: v.get("stage", "?") for k, v in data.items() if isinstance(v, dict)}
-            except (OSError, ValueError, KeyError, TypeError):
+                    return {
+                        k: v["stage"] if isinstance(v.get("stage"), str) else "?"
+                        for k, v in data.items()
+                        if isinstance(v, dict)
+                    }
+            except (OSError, ValueError, KeyError, TypeError, RecursionError):
                 pass
     return {}
 
@@ -98,10 +110,14 @@ def read_psv0(dxbc_path):
         off = struct.unpack_from("<I", d, 32 + 4 * k)[0]
         if off + 8 <= len(d) and d[off:off + 4] == b"PSV0":
             plen = struct.unpack_from("<I", d, off + 4)[0]
+            if off + 8 + plen > len(d):
+                return None
             p = d[off + 8:off + 8 + plen]
             if len(p) < 4:
                 return None
             rsize = struct.unpack_from("<I", p, 0)[0]
+            if 4 + rsize > len(p):
+                return None
             r = p[4:4 + rsize]
             if len(r) < 48:
                 return {"rsize": rsize}
@@ -215,10 +231,13 @@ def rbw_registers(insns):
         is_dual_dst = op.startswith("v_") and (
             "_co_" in op or op.startswith(("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64"))
         )
+        # The assembler's short form v_add_co_ci_u32 vD, src0, src1 (also sub/subrev) has VCC as its carry-out and
+        # carry-in and names neither: args[1] is src0, read, not a carry-out destination.
+        is_short_co_ci = op.endswith("_co_ci_u32") and len(args) == 3
         # Carry-out / scale-out forms write the VGPR and scalar mask first, even when they also take a carry-in source.
         if is_lds_load:
             dsts, srcs = [], args
-        elif not is_no_dest and is_dual_dst and len(args) >= 2:
+        elif not is_no_dest and is_dual_dst and len(args) >= 2 and not is_short_co_ci:
             dsts = args[:2]
             srcs = args[2:]
         elif is_no_dest:
@@ -263,8 +282,8 @@ def detect_wave64(insns):
 
 
 def audit(disasm_dir, fssm_dir=None, dxbc_dir=None, stages=("cs", "ms", "gs"), limit=None, *, report_path=None):
-    if limit is not None and limit < 0:
-        raise ValueError("limit must be non-negative")
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be at least 1")
     parent = os.path.dirname(os.path.realpath(disasm_dir))
     fssm_dir = fssm_dir or os.path.join(parent, "fssm")
     dxbc_dir = dxbc_dir or parent
@@ -370,6 +389,32 @@ def audit(disasm_dir, fssm_dir=None, dxbc_dir=None, stages=("cs", "ms", "gs"), l
     return out
 
 
+def write_json(path, report):
+    """Atomically write LF-only JSON, preserving file permissions and cleaning up temp files on error."""
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target) or "."
+    os.makedirs(parent, exist_ok=True)
+    if os.path.isdir(target):
+        raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), path)
+    payload = (json.dumps(report, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    fd, tmp_path = tempfile.mkstemp(prefix=".audit_shader4_regs_", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        os.chmod(tmp_path, published_mode(target))
+        replace_retry(tmp_path, target)
+    except BaseException:
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def print_report(rep):
     for st, rec in rep.items():
         print(f"=== {st.upper()} ({rec['count']} shaders; wave64={rec['wave64_heuristic']}, wave32={rec['wave32_heuristic']}) ===")
@@ -395,16 +440,25 @@ def print_report(rep):
                 print(f"    {v:6d}  {k}")
 
 
+def shader_count(text):
+    """--limit: at least 1; 0 used to mean an audit of nothing that still printed a zero report."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be at least 1") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Audit CS/MS/GS RSRC2/PSV0 headers and read-before-write registers.")
     ap.add_argument("disasm_dir", help="directory of disassembled .s files")
     ap.add_argument("--fssm", default=None, help="directory of .fssm files (default: <disasm_dir>/../fssm)")
     ap.add_argument("--dxbc", default=None, help="directory of .dxbc files (default: <disasm_dir>/..)")
     ap.add_argument("--json", dest="json_out", default=None, help="optional path to write full JSON report")
-    ap.add_argument("--limit", type=int, default=None, help="stop after N .s files")
+    ap.add_argument("--limit", type=shader_count, default=None, help="stop after N .s files (at least 1)")
     a = ap.parse_args(argv)
-    if a.limit is not None and a.limit < 0:
-        ap.exit(2, f"{ap.prog}: error: --limit must be non-negative\n")
     # A bad path is one ERROR line, not a traceback out of os.listdir: the audit of a whole corpus can
     # run for minutes, and an explicit --fssm/--dxbc that does not exist would otherwise be counted as
     # "(missing fssm)" and print a report that looks right.
@@ -418,7 +472,7 @@ def main(argv=None):
             print(f"ERROR: {label}{path}: not a folder", file=sys.stderr)
             return 2
 
-    report_path = a.json_out if a.json_out and os.path.isfile(a.json_out) else None
+    report_path = a.json_out or None
     try:
         rep = audit(a.disasm_dir, fssm_dir=a.fssm, dxbc_dir=a.dxbc, limit=a.limit, report_path=report_path)
     except ReportInputCollision as error:
@@ -427,10 +481,7 @@ def main(argv=None):
     print_report(rep)
     if a.json_out:
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(a.json_out)), exist_ok=True)
-            with open(a.json_out, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(rep, f, indent=2)
-                f.write("\n")
+            write_json(a.json_out, rep)
         except OSError as e:
             print(f"ERROR: {a.json_out}: cannot write: {e.strerror or e}", file=sys.stderr)
             return 1

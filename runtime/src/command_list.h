@@ -1,4 +1,5 @@
 #pragma once
+#include "command_list_epochs.h"
 #include "gpu_label_memory.h"
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
@@ -462,6 +463,7 @@ struct Draw {
     std::uint32_t first_instance = 0;
     bool mesh = false;
     std::shared_ptr<const DrawViewports> viewports;  // non-null when >1 viewport or >1 scissor was bound
+    std::array<float, 2> depth_bounds{0, 1};  // OMSetDepthBounds (min, max); used by depth-bounds pipelines only
 };
 
 // Only indirect draws allocate this extra payload. Copies of the IR share both its
@@ -545,8 +547,8 @@ struct UavView {
     std::uint64_t size;          // buffer: bytes in the view
     std::uint32_t element_size;  // buffer: bytes an element (rects count elements), 4 for a raw view
     std::uint32_t mip;           // texture
-    std::uint32_t first_layer;
-    std::uint32_t layer_count;
+    std::uint32_t first_layer;   // 1D/2D array: first slice; 3D volume: FirstWSlice
+    std::uint32_t layer_count;   // 1D/2D array: slice count; 3D volume: WSize
     bool exact_clear_format = false; // newly exposed 1D/3D UAVs: do not clear via a different backing format
 };
 
@@ -982,6 +984,7 @@ public:
         commands_.clear();
         active_.clear();
         closed_ = false;
+        stamp_.restamp();
         return true;
     }
 
@@ -1025,6 +1028,7 @@ private:
     std::vector<Command> commands_;
     std::vector<BeginQuery> active_;  // queries begun and not yet ended
     bool closed_ = false;
+    command_list_epochs::Stamp stamp_;  // when this recording began: a copy the layer retires waits for it
 };
 
 } // namespace leonida

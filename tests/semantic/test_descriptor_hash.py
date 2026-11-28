@@ -54,7 +54,7 @@ def readback_shader(mode):
         g.emit(f"{key} = OpLoad %uint {ptr}")
         keys.append(key)
     hashed = g.desc_hash(keys)
-    index = g.desc_lookup(keys)
+    index, _kind = g.desc_lookup(keys)      # tagged: the probe also returns the entry's kind, unused here
     g.emit("%hp = OpAccessChain %heap_ptr %pc %c0")
     g.emit("%heap = OpLoad %ulong %hp")
     for i, value in enumerate((hashed, index)):

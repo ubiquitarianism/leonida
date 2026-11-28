@@ -9,6 +9,13 @@
 //   gta6rt --init <image> [--game-dir DIR] [--overlay DIR]
 //       The same mapping, then each loaded DLL's TLS callbacks and DllMain(DLL_PROCESS_ATTACH) are run.
 //
+//   gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--big-bytes N] [--all] [--smallest-first]
+//          [--limit N] [--min-bytes N] [--max-bytes N] [--filter PART]... [--skip-listed] [--list]
+//       No game: creates the Vulkan device as --run does and builds every compute pipeline of the shader library
+//       (LEONIDA_SHADERS) into the pipeline journal and the driver's cache, so a title's first dispatch of a large one
+//       does not stall it. Resumable: entries already journaled are skipped (--all: built anyway). Programs named by
+//       LEONIDA_SKIP_COMPUTE are built too unless --skip-listed is given. See shims/d3d12_precompile.h.
+//
 //   gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE] [-- game arguments...]
 //       The same, then the EXE's own TLS callbacks and its entry point, on a game thread. The game's argv and
 //       command line are <exe name> plus the arguments after "--"; exit/ExitProcess from the game end the run
@@ -24,6 +31,7 @@
 #include <exception>
 #include <filesystem>
 #include <map>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -32,24 +40,51 @@
 
 namespace {
 
-// The retail executable (1.0.2.1) runs a hang watchdog thread (function at RVA 0x2215a60): when the game's main loop
-// has not set its "kick" byte (RVA 0x71b6331) for 30 one-second ticks, it calls a crash callback and then writes to
-// address 0 (`movl $0, 0` at RVA 0x2215c35). Under the runtime the game thread can legitimately stall for longer than
-// that, e.g. while the driver compiles pipelines against a cold cache (first boot after a driver update), and the
-// title then kills itself. By default the watchdog stays armed, as on the console. With LEONIDA_TITLE_WATCHDOG=0, and
-// only when that exact trap instruction sits where it does in this build, a runtime thread sets the kick byte twice a
-// second so the title's watchdog never fires.
-constexpr std::uint32_t kWatchdogTrapRva = 0x2215c35;
-constexpr std::uint32_t kWatchdogKickRva = 0x71b6331;
+// The retail title runs a hang watchdog thread: when the game's main loop has not set its "kick" byte for 30
+// one-second ticks, it calls a crash callback and then writes to address 0 (`movl $0, 0`). Under the runtime the
+// game thread can legitimately stall for longer than that, e.g. while the driver compiles pipelines against a cold
+// cache (first boot after a driver update), and the title then kills itself. By default the watchdog stays armed, as
+// on the console. LEONIDA_TITLE_WATCHDOG=0 asks to keep it from firing, as before. The two places that takes are
+// measured locally and not kept in the repository: LEONIDA_TITLE_WATCHDOG_KICK="<trap RVA>,<kick RVA>" (hex) names
+// them, and only with both variables, and only when that exact trap instruction sits at the first RVA, does a
+// runtime thread set the byte at the second twice a second, so the title's watchdog never fires. Either variable
+// alone leaves the watchdog armed and says so once.
 constexpr unsigned char kWatchdogTrap[] = {0xC7, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0};  // movl $0, 0x0
 
+bool watchdog_rvas(std::uint32_t& trap_rva, std::uint32_t& kick_rva) {
+    char value[64]{};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_TITLE_WATCHDOG_KICK", value, sizeof(value));
+    if (!n || n >= sizeof(value)) return false;
+    char* rest = nullptr;
+    const unsigned long long trap = std::strtoull(value, &rest, 16);
+    if (!rest || *rest != ',') return false;
+    const unsigned long long kick = std::strtoull(rest + 1, &rest, 16);
+    if (!rest || *rest || !trap || !kick || trap > 0xFFFFFFFFull || kick > 0xFFFFFFFFull) return false;
+    trap_rva = static_cast<std::uint32_t>(trap);
+    kick_rva = static_cast<std::uint32_t>(kick);
+    return true;
+}
+
 void keep_title_watchdog_kicked(std::uint8_t* base) {
-    char value[4]{};
-    if (GetEnvironmentVariableA("LEONIDA_TITLE_WATCHDOG", value, sizeof(value)) != 1 || value[0] != '0') return;
+    char keep[4]{};
+    const bool disarm = GetEnvironmentVariableA("LEONIDA_TITLE_WATCHDOG", keep, sizeof(keep)) == 1 && keep[0] == '0';
+    std::uint32_t kWatchdogTrapRva = 0, kWatchdogKickRva = 0;
+    const bool named = watchdog_rvas(kWatchdogTrapRva, kWatchdogKickRva);
+    if (!disarm) {
+        if (named)
+            std::fprintf(stderr, "[rt] loader: LEONIDA_TITLE_WATCHDOG_KICK is set but LEONIDA_TITLE_WATCHDOG is not 0;"
+                                 " the title's hang watchdog stays armed\n");
+        return;
+    }
+    if (!named) {
+        std::fprintf(stderr, "[rt] loader: LEONIDA_TITLE_WATCHDOG=0 needs LEONIDA_TITLE_WATCHDOG_KICK=<trap RVA>,"
+                             "<kick RVA> (hex); the title's hang watchdog stays armed\n");
+        return;
+    }
     MEMORY_BASIC_INFORMATION trap{}, kick{};
     if (!VirtualQuery(base + kWatchdogTrapRva, &trap, sizeof(trap)) || trap.State != MEM_COMMIT ||
         std::memcmp(base + kWatchdogTrapRva, kWatchdogTrap, sizeof(kWatchdogTrap)) != 0)
-        return;  // not the build this was measured on: leave the title's watchdog alone
+        return;  // not the trap the RVAs name: leave the title's watchdog alone
     const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
     if (!VirtualQuery(base + kWatchdogKickRva, &kick, sizeof(kick)) || kick.State != MEM_COMMIT ||
         !(kick.Protect & writable))
@@ -71,7 +106,7 @@ void keep_title_watchdog_kicked(std::uint8_t* base) {
     }
 }
 
-// LEONIDA_PEEK="0x9e1dac0:3,0x7446510,0x98f828c" (diagnostic): a thread prints the 8-byte values at these RVAs of the
+// LEONIDA_PEEK="<rva>:3,<rva>,<rva>" (diagnostic): a thread prints the 8-byte values at these RVAs of the
 // title's image (":n" = n consecutive values, at most 32; "RVA>OFF" reads through the pointer stored at the RVA, at
 // pointer + OFF, both hex) every LEONIDA_PEEK_SECONDS (default 10). For answering "what does this
 // global hold at run time" without a debugger: the reverse-engineering notes (docs/re/requests.md) ask for exactly
@@ -142,12 +177,14 @@ void start_title_peek(std::uint8_t* base) {
 }  // namespace
 
 #include "base_reservation.h"
+#include "compile_gate_policy.h"
 #include "code_hooks.h"
 #include "cpu_emulation.h"
 #include "host_cpu.h"
 #include "mods.h"
 #include "pe_loader.h"
 #include "thread_stacks.h"
+#include "dev_overlay.h"
 #include "thread_sampler.h"
 #include "title_page_watch.h"
 #include "title_geometry_watch.h"
@@ -155,7 +192,9 @@ void start_title_peek(std::uint8_t* base) {
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/file_system.h"
 #ifdef LEONIDA_VULKAN_DEVICE
+#include "vulkan_device_fault.h"
 #include "../shims/d3d12_compile_exit.h"
+#include "../shims/d3d12_precompile.h"
 #include "../shims/package_splash.h"
 #endif
 #include "../shims/process_shim.h"
@@ -196,7 +235,9 @@ bool configure_first_run_ui(const std::filesystem::path& package, std::filesyste
         {L"LEONIDA_D3D12", L"vulkan"}, {L"LEONIDA_ARENA_MB", L"2048"},
         {L"LEONIDA_GRAPHICS_STAGE_LAYOUT", L"1"}, {L"LEONIDA_PIPELINE_COMPILE", L"on-demand"},
         {L"LEONIDA_FRAME_PACING", L"1"},
-        {L"LEONIDA_KEYBOARD_PAD", L"always"},
+        // Focused, not always: keys typed into another window must not press anything on a consent page.
+        // Scripted presses (LEONIDA_INPUT_SCRIPT) still run while the window is unfocused.
+        {L"LEONIDA_KEYBOARD_PAD", L"1"},
     };
     for (const auto& setting : settings) {
         if (!set_default(setting.name, setting.value)) return false;
@@ -221,9 +262,66 @@ int usage() {
                  "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
                  "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
                  "       gta6rt --first-run-ui <exe> [--game-dir DIR] [--overlay DIR] [--trace FILE]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n"
+                 "       gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--big-bytes N] [--all] [--smallest-first] [--limit N] [--min-bytes N] [--max-bytes N] [--filter PART]... [--skip-listed] [--list] [--via-helper]\n"
+                 "       gta6rt --compile-server [--parent PID] [--threads N] [--idle-threads N] [--idle-exit SECONDS]\n");
     return 2;
 }
+
+#ifdef LEONIDA_VULKAN_DEVICE
+// gta6rt --precompile-pipelines ...: argv[1] is the mode.
+int precompile_main(int argc, wchar_t** argv) {
+    rt::d3d12::PrecompileOptions options;
+    const auto number = [&](int& i, auto& out) {
+        if (i + 1 >= argc) return false;
+        wchar_t* end = nullptr;
+        const unsigned long long v = std::wcstoull(argv[++i], &end, 10);
+        if (!end || *end) return false;
+        out = static_cast<std::remove_reference_t<decltype(out)>>(v);
+        return true;
+    };
+    for (int i = 2; i < argc; ++i) {
+        const std::wstring a = argv[i];
+        bool ok = true;
+        if (a == L"--threads") ok = number(i, options.threads);
+        else if (a == L"--big-threads") ok = number(i, options.big_threads);
+        else if (a == L"--big-bytes") ok = number(i, options.big_bytes);
+        else if (a == L"--limit") ok = number(i, options.limit);
+        else if (a == L"--min-bytes") ok = number(i, options.min_bytes);
+        else if (a == L"--max-bytes") ok = number(i, options.max_bytes);
+        else if (a == L"--all") options.rebuild = true;
+        else if (a == L"--smallest-first") options.smallest_first = true;
+        else if (a == L"--skip-listed") options.skip_listed = true;
+        else if (a == L"--list") options.dry_run = true;
+        else if (a == L"--via-helper") options.via_helper = true;
+        else if (a == L"--filter" && i + 1 < argc) {
+            const std::wstring part = argv[++i];
+            options.filters.emplace_back(part.begin(), part.end());  // library names are ASCII
+        } else ok = false;
+        if (!ok) return usage();
+    }
+    return rt::d3d12::precompile_compute_pipelines(options);
+}
+
+// gta6rt --compile-server [--parent PID] [--threads N] [--idle-threads N] [--idle-exit SECONDS]
+// (shims/d3d12_compile_helper.h).
+int compile_server_main(int argc, wchar_t** argv) {
+    rt::d3d12::CompileServerOptions options;
+    for (int i = 2; i < argc; ++i) {
+        const std::wstring a = argv[i];
+        if (i + 1 >= argc) return usage();
+        wchar_t* end = nullptr;
+        const unsigned long long v = std::wcstoull(argv[++i], &end, 10);
+        if (!end || *end) return usage();
+        if (a == L"--parent") options.parent_pid = static_cast<unsigned long>(v);
+        else if (a == L"--threads") options.threads = static_cast<unsigned>(v);
+        else if (a == L"--idle-threads") options.idle_threads = static_cast<unsigned>(v);
+        else if (a == L"--idle-exit") options.idle_exit_s = static_cast<unsigned>(v);
+        else return usage();
+    }
+    return rt::d3d12::compile_server(options);
+}
+#endif
 
 }  // namespace
 
@@ -231,13 +329,51 @@ int usage() {
 // The run ends with the title's Vulkan device alive, so no ~Device stops the background pipeline compiler: stop it
 // here, before ExitProcess ends its thread, maybe inside the driver's compiler (rt::d3d12::stop_pipeline_compiles).
 constexpr unsigned kExitCompileWaitMs = 2000;  // a console close gives the whole process 5 s
+// For a build still running on a title thread, then the session cache write (rt::d3d12::save_pipeline_caches_at_exit).
+constexpr unsigned kExitCacheWaitMs = 1000;
 
 static BOOL WINAPI stop_compiles_on_console_exit(DWORD event) {
     if (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT || event == CTRL_CLOSE_EVENT) {
         rt::d3d12_xs::stop_list_values(500);  // as at the run's end: no list-value thread cut off inside the layer
         rt::d3d12::stop_pipeline_compiles(kExitCompileWaitMs);
+        rt::d3d12::save_pipeline_caches_at_exit(kExitCacheWaitMs);
     }
     return FALSE;  // the next handler (the default one: ExitProcess) ends the process, as before
+}
+
+// A run that ends in an exception nothing handles (a fault in the title or one of its DLLs, the int3 after a device
+// loss) would otherwise keep none of the pipelines it compiled, and the next boot builds them all again. The device is
+// left alone apart from that write; the exception then goes on as before (the previous filter, or Windows' own
+// handling), so the exit code is the exception's. Not for a stack overflow: no stack is left to write with.
+static LPTOP_LEVEL_EXCEPTION_FILTER previous_fatal_filter = nullptr;
+// The retail title installs a filter of its own (SetUnhandledExceptionFilter from api-ms-win-core-errorhandling),
+// which replaced this one and ended the process without it (measured: a title fault at 354 s wrote nothing). Its
+// call is served here instead: this filter stays installed and hands the exception to the title's, as Windows would.
+static void* volatile title_fatal_filter = nullptr;
+
+static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI title_set_unhandled_exception_filter(LPTOP_LEVEL_EXCEPTION_FILTER filter) {
+    return reinterpret_cast<LPTOP_LEVEL_EXCEPTION_FILTER>(
+        InterlockedExchangePointer(&title_fatal_filter, reinterpret_cast<void*>(filter)));
+}
+
+static LONG WINAPI save_caches_on_fatal_exception(EXCEPTION_POINTERS* info) {
+    const DWORD code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0;
+    if (code != EXCEPTION_STACK_OVERFLOW) {
+        // Several title threads can fault at once (measured: eight within a second). The first writes; the others
+        // wait here for it, so none of them reaches the title's filter, which may end the process, mid-write.
+        static std::once_flag once;
+        std::call_once(once, [code] {
+            std::fprintf(stderr, "[rt] unhandled exception 0x%08lx: writing the session pipeline cache before the "
+                                 "process ends\n", static_cast<unsigned long>(code));
+            rt::d3d12::stop_pipeline_compiles(kExitCompileWaitMs);
+            rt::d3d12::save_pipeline_caches_at_exit(kExitCacheWaitMs);
+            std::fflush(stderr);
+        });
+    }
+    if (auto* title = reinterpret_cast<LPTOP_LEVEL_EXCEPTION_FILTER>(
+            InterlockedCompareExchangePointer(&title_fatal_filter, nullptr, nullptr)))
+        return title(info);
+    return previous_fatal_filter ? previous_fatal_filter(info) : EXCEPTION_CONTINUE_SEARCH;
 }
 
 static BOOL WINAPI show_package_window(HWND window, int command) {
@@ -251,6 +387,13 @@ static BOOL WINAPI show_package_window(HWND window, int command) {
 #endif
 
 int wmain(int argc, wchar_t** argv) {
+#ifdef LEONIDA_VULKAN_DEVICE
+    if (argc > 1 && std::wstring(argv[1]) == L"--precompile-pipelines") return precompile_main(argc, argv);
+    if (argc > 1 && std::wstring(argv[1]) == L"--compile-server") return compile_server_main(argc, argv);
+#endif
+    // The title's process (not a build host above): LEONIDA_COMPILE_GATE=auto may calibrate the driver when the device
+    // is made (src/compile_gate_policy.h).
+    leonida::compile_gate_policy::calibration_allowed = true;
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
     int archetype_lookup_arg = 0;
@@ -347,6 +490,13 @@ int wmain(int argc, wchar_t** argv) {
     rt::fs::configure(game_dir, overlay_dir);
 #ifdef LEONIDA_VULKAN_DEVICE
     if (run) {
+        // Before the image is loaded, so its import binds here (save_caches_on_fatal_exception).
+        const rt::shims::Entry filter_imports[] = {
+            {"api-ms-win-core-errorhandling-l1-1-0.dll", "SetUnhandledExceptionFilter",
+             reinterpret_cast<void*>(&title_set_unhandled_exception_filter)},
+            {"kernel32.dll", "SetUnhandledExceptionFilter", reinterpret_cast<void*>(&title_set_unhandled_exception_filter)},
+        };
+        rt::shims::Table{filter_imports, std::size(filter_imports)};
         rt::package_splash::configure(game_dir);
         if (rt::package_splash::configured()) {
             const rt::shims::Entry window_imports[] = {
@@ -388,6 +538,8 @@ int wmain(int argc, wchar_t** argv) {
     rt::d3d12_trace::set_enabled(trace_d3d12);
     // Slot 133 imports the title's pages; xmem commits them on first touch, so they are committed first.
     rt::d3d12_xs::set_placed_at_va_pages_hook(&rt::xmem::commit_physical_range);
+    if (rt::xmem::slot31_runs() && rt::xmem::queue_page_mappings_enabled())
+        rt::d3d12_xs::set_copy_page_mappings_hook(&rt::xmem::copy_page_mappings);
     // So do the file shims' reads, whose kernel writes do not fault them in: on ERROR_NOACCESS (title_page_watch.h).
     leonida::geometry_writes::aliases.store(&rt::xmem::geometry_aliases);
     leonida::kernel_writes::set_committer(&rt::xmem::commit_physical_range);
@@ -493,7 +645,9 @@ int wmain(int argc, wchar_t** argv) {
             std::fprintf(stderr, "error: %s has no entry point\n", main_module.name.c_str());
             return 1;
         }
-        const std::wstring paths = L"console paths: GAME: -> " + game_dir.native() + L", writes -> " + overlay_dir.native();
+        const std::filesystem::path scratch_dir = rt::fs::scratch_dir();
+        const std::wstring paths = L"console paths: GAME: -> " + game_dir.native() + L", writes -> " +
+                                   overlay_dir.native() + L", T: -> " + scratch_dir.native();
         const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
         DWORD mode;
         bool printed = false;
@@ -506,18 +660,25 @@ int wmain(int argc, wchar_t** argv) {
         if (!printed) {
             const auto game = game_dir.u8string();
             const auto overlay = overlay_dir.u8string();
-            std::printf("console paths: GAME: -> %s, writes -> %s\n",
-                        reinterpret_cast<const char*>(game.c_str()), reinterpret_cast<const char*>(overlay.c_str()));
+            const auto scratch = scratch_dir.u8string();
+            std::printf("console paths: GAME: -> %s, writes -> %s, T: -> %s\n",
+                        reinterpret_cast<const char*>(game.c_str()), reinterpret_cast<const char*>(overlay.c_str()),
+                        reinterpret_cast<const char*>(scratch.c_str()));
         }
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         keep_title_watchdog_kicked(main_module.base);
         start_title_peek(main_module.base);
+        leonida::dev_overlay::start();  // LEONIDA_DEV_OVERLAY=1
         leonida::thread_sampler::start(main_module.base, main_module.size);  // LEONIDA_SAMPLE_MS (diagnostic)
 #ifdef LEONIDA_VULKAN_DEVICE
         SetConsoleCtrlHandler(&stop_compiles_on_console_exit, TRUE);
+        previous_fatal_filter = SetUnhandledExceptionFilter(&save_caches_on_fatal_exception);
 #endif
         int code;
+#ifdef LEONIDA_VULKAN_DEVICE
+        leonida::thread_stack_hook.store(&rt::print_thread_stacks_now, std::memory_order_release);
+#endif
         {
             auto stacks = rt::start_thread_stacks();
             code = rt::process::run_entry(main_module.base + main_module.entry_rva);
@@ -536,6 +697,7 @@ int wmain(int argc, wchar_t** argv) {
         rt::d3d12_xs::stop_list_values(500);
 #ifdef LEONIDA_VULKAN_DEVICE
         rt::d3d12::stop_pipeline_compiles(kExitCompileWaitMs);
+        rt::d3d12::save_pipeline_caches_at_exit(kExitCacheWaitMs);
 #endif
         rt::cleanup_tls_clones();
         ExitProcess(static_cast<UINT>(code));

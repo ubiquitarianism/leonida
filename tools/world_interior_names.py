@@ -83,17 +83,16 @@ def _instances(b, structs, blocks, h):
 
 
 def _array(b, blocks, base, member):
-    """(block hash, first byte, count) of an array member: a u64 (low 12 bits: 1-based block index, bits 20+:
+    """(block hash, first byte, count) of an array member: a u64 (low 20 bits: 1-based block index, bits 20+:
     byte offset in that block) and a u16 count at +8, as docs/world.md describes for instance lists."""
     p = base + member[0]
     if p + 10 > len(b):
         return None
     ref, count = struct.unpack_from("<Q", b, p)[0], struct.unpack_from("<H", b, p + 8)[0]
-    index = ref & 0xFFF
+    index, start = WI.split_pointer(ref)
     if not count or not 1 <= index <= len(blocks):
         return None
     h, size, off = blocks[index - 1]
-    start = ref >> 20
     if off is None or start >= size:
         return None
     return h, off + start, count

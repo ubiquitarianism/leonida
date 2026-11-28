@@ -10,4 +10,11 @@ namespace rt::d3d12 {
 // False when one was still running at the deadline. Defined with the Vulkan device (d3d12_vulkan_device.cpp).
 bool stop_pipeline_compiles(unsigned wait_ms);
 
+// Writes each live device's session pipeline cache (pipeline_cache.session.bin), as ~Device does, for a process that
+// ends with its devices alive: after stop_pipeline_compiles, so the compiler's own builds are done. A build still
+// running on another thread is given `wait_ms`, then the cache is written without it (the pipelines finished so far);
+// the write itself is given 3 s before the process goes on ending. Runs once per process; true when a cache write
+// finished.
+bool save_pipeline_caches_at_exit(unsigned wait_ms);
+
 }  // namespace rt::d3d12

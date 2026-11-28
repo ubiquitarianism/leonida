@@ -1,0 +1,30 @@
+GPU:        NVIDIA GeForce RTX 5090 (Blackwell / GB202, PCI 10de:2b85), 32,607 MiB
+Driver:     NVIDIA 595.99.02 (proprietary), Vulkan 1.4.329 (loader 1.4.341)
+Subgroup:   32..32
+OS:         Ubuntu 26.04.1 LTS, Linux 7.0.0-43-generic
+Commit:     9e7720c (main, 2026-11-25)
+Tools:      llvm-mc 21.1.8 (Ubuntu llvm-21, AMDGPU target), SPIRV-Tools v2026.1 (Ubuntu),
+            glslang 16.2.0, CMake 4.2.3, Ninja 1.13.2, GCC 15.2.0, Python 3.14.4
+CPU:        AMD Ryzen 9 9950X 16-Core Processor
+RAM:        59 GiB reported
+
+run_gpu_tests.py: 274 shaders: 274 translated, 274 pass spirv-val (both modes)
+            native:                 208/264 passed, 55 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1:  242/264 passed, 21 skipped, 1 failed
+Failed:     cs_imgatomic_ext (native and emulated alike, 3 of 3 runs): 6 of 64 sint words differ, first
+            word 32: got 0x0badf00d, expected 0x00000101. These are the six 3D-volume glc returns (sint words
+            32..37); the 2D cases, cs_imgatomic and cs_imgatomic3d pass. Not this GPU: the same six words fail
+            on llvmpipe and on RADV (the 9950X's iGPU) on this PC. The fixture's volume T# (s[8:15]) lacks the
+            synthetic-UAV tag the translator gates 3D atomics on since c0a5d66fa, so the ops never run;
+            #1518 (GPU-IMG-ATOMIC-EXT-VOLUME-TAG) fixes the fixture.
+Skipped:    native: 33 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this
+            device" and 1 "cannot require a 64-wide fragment subgroup" (the wave64 fixtures, which the
+            emulated run covers), 19 documented "run by d3d12_*_test / w64_graphics.py" cases and 1 "needs
+            the Windows D3D12 runtime". Emulated: the same 19 and 1, plus the 64-wide fragment one.
+Notes:
+- Built with cmake -S runtime -B runtime/build/linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo and
+  cmake --build runtime/build/linux (the portable subset; gta6rt and the shims are Windows-only).
+- Run with VK_LOADER_DRIVERS_SELECT='nv*' LEONIDA_VK_DEVICE=5090 (the PC also has the 9950X's Radeon iGPU
+  on RADV) and LLVM_MC=/usr/lib/llvm-21/bin/llvm-mc.
+- The GPU was also running an unrelated compute job during these runs.
+- No game files were used; only the synthetic fixtures in runtime/test/shaders.

@@ -16,7 +16,8 @@
 //   racing        many PSOs released at once with builds queued and one usually running, repeated.
 //   restart       a device made after the worker stopped gets a new one, and its builds run.
 //   exit          stop_pipeline_compiles with a device alive: the queue goes, later builds are refused, a warm-up
-//                 is skipped and a dispatch (LEONIDA_ASYNC_PIPELINES on) builds its pipeline in place and runs.
+//                 is skipped and a dispatch (LEONIDA_ASYNC_PIPELINES on) builds its pipeline in place and runs;
+//                 save_pipeline_caches_at_exit then writes the session cache with the device alive, once.
 // After each case the compiler's thread is gone and the process's thread count is back where it was.
 // No game data: the shader is test/glsl/cs_user_data.comp, the programs are made-up FSSM bytes.
 #include "shader_fixture_path.h"
@@ -423,6 +424,14 @@ int main() {
 
     auto& compiler = PipelineCompiler::instance();
     EXPECT(!compiler.worker_running());
+    // llvmpipe keeps no pipelines in a VkPipelineCache (measured: vkGetPipelineCacheData returns the 32-byte header
+    // alone after the build), and the runtime writes no file of a bare header (save_session_pipeline_cache).
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+    reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+        d.instance_proc(d.instance, "vkGetPhysicalDeviceProperties2"))(d.physical, &properties);
+    const bool caches = driver.driverID != VK_DRIVER_ID_MESA_LLVMPIPE;
+    const auto session_file = cache_dir / "pipeline_cache.session.bin";
 
     // --- cache: one PSO built by the warm-up thread; the device writes the session cache at teardown -------------
     {
@@ -433,14 +442,7 @@ int main() {
         EXPECT(built(s.psos[0]));
         s.release();
         EXPECT(!compiler.worker_running());
-        // llvmpipe keeps no pipelines in a VkPipelineCache (measured: vkGetPipelineCacheData returns the 32-byte
-        // header alone after the build), and the runtime writes no file of a bare header (save_session_pipeline_cache).
-        VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
-        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
-            d.instance_proc(d.instance, "vkGetPhysicalDeviceProperties2"))(d.physical, &properties);
-        const bool caches = driver.driverID != VK_DRIVER_ID_MESA_LLVMPIPE;
-        EXPECT(std::filesystem::exists(cache_dir / "pipeline_cache.session.bin") == caches);
+        EXPECT(std::filesystem::exists(session_file) == caches);
         std::printf("cache: built in the background, session cache %s at teardown, worker joined\n",
                     caches ? "written" : "not written (the driver keeps no pipelines in its cache)");
     }
@@ -660,10 +662,19 @@ int main() {
         if (s.dispatch(pso, fresh)) return 1;
         EXPECT(built(pso));
         EXPECT(compiler.stats().submitted == before.submitted);
+        // The process ends with the device alive (a title never releases it): the exit save writes the session
+        // cache now, not at a teardown that will not come, and only once.
+        std::error_code ec;
+        std::filesystem::remove(session_file, ec);
+        EXPECT(!std::filesystem::exists(session_file));
+        EXPECT(rt::d3d12::save_pipeline_caches_at_exit(1000));
+        EXPECT(std::filesystem::exists(session_file) == caches);
+        EXPECT(!rt::d3d12::save_pipeline_caches_at_exit(1000));
         s.release();  // the device's teardown after the exit stop: nothing left to cancel or join
         EXPECT(!compiler.worker_running());
         EXPECT(rt::d3d12::live_pipeline_states() == 0);  // no PSO of any case leaked
-        std::printf("exit: queue dropped, later builds refused, a dispatch built its pipeline in place and ran\n");
+        std::printf("exit: queue dropped, later builds refused, a dispatch built its pipeline in place and ran, "
+                    "session cache %s with the device alive, once\n", caches ? "written" : "not written (llvmpipe)");
     }
     std::printf("ok\n");
     return 0;

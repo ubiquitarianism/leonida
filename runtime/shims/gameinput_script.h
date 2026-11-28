@@ -5,10 +5,13 @@
 //
 //   LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120"
 //
-// Each entry is button@seconds, the seconds counted from the shim's first update. A press is held for kHoldSeconds,
-// then released. Buttons: a b x y start back lb rb up down left right; rsup and rsdown throw the right stick fully up
-// or down for the same time (they replay the stick throws the press log writes). Spaces around an entry are allowed;
-// empty entries, unknown buttons and invalid times (negative, non-finite, trailing text) are counted as rejected.
+// Each entry is button@seconds[:hold], the seconds counted from the shim's first update. A press is held for `hold`
+// seconds (kHoldSeconds when the entry has none), then released: a longer hold reaches a title that reads its pad
+// only every few seconds, as the retail title does at world-start frame rates. Buttons: a b x y start back lb rb
+// up down left right; rsup and rsdown throw the right stick fully up or down for the same time (they replay the
+// stick throws the press log writes). Spaces around an entry are allowed; empty entries, unknown buttons, invalid
+// times (negative, non-finite, trailing text) and invalid holds (zero, negative, non-finite, more than
+// kMaxHoldSeconds) are counted as rejected.
 #pragma once
 #include <algorithm>
 #include <cctype>
@@ -24,6 +27,7 @@
 namespace rt::gameinput::script {
 
 constexpr double kHoldSeconds = 0.3;
+constexpr double kMaxHoldSeconds = 600;  // a typo such as b@10:1100 should not hold B for the whole run
 
 // One scriptable button: its name in the script and the press log, its GameInput gamepad bit, and its SDL3
 // SDL_GamepadButton number, which the "scripted press of button <n>" line has always carried (tools/stage_timeline.py
@@ -46,6 +50,7 @@ struct Press {
     uint32_t button = 0;  // a GameInput gamepad bit, or 0 for a stick throw
     int stick = 0;        // +1 rsup, -1 rsdown (GameInput's +Y is up)
     double at = 0;        // seconds
+    double hold = kHoldSeconds;
 };
 
 struct Script {
@@ -72,17 +77,22 @@ inline Script parse(std::string text) {
         const char* time = item.c_str() + sep + 1;
         char* tail;
         const double seconds = std::strtod(time, &tail);
-        if (tail == time || !std::isfinite(seconds) || seconds < 0 ||
-            item.find_first_not_of(whitespace, static_cast<size_t>(tail - item.c_str())) != std::string::npos)
-            continue;
+        if (tail == time || !std::isfinite(seconds) || seconds < 0) continue;
+        double hold = kHoldSeconds;
+        if (*tail == ':') {
+            const char* hold_text = tail + 1;
+            hold = std::strtod(hold_text, &tail);
+            if (tail == hold_text || !std::isfinite(hold) || hold <= 0 || hold > kMaxHoldSeconds) continue;
+        }
+        if (item.find_first_not_of(whitespace, static_cast<size_t>(tail - item.c_str())) != std::string::npos) continue;
         const auto is = [&](const char* name) { return item.compare(first, sep - first, name) == 0; };
         if (is("rsup") || is("rsdown")) {
-            out.presses.push_back({0, is("rsup") ? 1 : -1, seconds});
+            out.presses.push_back({0, is("rsup") ? 1 : -1, seconds, hold});
             continue;
         }
         for (const Button& b : kButtons) {
             if (is(b.name)) {
-                out.presses.push_back({b.bit, 0, seconds});
+                out.presses.push_back({b.bit, 0, seconds, hold});
                 out.named |= b.bit;
                 break;
             }
@@ -102,7 +112,7 @@ struct Held {
 inline Held held_at(const Script& script, double seconds) {
     Held h;
     for (const Press& p : script.presses) {
-        if (seconds < p.at || seconds >= p.at + kHoldSeconds) continue;
+        if (seconds < p.at || seconds >= p.at + p.hold) continue;
         if (p.stick) h.stick = p.stick;
         else h.buttons |= p.button;
     }

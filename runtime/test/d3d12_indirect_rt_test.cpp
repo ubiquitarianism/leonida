@@ -1,12 +1,18 @@
 // Real GPU test for:
-//   1) D3D12 draw-signature creation and a native Vulkan counted-draw pixel reference.
-//      The pixel reference tests suballocated argument/count offsets, not D3D12 command replay.
+// Real GPU test for:
+//   1) ExecuteIndirect with CountBuffer (ID3D12Device::CreateCommandSignature +
+//      ID3D12GraphicsCommandList::ExecuteIndirect -> vkCmdDrawIndirectCount, Vulkan 1.2 core), and the argument clamp
+//      pass (runtime/src/vulkan_indirect_clamp.h): a draw record asking for four billion instances is clamped on the
+//      GPU and renders the same triangle as the in-range one, instead of running until the host resets the driver.
+//      The same pixel reference is also run natively: D3D12 draw-signature creation and a Vulkan counted-draw pixel
+//      reference over suballocated argument/count offsets, independent of the D3D12 command replay.
 //   2) Hardware Ray Tracing / BVH (ID3D12Device5::GetRaytracingAccelerationStructurePrebuildInfo +
 //      ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure BLAS + TLAS + RayQueryKHR
 //      hit vs. miss; clean SKIP on GPUs without VK_KHR_acceleration_structure / VK_KHR_ray_query).
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (Core + Synchronization Validation).
 
 #include "../shims/d3d12_com.h"
+#include "../src/vulkan_indirect_clamp.h"
 #include "vulkan_loader.h"
 #include "../src/vulkan_device_filter.h"
 
@@ -74,6 +80,38 @@ D3D12_RESOURCE_DESC make_buf_desc(UINT64 bytes, D3D12_RESOURCE_FLAGS flags = D3D
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Flags = flags;
     return d;
+}
+
+// A driver whose GENERIC acceleration structures do not sit at buffer address + offset, through the device's own
+// function lookup (VulkanDeviceInfo::get_instance_proc): vkGetAccelerationStructureDeviceAddressKHR answers the real
+// address plus kShiftedAsDelta. Only resource creation and the address lookup run on such a device, no builds: the
+// shifted address names no real structure.
+constexpr VkDeviceAddress kShiftedAsDelta = 0x10000000;
+PFN_vkGetInstanceProcAddr g_real_gipa = nullptr;
+PFN_vkGetDeviceProcAddr g_real_gdpa = nullptr;
+PFN_vkGetAccelerationStructureDeviceAddressKHR g_real_as_address = nullptr;
+
+VKAPI_ATTR VkDeviceAddress VKAPI_CALL shifted_as_address(VkDevice device,
+                                                         const VkAccelerationStructureDeviceAddressInfoKHR* info) {
+    const VkDeviceAddress real = g_real_as_address(device, info);
+    return real ? real + kShiftedAsDelta : 0;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL shifted_gdpa(VkDevice device, const char* name) {
+    if (!std::strcmp(name, "vkGetAccelerationStructureDeviceAddressKHR")) {
+        g_real_as_address =
+            reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(g_real_gdpa(device, name));
+        return g_real_as_address ? reinterpret_cast<PFN_vkVoidFunction>(&shifted_as_address) : nullptr;
+    }
+    return g_real_gdpa(device, name);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL shifted_gipa(VkInstance instance, const char* name) {
+    if (!std::strcmp(name, "vkGetDeviceProcAddr")) {
+        g_real_gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(g_real_gipa(instance, name));
+        return reinterpret_cast<PFN_vkVoidFunction>(&shifted_gdpa);
+    }
+    return g_real_gipa(instance, name);
 }
 
 }  // namespace
@@ -291,6 +329,7 @@ int main() {
     DF(vkCreateComputePipelines);
     DF(vkDestroyPipeline);
     DF(vkCreateDescriptorSetLayout);
+    DF(vkGetAccelerationStructureDeviceAddressKHR);
     DF(vkDestroyDescriptorSetLayout);
     DF(vkCreateDescriptorPool);
     DF(vkDestroyDescriptorPool);
@@ -500,6 +539,51 @@ int main() {
             cbai.commandBufferCount = 1;
             vkAllocateCommandBuffers(vk_dev, &cbai, &cb);
 
+            leonida::ReplayFunctions rf{};
+            rf.external_graphics_scope = true;  // bind the graphics pipeline inside our own rendering scope below
+            rf.draw_indirect_count = vkCmdDrawIndirectCount;
+            // The argument clamp pass (runtime/src/vulkan_indirect_clamp.h), installed as gta6rt installs it: every
+            // record of the ExecuteIndirect is copied on the GPU into scratch with its values bounded before the draw
+            // reads it, so a record left by a skipped compute pass cannot ask for four billion vertices or instances.
+            // A device without bufferDeviceAddress keeps the raw path.
+            VkPhysicalDeviceMemoryProperties mem_props{};
+            reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
+                gipa(instance, "vkGetPhysicalDeviceMemoryProperties"))(physical, &mem_props);
+            const auto clamp_allocate = [&](const VkMemoryRequirements& requirements) -> VkDeviceMemory {
+                VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+                flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+                VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+                ai.allocationSize = requirements.size;
+                const auto allocate = reinterpret_cast<PFN_vkAllocateMemory>(gdpa(vk_dev, "vkAllocateMemory"));
+                for (const std::uint32_t type : leonida::memory_type_order(mem_props, requirements.memoryTypeBits,
+                                                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
+                                                                           requirements.size)) {
+                    ai.memoryTypeIndex = type;
+                    VkDeviceMemory out = VK_NULL_HANDLE;
+                    if (allocate(vk_dev, &ai, nullptr, &out) == VK_SUCCESS) return out;
+                }
+                return VK_NULL_HANDLE;
+            };
+            leonida::IndirectArgumentClamp clamp(gdpa, vk_dev, mem_props, chosen.limits, clamp_allocate);
+            auto clamp_batch = clamp.batch();
+            // LEONIDA_INDIRECT_CLAMP=0 turns the pass off at replay time, and then the raw argument buffer is read
+            // again: this test must not record its own pass either.
+            const bool clamp_on = clamp.loaded() && leonida::indirect_clamp_enabled();
+            if (clamp_on) {
+                rf.prepare_indirect_clamp = [&clamp_batch](VkBuffer args, VkDeviceSize args_offset, VkBuffer count,
+                                                           VkDeviceSize count_offset, std::uint32_t kind,
+                                                           std::uint32_t stride, std::uint32_t max_count,
+                                                           leonida::ClampedIndirect& out) {
+                    return clamp_batch->prepare(args, args_offset, count, count_offset, kind, stride, max_count, out);
+                };
+                rf.emit_indirect_clamp = [&clamp](VkCommandBuffer buffer, const leonida::ClampedIndirect& job) {
+                    clamp.emit(buffer, job);
+                };
+            }
+
+            // The native reference draws the same suballocated offsets with vkCmdDrawIndirectCount directly: a
+            // Vulkan-level pixel oracle for the counted draw, not a D3D12 command replay. Both bindings start after
+            // poison prefixes, and the buffer holds the same two records the command list replays below.
             auto run_native_count = [&](VkDeviceSize count_offset, std::uint8_t exp_r, std::uint8_t exp_g,
                                         std::uint8_t exp_b) -> int {
                 VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -580,8 +664,166 @@ int main() {
                 return 0;
             };
 
+            // The same two records through the D3D12 command list and leonida::replay, so the ExecuteIndirect
+            // CountBuffer path - and the clamp pass it emits - is exercised, not just the native Vulkan call.
+            auto run_indirect_count = [&](std::uint64_t count_offset, std::uint8_t exp_r, std::uint8_t exp_g,
+                                          std::uint8_t exp_b) -> int {
+                leonida::CommandList ir;
+                ir.execute_indirect({leonida::IndirectKind::draw, sizeof(D3D12_DRAW_ARGUMENTS), 2u,
+                                     rt::d3d12::resource_id(arg_buf), 0, rt::d3d12::resource_id(count_buf),
+                                     count_offset});
+                ir.close();
+
+                // The clamp pass is recorded here, before the drawing scope: vkCmdCopyBuffer and a memory barrier with
+                // a transfer access are outside it (VUID-vkCmdCopyBuffer-renderpass), which is also where gta6rt
+                // emits it for an indirect draw. replay then reads the clamped scratch whose records it is told about.
+                leonida::ClampedIndirect clamped{};
+                const bool has_clamp = clamp_on;
+                if (has_clamp) {
+                    if (!clamp_batch->prepare(rt::d3d12::vulkan_buffer(arg_buf), argument_base,
+                                              rt::d3d12::vulkan_buffer(count_buf), count_base + count_offset,
+                                              leonida::indirect_clamp_draw, sizeof(D3D12_DRAW_ARGUMENTS), 2u, clamped))
+                        return fail("clamp prepare");
+                }
+
+                VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(cb, &bi);
+                if (has_clamp) clamp.emit(cb, clamped);
+
+                VkImageMemoryBarrier b_to_rt{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b_to_rt.srcAccessMask = 0;
+                b_to_rt.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                b_to_rt.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                b_to_rt.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                b_to_rt.image = rt::d3d12::vulkan_image(rt);
+                b_to_rt.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                     &b_to_rt);
+
+                VkRenderingAttachmentInfo att{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                att.imageView = rt_view;
+                att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                att.clearValue.color.float32[3] = 1.0f;
+                VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+                ri.renderArea = {{0, 0}, {kW, kH}};
+                ri.layerCount = 1;
+                ri.colorAttachmentCount = 1;
+                ri.pColorAttachments = &att;
+                vkCmdBeginRendering(cb, &ri);
+                VkViewport vp{0, 0, float(kW), float(kH), 0, 1};
+                VkRect2D sc{{0, 0}, {kW, kH}};
+                vkCmdSetViewport(cb, 0, 1, &vp);
+                vkCmdSetScissor(cb, 0, 1, &sc);
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
+
+                const auto resolver = [&](leonida::ResourceId id) -> const leonida::ResourceBinding* {
+                    // Treat the two upload buffers as backing stores for slices that start after a prefix.
+                    static leonida::ResourceBinding arg_b{}, cnt_b{};
+                    arg_b.buffer = rt::d3d12::vulkan_buffer(arg_buf);
+                    arg_b.buffer_offset = argument_base;
+                    arg_b.size = buffer_size - argument_base;
+                    cnt_b.buffer = rt::d3d12::vulkan_buffer(count_buf);
+                    cnt_b.buffer_offset = count_base;
+                    cnt_b.size = buffer_size - count_base;
+                    if (id == rt::d3d12::resource_id(arg_buf)) return &arg_b;
+                    if (id == rt::d3d12::resource_id(count_buf)) return &cnt_b;
+                    return nullptr;
+                };
+                if (has_clamp) {
+                    rf.prepare_indirect_clamp = [&clamped](VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t,
+                                                           std::uint32_t, std::uint32_t,
+                                                           leonida::ClampedIndirect& out) {
+                        out = clamped;  // prepared and emitted above, before the drawing scope
+                        return true;
+                    };
+                    rf.emit_indirect_clamp = [](VkCommandBuffer, const leonida::ClampedIndirect&) {};
+                } else {
+                    rf.prepare_indirect_clamp = {};
+                    rf.emit_indirect_clamp = {};
+                }
+                const auto replayed = leonida::replay(ir, cb, resolver, rf);
+                if (replayed != leonida::ReplayResult::success) {
+                    std::fprintf(stderr, "replay result %d (clamped=%d)\n", int(replayed), int(has_clamp));
+                    return fail("leonida::replay(ExecuteIndirect CountBuffer)");
+                }
+
+                vkCmdEndRendering(cb);
+
+                VkImageMemoryBarrier b_to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b_to_src.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                b_to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                b_to_src.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                b_to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                b_to_src.image = rt::d3d12::vulkan_image(rt);
+                b_to_src.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     0, 0, nullptr, 0, nullptr, 1, &b_to_src);
+
+                VkBufferImageCopy bic{};
+                bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                bic.imageExtent = {kW, kH, 1};
+                vkCmdCopyImageToBuffer(cb, rt::d3d12::vulkan_image(rt), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       rt::d3d12::vulkan_buffer(rb), 1, &bic);
+
+                VkMemoryBarrier host_b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                host_b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                host_b.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_b, 0,
+                                     nullptr, 0, nullptr);
+                if (vkEndCommandBuffer(cb) != VK_SUCCESS) return fail("end replayed counted draw");
+
+                VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                si.commandBufferCount = 1;
+                si.pCommandBuffers = &cb;
+                vkQueueSubmit(vk_queue, 1, &si, VK_NULL_HANDLE);
+                vkQueueWaitIdle(vk_queue);
+                // The clamp's record scratch is idle now: hand it back for the next run, as a completed submission does.
+                clamp.retire(VK_NULL_HANDLE, 0);
+                clamp.collect();
+
+                void* mp = nullptr;
+                if (FAILED(rb->Map(0, nullptr, &mp)) || !mp) return fail("map replayed counted-draw readback");
+                const auto* px = static_cast<const std::uint8_t*>(mp);
+                const bool ok = std::abs(int(px[0]) - int(exp_r)) <= 1 && std::abs(int(px[1]) - int(exp_g)) <= 1 &&
+                                std::abs(int(px[2]) - int(exp_b)) <= 1 && px[3] == 255;
+                rb->Unmap(0, nullptr);
+                if (!ok) return fail("replayed counted-draw pixel mismatch");
+                return 0;
+            };
+
             if (run_native_count(0, 0, 0, 0) != 0) return 1;        // count = 0 -> black
             if (run_native_count(4, 32, 160, 240) != 0) return 1;   // count = 1 -> triangle
+            if (run_indirect_count(0, 0, 0, 0) != 0) return 1;      // count = 0 -> black, through replay
+            if (run_indirect_count(4, 32, 160, 240) != 0) return 1; // count = 1 -> triangle, through replay
+            if (clamp_on) {
+                // What a skipped or mistranslated compute pass leaves: an instance count of four billion, and a count
+                // buffer past max_command_count. The clamp cuts the instances to 2^26 / 3 and the count to
+                // max_command_count, so this draw completes in milliseconds instead of running until the host resets
+                // the display driver - and the triangle it renders is the same one.
+                void* mapped = nullptr;
+                if (FAILED(arg_buf->Map(0, nullptr, &mapped))) return fail("Map(indirect arguments) again");
+                auto* draws = reinterpret_cast<D3D12_DRAW_ARGUMENTS*>(static_cast<std::uint8_t*>(mapped) + argument_base);
+                draws[0] = {3, 0xFFFFFFFFu, 0, 0};
+                arg_buf->Unmap(0, nullptr);
+                if (FAILED(count_buf->Map(0, nullptr, &mapped))) return fail("Map(indirect count) again");
+                *reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(mapped) + count_base) = 0xFFFFFFFFu;
+                count_buf->Unmap(0, nullptr);
+                if (run_indirect_count(0, 32, 160, 240) != 0) return 1;   // count is clamped to max_command_count
+                // Read the pass's counters: destroying the batch releases its slots, as a completed submission does.
+                clamp_batch.reset();
+                const auto counters = clamp.counters();
+                if (counters.records_clamped != 1 || counters.counts_clamped != 1)
+                    return fail("clamp counters after a garbage record");
+                std::printf("  [PASS] a draw record of 0xFFFFFFFF instances is clamped on the GPU (%llu record(s), "
+                            "%llu count(s), %llu over the batch budget)\n",
+                            static_cast<unsigned long long>(counters.records_clamped),
+                            static_cast<unsigned long long>(counters.counts_clamped),
+                            static_cast<unsigned long long>(counters.over_budget));
+            }
 
             vkDestroyCommandPool(vk_dev, pool, nullptr);
             vkDestroyImageView(vk_dev, rt_view, nullptr);
@@ -590,7 +832,8 @@ int main() {
             rb->Release();
             rt->Release();
             std::printf("  [PASS] native Vulkan counted-draw reference with suballocated argument/count offsets "
-                        "(count=0 black, count=1 solid triangle)\n");
+                        "(count=0 black, count=1 solid triangle), and the same records through the D3D12\n"
+                        "         ExecuteIndirect replay (count=0 black, count=1 triangle)\n");
         } else {
             std::printf("  [SKIP] native counted-draw reference: drawIndirectCount unsupported\n");
         }
@@ -756,6 +999,63 @@ int main() {
         VkAccelerationStructureKHR tlas_ptr_vk =
             rt::d3d12::vulkan_acceleration_structure(dev, tlas_ptr_buf->GetGPUVirtualAddress());
         if (!tlas_vk || !tlas_ptr_vk) return fail("vulkan_acceleration_structure(TLAS)");
+
+        // The instance above holds the BLAS's GetGPUVirtualAddress(). Vulkan wants a value obtained from
+        // vkGetAccelerationStructureDeviceAddressKHR there (VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-12281),
+        // so every AS resource's GPU VA must be what the driver reports for the structure behind it. GPU-assisted
+        // validation only accepts addresses it has seen that call return.
+        if (!vkGetAccelerationStructureDeviceAddressKHR) return fail("vkGetAccelerationStructureDeviceAddressKHR");
+        for (ID3D12Resource* as_buf : {blas_buf, tlas_buf, tlas_ptr_buf}) {
+            const D3D12_GPU_VIRTUAL_ADDRESS va = as_buf->GetGPUVirtualAddress();
+            VkAccelerationStructureDeviceAddressInfoKHR dai{
+                VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+            dai.accelerationStructure = rt::d3d12::vulkan_acceleration_structure(dev, va);
+            if (!dai.accelerationStructure) return fail("vulkan_acceleration_structure(AS resource)");
+            const VkDeviceAddress driver_va = vkGetAccelerationStructureDeviceAddressKHR(vk_dev, &dai);
+            if (driver_va != va) {
+                std::fprintf(stderr,
+                             "FAIL: AS resource GPU VA 0x%llx, vkGetAccelerationStructureDeviceAddressKHR 0x%llx\n",
+                             static_cast<unsigned long long>(va), static_cast<unsigned long long>(driver_va));
+                return 1;
+            }
+        }
+        std::printf("  [PASS] AS resource GPU VAs are the driver's acceleration structure addresses\n");
+
+        // The same on a driver that answers another address than buffer address + offset: the resource's GPU VA is
+        // the driver's, the arena address still names the structure, and releasing the resource forgets both.
+        {
+            g_real_gipa = gipa;
+            rt::d3d12::VulkanDeviceInfo shifted_info = info;
+            shifted_info.get_instance_proc = &shifted_gipa;
+            ID3D12Device5* shifted = nullptr;
+            if (FAILED(rt::d3d12::create_vulkan_device(shifted_info, IID_PPV_ARGS(&shifted))) || !shifted)
+                return fail("create_vulkan_device(shifted AS addresses)");
+            ID3D12Resource* as_buf = nullptr;
+            if (FAILED(shifted->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &blas_desc,
+                                                        D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                                                        nullptr, IID_PPV_ARGS(&as_buf))))
+                return fail("CreateCommittedResource(AS, shifted addresses)");
+            const D3D12_GPU_VIRTUAL_ADDRESS va = as_buf->GetGPUVirtualAddress();
+            VkAccelerationStructureDeviceAddressInfoKHR dai{
+                VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+            dai.accelerationStructure = rt::d3d12::vulkan_acceleration_structure(shifted, va);
+            if (!dai.accelerationStructure) return fail("shifted AS: the GPU VA does not name the structure");
+            const VkDeviceAddress buffer_va = vkGetAccelerationStructureDeviceAddressKHR(vk_dev, &dai);
+            if (va != buffer_va + kShiftedAsDelta) {
+                std::fprintf(stderr, "FAIL: shifted AS: GPU VA 0x%llx, driver address 0x%llx\n",
+                             static_cast<unsigned long long>(va),
+                             static_cast<unsigned long long>(buffer_va + kShiftedAsDelta));
+                return 1;
+            }
+            if (rt::d3d12::vulkan_acceleration_structure(shifted, buffer_va) != dai.accelerationStructure)
+                return fail("shifted AS: the arena address does not name the structure");
+            as_buf->Release();
+            if (rt::d3d12::vulkan_acceleration_structure(shifted, va) ||
+                rt::d3d12::vulkan_acceleration_structure(shifted, buffer_va))
+                return fail("shifted AS: an address still names the structure after Release");
+            shifted->Release();
+            std::printf("  [PASS] a driver address other than buffer address + offset is the GPU VA; both freed\n");
+        }
 
         // BLAS compaction size (inline postbuild + standalone 2-source EmitPostbuild), CLONE, COMPACT, and
         // negative rejection checks.

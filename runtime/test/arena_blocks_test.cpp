@@ -257,6 +257,43 @@ int threads() {
     return 0;
 }
 
+// High alignment or keep-out ends near UINT64_MAX, non-advancing keep-out callbacks, and inverted reset bounds must
+// never wrap around or spin forever.
+int overflow_and_bounds() {
+    Blocks b;
+    b.reset(kReserved, kSize);
+    std::uint64_t out = 0;
+
+    // Alignment that would overflow value + alignment - 1: refused cleanly without wrapping to 0.
+    EXPECT(!b.allocate(0x1000, UINT64_MAX - 0x100, no_keep_out, out));
+
+    // A keep_out returning an end near UINT64_MAX where (keep_out_end + alignment - 1) wraps to 0 must skip the block
+    // instead of looping forever.
+    int calls = 0;
+    const auto wrapping_keep_out = [&](std::uint64_t, std::uint64_t) -> std::uint64_t {
+        ++calls;
+        return UINT64_MAX - 0x100;
+    };
+    EXPECT(!b.allocate(0x1000, kAlign, wrapping_keep_out, out) && calls == 1);
+
+    // A non-advancing keep_out (returning <= start) must not spin forever.
+    calls = 0;
+    const auto stagnant_keep_out = [&](std::uint64_t lo, std::uint64_t) -> std::uint64_t {
+        ++calls;
+        return lo;
+    };
+    EXPECT(!b.allocate(0x1000, kAlign, stagnant_keep_out, out) && calls == 1);
+
+    // consistent() must not overflow on huge live_bytes or underflow when reserved > size.
+    EXPECT(!b.consistent(UINT64_MAX));
+    b.reset(kSize, kReserved);
+    EXPECT(b.free_bytes() == 0 && b.count() == 0);
+    EXPECT(b.check() == Blocks::Fault::none);
+    EXPECT(b.consistent(0) && !b.consistent(1));
+    EXPECT(!b.allocate(0x1000, kAlign, no_keep_out, out));
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -268,6 +305,7 @@ int main() {
     if (int r = bad_releases()) return r;
     if (int r = reader()) return r;
     if (int r = threads()) return r;
+    if (int r = overflow_and_bounds()) return r;
     std::fprintf(stderr, "arena_blocks: ok\n");
     return 0;
 }

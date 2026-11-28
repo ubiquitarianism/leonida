@@ -12,6 +12,8 @@
 #include "d3d12_com.h"
 #include "d3d12_compile_exit.h"
 #include "d3d12_pipeline_compile.h"
+#include "d3d12_precompile.h"
+#include "d3d12_compile_helper.h"
 #include "d3d12_pipeline_checkpoint.h"
 #include "d3d12_feature_compat.h"
 
@@ -29,26 +31,38 @@
 #include "d3d12_xs_native_pso.h"
 #include "dxgi_com.h"
 #include "../src/arena_size.h"
+#include "../src/command_list_epochs.h"
 #include "../src/value_write_sink.h"
+#include "../src/address_guard.h"
 #include "../src/arena_blocks.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
 #include "../src/rgba4_fragment.h"
+#include "../src/dual_source_fragment.h"
 #include "../src/rect_list_geometry.h"
+#include "../src/stub_pipeline.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
 #include "../src/vulkan_mesh_limits.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
+#include "../src/compile_gate_calibration.h"
 #include "../src/pipeline_cache_file.h"
 #include "../src/pipeline_profile.h"
 #include "../src/submit_phases.h"
+#include "../src/heavy_pipeline_cache.h"
 #include "../src/pipeline_cache_store.h"
+#include "../src/pipeline_cache_journal.h"
+#include "../src/pipeline_order.h"
+#include "../src/pipeline_prewarm.h"
+#include "../src/large_module_gate.h"
+#include "../src/dev_status.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/console_texture_layout.h"
 #include "../src/shader_library.h"
+#include "../src/shadow_keep.h"
 #include "../src/dstorage_trace.h"
 #include "../src/title_page_watch.h"
 #include "../src/guarded_copy.h"
@@ -59,9 +73,11 @@
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
 #include "../src/title_va_alias.h"
+#include "../src/console_heap_slot_records.h"
 #include "../src/title_window_plan.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
+#include "../src/host_image_copy_policy.h"
 #include "../src/vulkan13_features.h"
 #include "../src/vulkan_index_view.h"
 #include "d3d12_compute_input_probe.h"
@@ -69,6 +85,7 @@
 #include "../src/local_diagnostics.h"
 #include "../src/mem_probe.h"  // LOCAL DIAGNOSTIC
 #include "../src/vulkan_aftermath.h"
+#include "../src/console_heap_gpu.h"
 
 #include <vulkan/vulkan_win32.h>
 #ifdef _MSC_VER
@@ -88,6 +105,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <unordered_map>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -96,11 +114,13 @@
 #include <optional>
 #include <set>
 #include <deque>
+#include <unordered_map>
 #include <unordered_set>
 #include <shared_mutex>
 #include <string>
 #include <type_traits>
 #include <cwchar>
+#include <intrin.h>
 #include <smmintrin.h>
 #include <vector>
 
@@ -116,6 +136,8 @@ constexpr VkDeviceSize kZeroPage = 64 * 1024;  // zeroed: what unbound vertex an
 constexpr auto kQuadIndicesPerQuad = std::uint32_t(leonida::quad_triangle_indices.size());
 constexpr std::uint32_t kQuadIndexCount = 16 * 1024 * kQuadIndicesPerQuad;
 constexpr VkDeviceSize kArenaReserved = kZeroPage + VkDeviceSize(kQuadIndexCount) * sizeof(std::uint32_t);
+// LEONIDA_ADDRESS_GUARD's header and sinks follow the quad indices (src/address_guard.h).
+static_assert(kArenaReserved <= leonida::address_guard::kGuardHeader);
 static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
 // pipeline_cache_store.h reads this layout without vulkan.h (D3D-704); remember the two.
 static_assert(sizeof(VkPipelineCacheHeaderVersionOne) == leonida::pipeline_cache_store::header_bytes);
@@ -146,6 +168,18 @@ enum class TitleImageOrigin { ordinary, placed, streamed, pending_stream };
 
 void log_once(const char* what, int value) {
     if (first_diagnostic(what, value)) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
+}
+
+// LEONIDA_ADDRESS_GUARD=1: the address guard (docs/d3d12_vulkan.md, "Address guard"). The arena keeps its guard
+// header and sinks at heap_base + 0x70000..0x80000 and a page table of every backing outside it is kept current
+// before each submission, so shaders translated with `rdna2spirv.py --address-guard` read 0 from, and drop stores
+// to, an address nothing backs. Without it those shaders find no header and check nothing.
+bool address_guard_enabled() {
+    static const bool on = [] {
+        wchar_t value[2]{};
+        return GetEnvironmentVariableW(L"LEONIDA_ADDRESS_GUARD", value, 2) == 1 && value[0] == L'1';
+    }();
+    return on;
 }
 
 // Matches the offset interpretation of the selected shader pack.
@@ -214,18 +248,24 @@ bool copy_guarded(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes,
 // (streaming, file reads, XG copies) or whole planes (video), never a few bytes inside a page. The same sampling as
 // OpenScarlett's texture hash before submission (src/gpu/d3d12_xs/device_x.cpp, f8e24d4, MIT), with more samples.
 // False when a page faults (the title unmapped it). No C++ objects here: it is a __try frame.
-inline std::uint64_t mix_words(std::uint64_t h, const std::uint8_t* at, std::size_t n) {
+#pragma pack(push, 1)
+struct UnalignedWord64 {
+    std::uint64_t value;
+};
+#pragma pack(pop)
+
+LEONIDA_GUARDED_NO_BUILTIN inline std::uint64_t mix_words(std::uint64_t h, const std::uint8_t* at, std::size_t n) {
     for (std::size_t i = 0; i + 8 <= n; i += 8) {
-        std::uint64_t w;
-        std::memcpy(&w, at + i, 8);
+        const std::uint64_t w = reinterpret_cast<const UnalignedWord64*>(at + i)->value;
         h = (h ^ w) * 0x100000001b3ull;
         h ^= h >> 29;
     }
     return h;
 }
 // The reads of hash_guarded, in a frame of its own: an inline load inside the __try is not covered by clang-cl
-// without /EHa (src/guarded_copy.h).
-__declspec(noinline) std::uint64_t hash_bytes(const std::uint8_t* p, std::size_t bytes, bool every_byte) {
+// without /EHa, and a CRT memcpy call is not covered under Wine (src/guarded_copy.h).
+__declspec(noinline) LEONIDA_GUARDED_NO_BUILTIN std::uint64_t hash_bytes(const std::uint8_t* p, std::size_t bytes,
+                                                                         bool every_byte) {
     std::uint64_t h = 0x9e3779b97f4a7c15ull ^ bytes;
     if (bytes <= (256u << 10) || every_byte) {
         h = mix_words(h, p, bytes & ~std::size_t(7));
@@ -251,6 +291,13 @@ inline std::uint64_t hashed_bytes(std::uint64_t bytes, bool every_byte = false) 
     return bytes <= (256u << 10) || every_byte ? bytes : bytes / 32 + 64;
 }
 
+bool async_texture_refresh() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("LEONIDA_TEXTURE_REFRESH_ASYNC");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    return enabled;
+}
 // Set while this thread is inside the title-texture registry (it holds title_texture_mutex): a staged copy it makes
 // submits through a queue, whose before-submission refresh must then not take the registry again.
 thread_local bool t_in_title_textures = false;
@@ -283,8 +330,10 @@ void copy_run(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, boo
 //   - other readable pages (read-only or copy-on-write pages of the title's own, pages another tracker protected)
 //     can't be watched: copied every time, as before;
 //   - pages not committed, or not readable, are zero in the copies (written once);
-//   - pages xmem reports mapped at another address too (title_page_watch.h) are copied every time: a write
-//     through the other address doesn't fault here;
+//   - pages xmem reports mapped at another address too (title_page_watch.h): a write through the other address
+//     doesn't fault here, so their 64 KiB blocks are guarded at every address by the geometry watch's cells
+//     (update_aliased) and copied when a cell's version moved. Without the other addresses (no xmem), or while a
+//     cell can't be armed, they are copied every time;
 //   - pages a file shim pinned for a kernel write (ReadFile into title memory, which fails with ERROR_NOACCESS on a
 //     read-only page instead of faulting) are left writable and copied every time until the pin ends.
 // If the protection can't be changed (VirtualProtect refuses, or the fault handler couldn't be installed), those
@@ -323,6 +372,13 @@ class ShadowPages {
 public:
     static constexpr std::uintptr_t kPage = 0x1000;
     static constexpr std::uintptr_t kBlock = 0x10000;  // what one write fault makes writable again
+    // LEONIDA_SHADOW_GPU (DeviceState::gpu_copy_shadow): takes a copy of [from, from + bytes) to `to` for the GPU, or
+    // returns false and the CPU copies it. Set once by the device.
+    using GpuCopy = bool (*)(void* context, std::uint8_t* to, const std::uint8_t* from, std::size_t bytes);
+    static inline GpuCopy gpu_copy = nullptr;
+    static inline void* gpu_copy_context = nullptr;
+    // Bytes this tracker's refreshes handed to gpu_copy so far.
+    std::uint64_t gpu_bytes() const { return gpu_bytes_; }
 
     ShadowPages(const std::uint8_t* pages, std::uint8_t* shadow, std::size_t size, bool watch) : watch_(watch) {
         begin_ = reinterpret_cast<std::uintptr_t>(pages);
@@ -331,6 +387,7 @@ public:
         last_ = (end_ + kPage - 1) & ~(kPage - 1);
         state_.assign((last_ - first_) / kPage, 0);
         idle_.assign(state_.size(), 0);
+        sums_.assign(state_.size() * kPieces, 0);
         cover_.assign(state_.size(), 1);
         targets_.push_back({begin_, end_, shadow});
         index_targets();
@@ -344,9 +401,150 @@ public:
         if (std::any_of(state_.begin(), state_.end(), [](std::uint8_t s) { return s & kProtected; }))
             reopen_locked(first_, last_);
         ReleaseSRWLockExclusive(&lock_);
+        for (auto& [va, block] : aliased_blocks_) release_cells(va, block);
+        aliased_blocks_.clear();
     }
     ShadowPages(const ShadowPages&) = delete;
     ShadowPages& operator=(const ShadowPages&) = delete;
+
+    // What the GPU writes into the copies of [from, to) goes back to the title's pages. Returns the bytes written.
+    // Called before the next refresh, so a page the title writes again is copied forward over the result, as on a GPU
+    // that shares the memory.
+    //
+    // Only the bytes a copy holds differently from the title's page go back, and only on a page known unchanged since
+    // it was copied: guarded (read-only since that copy), or write-watched and found unwritten by an asking made here.
+    // The asking comes first because write_back runs before refresh() asks: a hot page still carried kClean from the
+    // last asking, so the title's writes since then were copied over with the older copy. Comparing first leaves a
+    // read-only binding's pages alone (guarded, so a write the title makes meanwhile faults and waits on the lock),
+    // where opening them for a whole copy lost a write made between the opening and the copy; and of two copies of
+    // the same bytes only the one that differs is written, where the last one won.
+    //
+    // `only` (a retired window's copy, when it is freed): that copy alone goes back, where no live copy changed the
+    // bytes; the live copies' own results wait for their submissions' batches.
+    std::size_t write_back(std::uintptr_t from, std::uintptr_t to, const std::uint8_t* only = nullptr) {
+        from = std::max(from, first_), to = std::min(to, last_);
+        if (from >= to) return 0;
+        AcquireSRWLockExclusive(&lock_);
+        // The copies below can fault on a page another guard (the geometry watch, another view's shadow) keeps
+        // read-only. The fault handler asks this tracker too (reopen), and must not take lock_ again on this thread:
+        // SRW locks are not recursive, and a title thread hung there for good (621.40, a submission's write-back).
+        writer_.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        // What changed since the last refresh, as refresh() learns it: mappings (the journal), kernel-write pins, and
+        // the write watch. A journal that no longer reaches back makes nothing known: nothing goes back.
+        std::uint64_t map_generation = leonida::title_memory_map::generation();
+        bool known = map_generation_ != ~std::uint64_t(0);
+        if (known && map_generation != map_generation_)
+            known = leonida::title_memory_map::changes_since(
+                map_generation_, map_generation, first_, last_, [&](std::uintptr_t a, std::uintptr_t b) {
+                    for (std::size_t i = (a - first_) / kPage, i1 = (b - first_ + kPage - 1) / kPage;
+                         i < i1 && i < state_.size(); ++i)
+                        state_[i] |= kRequery;
+                });
+        if (!known) {
+            writer_.store(0, std::memory_order_relaxed);
+            ReleaseSRWLockExclusive(&lock_);
+            return 0;
+        }
+        leonida::kernel_writes::for_each_pin(from, to, [&](std::uintptr_t a, std::uintptr_t b) {
+            for (std::uintptr_t p = std::max(a, from) & ~(kPage - 1); p < std::min(b, to); p += kPage)
+                state_[(p - first_) / kPage] |= kPinned;
+            pinned_ = true;
+        });
+        ask_written_locked();
+        // A page the title wrote since it was last copied holds the newer bytes already: its GPU result is dropped and
+        // the refresh's own copy carries the title's. So is a page whose mapping changed, one a kernel write may be
+        // filling, and one xmem maps at another address too (a write there is seen by no guard and no watch here).
+        // Decided for every page before the first copy: a copy below can fault on another guard, and the handler then
+        // reopens the whole 64 KiB tile here on this thread (reopen_range), which clears kClean and kProtected there.
+        // Read live, that made the later runs in the tile count as written by the title, and their GPU results were
+        // dropped from a batch already taken off the queue. A page the title wrote before this point is held still.
+        const std::size_t p0 = (from - first_) / kPage, p1 = (to - first_ + kPage - 1) / kPage;
+        held_pages_.resize(p1 - p0);
+        for (std::size_t i = p0; i < p1; ++i) {
+            const std::uint8_t s = state_[i];
+            held_pages_[i - p0] = (s & (kZero | kRequery | kPinned | kAliased)) || (!(s & kProtected) && !(s & kClean));
+        }
+        const auto held = [&](std::size_t i) { return held_pages_[i - p0] != 0; };
+        constexpr std::uintptr_t kPiece = 256;  // compared and copied in pieces this size
+        std::size_t written = 0;
+        for (std::uintptr_t at = from & ~(kPage - 1); at < ((to + kPage - 1) & ~(kPage - 1));) {
+            std::size_t pages = 0;
+            while (at + (pages + 1) * kPage <= ((to + kPage - 1) & ~(kPage - 1)) &&
+                   held((at - first_) / kPage + pages) == held((at - first_) / kPage))
+                ++pages;
+            if (!held((at - first_) / kPage)) {
+                const std::uintptr_t a = std::max(at, from), b = std::min(at + pages * kPage, to);
+                bool opened = false;
+                Vector<const Target*> over;    // the targets with bytes in [a, b)
+                for (const Target& t : targets_)
+                    if (t.shadow && std::max(a, t.begin) < std::min(b, t.end)) over.push_back(&t);
+                // Piece by piece, against the title's bytes as they were before any copy went back here: a copy goes
+                // back on the bytes it holds differently from those, so one that still holds them is not written over
+                // another's result. A retired window's copy (retire_target) goes back only on bytes no live copy
+                // changed: what a submission wrote in it is older than what a live copy holds (the range that
+                // replaced it serves every submission recorded since). Byte by byte, as two copies can share a piece
+                // with disjoint bytes each.
+                for (std::uintptr_t c = a; c < b && !over.empty();) {
+                    const std::uintptr_t e = std::min(b, (c + kPiece) & ~(kPiece - 1));
+                    std::uint8_t before[kPiece];
+                    bool live[kPiece];  // the bytes a live copy changed, once `saved`
+                    bool saved = false;
+                    for (int pass = 0; pass < 2; ++pass)
+                        for (const Target* t : over) {
+                            if (t->retired != (pass == 1) || (only && pass == 1 && t->shadow != only)) continue;
+                            const std::uintptr_t x = std::max(c, t->begin), y = std::min(e, t->end);
+                            if (x >= y) continue;
+                            const std::uint8_t* copy = t->shadow + (x - t->begin);
+                            const void* now = saved ? static_cast<const void*>(before + (x - c))
+                                                    : reinterpret_cast<const void*>(x);
+                            if (std::memcmp(now, copy, y - x) == 0) continue;
+                            if (!saved) {
+                                std::memcpy(before, reinterpret_cast<const void*>(c), e - c);
+                                std::fill_n(live, e - c, false);
+                                saved = true;
+                            }
+                            const auto goes = [&](std::uintptr_t v) {
+                                return copy[v - x] != before[v - c] && !(pass == 1 && live[v - c]);
+                            };
+                            for (std::uintptr_t i = x; i < y;) {
+                                if (!goes(i)) {
+                                    ++i;
+                                    continue;
+                                }
+                                std::uintptr_t j = i + 1;
+                                while (j < y && goes(j)) ++j;
+                                if (pass == 0) std::fill(live + (i - c), live + (j - c), true);
+                                if (pass == 1 || !only) {  // `only`: the live copies' results wait for their batches
+                                    if (!opened) {
+                                        reopen_locked(at, at + pages * kPage);
+                                        opened = true;
+                                    }
+                                    std::memcpy(reinterpret_cast<void*>(i), copy + (i - x), j - i);
+                                    written += j - i;
+                                }
+                                // A retired copy's bytes are the title's now: the copies that held the older ones
+                                // take them too, as the next refresh would, so one read before it (the range that
+                                // replaced the window, when the window is freed after this submission's refresh)
+                                // is not behind the title. A copy that changed a byte keeps its own.
+                                if (pass == 1)
+                                    for (const Target* o : over) {
+                                        if (o == t) continue;
+                                        for (std::uintptr_t v = std::max(i, o->begin); v < std::min(j, o->end); ++v)
+                                            if (o->shadow[v - o->begin] == before[v - c])
+                                                o->shadow[v - o->begin] = copy[v - x];
+                                    }
+                                i = j;
+                            }
+                        }
+                    c = e;
+                }
+            }
+            at += pages * kPage;
+        }
+        writer_.store(0, std::memory_order_relaxed);
+        ReleaseSRWLockExclusive(&lock_);
+        return written;
+    }
 
     // The bytes of all targets, and how many there are.
     std::size_t size() const { return target_bytes_; }
@@ -383,12 +581,14 @@ public:
     // Brings every target up to date with the pages. Returns the bytes copied into them. With copy_aliased false, pages
     // xmem maps at another address too are left as they are this time (DeviceState::refresh_shadows throttles them).
     std::size_t refresh(bool copy_aliased = true) {
+        const auto walk_start = std::chrono::steady_clock::now();
+        pieces_ = {};
         copy_aliased_ = copy_aliased;
+        update_aliased();
         jobs_.clear();
         zeroed_.clear();
         copy_bytes_ = {};
         std::uint64_t queries = 0;
-        const std::uint64_t generation = leonida::title_page_aliases::generation();
         // LEONIDA_SHADOW_FULL_WALK=1 queries every page at every refresh, as before the generation skip.
         static const bool always_full_walk = [] {
             char value[8] = {};
@@ -411,15 +611,7 @@ public:
                 }))
             full_walk = true;
         refresh_walked_all_ = full_walk;
-        refresh_protects_ = 0;
-        if (generation != alias_generation_) {
-            alias_generation_ = generation;
-            for (std::uint8_t& s : state_) s &= ~kAliased;
-            leonida::title_page_aliases::for_each_in(first_, last_, [&](std::uintptr_t va) {
-                const std::uintptr_t from = std::max(va, first_), to = std::min(va + kBlock, last_);
-                for (std::uintptr_t p = from; p < to; p += kPage) state_[(p - first_) / kPage] |= kAliased;
-            });
-        }
+        refresh_protects_ = alias_arms_;
         if (pinned_) {
             for (std::uint8_t& s : state_) s &= ~kPinned;
             pinned_ = false;
@@ -430,38 +622,8 @@ public:
         });
         // The write-watched pages written since the last asking are no longer clean: asked before the walk, so a write
         // after this is in the next asking.
-        const std::uint64_t watch_generation = leonida::title_write_watch::generation();
-        if (watch_generation != watch_generation_) {
-            watch_generation_ = watch_generation;
-            update_watched();
-        }
-        if (runs_stale_) rebuild_watch_runs();
         refresh_asks_ = refresh_written_ = 0;
-        if (!watch_runs_.empty()) {
-            if (!reader_) {
-                reader_ = leonida::title_write_watch::open_reader();
-                forget_clean();
-            }
-            refresh_asks_ = watch_runs_.size();
-            leonida::title_write_watch::ask(
-                reader_, watch_runs_,
-                [&](std::uintptr_t from, std::uintptr_t to) {
-                    for (std::uintptr_t p = from; p < to; p += kPage) {
-                        std::uint8_t& s = state_[(p - first_) / kPage];
-                        if (!(s & kHot)) continue;  // asked over a gap between hot pages: guarded
-                        refresh_written_ += (s & kClean) != 0;
-                        s &= ~kClean;
-                        warm(p);
-                    }
-                },
-                [&](std::uintptr_t from, std::uintptr_t to) {
-                    // Not write-watched after all (released and reserved again): guarded from now on.
-                    for (std::uintptr_t p = from; p < to; p += kPage)
-                        state_[(p - first_) / kPage] &= ~(kWatched | kClean | kHot);
-                    runs_stale_ = true;
-                });
-            cool();  // a block it guards again leaves the runs at the next refresh
-        }
+        if (ask_written_locked()) cool();  // a block it guards again leaves the runs at the next refresh
         for (std::uintptr_t at = first_; at < last_;) {
             const std::size_t i0 = (at - first_) / kPage;
             if (!cover_[i0]) {  // no copy reads it: left as the title set it
@@ -475,13 +637,16 @@ public:
             // passed over like unchanged ones and queried at the next such refresh: a mapping change over them is in
             // the journal (kRequery) anyway. speed-16/17/18: 730-820 VirtualQuery calls a refresh, ~19 us each under
             // Wine (NtQueryVirtualMemory waits for Wine's virtual-memory lock, which the mapping threads hold), a
-            // fifth of the submitting thread's time.
-            const auto skip = [&](std::uint8_t s) {
-                return unchanged(s) || (!copy_aliased_ && (s == kAliased || s == kZero || s == (kZero | kAliased)));
+            // fifth of the submitting thread's time. So are aliased pages whose cells no write reached (aliased_clean):
+            // a mapping, commitment or protection change over a cell moves its version too.
+            const auto skip = [&](std::size_t i) {
+                const std::uint8_t s = state_[i];
+                return unchanged(s) || ((s & ~(kZero | kProtected)) == kAliased && aliased_clean(i)) ||
+                       (!copy_aliased_ && (s == kAliased || s == kZero || s == (kZero | kAliased)));
             };
-            if (!full_walk && skip(state_[i0])) {
+            if (!full_walk && skip(i0)) {
                 std::size_t i = i0 + 1;
-                while (i < state_.size() && skip(state_[i])) ++i;
+                while (i < state_.size() && skip(i)) ++i;
                 at = first_ + i * kPage;
                 continue;
             }
@@ -507,6 +672,7 @@ public:
                     if (state_[i] & kZero) continue;
                     const auto [offset, bytes] = span_of(i, i + 1);
                     zero_targets(offset, bytes);
+                    leonida::shadow_keep::forget(sums_.data(), first_, begin_ + offset, begin_ + offset + bytes);
                     if (!zeroed_.empty() && zeroed_.back().offset + zeroed_.back().bytes == offset)
                         zeroed_.back().bytes += bytes;
                     else
@@ -523,11 +689,15 @@ public:
                     switch (how) {
                     case Watch::clean: break;  // write-watched, not written since it was copied
                     case Watch::written:       // write-watched: written since, or not known yet
+                        // A page this tracker made read-only is opened first: dropping kProtected alone left it
+                        // read-only with no owner, so the next write could fault.
+                        unguard_ours(i, j);
                         for (std::size_t k = i; k < j; ++k)
                             state_[k] = std::uint8_t((state_[k] & ~(kZero | kProtected)) | kClean);
                         add_job(i, j, streaming, Copy::write_watched);
                         break;
                     case Watch::open:  // write-watched, but pinned for a kernel write: copied until the pin ends
+                        unguard_ours(i, j);
                         for (std::size_t k = i; k < j; ++k) state_[k] &= ~(kZero | kProtected | kClean);
                         add_job(i, j, streaming, Copy::write_watched);
                         break;
@@ -542,6 +712,7 @@ public:
                 }
                 break;
             case Kind::unwatched:
+                unguard_ours(i0, i1);  // as above: never drop kProtected over a page still read-only for us
                 for (std::size_t i = i0; i < i1; ++i) state_[i] &= kAliased | kPinned | kWatched;
                 add_job(i0, i1, streaming, Copy::copy_on_write);
                 break;
@@ -557,15 +728,59 @@ public:
             log_once("slot-133 shadow: VirtualProtect refused to watch the title's pages for writes, so they are "
                      "copied at every submission; error",
                      int(protect_error));
-        // The copies run without the lock: a write that faults meanwhile is let through and copied next time.
+        // The copies run without the lock: a write that faults meanwhile is let through and copied next time. Pages
+        // copied because they are aliased go to the GPU when LEONIDA_SHADOW_GPU set gpu_copy and it takes them.
+        // LEONIDA_SHADOW_JOIN=1: pieces of one job that go on where the one before ended, in the pages and in the copy
+        // both, are one copy (one GPU region, one gpu_copy call); one the GPU refuses is copied by the CPU whole.
+        static const bool join = [] {
+            char value[4] = {};
+            return GetEnvironmentVariableA("LEONIDA_SHADOW_JOIN", value, sizeof(value)) == 1 && value[0] == '1';
+        }();
+        const auto copy_start = std::chrono::steady_clock::now();
+        pieces_.walk_ms = std::chrono::duration<double, std::milli>(copy_start - walk_start).count();
         std::size_t copied = 0;
-        for (const Job& job : jobs_)
+        for (const Job& job : jobs_) {
+            if (keep_gpu_writes()) {  // only the pieces whose title bytes changed (src/shadow_keep.h)
+                copied += copy_changed(job);
+                continue;
+            }
+            std::uint8_t* run_dst = nullptr;
+            const std::uint8_t* run_src = nullptr;
+            std::size_t run_bytes = 0;
+            const auto flush = [&] {
+                if (!run_bytes) return;
+                ++pieces_.calls;
+                if (job.aliased && gpu_copy) ++pieces_.gpu_calls;
+                if (job.aliased && gpu_copy && gpu_copy(gpu_copy_context, run_dst, run_src, run_bytes))
+                    gpu_bytes_ += run_bytes;
+                else
+                    copy_run(run_dst, run_src, run_bytes, job.streaming);
+                run_bytes = 0;
+            };
             for_each_target(begin_ + job.offset, begin_ + job.offset + job.bytes,
                             [&](const Target& t, std::uintptr_t from, std::uintptr_t to) {
-                                copy_run(t.shadow + (from - t.begin), reinterpret_cast<const std::uint8_t*>(from),
-                                         to - from, job.streaming);
-                                copied += to - from;
+                                std::uint8_t* dst = t.shadow + (from - t.begin);
+                                const auto* src = reinterpret_cast<const std::uint8_t*>(from);
+                                const std::size_t n = to - from;
+                                ++pieces_.pieces;
+                                pieces_.short_pieces += n < kPage;
+                                const bool follows = run_bytes && run_dst + run_bytes == dst && run_src + run_bytes == src;
+                                pieces_.joinable += follows;
+                                if (join && follows) {
+                                    run_bytes += n;
+                                } else {
+                                    flush();
+                                    run_dst = dst;
+                                    run_src = src;
+                                    run_bytes = n;
+                                    if (!join) flush();
+                                }
+                                copied += n;
                             });
+            flush();
+        }
+        pieces_.copy_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copy_start).count();
         refresh_queries_ = queries;
         return copied;
     }
@@ -579,12 +794,14 @@ public:
             const std::size_t n = (first_ - first) / kPage;
             state_.insert(state_.begin(), n, std::uint8_t(0));
             idle_.insert(idle_.begin(), n, std::uint8_t(0));
+            sums_.insert(sums_.begin(), n * kPieces, std::uint64_t(0));
             cover_.insert(cover_.begin(), n, 0u);
             first_ = first;
         }
         if (last > last_) {
             state_.resize((last - first_) / kPage, 0);
             idle_.resize(state_.size(), 0);
+            sums_.resize(state_.size() * kPieces, 0);
             cover_.resize(state_.size(), 0);
             last_ = last;
         }
@@ -604,6 +821,8 @@ public:
             state_[at + i] |= other.state_[i];
             cover_[at + i] += other.cover_[i];
             idle_[at + i] = other.idle_[i];
+            std::copy_n(other.sums_.begin() + std::ptrdiff_t(i * kPieces), kPieces,
+                        sums_.begin() + std::ptrdiff_t((at + i) * kPieces));
         }
         targets_.insert(targets_.end(), other.targets_.begin(), other.targets_.end());
         if (other.map_generation_ != map_generation_) map_generation_ = ~std::uint64_t(0);
@@ -616,6 +835,7 @@ public:
             leonida::title_write_watch::merge_reader(reader_, other.reader_);
         }
         watch_generation_ = ~std::uint64_t(0);
+        alias_generation_ = ~std::uint64_t(0);
         pinned_ |= other.pinned_;
         watch_ = watch_ && other.watch_;
         faults_.fetch_add(other.faults(), std::memory_order_relaxed);
@@ -632,6 +852,7 @@ public:
         targets_.push_back({begin, end, shadow});
         for (std::uintptr_t p = begin & ~(kPage - 1); p < end; p += kPage) ++cover_[(p - first_) / kPage];
         index_targets();
+        alias_generation_ = ~std::uint64_t(0);  // the aliased blocks the copies read
         ReleaseSRWLockExclusive(&lock_);
     }
 
@@ -648,13 +869,56 @@ public:
                 kind = classify(region);
             }
             const std::uintptr_t from = std::max(at, begin), to = std::min(next, end);
-            if (kind == Kind::zero)
+            if (kind == Kind::zero) {
                 std::memset(shadow + (from - begin), 0, to - from);
-            else
-                copy_run(shadow + (from - begin), reinterpret_cast<const std::uint8_t*>(from), to - from,
-                         (region.Protect & PAGE_WRITECOMBINE) != 0);
+            } else {
+                const bool streaming = (region.Protect & PAGE_WRITECOMBINE) != 0;
+                copy_run(shadow + (from - begin), reinterpret_cast<const std::uint8_t*>(from), to - from, streaming);
+                // The sums stand for what every target holds. The new target now holds the title's current bytes, so
+                // the pieces where those differ from the sums are brought to the other targets too, and the sums
+                // follow; otherwise a title that later writes the old bytes back would leave the new target behind.
+                // Whole pieces (inside this page, so this region) up to the targets' ends, as a refresh sums them: a
+                // piece cut at the new target's edge would be summed short and copied again at the next refresh.
+                constexpr std::uintptr_t kPiece = leonida::shadow_keep::kPiece;
+                if (keep_gpu_writes())
+                    reconcile(std::max(from & ~(kPiece - 1), begin_), std::min((to + kPiece - 1) & ~(kPiece - 1), end_),
+                              streaming);
+            }
             at = next;
         }
+    }
+
+    // [from, to), readable title pages: the pieces whose bytes differ from the sums are copied to every target over
+    // them and their sums updated, as a refresh does.
+    void reconcile(std::uintptr_t from, std::uintptr_t to, bool streaming) {
+        alignas(64) std::uint8_t page[kPage];
+        for (std::uintptr_t va = from; va < to;) {
+            const std::size_t n = std::min<std::size_t>(to - va, kPage - (va & (kPage - 1)));
+            copy_run(page, reinterpret_cast<const std::uint8_t*>(va), n, streaming);
+            leonida::shadow_keep::copy_changed(
+                page, va, n, sums_.data(), first_, [&](std::uintptr_t a, std::uintptr_t b, const std::uint8_t* source) {
+                    for_each_target(a, b, [&](const Target& t, std::uintptr_t lo, std::uintptr_t hi) {
+                        std::memcpy(t.shadow + (lo - t.begin), source + (lo - a), hi - lo);
+                    });
+                });
+            va += n;
+        }
+    }
+
+    // Under shadow_mutex: `shadow` is a retired window's copy (retire_orphan_windows). It is still refreshed, so it
+    // never holds bytes older than the title's but what the GPU wrote in it, and what it holds goes back only where
+    // no live copy changed the bytes (write_back). False when it isn't one of this tracker's.
+    bool retire_target(const std::uint8_t* shadow) {
+        AcquireSRWLockExclusive(&lock_);
+        bool found = false;
+        for (Target& t : targets_)
+            if (t.shadow == shadow) t.retired = found = true;
+        ReleaseSRWLockExclusive(&lock_);
+        return found;
+    }
+
+    bool has_target(const std::uint8_t* shadow) const {
+        return std::any_of(targets_.begin(), targets_.end(), [shadow](const Target& t) { return t.shadow == shadow; });
     }
 
     // Under shadow_mutex: `shadow` is no longer a target. Pages no other target covers are made writable again and
@@ -679,6 +943,7 @@ public:
         targets_.erase(it);
         index_targets();
         watch_generation_ = ~std::uint64_t(0);  // recounts the write-watched pages covered
+        alias_generation_ = ~std::uint64_t(0);  // and the aliased blocks the copies read
         ReleaseSRWLockExclusive(&lock_);
         return true;
     }
@@ -689,14 +954,15 @@ public:
         from = std::max(from & ~(kPage - 1), first_);
         to = std::min((to + kPage - 1) & ~(kPage - 1), last_);
         if (from >= to) return;
-        AcquireSRWLockExclusive(&lock_);
+        const bool held = writer_.load(std::memory_order_relaxed) == GetCurrentThreadId();  // see write_back
+        if (!held) AcquireSRWLockExclusive(&lock_);
         bool guarded = false;
         for (std::size_t i = (from - first_) / kPage, i1 = (to - first_) / kPage; i < i1; ++i) {
             state_[i] &= ~kClean;
             guarded |= (state_[i] & kProtected) != 0;
         }
         if (guarded) reopen_locked(from, to);
-        ReleaseSRWLockExclusive(&lock_);
+        if (!held) ReleaseSRWLockExclusive(&lock_);
     }
 
     // From the fault handler: a write to `address`, inside this range, faulted. True when the write can be retried:
@@ -707,7 +973,9 @@ public:
     // write it should have retried, which ended the process (seen natively on Windows 11: threads writing one page
     // across a submission).
     bool reopen(std::uintptr_t address) {
-        AcquireSRWLockExclusive(&lock_);
+        // On the thread whose write_back faulted, lock_ is held already (see write_back).
+        const bool held = writer_.load(std::memory_order_relaxed) == GetCurrentThreadId();
+        if (!held) AcquireSRWLockExclusive(&lock_);
         const std::size_t index = (address - first_) / kPage;
         bool retry = (state_[index] & kProtected) != 0;
         if (retry) {
@@ -733,7 +1001,7 @@ public:
             retry = VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) &&
                     classify(region) == Kind::writable;
         }
-        ReleaseSRWLockExclusive(&lock_);
+        if (!held) ReleaseSRWLockExclusive(&lock_);
         return retry;
     }
 
@@ -760,6 +1028,15 @@ public:
     // read-only pages that are not this tracker's, copy-on-write pages, write-watched pages found written.
     enum class Copy { guarded, unguarded, aliased, pinned, read_only, copy_on_write, write_watched, count };
     const std::array<std::uint64_t, unsigned(Copy::count)>& copy_bytes() const { return copy_bytes_; }
+    // The last refresh()'s copies as pieces (one per job and target: a slot-133 buffer is a few KiB, so a run of
+    // pages over many of them is many pieces), those under 4 KiB, those that go on where the one before ended in both
+    // the title's pages and the copy (VItoriaBr's JOIN_COPIES case), the copy calls made after LEONIDA_SHADOW_JOIN
+    // joined those, and the milliseconds of the walk (queries, guards, under the lock) and of the copies.
+    struct Pieces {
+        std::uint64_t pieces = 0, short_pieces = 0, joinable = 0, calls = 0, gpu_calls = 0;
+        double walk_ms = 0, copy_ms = 0;
+    };
+    const Pieces& pieces() const { return pieces_; }
 
 private:
     // How a committed, readable page is watched: by the kernel (clean, written or, pinned or aliased, open) or by
@@ -773,6 +1050,42 @@ private:
     // A page known unchanged since the last refresh, which one that doesn't walk everything passes over.
     static bool unchanged(std::uint8_t s) {
         return s == kProtected || s == (kWatched | kProtected) || s == (kWatched | kHot | kClean);
+    }
+
+    // One asking of the write watch, under lock_: the hot pages written since the last asking lose kClean (counted in
+    // refresh_written_). From refresh() before its walk, and from write_back() before it trusts kClean. False when no
+    // page is write-watched here.
+    bool ask_written_locked() {
+        const std::uint64_t watch_generation = leonida::title_write_watch::generation();
+        if (watch_generation != watch_generation_) {
+            watch_generation_ = watch_generation;
+            update_watched();
+        }
+        if (runs_stale_) rebuild_watch_runs();
+        if (watch_runs_.empty()) return false;
+        if (!reader_) {
+            reader_ = leonida::title_write_watch::open_reader();
+            forget_clean();
+        }
+        refresh_asks_ += watch_runs_.size();
+        leonida::title_write_watch::ask(
+            reader_, watch_runs_,
+            [&](std::uintptr_t from, std::uintptr_t to) {
+                for (std::uintptr_t p = from; p < to; p += kPage) {
+                    std::uint8_t& s = state_[(p - first_) / kPage];
+                    if (!(s & kHot)) continue;  // asked over a gap between hot pages: guarded
+                    refresh_written_ += (s & kClean) != 0;
+                    s &= ~kClean;
+                    warm(p);
+                }
+            },
+            [&](std::uintptr_t from, std::uintptr_t to) {
+                // Not write-watched after all (released and reserved again): guarded from now on.
+                for (std::uintptr_t p = from; p < to; p += kPage)
+                    state_[(p - first_) / kPage] &= ~(kWatched | kClean | kHot);
+                runs_stale_ = true;
+            });
+        return true;
     }
 
     // A hot page `p` was found written: its block is not idle.
@@ -806,7 +1119,11 @@ private:
             const bool unwatched = state_[i] & (kAliased | kPinned);
             std::size_t j = i + 1;
             while (j < i1 && bool(state_[j] & (kAliased | kPinned)) == unwatched) ++j;
-            for (std::size_t k = i; k < j; ++k) state_[k] &= ~(kZero | kProtected);
+            for (std::size_t k = i; k < j; ++k) {
+                state_[k] &= ~(kZero | kProtected);
+                // Writable with no write seen: its cells must be armed again (update_aliased).
+                if (aliased_clean(k) && (rearm_.empty() || rearm_.back() != block_of(k))) rearm_.push_back(block_of(k));
+            }
             if (!unwatched && watch_) protect(i, j, current);
             if (unwatched && !copy_aliased_ && (state_[i] & kAliased)) {
                 i = j;
@@ -820,13 +1137,18 @@ private:
         }
     }
 
-    // Guarded pages [i, j) of a read-only region: pages this tracker protected are as the last refresh left them;
-    // any other is copied again.
+    // Guarded pages [i, j) of a read-only region: pages this tracker protected, and aliased pages whose cells no write
+    // reached, are as the last refresh left them; any other is copied again.
     void guard_read_only(std::size_t i0, std::size_t i1, bool streaming) {
+        const auto clean_at = [&](std::size_t k) {
+            const std::uint8_t s = state_[k];
+            return (s & (kProtected | kAliased | kPinned)) == kProtected ||
+                   ((s & (kAliased | kPinned)) == kAliased && aliased_clean(k));
+        };
         for (std::size_t i = i0; i < i1;) {
-            const bool clean = (state_[i] & (kProtected | kAliased | kPinned)) == kProtected;
+            const bool clean = clean_at(i);
             std::size_t j = i + 1;
-            while (j < i1 && ((state_[j] & (kProtected | kAliased | kPinned)) == kProtected) == clean) ++j;
+            while (j < i1 && clean_at(j) == clean) ++j;
             if (!clean && !(!copy_aliased_ && (state_[i] & kAliased))) {
                 for (std::size_t k = i; k < j; ++k) state_[k] &= ~kZero;
                 add_job(i, j, streaming,
@@ -836,6 +1158,99 @@ private:
             }
             i = j;
         }
+    }
+
+    // An aliased block's cell, its other addresses' cells, and their mapping and version when it was last armed.
+    struct AliasedBlock {
+        leonida::geometry_writes::Cell* cell = nullptr;
+        Vector<std::pair<std::uintptr_t, leonida::geometry_writes::Cell*>> peers;
+        std::uint64_t mapping = 0, version = 0;
+        bool armed = false;
+    };
+
+    // The 64 KiB block of page i, and whether update_aliased found no write reached it.
+    std::uintptr_t block_of(std::size_t i) const { return (first_ + i * kPage) & ~(kBlock - 1); }
+    bool aliased_clean(std::size_t i) const {
+        return !clean_.empty() && clean_[((first_ & (kBlock - 1)) + i * kPage) / kBlock];
+    }
+
+    // At the start of refresh(), outside lock_ (the cells' lock is the write-fault handler's, and the other addresses
+    // are asked for on the process heap). Each aliased block the copies read is guarded at every address xmem maps it
+    // by a cell of the geometry watch, whose faults shadow_write_fault answers: a write through any of the addresses,
+    // a remap or a protection change moves a cell's version. A block whose cells kept their versions since they were
+    // armed is clean (clean_); any other is armed again before the walk copies it, so a write after the arming is
+    // copied at the next refresh. A block is copied every time while its cells can't be armed: no other address
+    // known, a page pinned for a kernel write, or the refreshes that leave aliased pages alone (copy_aliased_).
+    void update_aliased() {
+        namespace watch = leonida::geometry_writes;
+        const std::uint64_t generation = leonida::title_page_aliases::generation();
+        AcquireSRWLockExclusive(&lock_);
+        if (generation != alias_generation_) {
+            alias_generation_ = generation;
+            aliased_list_.clear();
+            for (std::uint8_t& s : state_) s &= ~kAliased;
+            leonida::title_page_aliases::for_each_in(first_, last_, [&](std::uintptr_t va) {
+                const std::uintptr_t from = std::max(va, first_), to = std::min(va + kBlock, last_);
+                bool read = false;
+                for (std::uintptr_t p = from; p < to; p += kPage) {
+                    state_[(p - first_) / kPage] |= kAliased;
+                    read |= cover_[(p - first_) / kPage] != 0;
+                }
+                if (read) aliased_list_.push_back(va);
+            });
+        }
+        Vector<std::uintptr_t> rearm;
+        rearm.swap(rearm_);
+        ReleaseSRWLockExclusive(&lock_);
+        const std::uintptr_t base = first_ & ~(kBlock - 1);
+        clean_.assign(aliased_list_.empty() ? 0 : (last_ - base + kBlock - 1) / kBlock, 0);
+        alias_arms_ = 0;
+        const auto aliases = watch::aliases.load(std::memory_order_acquire);
+        const bool guard = aliases && watch_;
+        for (auto it = aliased_blocks_.begin(); it != aliased_blocks_.end();) {
+            if (guard && std::binary_search(aliased_list_.begin(), aliased_list_.end(), it->first)) {
+                ++it;
+                continue;
+            }
+            release_cells(it->first, it->second);
+            it = aliased_blocks_.erase(it);
+        }
+        if (!guard) return;
+        for (const std::uintptr_t va : rearm)
+            if (const auto it = aliased_blocks_.find(va); it != aliased_blocks_.end()) it->second.armed = false;
+        for (const std::uintptr_t va : aliased_list_) {
+            AliasedBlock& b = aliased_blocks_[va];
+            if (!b.cell) b.cell = watch::acquire(va);
+            std::uint64_t version = b.cell->version.load(std::memory_order_acquire);
+            const std::uint64_t mapping = b.cell->mapping.load(std::memory_order_acquire);
+            if (mapping != b.mapping) {
+                std::vector<std::uintptr_t> others;
+                if (aliases) aliases(va, others);
+                auto old = std::move(b.peers);
+                b.peers.clear();
+                for (const std::uintptr_t other : others) b.peers.emplace_back(other, watch::acquire(other));
+                for (const auto& [other, cell] : old) watch::release(other);
+                b.mapping = mapping;
+                b.armed = false;
+            }
+            for (const auto& [other, cell] : b.peers)
+                version = std::max(version, cell->version.load(std::memory_order_acquire));
+            if (b.armed && version == b.version) {
+                clean_[(va - base) / kBlock] = 1;
+                continue;
+            }
+            b.armed = false;
+            if (!copy_aliased_ || b.peers.empty()) continue;
+            b.armed = watch::arm(va, *b.cell);
+            for (const auto& [other, cell] : b.peers) b.armed = watch::arm(other, *cell) && b.armed;
+            alias_arms_ += 1 + b.peers.size();
+            b.version = version;
+        }
+    }
+    static void release_cells(std::uintptr_t va, AliasedBlock& b) {
+        if (b.cell) leonida::geometry_writes::release(va);
+        for (const auto& [other, cell] : b.peers) leonida::geometry_writes::release(other);
+        b = {};
     }
 
     // With the lock held, when this tracker opens a new write-watch reader: no page is clean until that reader has
@@ -904,10 +1319,12 @@ private:
     struct Job {
         std::size_t offset, bytes;  // from begin_
         bool streaming;
+        bool aliased;  // copied because xmem maps the pages elsewhere too (Copy::aliased)
     };
     struct Target {
         std::uintptr_t begin, end;  // the title's bytes
         std::uint8_t* shadow;       // where begin's byte goes
+        bool retired = false;       // a window nothing answers from, kept until its submissions are copied back
     };
 
     static Kind classify(const MEMORY_BASIC_INFORMATION& region) {
@@ -932,12 +1349,47 @@ private:
     void add_job(std::size_t i, std::size_t j, bool streaming, Copy why) {
         const auto [offset, bytes] = span_of(i, j);
         copy_bytes_[unsigned(why)] += bytes;
-        if (!jobs_.empty() && jobs_.back().streaming == streaming &&
+        const bool aliased = why == Copy::aliased;
+        if (!jobs_.empty() && jobs_.back().streaming == streaming && jobs_.back().aliased == aliased &&
             jobs_.back().offset + jobs_.back().bytes == offset) {
             jobs_.back().bytes += bytes;
             return;
         }
-        jobs_.push_back({offset, bytes, streaming});
+        jobs_.push_back({offset, bytes, streaming, aliased});
+    }
+
+    // LEONIDA_SHADOW_KEEP (on; 0: every job copied whole, as before): a job's bytes reach the copies only where they
+    // differ from those copied last (src/shadow_keep.h), so a shader's write into a copy of pages copied without a
+    // sign that the title wrote them stays until the title changes those bytes.
+    // shortcut: a title that rewrites the same bytes to reset a GPU-written value is not seen; needs a real write
+    // signal (a write-back to the title's pages) then.
+    static bool keep_gpu_writes() {
+        static const bool on = [] {
+            char value[2] = {};
+            std::size_t length = 0;
+            return getenv_s(&length, value, sizeof(value), "LEONIDA_SHADOW_KEEP") != 0 || length == 0 ||
+                   value[0] != '0';
+        }();
+        return on;
+    }
+    static constexpr std::size_t kPieces = kPage / leonida::shadow_keep::kPiece;
+    std::size_t copy_changed(const Job& job) {
+        std::size_t copied = 0;
+        alignas(64) std::uint8_t page[kPage];
+        for (std::size_t at = job.offset, end = job.offset + job.bytes; at < end;) {
+            const std::uintptr_t va = begin_ + at;
+            const std::size_t n = std::min<std::size_t>(end - at, kPage - (va & (kPage - 1)));
+            copy_run(page, reinterpret_cast<const std::uint8_t*>(va), n, job.streaming);
+            leonida::shadow_keep::copy_changed(
+                page, va, n, sums_.data(), first_, [&](std::uintptr_t a, std::uintptr_t b, const std::uint8_t* source) {
+                    for_each_target(a, b, [&](const Target& t, std::uintptr_t from, std::uintptr_t to) {
+                        std::memcpy(t.shadow + (from - t.begin), source + (from - a), to - from);
+                        copied += to - from;
+                    });
+                });
+            at += n;
+        }
+        return copied;
     }
 
     // The targets sorted by start, the bytes they hold, and reach_[k], the furthest end among targets_[0..k]: the
@@ -988,6 +1440,18 @@ private:
         ++refresh_protects_;
     }
 
+    // With the lock held: before pages [i, j) stop counting as ours (kProtected), the ones this tracker made read-only
+    // are given back their write access, so no page stays read-only with no guard to answer its writes.
+    void unguard_ours(std::size_t i, std::size_t j) {
+        for (std::size_t k = i; k < j; ++k)
+            if (state_[k] & kProtected) {
+                ++unguarded_on_drop_;
+                reopen_locked(first_ + i * kPage, first_ + j * kPage);
+                return;
+            }
+    }
+    std::uint64_t unguarded_on_drop_ = 0;  // times unguard_ours found pages of ours to reopen (diagnostic)
+
     // With the lock held: the pages in [from, to) this tracker made read-only are read-write again.
     void reopen_locked(std::uintptr_t from, std::uintptr_t to) {
         for (std::uintptr_t at = from; at < to;) {
@@ -1028,12 +1492,21 @@ private:
     std::uintptr_t begin_ = 0, end_ = 0;   // the targets' bytes: the first start and the furthest end
     std::uintptr_t first_ = 0, last_ = 0;  // the pages covered
     SRWLOCK lock_ = SRWLOCK_INIT;          // state_, cover_, the targets, and the protection of the pages
+    std::atomic<DWORD> writer_{0};         // the thread in write_back, which holds lock_ while it copies into the title
+    Vector<std::uint8_t> held_pages_;      // write_back's per-page decision, taken before its copies (under lock_)
     Vector<std::uint8_t> state_;           // per 4 KiB page
     Vector<std::uint32_t> cover_;          // per 4 KiB page: the targets that read it
     Vector<Target> targets_;               // by start
     Vector<std::uintptr_t> reach_;         // see index_targets
     std::size_t target_bytes_ = 0;
     std::uint64_t alias_generation_ = ~std::uint64_t(0);
+    // Aliased blocks (update_aliased), refresh() only: those the copies read, in address order; their cells; per 64 KiB
+    // block from first_ rounded down, whether no write reached it; and the clean blocks the walk found writable.
+    Vector<std::uintptr_t> aliased_list_;
+    leonida::host_heap::map<std::uintptr_t, AliasedBlock> aliased_blocks_;
+    Vector<std::uint8_t> clean_;
+    Vector<std::uintptr_t> rearm_;
+    std::uint64_t alias_arms_ = 0;  // arm() calls of the last update_aliased()
     std::uint64_t map_generation_ = ~std::uint64_t(0);
     bool pinned_ = false;  // some page has kPinned
     Vector<Job> jobs_;    // refresh() only, which DeviceState::shadow_mutex serializes
@@ -1041,6 +1514,8 @@ private:
     DWORD protect_error_ = 0;  // a VirtualProtect refusal of this refresh(), logged after it
     std::array<std::uint64_t, unsigned(Copy::count)> copy_bytes_{};  // refresh() only, likewise
     bool copy_aliased_ = true;                                        // likewise
+    std::uint64_t gpu_bytes_ = 0;
+    Pieces pieces_;  // refresh() only, likewise
     std::uint64_t refresh_queries_ = 0;
     std::uint64_t refresh_protects_ = 0;  // VirtualProtect calls of the last refresh()
     bool refresh_walked_all_ = false;     // the last refresh() queried every page (the title memory map changed)
@@ -1052,6 +1527,7 @@ private:
     std::uint64_t reader_ = 0;
     std::size_t watched_pages_ = 0, hot_pages_ = 0;  // covered pages write-watched, and hot
     Vector<std::uint8_t> idle_;  // per 4 KiB page: refreshes a hot page went without a write (kCool)
+    Vector<std::uint64_t> sums_;  // per 256-byte piece from first_: sum of the bytes copied last, 0: not known
     bool runs_stale_ = false;         // a page became hot or cold: watch_runs_ is rebuilt at the next refresh
     std::uint64_t refresh_asks_ = 0;
     std::uint64_t refresh_written_ = 0;
@@ -1065,15 +1541,59 @@ leonida::host_heap::vector<ShadowPages*>& shadow_pages_list() {
     return *list;
 }
 
+// A title write into a committed, private, read-only page of title memory that no guard owns (the geometry watch,
+// the slot-133 shadows and the kernel-write unguarder all declined it): a guard of ours left behind, since the title
+// never writes memory it made read-only itself on the console. Said for the first 32 pages, with whether a shadow's
+// range still covers the page (its bookkeeping then calls the page unguarded). LEONIDA_STRAY_RO_HEAL=1: the page is
+// made writable again and the write retried, so the title goes on (a shadow may then miss that page's next writes:
+// the GPU copy may be stale for one frame).
+bool stray_read_only(EXCEPTION_POINTERS* info, std::uintptr_t address) {
+    MEMORY_BASIC_INFORMATION m{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(address), &m, sizeof m)) return false;
+    if (m.State != MEM_COMMIT || m.Type != MEM_PRIVATE || (m.Protect & 0xff) != PAGE_READONLY) return false;
+    std::uint64_t lo = 0, hi = 0;
+    if (!leonida::title_va_aliases().title_memory(address, lo, hi)) return false;
+    static const bool heal = [] {
+        const char* v = std::getenv("LEONIDA_STRAY_RO_HEAL");
+        return v && *v == '1';
+    }();
+    unsigned covering = 0;
+    AcquireSRWLockShared(&g_shadow_pages_lock);
+    for (ShadowPages* pages : shadow_pages_list()) covering += pages->contains(address);
+    ReleaseSRWLockShared(&g_shadow_pages_lock);
+    static std::atomic<unsigned> told{0}, healed{0};
+    const std::uintptr_t page = address & ~std::uintptr_t(0xfff);
+    bool ok = false;
+    if (heal) {
+        DWORD old = 0;
+        ok = VirtualProtect(reinterpret_cast<void*>(page), 0x1000, (m.Protect & ~DWORD(0xff)) | PAGE_READWRITE, &old) != 0;
+        if (ok) healed.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (told.fetch_add(1, std::memory_order_relaxed) < 32) {
+        const auto rip = info && info->ContextRecord ? info->ContextRecord->Rip : 0;
+        std::fprintf(stderr, "[rt] d3d12: stray read-only title page 0x%llx (write to 0x%llx from rip 0x%llx; "
+                             "allocation 0x%llx, protect 0x%lx): no guard owns it, %u shadow range(s) cover it; %s "
+                             "(%u healed so far)\n",
+                     static_cast<unsigned long long>(page), static_cast<unsigned long long>(address),
+                     static_cast<unsigned long long>(rip), static_cast<unsigned long long>(
+                         reinterpret_cast<std::uintptr_t>(m.AllocationBase)),
+                     static_cast<unsigned long>(m.Protect), covering,
+                     !heal ? "left to fault (LEONIDA_STRAY_RO_HEAL=1 makes it writable)" : ok ? "made writable" : "could not be made writable",
+                     healed.load(std::memory_order_relaxed));
+    }
+    return ok;
+}
+
 // A write to a page a shadow made read-only: the page is made writable again and the write retried. First in the
 // handler chain, so a startup trace doesn't log these as exceptions; any other access violation goes on down it.
 // Whatever thread wrote: the title's, or a host thread of the runtime's (a DirectStorage queue's copy).
 //
 // A physical page xmem maps at two addresses (a stream pool's CPU view and its GPU-only twin) has a protection per
-// address: a guard on one view never faults a write through the other, which the shadows see by copying aliased
-// pages at every submission (title_page_aliases), so the guard to look for is the faulting address's own. When none
-// answers for it (each guard reopens only what it protected), xmem makes the page writable again if its window is
-// (kernel_writes' unguarder): a read-only page nobody reopens would fault that write, and every later one, for good.
+// address: a guard on one view never faults a write through the other, which the shadows see through the geometry
+// watch's cells they arm at every address of an aliased page (ShadowPages::update_aliased), so the guard to look for
+// is the faulting address's own. When none answers for it (each guard reopens only what it protected), xmem makes the
+// page writable again if its window is (kernel_writes' unguarder): a read-only page nobody reopens would fault that
+// write, and every later one, for good.
 LONG CALLBACK shadow_write_fault(EXCEPTION_POINTERS* info) {
     const EXCEPTION_RECORD* record = info ? info->ExceptionRecord : nullptr;
     if (!record || record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 ||
@@ -1096,6 +1616,7 @@ LONG CALLBACK shadow_write_fault(EXCEPTION_POINTERS* info) {
     if (!retry)
         if (const auto unguard = leonida::kernel_writes::state().unguarder.load(std::memory_order_acquire))
             retry = unguard(address, address + 1);
+    if (!retry) retry = stray_read_only(info, address);
     return retry ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -1111,6 +1632,15 @@ void open_shadow_pages(std::uintptr_t from, std::uintptr_t to) {
     AcquireSRWLockShared(&g_shadow_pages_lock);
     for (ShadowPages* pages : shadow_pages_list()) pages->reopen_range(from, to);
     ReleaseSRWLockShared(&g_shadow_pages_lock);
+}
+
+// fsdraw's backing hook: whether a slot-133 shadow keeps the GPU copy of a title VA (LEONIDA_FSDRAW_PROBE only).
+const char* fsdraw_backing(std::uint64_t title_va) {
+    unsigned covering = 0;
+    AcquireSRWLockShared(&g_shadow_pages_lock);
+    for (ShadowPages* pages : shadow_pages_list()) covering += pages->contains(std::uintptr_t(title_va));
+    ReleaseSRWLockShared(&g_shadow_pages_lock);
+    return covering ? "a slot-133 shadow" : "an alias with no slot-133 shadow (window, geometry view or import)";
 }
 
 // Installs the handler once. false: it couldn't be, and shadows copy every page at every submission.
@@ -1237,6 +1767,161 @@ std::filesystem::path pipeline_cache_session_path() {
     return path;
 }
 
+// The pipelines the offline seed does not have, kept next to it and written while the game runs
+// (src/heavy_pipeline_cache.h).
+std::filesystem::path pipeline_cache_heavy_path() {
+    std::filesystem::path path = pipeline_cache_path();
+    if (!path.empty()) path.replace_filename(L"pipeline_cache.heavy.bin");
+    return path;
+}
+
+// LEONIDA_COMPILE_GATE unset or `auto` (src/compile_gate_policy.h): decides the compile gate for this GPU and driver
+// before the VulkanContext (and its SubmitMutex) exists. The verdict comes from compile_gate_calibration.txt beside
+// the pipeline cache, or from a calibration on `info.queue` (src/compile_gate_calibration.h), written there once.
+// Only in gta6rt's title process (compile_gate_policy::calibration_allowed): a build host, a test or anything else
+// that creates a device keeps the classic gate and never calibrates. A forced setting returns at once.
+void decide_auto_compile_gate(const VulkanDeviceInfo& info, PFN_vkGetDeviceProcAddr get_device,
+                              const leonida::cached_pso::Identity& identity) {
+    namespace policy = leonida::compile_gate_policy;
+    using leonida::CompileGateMode;
+    using leonida::SubmitMutex;
+    if (SubmitMutex::compile_gate_setting() != policy::Setting::automatic) return;
+    if (!policy::calibration_allowed.load() || compile_helper::build_host.load()) return;  // classic, as before `auto`
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        const auto decide = [](CompileGateMode mode, const std::string& why) {
+            SubmitMutex::decide_auto_gate(mode);
+            std::fprintf(stderr, "[rt] compile-gate: auto: %s (%s; LEONIDA_COMPILE_GATE=classic|adaptive overrides)\n",
+                         mode == CompileGateMode::adaptive ? "adaptive" : "classic", why.c_str());
+        };
+        const auto utf8 = [](const std::filesystem::path& path) {
+            const std::wstring& wide = path.native();
+            const int n = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), int(wide.size()), nullptr, 0, nullptr, nullptr);
+            std::string out(std::size_t(n > 0 ? n : 0), '\0');
+            if (n > 0) WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), int(wide.size()), out.data(), n, nullptr, nullptr);
+            return out;
+        };
+        if (!identity.vendor || !info.device || !info.queue || !get_device) {
+            decide(CompileGateMode::classic, "the GPU or its queue is not known, so no calibration");
+            return;
+        }
+        const std::string driver = policy::describe_driver(identity.vendor, identity.driver);
+        if (info.physical && info.get_instance_proc) {
+            if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                    info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
+                VkPhysicalDeviceProperties props{};
+                get_props(info.physical, &props);
+                if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+                    decide(CompileGateMode::classic, driver + " is a CPU device, not calibrated");
+                    return;
+                }
+            }
+        }
+        policy::CacheKey key;
+        key.vendor = identity.vendor;
+        key.device = identity.device;
+        key.driver = identity.driver;
+        std::memcpy(key.uuid, identity.cache_uuid, sizeof key.uuid);
+        std::filesystem::path path = pipeline_cache_path();
+        if (!path.empty()) path.replace_filename(L"compile_gate_calibration.txt");
+        std::string text;
+        if (!path.empty()) {
+            std::ifstream in(path, std::ios::binary);
+            if (in) text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        char value[4] = {};
+        std::size_t length = 0;
+        const bool recalibrate =
+            getenv_s(&length, value, "LEONIDA_COMPILE_GATE_RECALIBRATE") == 0 && length > 1 && policy::recalibrate(value);
+        if (!recalibrate) {
+            if (const auto cached = policy::find_entry(text, key)) {
+                decide(policy::mode_for(cached->verdict.outcome),
+                       "cached calibration of " + driver + ": " + policy::describe_verdict(cached->verdict) + "; in " +
+                           utf8(path) + ", LEONIDA_COMPILE_GATE_RECALIBRATE=1 measures again");
+                return;
+            }
+        }
+        const auto seed = static_cast<std::uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count()) | 1u;
+        const leonida::compile_gate_calibration::Result result =
+            leonida::compile_gate_calibration::calibrate(get_device, info.device, info.queue, info.queue_family, seed);
+        if (!result.ok) {
+            decide(CompileGateMode::classic, "calibration of " + driver + " failed: " + result.error + "; not cached");
+            return;
+        }
+        std::string where = "not cached (no pipeline cache folder)";
+        if (!policy::cache_verdict(result.verdict.outcome)) {
+            where = "not cached: the next launch measures again";
+        } else if (!path.empty()) {
+            const std::string updated = policy::replace_entry(text, {key, result.verdict});
+            std::filesystem::path temp = path;
+            temp += L".tmp";
+            bool written = false;
+            {
+                std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+                out.write(updated.data(), std::streamsize(updated.size()));
+                written = bool(out);
+            }
+            std::error_code ec;
+            if (written) std::filesystem::rename(temp, path, ec);
+            where = written && !ec ? "cached in " + utf8(path) : "not cached (" + utf8(path) + " could not be written)";
+        }
+        char took[64];
+        std::snprintf(took, sizeof took, " in %.1f s", result.total_ms / 1000.0);
+        decide(policy::mode_for(result.verdict.outcome), "calibrated on " + driver + took + ": " +
+                                                             policy::describe_verdict(result.verdict) + "; " + where);
+    });
+}
+
+// LEONIDA_HEAVY_PIPELINE_CACHE_MS: a compile at least this long schedules a write of the heavy cache; 0 turns the
+// heavy cache off. One line for a value that is not a number.
+std::uint32_t heavy_pipeline_cache_ms() {
+    static const std::uint32_t ms = [] {
+        char text[32] = {};
+        size_t length = 0;
+        const bool present = getenv_s(&length, text, "LEONIDA_HEAVY_PIPELINE_CACHE_MS") == 0 && length > 1;
+        const auto threshold = leonida::heavy_pipeline_cache::parse_threshold(present ? text : "");
+        if (!threshold.valid)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_HEAVY_PIPELINE_CACHE_MS=%s is not a number of milliseconds; "
+                                 "using %u\n", text, threshold.ms);
+        return threshold.ms;
+    }();
+    return ms;
+}
+
+std::size_t pipeline_cache_save_limit();
+
+// LOCAL FIX (pipeline journal, pipeline_cache_journal.h): where each compute pipeline's own cache file goes, beside
+// the session file (so LEONIDA_PIPELINE_CACHE_DIR moves it too). Empty, and no journal, with LEONIDA_PIPELINE_JOURNAL=0
+// or LEONIDA_PIPELINE_CACHE_BYTES=0.
+const leonida::pipeline_journal::Roots& pipeline_journal_roots() {
+    static const auto roots = []() -> leonida::pipeline_journal::Roots {
+        wchar_t value[2]{};
+        if (GetEnvironmentVariableW(L"LEONIDA_PIPELINE_JOURNAL", value, 2) == 1 && value[0] == L'0')
+            return {};
+        if (!pipeline_cache_save_limit()) return {};
+        std::filesystem::path path = pipeline_cache_path();
+        if (!path.empty()) path.replace_filename(L"pipeline_cache.d");
+        std::wstring seed(32768, L'\0');
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_PIPELINE_JOURNAL_SEED_DIR", seed.data(),
+                                                static_cast<DWORD>(seed.size()));
+        if (n >= seed.size()) return {};
+        seed.resize(n);
+        auto result = leonida::pipeline_journal::resolve_roots(path, seed);
+        if (!seed.empty() && result.writable.empty())
+            std::fprintf(stderr, "[rt] d3d12: invalid or overlapping compute journal directories; journal disabled\n");
+        return result;
+    }();
+    return roots;
+}
+
+const std::filesystem::path& pipeline_journal_dir() {
+    return pipeline_journal_roots().writable;
+}
+
+// The offline seed's size (pipeline_cache.bin) when the device cache was created from it, 0 otherwise: the save limit
+// does not count it (pipeline_cache_store::over_save_limit).
+std::atomic<std::size_t> g_offline_seed_bytes{0};
+
 // LEONIDA_PIPELINE_CACHE_BYTES, in bytes; 0 turns the session file off. One line for a value that is not a number.
 std::size_t pipeline_cache_save_limit() {
     char text[32] = {};
@@ -1309,6 +1994,7 @@ VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_ca
         return VK_NULL_HANDLE;
     }
     std::fprintf(stderr, "[rt] d3d12: loaded %zu bytes from %s\n", seed.size(), name);
+    if (!session) g_offline_seed_bytes.store(seed.size(), std::memory_order_relaxed);
     if (trace_pipeline_compile())
         std::fprintf(stderr, "[rt] pipeline-cache op=load bytes=%zu map_us=%lld driver_us=%lld file=%s\n",
                      seed.size(), mapped-start, compile_us()-mapped, name);
@@ -1319,16 +2005,16 @@ VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_ca
 // and the session file cannot be handed over as one VkPipelineCacheCreateInfo -- Vulkan reads a single blob -- so the
 // session cache is created on its own and merged in. A missing, foreign or corrupt session file leaves the cache as
 // it was, and so does a driver that does not expose vkMergePipelineCaches.
-void merge_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
+bool merge_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
                                   const leonida::cached_pso::Identity& identity) {
-    if (!cache || !vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache || !vk.vkMergePipelineCaches) return;
-    if (!pipeline_cache_save_limit()) return;  // LEONIDA_PIPELINE_CACHE_BYTES=0 turns the session file off
+    if (!cache || !vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache || !vk.vkMergePipelineCaches) return false;
+    if (!pipeline_cache_save_limit()) return false;  // LEONIDA_PIPELINE_CACHE_BYTES=0 turns the session file off
     const auto start = compile_us();
     const PipelineCacheSeed seed(pipeline_cache_session_path());
-    if (!seed.data()) return;
+    if (!seed.data()) return false;
     if (!seed.compatible(identity)) {
         std::fprintf(stderr, "[rt] d3d12: pipeline_cache.session.bin does not match this Vulkan device\n");
-        return;
+        return false;
     }
     const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, seed.size(),
                                            seed.data()};
@@ -1336,7 +2022,7 @@ void merge_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDe
     VkPipelineCache session = VK_NULL_HANDLE;
     if (vk.vkCreatePipelineCache(device, &create, nullptr, &session) != VK_SUCCESS) {
         std::fprintf(stderr, "[rt] d3d12: Vulkan declined pipeline_cache.session.bin\n");
-        return;
+        return false;
     }
     const auto created = compile_us();
     const VkResult result = vk.vkMergePipelineCaches(device, cache, 1, &session);
@@ -1350,12 +2036,14 @@ void merge_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDe
     else
         std::fprintf(stderr, "[rt] d3d12: vkMergePipelineCaches on pipeline_cache.session.bin returned %d; ignored\n",
                      static_cast<int>(result));
+    return result == VK_SUCCESS;
 }
 
 // LEONIDA_SKIP_COMPUTE=<part of a name>[,<part>...]: compute programs whose library name contains one of the parts are
 // never built and every dispatch of theirs is dropped ("all" or "*": every compute program). For getting past a
 // program that hangs the GPU, such as a translated loop that never ends on the input it is given here, while the
 // program or its input is being fixed. What the program would have written keeps its previous contents.
+// gta6rt --precompile-pipelines builds the listed programs anyway unless it is given --skip-listed.
 bool skip_compute(const std::string& name) {
     static const std::vector<std::string> parts = [] {
         std::vector<std::string> out;
@@ -1401,14 +2089,39 @@ bool console_format_stand_ins() {
     return on;
 }
 
-// A driver's compiler needs hundreds of MiB for a very large module; several at once exhausted host memory. Compute modules
-// over 128 KiB compile one at a time (LEONIDA_SERIAL_BIG_COMPILES=0: as many as are asked for).
-bool serial_big_compile(std::size_t spirv_bytes) {
-    static const bool serial = [] {
+// A driver's compiler needs hundreds of MiB for a very large module; several at once exhausted host memory. Large are
+// compute modules over 128 KiB and graphics pipelines of PipelineCompiles::large_spirv_bytes or more. They compile side by
+// side while their estimates fit the memory that is free (big_compile_gate). LEONIDA_SERIAL_BIG_COMPILES=1: one at a time,
+// as before there was a budget (graphics: one after another in each submission). 0: as many as are asked for.
+enum class BigCompiles { budget, serial, unlimited };
+BigCompiles big_compiles() {
+    static const BigCompiles mode = [] {
         wchar_t v[2]{};
-        return !(GetEnvironmentVariableW(L"LEONIDA_SERIAL_BIG_COMPILES", v, 2) == 1 && v[0] == L'0');
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_SERIAL_BIG_COMPILES", v, 2);
+        if (n == 0) return BigCompiles::budget;
+        return n == 1 && v[0] == L'0' ? BigCompiles::unlimited : BigCompiles::serial;
     }();
-    return serial && spirv_bytes > 128 * 1024;
+    return mode;
+}
+bool big_compute(std::size_t spirv_bytes) { return spirv_bytes > 128 * 1024; }
+
+// Where large compiles wait for memory: one for the process, as the memory is the machine's. Never destroyed: static
+// destruction must not race the compile worker.
+leonida::LargeModuleGate& big_compile_gate() {
+    static auto* const gate = [] {
+        char text[32]{};
+        std::size_t length = 0;
+        const bool present = getenv_s(&length, text, "LEONIDA_BIG_COMPILE_BUDGET_MB") == 0 && length > 1;
+        const auto setting = leonida::large_compile_budget(present ? text : "");
+        if (!setting.valid)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_BIG_COMPILE_BUDGET_MB=%s is not a number; not used\n", text);
+        auto budget = [fixed = setting.fixed] { return fixed ? *fixed : leonida::large_compile_budget_bytes(); };
+        std::fprintf(stderr, "[rt] d3d12: large pipelines compile side by side within %llu MiB (%s)\n",
+                     static_cast<unsigned long long>(budget() >> 20),
+                     setting.fixed ? "LEONIDA_BIG_COMPILE_BUDGET_MB" : "3/4 of the memory free now");
+        return new leonida::LargeModuleGate(std::move(budget));
+    }();
+    return *gate;
 }
 
 bool startup_cache_checkpoints_enabled() {
@@ -1421,18 +2134,19 @@ bool startup_cache_checkpoints_enabled() {
 
 // Writes the session cache at a startup checkpoint or during device teardown. The size cap applies to either write.
 void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
-                                 bool checkpoint = false) {
+                                 bool checkpoint = false, const char* op = nullptr) {
     if (!cache || !vk.vkGetPipelineCacheData) return;
-    auto limit = pipeline_cache_save_limit();
-    // The output is an opaque Vulkan blob. A prefix is not an incremental cache.
-    if (checkpoint) limit = (std::min)(limit, std::size_t{512} << 20);
+    // The output is an opaque Vulkan blob. A prefix is not an incremental cache, so past the limit nothing is written.
+    const auto limit = pipeline_cache_save_limit();
     if (!limit) return;
     const auto start = compile_us();
     std::size_t size = 0;
     if (vk.vkGetPipelineCacheData(device, cache, &size, nullptr) != VK_SUCCESS ||
         size <= sizeof(VkPipelineCacheHeaderVersionOne)) return;
-    if (size > limit) {
-        std::fprintf(stderr, "[rt] d3d12: pipeline cache is %zu bytes, over the %zu-byte write limit\n", size, limit);
+    const std::size_t seed = g_offline_seed_bytes.load(std::memory_order_relaxed);
+    if (leonida::pipeline_cache_store::over_save_limit(size, seed, limit)) {
+        std::fprintf(stderr, "[rt] d3d12: pipeline cache is %zu bytes (%zu of them the offline seed), over the "
+                             "%zu-byte write limit for what a session adds\n", size, seed, limit);
         return;
     }
     const auto queried = compile_us();
@@ -1452,10 +2166,70 @@ void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDev
                     written <= size && staging.publish(path, written);
     if (trace_pipeline_compile())
         std::fprintf(stderr, "[rt] pipeline-cache op=%s bytes=%zu query_us=%lld fill_us=%lld publish_us=%lld ok=%d result=%d\n",
-                     checkpoint ? "checkpoint" : "teardown", written, queried-start, filled-queried,
+                     op ? op : checkpoint ? "checkpoint" : "teardown", written, queried-start, filled-queried,
                      compile_us()-filled, int(ok), int(result));
     if (ok) std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes to pipeline_cache.session.bin\n", written);
     else std::fprintf(stderr, "[rt] d3d12: pipeline cache snapshot incomplete (%d); previous session retained\n", int(result));
+}
+
+// The heavy cache, seeded from pipeline_cache.heavy.bin when it is there and made for this device; empty otherwise.
+VkPipelineCache create_heavy_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device,
+                                            const leonida::cached_pso::Identity& identity) {
+    const auto path = pipeline_cache_heavy_path();
+    clean_stale_cache_files(path);
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    {
+        const PipelineCacheSeed seed(path);
+        if (seed.data() && seed.compatible(identity)) {
+            const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0,
+                                                   seed.size(), seed.data()};
+            if (vk.vkCreatePipelineCache(device, &create, nullptr, &cache) == VK_SUCCESS) {
+                std::fprintf(stderr, "[rt] d3d12: loaded %zu bytes from pipeline_cache.heavy.bin\n", seed.size());
+                return cache;
+            }
+            std::fprintf(stderr, "[rt] d3d12: Vulkan declined pipeline_cache.heavy.bin; starting it empty\n");
+        } else if (seed.data()) {
+            std::fprintf(stderr, "[rt] d3d12: pipeline_cache.heavy.bin does not match this Vulkan device; starting "
+                                 "it empty\n");
+        }
+    }
+    const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    if (vk.vkCreatePipelineCache(device, &create, nullptr, &cache) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return cache;
+}
+
+// Writes the heavy cache whole: a staging file renamed over pipeline_cache.heavy.bin, so the file on disk is always
+// a complete blob. It only holds what the offline seed missed, so it has no size limit of its own.
+bool save_heavy_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
+                               std::uint64_t compiles, std::uint64_t hits) {
+    if (!cache || !vk.vkGetPipelineCacheData) return false;
+    const auto path = pipeline_cache_heavy_path();
+    if (path.empty()) return false;
+    const auto start = compile_us();
+    std::size_t size = 0;
+    if (vk.vkGetPipelineCacheData(device, cache, &size, nullptr) != VK_SUCCESS ||
+        size <= sizeof(VkPipelineCacheHeaderVersionOne))
+        return false;
+    CacheStagingFile staging(path, size);
+    if (!staging.data) {
+        std::fprintf(stderr, "[rt] d3d12: could not map a staging file for %zu heavy pipeline cache bytes\n", size);
+        return false;
+    }
+    auto written = size;
+    const VkResult result = vk.vkGetPipelineCacheData(device, cache, &written, staging.data);
+    // VK_INCOMPLETE means the cache grew after the size query and the blob is a truncated snapshot; it must not
+    // replace a complete file. The writer tries again later with a fresh size.
+    const bool ok = result == VK_SUCCESS && written > sizeof(VkPipelineCacheHeaderVersionOne) && written <= size &&
+                    staging.publish(path, written);
+    if (ok)
+        std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes to pipeline_cache.heavy.bin in %.1f s (%llu slow builds "
+                             "and %llu other builds past the offline cache so far)\n",
+                     written, double(compile_us() - start) / 1e6, static_cast<unsigned long long>(compiles),
+                     static_cast<unsigned long long>(hits));
+    else
+        std::fprintf(stderr, "[rt] d3d12: pipeline_cache.heavy.bin not written (%d); the previous file is kept\n",
+                     int(result));
+    return ok;
 }
 
 // A shader whose subgroup size cannot be had runs at the device's: inexact if it crosses the halves of a wave64 (or,
@@ -1874,6 +2648,18 @@ public:
             if (va >= r.console_va && va - r.console_va < r.bytes) return r.shader_va + (va - r.console_va);
         return va;
     }
+    // The console heap holding `va`: its console VA and size. False when no console heap with a copy holds it.
+    bool range_of(std::uint64_t va, std::uint64_t& console_va, std::uint64_t& bytes) const {
+        if (!count_.load(std::memory_order_acquire)) return false;
+        std::shared_lock lock(mutex_);
+        for (const Range& r : ranges_)
+            if (va >= r.console_va && va - r.console_va < r.bytes) {
+                console_va = r.console_va;
+                bytes = r.bytes;
+                return true;
+            }
+        return false;
+    }
 
 private:
     struct Range {
@@ -1903,12 +2689,68 @@ bool console_heap_shadow_enabled() {
 // What a T# the title wrote itself into a console descriptor heap came to (bind_title_image, after Resource).
 // not_tsharp: words with an image TYPE that do not decode as a T#: data, not a descriptor (the retail heap's last
 // 27 MiB are also the slot-133 pool, whose buffers sit there; T14 in ref/GAP-ANALYSIS-2.md).
-enum class TitleImage { known, bound, unknown, refused, not_tsharp };
+// TitleImage is defined in d3d12_com.h.
 class Resource;
 struct DeviceState;
 // `why`, when given, says what refused a T#: the first refusals are logged with their words (scan_console_slots).
 TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why = nullptr);
 struct TitleTexture;  // a texture the title keeps in its own memory (TitleTexture, after Resource)
+
+// The first refused T#s of each reason, with where they sit in the heap and their words, and counts of the
+// distinct slots refused overall and per reason (a slot is scanned again every pass over the heap).
+struct UnboundTsharpTracker {
+    std::mutex mutex;
+    std::set<std::size_t> total_slots;
+    std::map<std::string, std::set<std::size_t>> slots_by_reason;
+    std::map<std::string, std::uint64_t> counts_by_reason;
+    std::map<std::string, unsigned> logged;
+    std::uint64_t total_refusals = 0;
+
+    void note(std::uint64_t heap_va, std::size_t offset, const leonida::gfx10::ImageWords& words, const char* why) {
+        std::lock_guard lock(mutex);
+        const std::string reason = why ? why : "?";
+        ++total_refusals;
+        ++counts_by_reason[reason];
+        if (total_slots.size() >= 262144) return;  // enough to say how many
+        const bool fresh_overall = total_slots.insert(offset).second;
+        const bool fresh_reason = slots_by_reason[reason].insert(offset).second;
+        unsigned& n = logged[reason];
+        if ((!fresh_overall && !fresh_reason) || n >= 6) return;
+        ++n;
+        std::fprintf(stderr,
+                     "[rt] d3d12: unbound T# in console heap 0x%llx at +0x%zx (%zu distinct slots so far, %zu for '%s'): %s: "
+                     "%08x %08x %08x %08x %08x %08x %08x %08x\n",
+                     static_cast<unsigned long long>(heap_va), offset, total_slots.size(),
+                     slots_by_reason[reason].size(), reason.c_str(), reason.c_str(), words[0],
+                     words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    }
+
+    UnboundTsharpStats stats() {
+        std::lock_guard lock(mutex);
+        UnboundTsharpStats s;
+        s.total_distinct_slots = total_slots.size();
+        s.total_refusals = total_refusals;
+        for (const auto& [reason, slots] : slots_by_reason) {
+            s.by_reason[reason].distinct_slots = slots.size();
+            s.by_reason[reason].total_refusals = counts_by_reason[reason];
+        }
+        return s;
+    }
+
+    void reset() {
+        std::lock_guard lock(mutex);
+        total_slots.clear();
+        slots_by_reason.clear();
+        counts_by_reason.clear();
+        logged.clear();
+        total_refusals = 0;
+    }
+};
+
+UnboundTsharpTracker& unbound_tsharp_tracker() {
+    static UnboundTsharpTracker tracker;
+    return tracker;
+}
 
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 class Resource;
@@ -1959,8 +2801,95 @@ struct DeviceState {
     // heap equivalents are in MEMORY_POOL_L0 and custom heaps in L1 are refused, as the host runtime does there.
     bool uma = false;
     leonida::cached_pso::Identity pso_identity;  // what GetCachedBlob records and CachedPSO is checked against
+    // LEONIDA_PIPELINE_ORDER_LOG=1: which pipelines the title asks for first, appended to pipeline_order.log beside the
+    // session cache (pipeline_order.h). Null when off: the pipelines then carry no hook at all.
+    std::unique_ptr<leonida::pipeline_order::Recorder> order_log;
+    // LEONIDA_PIPELINE_PREWARM_ORDER=<file> ("1": pipeline_order.log beside the session cache): the graphics pipelines an
+    // earlier run asked for first, queued as warm-ups in that order when the title creates them (pipeline_prewarm.h).
+    // Null when off. Read before start_order_log, which appends this run to the same file when both are on.
+    std::unique_ptr<const leonida::pipeline_prewarm::Plan> prewarm_plan;
+    void load_prewarm_plan() {
+        namespace prewarm = leonida::pipeline_prewarm;
+        wchar_t value[1024]{};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_PIPELINE_PREWARM_ORDER", value, DWORD(std::size(value)));
+        if (n == 0 || n >= std::size(value) || (n == 1 && value[0] == L'0')) return;
+        try {
+            std::filesystem::path path = value;
+            if (n == 1 && value[0] == L'1') {
+                path = pipeline_cache_session_path();
+                if (path.empty()) {
+                    std::fprintf(stderr, "[rt] pipeline-prewarm: no session cache folder; nothing is prewarmed\n");
+                    return;
+                }
+                path.replace_filename(L"pipeline_order.log");
+            }
+            const auto count = [](const char* name, std::uint64_t fallback) {
+                char text[32]{};
+                const DWORD m = GetEnvironmentVariableA(name, text, sizeof(text));
+                return prewarm::parse_count(m > 0 && m < sizeof(text) ? text : nullptr, fallback);
+            };
+            prewarm::Options options;
+            options.budget_ms = count("LEONIDA_PIPELINE_PREWARM_BUDGET_MS", prewarm::default_budget_ms);
+            options.max_entries = std::size_t(count("LEONIDA_PIPELINE_PREWARM_MAX_ENTRIES", prewarm::default_max_entries));
+            auto plan = prewarm::load_plan(path, pso_identity.vendor, pso_identity.device, options);
+            std::fprintf(stderr, "%s\n", plan.message.c_str());
+            if (plan) prewarm_plan = std::make_unique<const prewarm::Plan>(std::move(plan));
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] pipeline-prewarm: the order log could not be read (%s); nothing is prewarmed\n",
+                         e.what());
+        }
+    }
+    void start_order_log() {
+        char text[8]{};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_PIPELINE_ORDER_LOG", text, sizeof(text));
+        if (n == 0 || n >= sizeof(text) || !leonida::pipeline_order::parse_enabled(text)) return;
+        auto path = pipeline_cache_session_path();
+        if (path.empty()) return;
+        path.replace_filename(L"pipeline_order.log");
+        leonida::pipeline_order::Recorder::Config config;
+        config.path = std::move(path);
+        config.vendor = pso_identity.vendor;
+        config.device = pso_identity.device;
+        config.now_ms = &order_now_ms;
+        order_log = std::make_unique<leonida::pipeline_order::Recorder>(std::move(config));
+        order_log->start(std::chrono::milliseconds(250));
+    }
+    // The one line of counts, once: at the exit save or when the device goes, whichever comes first.
+    void close_order_log() {
+        if (!order_log) return;
+        const std::string line = order_log->close();
+        if (line.empty()) return;
+        if (order_log->failed())
+            std::fprintf(stderr, "[rt] pipeline-order: could not write %ls\n", order_log->path().c_str());
+        else
+            std::fprintf(stderr, "%s\n", line.c_str());
+    }
+    // Milliseconds since this process started.
+    static std::uint32_t order_now_ms() {
+        static const ULONGLONG started = [] {
+            FILETIME created{}, exited{}, kernel{}, user{};
+            if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return ULONGLONG(0);
+            return (ULONGLONG(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+        }();
+        FILETIME now{};
+        GetSystemTimeAsFileTime(&now);
+        const ULONGLONG t = (ULONGLONG(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+        return started && t > started ? std::uint32_t(std::min<ULONGLONG>((t - started) / 10000, 0xfffffffeull)) : 0;
+    }
     std::once_flag pipeline_cache_once;
     VkPipelineCache pipeline_cache_handle = VK_NULL_HANDLE;
+    // The shared cache started from a file (the offline seed or an earlier session): a compute pipeline the journal
+    // has no file for may still be in it (build_compute asks it first, when it can ask without a compile).
+    bool pipeline_cache_seeded = false;
+    std::atomic<unsigned> journal_hits{0}, journal_writes{0}, journal_shared_hits{0};
+    std::atomic<std::uint64_t> journal_bytes{0};  // on disk: counted at the cache's creation, then added to
+    std::uint64_t journal_budget = leonida::pipeline_journal::default_budget;
+    // Ask the shared cache first, with FAIL_ON_PIPELINE_COMPILE_REQUIRED, while the driver honours it.
+    // LEONIDA_PIPELINE_JOURNAL_ASK_SHARED=0: never.
+    std::atomic<bool> journal_ask_shared{[] {
+        wchar_t value[2]{};
+        return !(GetEnvironmentVariableW(L"LEONIDA_PIPELINE_JOURNAL_ASK_SHARED", value, 2) == 1 && value[0] == L'0');
+    }()};
     std::atomic<ULONGLONG> next_checkpoint{GetTickCount64() + 120000};
     std::atomic<unsigned> active_compiles{0};
 
@@ -1969,23 +2898,147 @@ struct DeviceState {
             const auto& vk = context->vk;
             if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache) return;
             if (pipeline_cache_save_limit()) clean_stale_cache_files(pipeline_cache_session_path());
-            pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity);
+            // A build host (precompile, compile helper) journals every pipeline: no seed, no session file.
+            if (!compile_helper::build_host)
+                pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity);
             if (pipeline_cache_handle) {
+                pipeline_cache_seeded = true;
                 merge_session_pipeline_cache(vk, info.device, pipeline_cache_handle, pso_identity);
-            } else if (pipeline_cache_save_limit() && direct_session_cache()) {
+            } else if (pipeline_cache_save_limit() && direct_session_cache() && !compile_helper::build_host) {
                 // With no offline seed the session file can initialize the actual cache directly.
                 pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity, true);
+                pipeline_cache_seeded = pipeline_cache_handle != VK_NULL_HANDLE;
             }
             if (!pipeline_cache_handle) {
                 const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
                 if (vk.vkCreatePipelineCache(info.device, &create, nullptr, &pipeline_cache_handle) != VK_SUCCESS)
                     pipeline_cache_handle = VK_NULL_HANDLE;
-                else if (!direct_session_cache())
-                    merge_session_pipeline_cache(vk, info.device, pipeline_cache_handle, pso_identity);
+                else if (!direct_session_cache() && !compile_helper::build_host)
+                    pipeline_cache_seeded = merge_session_pipeline_cache(vk, info.device, pipeline_cache_handle, pso_identity);
             }
+            if (!pipeline_journal_dir().empty()) {
+                char text[32] = {};
+                size_t length = 0;
+                if (getenv_s(&length, text, "LEONIDA_PIPELINE_JOURNAL_BYTES") == 0 && length > 1) {
+                    const auto budget = leonida::pipeline_cache_store::parse_save_limit(text);
+                    if (budget.valid) journal_budget = budget.bytes;
+                }
+                // Old staging files out, and the least recently used files when over the budget: translator
+                // regenerations leave files no build names any more.
+                const auto tidy = leonida::pipeline_journal::tidy(pipeline_journal_dir(), journal_budget);
+                journal_bytes = tidy.bytes;
+                if (tidy.evicted || tidy.swept)
+                    std::fprintf(stderr, "[rt] d3d12: pipeline journal: removed %zu least recently used file(s) over "
+                                         "the %llu-byte budget and %zu stale staging file(s); %zu file(s), %llu bytes "
+                                         "left\n", tidy.evicted, static_cast<unsigned long long>(journal_budget),
+                                 tidy.swept, tidy.entries, static_cast<unsigned long long>(tidy.bytes));
+            }
+            if (!pipeline_journal_dir().empty())
+                std::fprintf(stderr, "[rt] d3d12: compute pipelines are journaled one file each in %ls\n",
+                             pipeline_journal_dir().c_str());
+            if (compile_helper::enabled() && !pipeline_journal_dir().empty()) compile_helper::Client::instance().prestart();
         });
         // Without EXTERNALLY_SYNCHRONIZED_BIT the driver synchronizes concurrent pipeline creation using this cache.
         return pipeline_cache_handle;
+    }
+
+    // The heavy pipeline cache (src/heavy_pipeline_cache.h) and the thread that writes it.
+    std::once_flag heavy_cache_once;
+    VkPipelineCache heavy_cache_handle = VK_NULL_HANDLE;
+    std::mutex heavy_mutex;
+    std::condition_variable heavy_wake;
+    leonida::heavy_pipeline_cache::WriteSchedule heavy_schedule;  // under heavy_mutex
+    bool heavy_stop = false;                                      // under heavy_mutex
+    std::thread heavy_writer;                                     // started at the first slow build
+    std::atomic<std::uint64_t> heavy_compiles{0}, heavy_hits{0};
+    std::atomic<bool> heavy_changed{false};  // a build went into the heavy cache since it was loaded
+
+    VkPipelineCache heavy_cache() {
+        std::call_once(heavy_cache_once, [this] {
+            if (context->vk.vkCreatePipelineCache)
+                heavy_cache_handle = create_heavy_pipeline_cache(context->vk, info.device, pso_identity);
+        });
+        return heavy_cache_handle;
+    }
+
+    // A build past the offline cache took `took_ms`: a slow one schedules a write.
+    void note_heavy_build(ULONGLONG took_ms) {
+        heavy_changed = true;
+        if (took_ms < heavy_pipeline_cache_ms()) {
+            ++heavy_hits;
+            return;
+        }
+        ++heavy_compiles;
+        std::lock_guard lock(heavy_mutex);
+        if (heavy_stop) return;
+        heavy_schedule.note_heavy(GetTickCount64());
+        if (!heavy_writer.joinable()) {
+            try {
+                heavy_writer = std::thread([this] { write_heavy_cache_loop(); });
+            } catch (const std::exception&) {
+                return;  // no thread: the cache is still written at teardown
+            }
+        }
+        heavy_wake.notify_one();
+    }
+
+    void write_heavy_cache_loop() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        std::unique_lock lock(heavy_mutex);
+        while (!heavy_stop) {
+            if (!heavy_schedule.dirty()) {
+                heavy_wake.wait(lock);
+                continue;
+            }
+            const std::uint64_t now = GetTickCount64();
+            if (!heavy_schedule.due(now)) {
+                heavy_wake.wait_for(lock, std::chrono::milliseconds(heavy_schedule.due_ms() - now));
+                continue;
+            }
+            const std::uint64_t generation = heavy_schedule.generation();
+            lock.unlock();
+            const bool saved = save_heavy_pipeline_cache(context->vk, info.device, heavy_cache_handle,
+                                                         heavy_compiles.load(), heavy_hits.load());
+            lock.lock();
+            // A failed write leaves the cache dirty: it is tried again after a growing delay, not only at teardown.
+            if (saved) heavy_schedule.written(generation, now);
+            else heavy_schedule.failed(now);
+        }
+    }
+
+    // At device teardown, with no build running: stop the writer and write the cache if any build went into it.
+    // Fast builds never schedule a write, so this is where they are kept: without an offline seed every build is
+    // a miss, and these are the builds pipeline_cache.session.bin used to keep.
+    void finish_heavy_cache() {
+        {
+            std::lock_guard lock(heavy_mutex);
+            heavy_stop = true;
+        }
+        heavy_wake.notify_all();
+        if (heavy_writer.joinable()) heavy_writer.join();
+        if (!heavy_cache_handle) return;
+        if (heavy_changed.load() && !active_compiles.load())
+            save_heavy_pipeline_cache(context->vk, info.device, heavy_cache_handle, heavy_compiles.load(),
+                                      heavy_hits.load());
+        context->vk.vkDestroyPipelineCache(info.device, heavy_cache_handle, nullptr);
+        heavy_cache_handle = VK_NULL_HANDLE;
+    }
+
+    // vkCreateGraphicsPipelines through `create(cache, flags)` (compute pipelines have their journal). With the heavy
+    // cache, the offline cache is asked first without compiling; a pipeline it does not have is built against the heavy
+    // cache, which a slow build then writes back to disk. A caller that already asked for a cache-only create keeps it.
+    template <class Create>
+    VkResult create_pipeline(VkPipelineCreateFlags flags, Create&& create) {
+        constexpr VkPipelineCreateFlags cache_only = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+        const VkPipelineCache corpus = pipeline_cache();
+        if (!info.heavy_pipeline_cache || (flags & cache_only)) return create(corpus, flags);
+        const VkResult cached = create(corpus, flags | cache_only);
+        if (cached != VK_PIPELINE_COMPILE_REQUIRED) return cached;
+        const VkPipelineCache heavy = heavy_cache();
+        const ULONGLONG started = GetTickCount64();
+        const VkResult built = create(heavy ? heavy : corpus, flags);
+        if (built == VK_SUCCESS && heavy) note_heavy_build(GetTickCount64() - started);
+        return built;
     }
 
     QueueClock clock;  // device-wide calibration entry points
@@ -2058,6 +3111,7 @@ struct DeviceState {
     std::uint64_t shadow_asks = 0;      // GetWriteWatch calls, likewise
     std::uint64_t shadow_written = 0;   // write-watched pages they found written, likewise
     std::array<std::uint64_t, unsigned(ShadowPages::Copy::count)> shadow_copy_bytes{};  // by cause, likewise
+    ShadowPages::Pieces shadow_pieces;  // summed over the refreshes since the last log line
     std::chrono::steady_clock::time_point shadow_alias_time{};  // the last refresh that copied aliased pages
     double shadow_ms = 0;               // spent since the last log line
     double shadow_max_ms = 0;           // the longest refresh since the last log line
@@ -2101,6 +3155,26 @@ struct DeviceState {
         for (std::size_t k = hits.size(); k-- > 1;) shadows.erase(shadows.begin() + std::ptrdiff_t(hits[k]));
         keep.fill(begin, end, shadow);
     }
+    void retire_shadow(const std::uint8_t* mapped) {
+        std::lock_guard lock(shadow_mutex);
+        for (const ShadowPagesPtr& s : shadows)
+            if (s->retire_target(mapped)) return;
+    }
+    // A retired window's memory is freed: what its copy holds that the title's pages do not, written by submissions
+    // that have all completed, goes back once more (where no live copy changed those bytes), then the copy leaves
+    // its tracker.
+    void free_retired_shadow(const std::uint8_t* mapped, std::uint64_t start, std::uint64_t size) {
+        std::lock_guard lock(shadow_mutex);
+        for (auto it = shadows.begin(); it != shadows.end(); ++it) {
+            ShadowPages& s = **it;
+            if (!s.has_target(mapped)) continue;
+            title_write_back_total += s.write_back(static_cast<std::uintptr_t>(start),
+                                                   static_cast<std::uintptr_t>(start + size), mapped);
+            s.remove_target(mapped);
+            if (!s.targets()) shadows.erase(it);
+            return;
+        }
+    }
     void remove_shadow(const std::uint8_t* mapped) {
         std::lock_guard lock(shadow_mutex);
         for (auto it = shadows.begin(); it != shadows.end(); ++it)
@@ -2124,11 +3198,13 @@ struct DeviceState {
         if (!pages) return;
         const leonida::submit_phases::Scope timed(leonida::submit_phases::shadows);
         std::lock_guard lock(shadow_mutex);
+        write_back_titles();  // what the last submission wrote in the copies, before the forward copy below
         if (shadows.empty()) return;
         const auto start = clock::now();
-        // LEONIDA_SHADOW_ALIAS_MS (0 by default: every submission): pages xmem maps at two addresses, which no guard
-        // can watch, are copied at most this often. After the story load they were 59 MiB a submission (speed-6); a
-        // GPU read of them is at most this many milliseconds behind the title's writes.
+        // LEONIDA_SHADOW_ALIAS_MS (0 by default: every submission): pages xmem maps at two addresses that a write
+        // reached, or whose cells can't be armed (ShadowPages::update_aliased), are copied at most this often. After
+        // the story load they were 59 MiB a submission (speed-6), copied every time; a GPU read of them is at most
+        // this many milliseconds behind the title's writes.
         static const auto alias_period = std::chrono::milliseconds([] {
             char text[16] = {};
             const DWORD n = GetEnvironmentVariableA("LEONIDA_SHADOW_ALIAS_MS", text, sizeof(text));
@@ -2145,6 +3221,14 @@ struct DeviceState {
             shadow_asks += s->refresh_asks();
             shadow_written += s->refresh_written();
             for (unsigned k = 0; k < shadow_copy_bytes.size(); ++k) shadow_copy_bytes[k] += s->copy_bytes()[k];
+            const ShadowPages::Pieces& p = s->pieces();
+            shadow_pieces.pieces += p.pieces;
+            shadow_pieces.short_pieces += p.short_pieces;
+            shadow_pieces.joinable += p.joinable;
+            shadow_pieces.calls += p.calls;
+            shadow_pieces.gpu_calls += p.gpu_calls;
+            shadow_pieces.walk_ms += p.walk_ms;
+            shadow_pieces.copy_ms += p.copy_ms;
         }
         const auto now = clock::now();
         const double ms = std::chrono::duration<double, std::milli>(now - start).count();
@@ -2180,6 +3264,15 @@ struct DeviceState {
                      kib(ShadowPages::Copy::guarded), kib(ShadowPages::Copy::unguarded), kib(ShadowPages::Copy::aliased),
                      kib(ShadowPages::Copy::pinned), kib(ShadowPages::Copy::read_only),
                      kib(ShadowPages::Copy::copy_on_write), kib(ShadowPages::Copy::write_watched));
+        std::fprintf(stderr,
+                     "[rt] d3d12: slot-133 shadow copies as pieces, a refresh: %.1f pieces (%.1f under 4 KiB, %.1f going on "
+                     "where the one before ended), %.1f copy calls (%.1f offered to the GPU); walk %.3f ms, copies %.3f "
+                     "ms\n",
+                     double(shadow_pieces.pieces) / count, double(shadow_pieces.short_pieces) / count,
+                     double(shadow_pieces.joinable) / count, double(shadow_pieces.calls) / count,
+                     double(shadow_pieces.gpu_calls) / count, shadow_pieces.walk_ms / count,
+                     shadow_pieces.copy_ms / count);
+        shadow_pieces = {};
         shadow_copy_bytes = {};
         shadow_logged = shadow_submissions;
         shadow_log_time = now;
@@ -2195,20 +3288,35 @@ struct DeviceState {
     // defined after TitleTexture.
     std::mutex title_texture_mutex;
     std::map<std::uint64_t, std::shared_ptr<TitleTexture>> title_textures;
+    leonida::TitleTextureRangeIndex texture_ranges;
+    std::map<std::uint64_t, std::shared_ptr<TitleTexture>> mapped_title_textures;
+    void index_texture(const TitleTexture& t);
     void title_texture_mapped(const void* resource, std::uint64_t address);
     void title_texture_unmapped(const void* resource, std::uint64_t address);  // the title wrote texels
     void title_texture_gone(const void* resource, std::uint64_t address);
+    // Textures destroyed while their thread held title_texture_mutex (inside the registry, t_in_title_textures): a
+    // descriptor it overwrote held the last reference. Their GPU placement is removed at once; title_texture_gone
+    // cannot take the registry mutex again there (MSVC's
+    // std::mutex throws resource_deadlock_would_occur, which Wine's msvcp140 aborts on), so their entries only stop
+    // naming the resource and are removed by drain_titles_gone once the mutex is free. Under title_texture_mutex.
+    std::vector<std::pair<const void*, std::uint64_t>> titles_gone;
+    std::atomic<bool> titles_gone_pending{false};
+    void drain_titles_gone();
 
     // Windows of the title's own memory in the GPU address arena (src/title_va_alias.h, docs/d3d12_vulkan.md
     // section 3.3 "Title-chosen addresses"): a root view or buffer V# that names the title's memory outside any
     // slot-133 buffer (a per-frame constant ring, #8862 section 3.5) gets a copy of the 64 KiB-aligned pages it
-    // covers, refreshed before every submission like a slot-133 shadow, and the address of that copy. Windows are
-    // kept until the device goes (the ring comes round to the same pages), up to LEONIDA_TITLE_WINDOWS_MB (64 MiB
-    // by default). A window that does not fit is not made: the range is backed by a geometry copy instead, or the
-    // view written with a zero-size range (src/title_window_plan.h).
+    // covers, refreshed before every submission like a slot-133 shadow, and the address of that copy. A window never
+    // covers bytes an existing range already serves (it stays inside the free span, in both views of a stream pool),
+    // and is kept while an address range still answers from it (the ring comes round to the same pages), up to
+    // LEONIDA_TITLE_WINDOWS_MB (64 MiB by default); one a newer range replaced everywhere is retired
+    // (retire_orphan_windows). A window that does not fit is not made: the range is backed by a geometry copy
+    // instead, or the view written with a zero-size range (src/title_window_plan.h).
     struct TitleWindow {
         std::uint64_t start;
         std::uint64_t shader_va;
+        std::uint64_t size;
+        std::uint8_t* mapped;  // the copy, as the tracker of its pages writes it
     };
     static constexpr std::uint64_t kTitleWindowAlign = 65536;
     static constexpr std::uint64_t kTitleWindowMax = 16ull << 20;  // the most one address pulls in
@@ -2217,11 +3325,30 @@ struct DeviceState {
     static constexpr std::uint64_t kPoolExtentMax = 1ull << 20;
     std::mutex title_window_mutex;  // taken before shadow_mutex, never under it
     rt::d3d12::TitleBufferWindows external_windows;
+    std::atomic<bool> external_window_made{false};  // a window lies outside the arena: device_reachable looks there
     std::vector<TitleWindow> title_windows;
     std::atomic<std::size_t> title_window_count{0};  // title_windows.size(), read without the mutex
     std::uint64_t title_window_bytes = 0;
     std::uint64_t title_window_cap = 64ull << 20;
-    // The stream pools' mappings (title_gpu_views): one per readable run of a pool, kept for the device's life.
+    // What the GPU wrote into a copy of the title's memory goes back to the title's pages: the ranges reached since
+    // the last submission (title_va_alias.h note_reached), copied back at the next refresh before the forward copy.
+    // A window is a read-side mirror, so without this a UAV or a raw write lands in the copy and the title never sees
+    // it (#1537, the WRITE_INVALID stop at the world start).
+    std::mutex title_write_back_mutex;  // its own: taken under shadow_mutex, never the other way round
+    std::map<std::uint64_t, std::uint64_t> title_write_back;  // start -> end, of the submission about to run
+    std::deque<std::pair<std::uint64_t, std::map<std::uint64_t, std::uint64_t>>> title_write_back_pending;  // by ticket
+    std::uint64_t title_write_back_refused = 0;               // ranges past the caps, logged once
+    std::uint64_t title_write_back_bytes = 0;                 // queued for this submission
+    std::uint64_t title_write_back_total = 0;                 // copied back, all submissions
+    std::uint64_t title_write_back_calls = 0;                 // log line count
+    std::uint64_t title_write_back_unfenced = 0;
+    static constexpr std::size_t kTitleWriteBackBatches = 64; // pending batches before the oldest goes back unfenced
+    static constexpr std::size_t kTitleWriteBackRanges = 8192;         // ranges kept per submission
+    static constexpr std::uint64_t kTitleWriteBackBytes = 64ull << 20; // bytes copied back per submission
+    // The stream pools' mappings (title_gpu_views): one per readable run of a pool that no other mapping serves yet. A
+    // window goes once no address answers from it (retire_orphan_windows); a geometry copy goes when its view is
+    // retired (the pages were freed, unmapped or remapped: drain_geometry_releases), and the next request for those
+    // pages makes a new one.
     struct PoolSpan {
         std::uint64_t source;     // the readable side of the pair the copy is made from
         std::uint64_t twin;       // the extent's address in the pair's other view (0 when there is none)
@@ -2232,10 +3359,246 @@ struct DeviceState {
     std::vector<PoolSpan> pool_spans;
     std::atomic<std::size_t> pool_span_count{0};
     std::uint64_t pool_span_bytes = 0;
+    std::uint64_t pool_spans_retired = 0;  // extents gone with their copy (forget_pool_span, retire_orphan_windows)
     std::uint64_t title_window_refusals = 0;  // windows neither the budget nor the arena allowed
     std::uint64_t unbacked_requests = 0;      // title addresses no backing could be made for (zero-size views)
+    std::uint64_t pool_covers = 0;            // stream-pool requests given one mapping over windows they ran into
+
+    // Title windows no address range answers from any more (retire_orphan_windows): the removed ranges' copies, as the
+    // alias table's listener records them, and the retired windows whose memory waits for the GPU: freed as a retired
+    // geometry view's is, once every replay in progress at the retirement has recorded its submissions (ticket
+    // kAfterExecutes until then, see stamp_retired_windows) and those have completed. A command list resolves its root
+    // views when they are recorded, so a list recorded before the retirement and executed (again) after it still
+    // names the window: the ticket is taken only once every list (and every copy a held batch or the async worker
+    // keeps) whose recording began before the retirement is gone (src/command_list_epochs.h). Its copy stays a target
+    // of its pages' tracker until then, still refreshed: what those submissions wrote in it goes back to the title's
+    // pages (write_back_titles, and once more when it is freed), not dropped with it.
+    struct RetiredWindow {
+        std::uint64_t start, shader_va, size, ticket, epoch;
+        std::uint8_t* mapped;
+        std::uint64_t lists;  // the command-list epoch of the retirement
+    };
+    static constexpr std::size_t kWindowAliasRemovals = 4096;  // kept before every window is looked at instead
+    std::mutex window_alias_removal_mutex;  // a leaf: taken in alias_changed, under the alias table's lock
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> window_alias_removals;  // (shader VA, bytes)
+    bool window_alias_removals_overflow = false;
+    std::atomic<bool> window_alias_removals_pending{false};
+    std::mutex retired_window_mutex;  // taken under title_window_mutex; only GeometryViews' execute_mutex_ under it
+    std::vector<RetiredWindow> retired_windows;
+    std::atomic<std::size_t> retired_window_count{0};
+    std::atomic<bool> retired_windows_unstamped{false};
+    std::uint64_t title_windows_retired = 0, title_window_bytes_retired = 0, window_retirements = 0;
 
     rt::d3d12::GeometryViews geometry;
+    // A retired geometry view: its alias ranges go, and so does every answer made through it without one
+    // (vsharp_address and placed views take geometry_va() directly), by its CPU and its GPU-twin address.
+    static void forget_geometry_alias(std::uintptr_t source, std::size_t size, VkDeviceSize va) {
+        auto& aliases = leonida::title_va_aliases();
+        aliases.remove(source, va);
+        aliases.forget_copy(source, size, va);
+        if (const auto twin = leonida::title_gpu_views::other_view(source)) {
+            aliases.remove(twin, va);
+            aliases.forget_copy(twin, size, va);
+        }
+    }
+    // Before the submission's console heap slots are translated (refresh_shadows): a view retired here is answered
+    // by nothing from now on. It is freed only after every replay in progress has recorded its submissions and those
+    // have completed (GeometryViews::kAfterExecutes, execute_end): this submission's own lists, recorded before, and
+    // another queue's replay that translated its slots before this retirement may still name it. A ticket read here
+    // would be one short of this submission, which records its own only after before_execute_ (and with an idle GPU
+    // the view would be reaped in this very call).
+    // A retired view's last copy is made here from the title's pages as they are now, when they are still readable
+    // (GeometryViews::retire_range).
+    // A stream-pool extent it backed leaves pool_spans: the next request for those pages makes a new mapping.
+    void drain_geometry_releases() {
+        if (!context || !geometry.has_pending_reclaim()) return;
+        const std::uint64_t completed_ticket = geometry.has_retired() ? context->completed_retire_ticket() : 0;
+        geometry.drain_released(
+            *this, rt::d3d12::GeometryViews::kAfterExecutes, completed_ticket,
+            [this](std::uintptr_t source, std::size_t size, VkDeviceSize va) {
+                forget_geometry_alias(source, size, va);
+                forget_pool_span(va);
+            },
+            copy_geometry);
+    }
+    void forget_pool_span(VkDeviceSize va) {
+        std::lock_guard windows(title_window_mutex);
+        const auto it = std::find_if(pool_spans.begin(), pool_spans.end(),
+                                     [&](const PoolSpan& span) { return span.geometry && span.shader_va == va; });
+        if (it == pool_spans.end()) return;
+        pool_span_bytes -= it->size;
+        pool_spans.erase(it);
+        pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
+        ++pool_spans_retired;
+    }
+    // After this submission's refresh (the windows' last copy is the one it made): a title window no address range
+    // answers from any more leaves the refresh. Its ranges went because a newer range was entered over them (a
+    // slot-133 buffer placed over the pages, a BVH input's exact copy, src/title_va_alias.h add), and a window nothing
+    // reaches is only cost: its tracker walks its pages at every refresh and its bytes count against
+    // LEONIDA_TITLE_WINDOWS_MB. Its stream-pool extent and its budget go at once; its copy leaves its tracker and its
+    // memory is freed later (retired_windows), and the retired windows due are freed here. Only windows whose copy a
+    // removed range answered from are looked at (alias_changed records those).
+    void retire_orphan_windows() {
+        if (!context || (!window_alias_removals_pending.load(std::memory_order_acquire) &&
+                         !retired_window_count.load(std::memory_order_acquire)))
+            return;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> removed;  // (shader VA, bytes)
+        bool every = false;
+        {
+            std::lock_guard lock(window_alias_removal_mutex);
+            removed.swap(window_alias_removals);
+            every = window_alias_removals_overflow;
+            window_alias_removals_overflow = false;
+            window_alias_removals_pending.store(false, std::memory_order_release);
+        }
+        stamp_retired_windows();  // lists reset or released since the last replay
+        const std::uint64_t completed = context->completed_retire_ticket();
+        std::lock_guard windows(title_window_mutex);
+        free_retired_windows(completed);
+        if (removed.empty() && !every) return;
+        std::sort(removed.begin(), removed.end());
+        std::uint64_t longest = 0;
+        for (const auto& r : removed) longest = std::max(longest, r.second);
+        const auto touched = [&](const TitleWindow& window) {  // a removed range answered from inside this copy
+            if (every) return true;
+            auto it = std::lower_bound(removed.begin(), removed.end(),
+                                       std::pair{window.shader_va + window.size, std::uint64_t(0)});
+            while (it != removed.begin()) {
+                --it;
+                if (window.shader_va - std::min(window.shader_va, it->first) >= longest) break;
+                if (it->first + it->second > window.shader_va) return true;
+            }
+            return false;
+        };
+        auto& aliases = leonida::title_va_aliases();
+        std::vector<std::uint64_t> gone;  // shader VAs of the windows retired, sorted below
+        for (const TitleWindow& window : title_windows)
+            if (touched(window) && !aliases.answers_into(window.shader_va, window.size))
+                gone.push_back(window.shader_va);
+        if (gone.empty()) return;
+        std::sort(gone.begin(), gone.end());
+        const auto is_gone = [&](std::uint64_t va) { return std::binary_search(gone.begin(), gone.end(), va); };
+        const std::size_t spans = pool_spans.size();
+        std::erase_if(pool_spans, [&](const PoolSpan& span) {
+            if (span.geometry || !is_gone(span.shader_va)) return false;
+            pool_span_bytes -= span.size;
+            return true;
+        });
+        pool_spans_retired += spans - pool_spans.size();
+        pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
+        std::vector<RetiredWindow> retiring;
+        const std::uint64_t epoch = geometry.execute_epoch();
+        const std::uint64_t lists = leonida::command_list_epochs::advance();
+        std::uint64_t bytes = 0;
+        std::erase_if(title_windows, [&](const TitleWindow& window) {
+            if (!is_gone(window.shader_va)) return false;
+            retire_shadow(window.mapped);
+            retiring.push_back({window.start, window.shader_va, window.size, rt::d3d12::GeometryViews::kAfterExecutes,
+                                epoch, window.mapped, lists});
+            title_window_bytes -= window.size;
+            bytes += window.size;
+            return true;
+        });
+        title_window_count.store(title_windows.size(), std::memory_order_relaxed);
+        {
+            std::lock_guard retired(retired_window_mutex);
+            retired_windows.insert(retired_windows.end(), retiring.begin(), retiring.end());
+            retired_window_count.store(retired_windows.size(), std::memory_order_release);
+            retired_windows_unstamped.store(true, std::memory_order_release);
+        }
+        title_windows_retired += retiring.size();
+        title_window_bytes_retired += bytes;
+        ++window_retirements;
+        if (window_retirements <= 4 || !(window_retirements & (window_retirements - 1)))
+            std::fprintf(stderr, "[rt] d3d12: %zu title windows (%llu KiB) no address answers from any more were "
+                                 "retired (%zu windows, %llu KiB left; %llu retired, %llu KiB returned so far)\n",
+                         retiring.size(), static_cast<unsigned long long>(bytes >> 10), title_windows.size(),
+                         static_cast<unsigned long long>(title_window_bytes >> 10),
+                         static_cast<unsigned long long>(title_windows_retired),
+                         static_cast<unsigned long long>(title_window_bytes_retired >> 10));
+    }
+    // The memory of retired windows whose submissions have completed by `completed`; what their copies hold goes back
+    // once more first (free_retired_shadow). title_window_mutex held.
+    void free_retired_windows(std::uint64_t completed) {
+        std::vector<RetiredWindow> due;
+        {
+            std::lock_guard retired(retired_window_mutex);
+            std::erase_if(retired_windows, [&](const RetiredWindow& window) {
+                if (window.ticket == rt::d3d12::GeometryViews::kAfterExecutes || window.ticket > completed)
+                    return false;
+                due.push_back(window);
+                return true;
+            });
+            retired_window_count.store(retired_windows.size(), std::memory_order_release);
+        }
+        for (const RetiredWindow& window : due) {
+            free_retired_shadow(window.mapped, window.start, window.size);
+            if (window.shader_va < arena.size) {
+                arena_release(window.shader_va, window.size, arena_buffer);
+            } else {
+                backing(arena.address + window.shader_va, window.size, window.start, false);
+                external_windows.free(*this, window.shader_va, window.size);
+            }
+        }
+    }
+    // A replay has recorded its submissions, or a refresh runs: retired windows that only replays now finished and
+    // only lists now gone may name get the submissions recorded so far as their ticket (GeometryViews::execute_end
+    // does the same for its views, by replays alone).
+    void stamp_retired_windows() {
+        if (!retired_windows_unstamped.load(std::memory_order_acquire)) return;
+        // Under the lock: a window retired by a replay begun after `oldest` was read must not be stamped here.
+        std::lock_guard retired(retired_window_mutex);
+        const std::uint64_t oldest = geometry.oldest_execute();
+        // Before the ticket: a list released after this read has had its submissions counted in it.
+        const std::uint64_t oldest_list = leonida::command_list_epochs::oldest();
+        const std::uint64_t ticket = context->submitted_retire_ticket();
+        bool left = false;
+        for (RetiredWindow& window : retired_windows) {
+            if (window.ticket != rt::d3d12::GeometryViews::kAfterExecutes) continue;
+            if (window.epoch < oldest && window.lists <= oldest_list) window.ticket = ticket;
+            else left = true;
+        }
+        retired_windows_unstamped.store(left, std::memory_order_release);
+    }
+    // ExecuteCommandLists replays in progress, for GeometryViews::kAfterExecutes (see drain_geometry_releases).
+    // A plain aggregate on purpose: a C++ thread_local with a destructor in gta6rt.exe adds TLS callbacks to the image
+    // the loader's TLS index-0 move must not have (pe_loader.cpp reserve_tls_index0; VulkanContext::stage_xdxr_table
+    // keeps its range list a member for the same reason). A std::vector here made the title's CRT abort at startup.
+    struct GeometryExecuteSerials {
+        static constexpr unsigned kCapacity = 32;  // a replay has not been seen nested this deep
+        std::uint64_t serials[kCapacity]{};
+        unsigned count{};
+        unsigned skipped{};  // replays begun while the stack was full: the innermost, ended first
+    };
+    static GeometryExecuteSerials& geometry_execute_serials() {
+        thread_local GeometryExecuteSerials serials;
+        return serials;
+    }
+    // Kept with geometry copies off too: a retired title window waits for the same replays (stamp_retired_windows).
+    void geometry_execute_begin() {
+        auto& serials = geometry_execute_serials();
+        if (serials.count == GeometryExecuteSerials::kCapacity) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true))
+                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists nested more than %u deep; a geometry view or "
+                                     "title window retired in the extra replay is not deferred to it\n",
+                             GeometryExecuteSerials::kCapacity);
+            ++serials.skipped;
+            return;
+        }
+        serials.serials[serials.count++] = geometry.execute_begin();
+    }
+    void geometry_execute_end() {
+        auto& serials = geometry_execute_serials();
+        if (serials.skipped != 0) {
+            --serials.skipped;
+            return;
+        }
+        if (serials.count == 0) return;
+        const std::uint64_t serial = serials.serials[--serials.count];
+        geometry.execute_end(serial, [this] { return context->submitted_retire_ticket(); });
+        stamp_retired_windows();
+    }
     static rt::d3d12::GeometryCopy copy_geometry(std::uint8_t* to, const std::uint8_t* from, std::size_t size) {
         using Result = rt::d3d12::GeometryCopy;
         if (!leonida::texture_memory_readable(reinterpret_cast<std::uintptr_t>(from), size)) return Result::unreadable;
@@ -2312,9 +3675,11 @@ struct DeviceState {
 
     // A window for [start, start + size): an arena range or a block outside the arena, charged to
     // LEONIDA_TITLE_WINDOWS_MB and refreshed before every submission by the tracker of its pages. 0 when neither the
-    // budget nor the arena has room. title_window_mutex held.
-    std::uint64_t make_title_window(std::uint64_t start, std::uint64_t size) {
-        if (!leonida::title_window_fits(title_window_cap, title_window_bytes, size)) {
+    // budget nor the arena has room. `credit`: bytes of windows this one replaces, retired at the next submission
+    // (cover_pool_request), not counted against it. title_window_mutex held.
+    std::uint64_t make_title_window(std::uint64_t start, std::uint64_t size, std::uint64_t credit = 0) {
+        if (!leonida::title_window_fits(title_window_cap, title_window_bytes - std::min(credit, title_window_bytes),
+                                        size)) {
             ++title_window_refusals;
             log_once("title memory named by a shader address is past LEONIDA_TITLE_WINDOWS_MB, no window; MiB copied "
                      "so far:",
@@ -2325,7 +3690,10 @@ struct DeviceState {
         std::uint8_t* mapped{};
         if (arena_allocate(size, kTitleWindowAlign, offset, arena_buffer)) {
             mapped = arena.mapped + offset;
-        } else if (!stream_windows() || !external_windows.allocate(*this, size, offset, mapped)) {
+        } else if (leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::windows);
+                   stream_windows() && external_windows.allocate(*this, size, offset, mapped)) {
+            external_window_made.store(true, std::memory_order_release);
+        } else {
             ++title_window_refusals;
             log_once("GPU address arena full (raise LEONIDA_ARENA_MB): title memory has no window; window KiB:",
                      int(std::min<std::uint64_t>(size >> 10, INT_MAX)));
@@ -2334,7 +3702,7 @@ struct DeviceState {
         if (offset >= arena.size) backing(arena.address + offset, size, start, true);
         const auto* pages = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(start));
         add_shadow(pages, mapped, std::size_t(size));
-        title_windows.push_back({start, offset});
+        title_windows.push_back({start, offset, size, mapped});
         title_window_count.store(title_windows.size(), std::memory_order_relaxed);
         title_window_bytes += size;
         if (title_windows.size() <= 4 || !(title_windows.size() & (title_windows.size() - 1)))
@@ -2343,6 +3711,111 @@ struct DeviceState {
                          static_cast<unsigned long long>(size >> 10), title_windows.size(),
                          static_cast<unsigned long long>(title_window_bytes >> 10));
         return offset;
+    }
+    // Undoes make_title_window for a window no range was entered for (the table refused the mapping): nothing has
+    // answered from it, so no submission names it and its memory goes at once. title_window_mutex held.
+    void drop_title_window(std::uint64_t shader_va) {
+        const auto it = std::find_if(title_windows.begin(), title_windows.end(),
+                                     [&](const TitleWindow& window) { return window.shader_va == shader_va; });
+        if (it == title_windows.end()) return;
+        const TitleWindow window = *it;
+        title_windows.erase(it);
+        title_window_count.store(title_windows.size(), std::memory_order_relaxed);
+        title_window_bytes -= window.size;
+        remove_shadow(window.mapped);
+        if (window.shader_va < arena.size) {
+            arena_release(window.shader_va, window.size, arena_buffer);
+        } else {
+            backing(arena.address + window.shader_va, window.size, window.start, false);
+            external_windows.free(*this, window.shader_va, window.size);
+        }
+    }
+
+    // A binding of the title's memory reached for the coming submission: keep its range for the copy back after it.
+    // Over-inclusive on purpose (a read-only view costs a copy, a write is never missed: a V# has no read/write bit).
+    void note_title_write(std::uint64_t va, std::uint64_t bytes) {
+        static const bool on = [] {
+            char value[2] = {};
+            std::size_t length = 0;
+            return getenv_s(&length, value, sizeof(value), "LEONIDA_TITLE_WRITEBACK") != 0 || value[0] != '0';
+        }();
+        if (!on || !va || !bytes) return;
+        std::uint64_t lo = 0, hi = 0;
+        if (!leonida::title_va_aliases().title_memory(va, lo, hi) || va >= hi) return;
+        const std::uint64_t end = va + std::min(bytes, hi - va);
+        std::lock_guard lock(title_write_back_mutex);
+        auto it = title_write_back.lower_bound(va);
+        if (it != title_write_back.begin()) {
+            auto previous = std::prev(it);
+            if (previous->second >= va) {
+                if (previous->second < end) previous->second = end;
+                return;
+            }
+        }
+        if (it != title_write_back.end() && it->first <= end) {
+            it->second = std::max(it->second, end);
+            return;
+        }
+        if (title_write_back.size() >= kTitleWriteBackRanges || title_write_back_bytes >= kTitleWriteBackBytes) {
+            if (!title_write_back_refused++)
+                log_once("past LEONIDA_TITLE_WRITEBACK's caps: reached ranges are not copied back this submission; "
+                         "ranges refused:",
+                         1);
+            return;
+        }
+        title_write_back_bytes += end - va;
+        title_write_back.emplace(va, end);
+    }
+
+    // What the GPU wrote into those copies goes back to the title's pages, so a later read by the title or the next
+    // forward copy sees it. Only once the submission that wrote them has completed: a batch carries the ticket of the
+    // submission after it (a submission's commands are recorded before it exists), and is copied back when the
+    // context reports that ticket done. Runs at the start of a refresh, under shadow_mutex and before the forward
+    // copies, so a page the title wrote again is copied forward over the result.
+    void write_back_titles() {
+        if (!&context) return;
+        const std::uint64_t done = context->completed_retire_ticket();
+        std::vector<std::pair<uint64_t, std::uint64_t>> finished;  // one entry per range, collected under the lock
+        {
+            std::lock_guard lock(title_write_back_mutex);
+            if (!title_write_back.empty()) {
+                // The ranges of the submission about to execute, which is the next ticket.
+                title_write_back_pending.push_back({context->submitted_retire_ticket() + 1,
+                                                    std::move(title_write_back)});
+                title_write_back.clear();
+                title_write_back_bytes = 0;
+            }
+            bool forced = false;
+            while (!title_write_back_pending.empty() &&
+                   (title_write_back_pending.front().first <= done ||
+                    title_write_back_pending.size() > kTitleWriteBackBatches)) {
+                forced = forced || title_write_back_pending.front().first > done;
+                for (const auto& [begin, end] : title_write_back_pending.front().second)
+                    finished.push_back({begin, end});
+                title_write_back_pending.pop_front();
+            }
+            // A queue held deep (console ordering) can leave batches waiting: the oldest go back anyway, once each.
+            if (forced && !title_write_back_unfenced++)
+                log_once("more than 64 title write-back batches wait on their submissions: the oldest are copied "
+                         "back without their ticket; batches:",
+                         1);
+        }
+        if (finished.empty()) return;
+        std::uint64_t written = 0, ranges = 0;
+        for (const auto& [begin, end] : finished)
+            for (const ShadowPagesPtr& s : shadows)
+                if (end > s->first() && begin < s->last()) {
+                    const std::uint64_t bytes = s->write_back(begin, end);
+                    written += bytes;
+                    ranges += bytes != 0;
+                }
+        title_write_back_total += written;
+        if (!written) return;
+        if (++title_write_back_calls <= 4 || !(title_write_back_calls & (title_write_back_calls - 1)))
+            std::fprintf(stderr, "[rt] d3d12: %llu KiB of the GPU's writes in %llu reached range(s) went back to the "
+                                 "title's pages (%llu KiB so far)\n",
+                         static_cast<unsigned long long>(written >> 10), static_cast<unsigned long long>(ranges),
+                         static_cast<unsigned long long>(title_write_back_total >> 10));
     }
 
     // A stream pool's address (a CPU view paired with a GPU-only alias). Rule B
@@ -2355,81 +3828,186 @@ struct DeviceState {
     // held.
     bool resolve_pool_memory(std::uint64_t va, std::uint64_t bytes, std::uint64_t& out) {
         leonida::title_gpu_views::Range view{};
-        if (!leonida::title_gpu_views::view_at(static_cast<std::uintptr_t>(va),
-                                               static_cast<std::uintptr_t>(std::max<std::uint64_t>(bytes, 1)), view))
-            return false;
-        const std::uint64_t offset = va >= view.gpu && va - view.gpu < view.size ? va - view.gpu : va - view.cpu;
-        // Rule B: the CPU view where the host reads the frames, the GPU-only pages only when that view has none.
-        const std::uint64_t source = leonida::title_gpu_views::to_host_view(static_cast<std::uintptr_t>(va),
-                                                                           static_cast<std::uintptr_t>(
-                                                                               std::max<std::uint64_t>(bytes, 1)));
-        const std::uint64_t twin = leonida::title_gpu_views::other_view(static_cast<std::uintptr_t>(source));
-        const std::uint64_t twin_view = twin ? twin : source;  // the pair always has two addresses
-        if (!readable_page(source)) {
+        if (!leonida::title_gpu_views::view_at(static_cast<std::uintptr_t>(va), 1, view)) return false;
+        const auto want = std::max<std::uint64_t>(bytes, 1);
+        const auto unbacked = [&] {
             out = 0;
             ++unbacked_requests;
             note_unbacked("stream pool", va, bytes);
             return true;
-        }
+        };
+        const std::uint64_t offset = va >= view.gpu && va - view.gpu < view.size ? va - view.gpu : va - view.cpu;
+        if (want > view.size - offset) return unbacked();
+        // Rule B: the CPU view where the host reads the frames, the GPU-only pages only when that view has none.
+        const std::uint64_t source = leonida::title_gpu_views::to_host_view(static_cast<std::uintptr_t>(va), want);
+        const std::uint64_t twin = leonida::title_gpu_views::other_view(static_cast<std::uintptr_t>(source));
+        const std::uint64_t twin_view = twin ? twin : source;  // the pair always has two addresses
+        auto& aliases = leonida::title_va_aliases();
+        const auto other = source == va ? twin_view : source;
+        const auto max_size = std::min<std::uint64_t>(view.size - offset, kPoolExtentMax);
+        const auto reuse = [&] { return aliases.reuse_pool_mapping(va, other, want, max_size, out); };
+        if (reuse()) return true;
+        if (!readable_page(source)) return unbacked();
         const std::uint64_t pool_end = (source >= view.gpu && source - view.gpu < view.size ? view.gpu : view.cpu) +
                                        view.size;
         const std::uint64_t run_end =
             readable_run_end(source & ~(kTitleWindowAlign - 1), std::min(pool_end, source + kPoolExtentMax));
+        // Up to the next mapping in either view at most, never over it.
         leonida::TitleWindowRange extent{};
         if (!leonida::title_pool_extent(source - offset, pool_end, source, run_end, kTitleWindowAlign, kPoolExtentMax,
-                                        extent)) {
-            out = 0;
-            ++unbacked_requests;
-            note_unbacked("stream pool", va, bytes);
-            return true;
+                                        extent))
+            return unbacked();
+        std::uint64_t source_lo, source_hi, twin_lo, twin_hi;
+        aliases.gap(source, source_lo, source_hi);
+        aliases.gap(twin_view, twin_lo, twin_hi);
+        // A request that runs past what would serve it, the mapping holding its first byte or the extent clipped
+        // at the next one, gets one mapping over itself and the windows it reaches (cover_pool_request) rather than
+        // a zero-size view; only a range that is not a window in the way (a slot-133 buffer, a geometry copy) still
+        // leaves it with none.
+        const std::uint64_t request_end = source + want;
+        if (!leonida::clip_title_pool_extent(extent, source, twin_view, source_lo, source_hi, twin_lo, twin_hi))
+            return reuse() || cover_pool_request(source, twin_view, source, request_end, source - offset, pool_end,
+                                                 out) ||
+                   unbacked();
+        if (want > std::min(extent.size - (source - extent.start), run_end - source))
+            return reuse() ||
+                   cover_pool_request(source, twin_view, extent.start, request_end, source - offset, pool_end, out) ||
+                   unbacked();
+        const auto twin_start = twin_view - (source - extent.start);
+        std::uint64_t shader = 0;
+        if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(extent.start, extent.size))
+            shader = geometry.resolve(*this, extent.start, extent.size, copy_geometry);
+        const bool geometry_copy = shader != 0;
+        if (!shader) shader = make_title_window(extent.start, extent.size);
+        if (!shader) return reuse() || unbacked();
+        if (!aliases.add_twin(extent.start, twin_start, extent.size, shader)) {
+            if (!geometry_copy) drop_title_window(shader);
+            return reuse() || unbacked();
         }
-        const std::uint64_t twin_start = twin_view - (source - extent.start);  // the same pages in the other view
-        auto& aliases = leonida::title_va_aliases();
-        // A mapping that already holds the extent's start (a buffer made over these pages, or a window from another
-        // request) serves the request only as far as it reaches: claim that much, never bytes it does not cover.
-        std::uint64_t shader = 0, available = 0;
-        if (aliases.range_of(extent.start, shader, available) ||
-            aliases.range_of(twin_start, shader, available)) {
-            if (available < extent.size) {
-                if (available <= source - extent.start) shader = 0;
-                else extent.size = available;
-            }
-        }
-        if (shader) {
-            // Both addresses must reach it. The address the mapping was found at keeps its own (possibly wider)
-            // range: adding a shorter one over it would drop bytes another view still uses.
-            if (aliases.shader_va(twin_start) == twin_start) aliases.add(twin_start, extent.size, shader);
-            if (aliases.shader_va(extent.start) == extent.start) aliases.add(extent.start, extent.size, shader);
-        } else {
-            bool geometry_copy = false;
-            if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(extent.start, extent.size))
-                shader = geometry.resolve(*this, extent.start, extent.size, copy_geometry), geometry_copy = shader != 0;
-            if (!shader) shader = make_title_window(extent.start, extent.size);
-            if (!shader) {
-                out = 0;
-                ++unbacked_requests;
-                note_unbacked("stream pool", va, bytes);
-                return true;
-            }
-            aliases.add_twin(extent.start, twin_start, extent.size, shader);
-            pool_spans.push_back({extent.start, twin_start, shader, extent.size, geometry_copy});
-            pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
-            pool_span_bytes += extent.size;
-            if (pool_spans.size() <= 4 || !(pool_spans.size() & (pool_spans.size() - 1)))
-                std::fprintf(stderr,
-                             "[rt] d3d12: a %llu KiB stream-pool extent is one %s mapping (alias 0x%llx and CPU view "
-                             "0x%llx share shader VA 0x%llx; %zu extents, %llu KiB)\n",
-                             static_cast<unsigned long long>(extent.size >> 10),
-                             geometry_copy ? "geometry-copy" : "window", static_cast<unsigned long long>(twin_view),
-                             static_cast<unsigned long long>(source), static_cast<unsigned long long>(shader),
-                             pool_spans.size(), static_cast<unsigned long long>(pool_span_bytes >> 10));
-        }
+        pool_spans.push_back({extent.start, twin_start, shader, extent.size, geometry_copy});
+        pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
+        pool_span_bytes += extent.size;
+        if (pool_spans.size() <= 4 || !(pool_spans.size() & (pool_spans.size() - 1)))
+            std::fprintf(stderr,
+                         "[rt] d3d12: a %llu KiB stream-pool extent is one %s mapping (alias 0x%llx and CPU view "
+                         "0x%llx share shader VA 0x%llx; %zu extents, %llu KiB)\n",
+                         static_cast<unsigned long long>(extent.size >> 10),
+                         geometry_copy ? "geometry-copy" : "window", static_cast<unsigned long long>(twin_view),
+                         static_cast<unsigned long long>(source), static_cast<unsigned long long>(shader),
+                         pool_spans.size(), static_cast<unsigned long long>(pool_span_bytes >> 10));
         out = shader + (source - extent.start);
         return true;
     }
 
+    // One mapping for a stream-pool request [source, end) that what would serve it stops short of: the extent from
+    // `start` clipped at the next mapping, or the mapping holding `source`, ends first (title_pool_cover). It covers
+    // the request and, whole, the windows it reaches in either view; the range entered over theirs replaces them
+    // (TitleVaAliases::replace_twin), and they are retired at the next submission like any window nothing answers
+    // from (retire_orphan_windows), what the GPU wrote in them copied back first. Their bytes are not charged twice
+    // meanwhile. False when another kind of range is in the way (a slot-133 buffer, a geometry copy), the pages are not
+    // all readable, or the mapping cannot be made. title_window_mutex held.
+    bool cover_pool_request(std::uint64_t source, std::uint64_t twin_view, std::uint64_t start, std::uint64_t end,
+                            std::uint64_t pool_lo, std::uint64_t pool_end, std::uint64_t& out) {
+        std::vector<std::size_t> replaced;  // title_windows entries the ranges in the way answer from
+        const auto window_of = [&](std::uint64_t shader_va) {
+            std::size_t i = 0;
+            for (; i < title_windows.size(); ++i)
+                if (shader_va - title_windows[i].shader_va < title_windows[i].size) break;
+            return i;
+        };
+        const auto owned = [&](std::uint64_t shader_va) {
+            const std::size_t i = window_of(shader_va);
+            if (i == title_windows.size()) return false;
+            if (std::find(replaced.begin(), replaced.end(), i) == replaced.end()) replaced.push_back(i);
+            return true;
+        };
+        // What replace_twin may erase: only those windows. A slot-133 buffer is entered without title_window_mutex,
+        // so one may have been placed over the cover's span (in either view) since it was planned.
+        const auto planned = [&](std::uint64_t shader_va) {
+            return std::find(replaced.begin(), replaced.end(), window_of(shader_va)) != replaced.end();
+        };
+        auto& aliases = leonida::title_va_aliases();
+        leonida::TitleWindowRange cover{};
+        if (end > pool_end ||
+            !leonida::title_pool_cover(aliases, pool_lo, pool_end, source, twin_view, start, end, kTitleWindowAlign,
+                                       kTitleWindowMax, owned, cover))
+            return false;
+        const std::uint64_t cover_end = cover.start + cover.size;
+        if (readable_run_end(cover.start & ~(kTitleWindowAlign - 1), cover_end) < cover_end) return false;
+        std::uint64_t credit = 0;
+        for (const std::size_t i : replaced) credit += title_windows[i].size;
+        const std::uint64_t twin_start = twin_view - (source - cover.start);
+        std::uint64_t shader = 0;
+        if (geometry.cap() && watch_shadow_writes() && !context->knows_buffer_va(cover.start, cover.size))
+            shader = geometry.resolve(*this, cover.start, cover.size, copy_geometry);
+        const bool geometry_copy = shader != 0;
+        if (!shader) shader = make_title_window(cover.start, cover.size, credit);
+        if (!shader) return false;
+        if (!aliases.replace_twin(cover.start, twin_start, cover.size, shader, planned)) {
+            if (!geometry_copy) drop_title_window(shader);
+            return false;
+        }
+        pool_spans.push_back({cover.start, twin_start, shader, cover.size, geometry_copy});
+        pool_span_count.store(pool_spans.size(), std::memory_order_relaxed);
+        pool_span_bytes += cover.size;
+        ++pool_covers;
+        if (pool_covers <= 4 || !(pool_covers & (pool_covers - 1)))
+            std::fprintf(stderr,
+                         "[rt] d3d12: a stream-pool request ran past the mapping that would serve it: one %llu KiB "
+                         "%s covers it and the %zu window(s) it reached, retired at the next submission (%llu so "
+                         "far)\n",
+                         static_cast<unsigned long long>(cover.size >> 10), geometry_copy ? "geometry copy" : "window",
+                         replaced.size(), static_cast<unsigned long long>(pool_covers));
+        out = shader + (source - cover.start);
+        return true;
+    }
+
+    // Whether a shader that forms heap_base + `va` reaches memory of the device's: the arena, a registered buffer (an
+    // upload or readback heap, an import, by its VA), a geometry copy, a title window outside the arena, or the copy
+    // of any title range (an address the layer already wrote for the title). A raw title address is none of these.
+    // A V#'s base is 48 bits and translated shaders sign-extend it (Gen.host_addr), so a wrapped one is also tried
+    // with its upper bits set. `buffers_checked`: the caller already asked the buffer index about `va` itself (the
+    // resolver does). Cheapest first; title_window_mutex only once a window outside the arena exists, and never
+    // called with it held.
+    bool device_reachable(std::uint64_t va, bool buffers_checked = false) {
+        if (va < arena.size) return true;
+        const bool wrapped = va < (1ull << 48) && (va >> 47);
+        const std::uint64_t candidates[2] = {va, wrapped ? va | ~((1ull << 48) - 1) : va};
+        auto& aliases = leonida::title_va_aliases();
+        for (int i = 0; i < (wrapped ? 2 : 1); ++i) {
+            const std::uint64_t at = candidates[i];
+            if (aliases.shader_side(at)) return true;
+            std::uint64_t host = 0, room = 0;
+            if (geometry.cap() && geometry.lookup(arena.address + at, host, room)) return true;
+            if (external_window_made.load(std::memory_order_acquire)) {
+                std::lock_guard lock(title_window_mutex);
+                if (external_windows.lookup(arena.address + at, host, room)) return true;
+            }
+            if (context && !(i == 0 && buffers_checked) && context->knows_buffer_va(at)) return true;
+        }
+        return false;
+    }
+
+    // One line per kind (and then at 2, 4, 8... of it): an address outside the title's memory that names nothing of
+    // the device's, written as a zero-size view (a V#) or 0 (a root view) instead of a raw address.
+    void note_unmapped(std::uint64_t va, std::uint64_t bytes) {
+        static std::atomic<std::uint64_t> seen{0};
+        const std::uint64_t n = seen.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n != 1 && (n & (n - 1))) return;
+        std::fprintf(stderr,
+                     "[rt] d3d12: address 0x%llx (%llu bytes) is neither the title's memory nor any allocation of the "
+                     "device's: the view is written with no base and no records (loads 0, stores dropped); %llu so "
+                     "far\n",
+                     static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes),
+                     static_cast<unsigned long long>(n));
+    }
+
     // Called through title_va_aliases().resolve for an address with no copy yet. False: not the title's memory.
-    // True: it is, and `out` is its shader VA, 0 when no backing could be made (never the raw address).
+    // True: it is, and `out` is its shader VA, 0 when no backing could be made (never the raw address). An address
+    // past the arena that is not the title's memory either gets 0 too when nothing of the device's is there
+    // (device_reachable): heap_base + such an address is no allocation, and a shader that reads or writes through it
+    // takes an MMU fault (measured with Aftermath at world start: compute reads ~4 GiB and ~10 GiB above anything
+    // allocated).
     bool resolve_title_memory(std::uint64_t va, std::uint64_t bytes, std::uint64_t& out) {
         out = va;
         if (!arena.mapped || !context) return false;
@@ -2450,12 +4028,18 @@ struct DeviceState {
         }
         const std::uint64_t want = std::max<std::uint64_t>(bytes, 1);
         std::lock_guard lock(title_window_mutex);
-        if (const std::uint64_t made = aliases.shader_va(va); made != va) {  // another thread made it meanwhile
+        std::uint64_t made = 0, available = 0;
+        const bool has_mapping = aliases.range_of(va, made, available) && made != va;
+        if (has_mapping && available >= want) {
             out = made;
             return true;
         }
         // A stream pool's address: one mapping for its readable run, shared by both of its views.
         if (resolve_pool_memory(va, bytes, out)) return true;
+        if (has_mapping) {
+            out = made;
+            return true;
+        }
         if (readable_page(va)) {
             std::uint64_t lo = 0, hi = UINT64_MAX;
             aliases.gap(va, lo, hi);  // never over a slot-133 buffer's range or another window
@@ -2658,8 +4242,8 @@ struct DeviceState {
             for (auto& t : b.triangles) {
                 const std::uint64_t triangles = (t.index_type ? t.index_count : t.vertex_count) / 3;
                 if (!triangles) continue;
-                // Unindexed: three vertices a triangle. Indexed: the VertexCount the title declared (indices past
-                // it read past the buffer, as on the console).
+                // Unindexed: three vertices a triangle. Indexed: the VertexCount the title declared (an index past
+                // it is not read: xdxr_build.comp vertex() makes its triangle inactive).
                 const std::uint64_t vertices = t.index_type ? t.vertex_count : 3 * triangles;
                 const std::uint64_t element = t.vertex_format == VK_FORMAT_R32G32_SFLOAT ? 8 : 12;
                 const std::uint64_t vertex_bytes = vertices ? (vertices - 1) * t.vertex_stride + element : 0;
@@ -2772,10 +4356,6 @@ struct DeviceState {
         --it;
         return addr < it->second && (addr-it->first) % kDescriptorSize == 0;
     }
-    // The shader-visible CBV/SRV/UAV heaps (arena offset -> end), for the scan of bound tables before a submission.
-    std::mutex cbv_heap_mutex;
-    std::map<VkDeviceSize, VkDeviceSize> cbv_heaps;
-
     // The buffer V#s of the table at `table_va` whose base is in the title's own memory get the address of a copy,
     // written in place: the title wrote them itself (or copied them), so no Create*View saw them. Images (T#s) and
     // null slots are skipped; so is a V# already in the arena, so a rewritten one is left alone next time.
@@ -2798,20 +4378,99 @@ struct DeviceState {
         // Slots the title wrote in its own backing of this heap, if it gave the heap one.
         aliases.pull_descriptors(arena.mapped + table_va, std::size_t(end - table_va));
         if (sampler) return;  // S# words describe sampling state. They have no buffer address to translate.
-        // Each slot's V# and the counter V# in its second half, as a console heap's GPU copy (fix_vsharp): a base in
-        // the title's memory is rebased, one nothing backs becomes zero-size instead of a GPU fault at heap_base plus
-        // that address.
-        for (VkDeviceSize at = table_va; at + kDescriptorSize <= end; at += kDescriptorSize) {
-            auto* const w = reinterpret_cast<std::uint32_t*>(arena.mapped + at);
-            fix_vsharp(w, VsharpPath::table);
-            fix_vsharp(w + 4, VsharpPath::table);
+        for (VkDeviceSize at = table_va; at + 16 <= end; at += kDescriptorSize) {
+            auto* words = reinterpret_cast<std::uint32_t*>(arena.mapped + at);
+            if (words[3] >> 30) continue;
+            if (retry_nulled_table_slot(at, words, aliases)) continue;
+            const std::uint32_t original[3] = {words[0], words[1], words[2]};
+            bool unbacked = false;
+            if (!rebase_title_vsharp(words, aliases, true, &unbacked) && unbacked) {
+                // Title memory no window or geometry copy could back, or an address nothing backs: no base and no
+                // records, so a shader's load returns 0 and its store is dropped rather than written at heap_base +
+                // the raw address. The words are kept to look at again (retry_nulled_table_slot). The null form is the
+                // one a zero-size view has (base 0, no records): base 0 is the arena's zero page, which reads 0.
+                words[0] = 0;
+                words[1] &= 0xFFFF0000u;
+                words[2] = 0;
+                note_nulled_table_slot(at, original, words[3]);
+            }
+            // The slot's second V# is a UAV counter (raw, 4 bytes, in the descriptor's upper 16 bytes): a store to it
+            // at heap_base + a raw title address loses the device just as one through the buffer V# does. Nothing
+            // retries it - a counter whose backing arrives later stays with no records until the title rewrites it.
+            if (at + kDescriptorSize <= end) fix_vsharp(words + 4, VsharpPath::table);
         }
+    }
+
+    // The table slots scan_title_table wrote null in place (the layer's heaps have no separate GPU copy), by arena
+    // offset, with the words the title gave them: at each later scan that still finds the null form there, the
+    // original is tried again, kNulledTableTries times at most, so a V# whose buffer or copy comes after the
+    // descriptor gets its base back. A slot the title rewrote meanwhile is forgotten and scanned as new. At most
+    // kNulledTableSlots are kept (past that a nulled slot stays null until rewritten). The null form is base 0 with no
+    // records, as a zero-size view has; a slot holding it is recognised by the rest of the words the title gave it,
+    // so a view Create*View wrote (also base 0) is only retried when its other words match a nulled slot's exactly.
+    struct NulledTableSlot {
+        std::uint32_t words[4];
+        std::uint32_t tries;
+    };
+    static constexpr std::size_t kNulledTableSlots = 65536;
+    static constexpr std::uint32_t kNulledTableTries = 16;
+    std::mutex nulled_table_mutex;
+    std::unordered_map<VkDeviceSize, NulledTableSlot> nulled_table_slots;
+    std::atomic<std::size_t> nulled_table_count{0};
+
+    void note_nulled_table_slot(VkDeviceSize at, const std::uint32_t (&original)[3], std::uint32_t word3) {
+        std::lock_guard lock(nulled_table_mutex);
+        if (nulled_table_slots.size() >= kNulledTableSlots) return;
+        nulled_table_slots[at] = {{original[0], original[1], original[2], word3}, 0};
+        nulled_table_count.store(nulled_table_slots.size(), std::memory_order_relaxed);
+    }
+
+    // A heap's arena range is released: what was noted in it is no longer anybody's slot.
+    void forget_nulled_table_slots(VkDeviceSize offset, VkDeviceSize bytes) {
+        if (!nulled_table_count.load(std::memory_order_relaxed)) return;
+        std::lock_guard lock(nulled_table_mutex);
+        std::erase_if(nulled_table_slots, [&](const auto& e) { return e.first - offset < bytes; });
+        nulled_table_count.store(nulled_table_slots.size(), std::memory_order_relaxed);
+    }
+
+    // True when `at` is a slot this scan nulled earlier and still holds that null form: tried again (and restored
+    // when its address is backed now), so the caller moves on.
+    bool retry_nulled_table_slot(VkDeviceSize at, std::uint32_t* words, leonida::TitleVaAliases& aliases) {
+        if (!nulled_table_count.load(std::memory_order_relaxed)) return false;
+        NulledTableSlot entry{};
+        {
+            std::lock_guard lock(nulled_table_mutex);
+            const auto it = nulled_table_slots.find(at);
+            if (it == nulled_table_slots.end()) return false;
+            entry = it->second;
+            // entry.words[2] != 0: a view the title wrote with zero records is not one this scan nulled.
+            const bool still_null = words[0] == 0 && words[2] == 0 && entry.words[2] != 0 &&
+                                    words[3] == entry.words[3] && words[1] == (entry.words[1] & 0xFFFF0000u);
+            if (!still_null || ++it->second.tries > kNulledTableTries) {
+                nulled_table_slots.erase(it);
+                nulled_table_count.store(nulled_table_slots.size(), std::memory_order_relaxed);
+                return still_null;  // rewritten by the title: scanned as new; out of tries: left null
+            }
+        }
+        std::uint32_t retry[4] = {entry.words[0], entry.words[1], entry.words[2], words[3]};
+        bool unbacked = false;
+        const bool rebased = rebase_title_vsharp(retry, aliases, true, &unbacked);
+        if (!rebased && unbacked) return true;  // still nothing behind it: stays null, looked at again next scan
+        words[0] = retry[0];
+        words[1] = retry[1];
+        words[2] = retry[2];
+        std::lock_guard lock(nulled_table_mutex);
+        nulled_table_slots.erase(at);
+        nulled_table_count.store(nulled_table_slots.size(), std::memory_order_relaxed);
+        return true;
     }
 
     // A buffer V# (its first four dwords at `w`) whose base is in the title's own memory gets the console VA of a GPU
     // copy of that memory, in place. False for anything else: a null slot, an image, a V# already in the arena, or
-    // memory no copy could be made of.
-    bool rebase_title_vsharp(std::uint32_t* w, leonida::TitleVaAliases& aliases, bool make_window = true) {
+    // memory no copy could be made of. `unbacked` (when given) is set for the last case: title memory with neither a
+    // window nor a geometry copy behind it, which the caller writes as a zero-size range.
+    bool rebase_title_vsharp(std::uint32_t* w, leonida::TitleVaAliases& aliases, bool make_window = true,
+                             bool* unbacked = nullptr) {
         const std::uint32_t w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
         if (!(w0 | w1 | w2 | w3) || (w3 >> 30)) return false;  // null, or not a buffer V# (TYPE, dword 3 bits 30-31)
         const std::uint64_t base = std::uint64_t(w0) | (std::uint64_t(w1 & 0xFFFFu) << 32);
@@ -2819,6 +4478,14 @@ struct DeviceState {
         if (base < arena.size || (geometry.cap() && geometry.lookup(arena.address + base, host, remaining))) return false;
         const std::uint32_t stride = (w1 >> 16) & 0x3FFFu;
         const std::uint64_t span = std::uint64_t(w2) * (stride ? stride : 1);
+        // A V# the layer wrote for one of its own buffers that the driver put below the arena (an upload buffer in
+        // ReBAR memory, say): the low 48 bits of a negative offset, which the shaders read sign-extended
+        // (vsharp_address). Not the title's memory: left as it is, never nulled.
+        if (base & (1ull << 47)) {
+            std::lock_guard lock(backing_mutex);
+            if (gpu_backings.covers(arena.address + (base | ~((1ull << 48) - 1)), std::max<std::uint64_t>(span, 1)))
+                return false;
+        }
         std::uint64_t to{};
         if (geometry.cap()) {
             const leonida::gfx10::BufferWords words{w0, w1, w2, w3};
@@ -2842,30 +4509,128 @@ struct DeviceState {
         if (!to) to = make_window ? aliases.resolve(base, span, leonida::TitleVaAliases::table_view)
                                   : aliases.shader_va(base, span);
 
-        if (to == base || (to >> 48)) return false;
+        // to == 0: the title's memory, and neither a window nor a geometry copy could back it, or an address that is
+        // nobody's (resolve_title_memory). to == base: no copy was asked for (a heap scan only looks existing ones up)
+        // or the address is left as it is; that holds only when the device can reach it (a raw title address, or one
+        // past every allocation, cannot be). A copy whose VA does not fit the V#'s 48 bits (an import below heap_base,
+        // off by default) cannot be named here either, and the raw base is no better. False in each case, and
+        // `unbacked` tells the caller to write it with no records instead of leaving a base a shader would add
+        // heap_base to.
+        if (!to || to == base || (to >> 48)) {
+            // The resolver (make_window) answers 0 for an address the device cannot reach, so a base it left as it
+            // is needs no second look; a heap scan only looked existing copies up and asks here.
+            if (unbacked) *unbacked = !to || (to >> 48) || (!make_window && !device_reachable(base));
+            return false;
+        }
         w[0] = std::uint32_t(to);
         w[1] = (w1 & 0xFFFF0000u) | std::uint32_t((to >> 32) & 0xFFFFu);
         return true;
     }
 
     // Indexed by actual Vulkan address, never by a placed buffer's CPU address.
-    std::atomic<uint64_t> released_backings{};
+    std::atomic<uint64_t> backing_generation{};  // every add and release
     std::mutex backing_mutex;
     leonida::BufferVaIndex<uint64_t> gpu_backings;
+
+    // What changed for the console heaps' slot records (ConsoleHeap::records) since the last submission: backings and
+    // copies released or added, alias ranges removed or added, title memory added. Unbounded: every change is applied
+    // at the next refresh_console_heaps, which takes the whole list. Written from any thread, under the lock of what
+    // changed (backing_mutex, the alias table's); slot_change_mutex is taken last and nothing is taken under it.
+    // Nothing is kept before a console resource heap with a CPU copy exists (no slot has a record then).
+    std::mutex slot_change_mutex;
+    std::vector<leonida::SlotChange> slot_changes;
+    std::atomic<bool> slot_records_live{false};
+    void note_slot_change(leonida::SlotChange::Kind kind, std::uint64_t lo, std::uint64_t bytes) {
+        if (!bytes || !slot_records_live.load(std::memory_order_acquire)) return;
+        const std::uint64_t hi = lo + bytes < lo ? UINT64_MAX : lo + bytes;
+        std::lock_guard lock(slot_change_mutex);
+        slot_changes.push_back({kind, lo, hi});
+    }
+    // A device range [address, address + bytes) as the V# bases that name it directly: arena offsets in the V#'s 48
+    // bits (a buffer below the arena, as sign-extended offsets, vsharp_address). Nothing for a range no V# reaches.
+    void note_slot_source_added(VkDeviceAddress address, std::uint64_t bytes) {
+        constexpr std::uint64_t mask = (1ull << 48) - 1;
+        const std::uint64_t offset = address - arena.address;
+        if (offset <= mask) note_slot_change(leonida::SlotChange::source_added, offset, bytes);
+        else if (offset >= ~(mask >> 1)) note_slot_change(leonida::SlotChange::source_added, offset & mask, bytes);
+    }
+    // The alias table's changes (TitleVaAliases::add_listener), under its lock.
+    static void alias_changed(void* device, leonida::TitleVaAliases::Change change, std::uint64_t title_va,
+                              std::uint64_t bytes, std::uint64_t shader_va) {
+        auto& self = *static_cast<DeviceState*>(device);
+        using Change = leonida::TitleVaAliases::Change;
+        if (change == Change::removed) {
+            // What resolved through the range (by its base), and what names its copy (by the copy's address).
+            self.note_slot_change(leonida::SlotChange::source_gone, title_va, bytes);
+            self.note_slot_change(leonida::SlotChange::target_gone, self.arena.address + shader_va, bytes);
+            // A title window it answered from may be answered by nothing now (retire_orphan_windows).
+            if (self.title_window_count.load(std::memory_order_relaxed)) {
+                std::lock_guard lock(self.window_alias_removal_mutex);
+                if (self.window_alias_removals.size() < kWindowAliasRemovals)
+                    self.window_alias_removals.push_back({shader_va, bytes});
+                else
+                    self.window_alias_removals_overflow = true;
+                self.window_alias_removals_pending.store(true, std::memory_order_release);
+            }
+        } else {
+            self.note_slot_change(leonida::SlotChange::source_added, title_va, bytes);
+        }
+    }
+
+    // A title-window or geometry-copy block was destroyed (TitleBufferWindows::destroy_block; its GPU work completed):
+    // as for a released backing, the backed table cuts it and the key entries and heap slots answering into it go at
+    // the next refresh, so no table names the freed memory.
+    void title_block_gone(VkDeviceAddress address, VkDeviceSize bytes) {
+        std::lock_guard lock(backing_mutex);
+        backing_generation.fetch_add(1, std::memory_order_relaxed);
+        note_slot_change(leonida::SlotChange::target_gone, address, bytes);
+        if (heap_gpu) released_ranges.emplace_back(address - arena.address, bytes);
+    }
     void backing(VkDeviceAddress address, uint64_t bytes, uint64_t id, bool add) {
         std::lock_guard lock(backing_mutex);
-        if (add) gpu_backings.insert(address, bytes, id);
-        else {
+        backing_generation.fetch_add(1, std::memory_order_relaxed);
+        if (add) {
+            gpu_backings.insert(address, bytes, id);
+            // A V# that named this range before it was backed, directly or through an alias, can resolve now.
+            note_slot_change(leonida::SlotChange::target_added, address, bytes);
+            note_slot_source_added(address, bytes);
+        } else {
             gpu_backings.erase(address, id);
-            released_backings.fetch_add(1, std::memory_order_release);
+            // The heap slots whose copy names it are fixed again at the next refresh.
+            note_slot_change(leonida::SlotChange::target_gone, address, bytes);
+            // LEONIDA_CONSOLE_HEAP_GPU: the key entries answering into it go at the next refresh.
+            if (heap_gpu) released_ranges.emplace_back(address - arena.address, bytes);
         }
     }
 
     enum class VsharpPath { table, shadow, scratch };
     enum class VsharpResult { unchanged, rebased, empty };
+    // What fix_vsharp resolved a V# to, for a console heap's slot record (ConsoleHeapSlotRecords::set).
+    struct VsharpRecord {
+        leonida::ConsoleHeapSlotRecords::State state = leonida::ConsoleHeapSlotRecords::none;
+        uint64_t base = 0, span = 0, target = 0;
+    };
+    // A buffer V#'s words, and what fix_vsharp made of them (ConsoleHeap::answers).
+    struct VsharpWords {
+        std::uint64_t low = 0, high = 0;
+        bool operator==(const VsharpWords&) const = default;
+    };
+    struct VsharpWordsHash {
+        std::size_t operator()(const VsharpWords& words) const noexcept {
+            return std::hash<std::uint64_t>{}(words.low ^ (words.high * 0x9e3779b97f4a7c15ull));
+        }
+    };
+    struct VsharpAnswer {
+        std::uint32_t words[3];
+        VsharpResult result;
+        VsharpRecord record;
+    };
 
+    // `refused` (when given): for an answer of 0, the copy an alias range named that was not backed (0: none), so the
+    // console heap's slot record is found again when a backing is added there.
     uint64_t vsharp_address(uint64_t base, uint64_t bytes, leonida::TitleVaAliases::Kind kind = leonida::TitleVaAliases::created_view,
-                            bool make_window = true, bool try_geometry = false) {
+                            bool make_window = true, bool try_geometry = false, uint64_t* refused = nullptr) {
+        if (refused) *refused = 0;
         if (!base || !bytes) return 0;
         auto& aliases = leonida::title_va_aliases();
         constexpr uint64_t mask = (1ull << 48) - 1;
@@ -2889,32 +4654,85 @@ struct DeviceState {
             uint64_t host{}, room{};
             return geometry.cap() && geometry.lookup(bda, host, room) && room >= bytes;
         };
+        const auto path = [this](unsigned p) { vsharp_paths[p].fetch_add(1, std::memory_order_relaxed); };
         uint64_t to{}, room{};
         if (aliases.range_of(base, to, room)) {
-            if (!to || room < bytes || !backed(to)) return 0;
+            // A range that ends before the V# does: the resolver may give a stream pool's request one mapping for all
+            // of it (resolve_pool_memory), as TitleVaAliases::resolve asks it for a short range.
+            uint64_t whole{};
+            if (to && room < bytes && make_window && resolve_title_memory(base, bytes, whole) && whole)
+                aliases.range_of(base, to, room);
+            if (!to || room < bytes || !backed(to)) {
+                if (refused) *refused = to;
+                return path(1), 0;
+            }
             aliases.note_translation(kind);
-            return to;
+            return path(0), to;
         }
         // An already rewritten descriptor carries only the low 48 bits.
         uint64_t offset = base;
         if (signed_vsharp_offsets() && base <= mask && (base & (1ull << 47))) offset |= ~mask;
-        if (backed(offset)) return offset;
+        if (backed(offset)) return path(2), offset;
         // Read the other way: bit 47 as a sign, for a below-arena buffer's V# the layer wrote itself.
         if (offset == base && base <= mask && (base & (1ull << 47)) && backed(base | ~mask)) return base | ~mask;
         if (try_geometry) {
             to = geometry_va(base, bytes, false);
-            if (to && encodable(to)) return to;
+            if (to && encodable(to)) return path(3), to;
         }
         uint64_t lo{}, hi{};
         if (make_window && aliases.title_memory(base, lo, hi) && bytes <= hi - base) {
             to = aliases.resolve(base, bytes, kind);
             uint64_t mapped{};
-            if (to && aliases.range_of(base, mapped, room) && mapped == to && room >= bytes && backed(to)) return to;
+            if (to && aliases.range_of(base, mapped, room) && mapped == to && room >= bytes && backed(to))
+                return path(4), to;
+            if (refused) *refused = to;
         }
-        return 0;
+        return path(5), 0;
+    }
+    // vsharp_address's outcomes (diagnostics): alias hit, alias refused, arena VA, geometry copy, window, none.
+    static constexpr unsigned kVsharpPathCount = 6;
+    std::array<std::atomic<std::uint64_t>, kVsharpPathCount> vsharp_paths{};
+
+    // LEONIDA_UNBACKED_VSHARP=1 (diagnostic): the buffer V#s fix_vsharp writes empty because nothing backs their base.
+    // One line for each of the first 120 distinct bases (span and stride), and every 8192 such V#s a summary by 4 GiB
+    // range of the base, so the address ranges the world's data comes from can be compared with the title memory.
+    static void note_unbacked_vsharp(uint64_t base, uint64_t span, uint32_t stride, const uint32_t* w) {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_UNBACKED_VSHARP");
+            return v && *v == '1';
+        }();
+        if (!on) return;
+        static std::mutex mutex;
+        static std::unordered_map<uint64_t, uint64_t> seen;  // base -> span
+        static std::map<uint64_t, uint64_t> by_range;         // base >> 32 -> distinct bases
+        static uint64_t count = 0;
+        std::lock_guard lock(mutex);
+        ++count;
+        if (seen.emplace(base, span).second) {
+            ++by_range[base >> 32];
+            if (seen.size() <= 120)
+                std::fprintf(stderr,
+                             "[rt] unbacked-vsharp: #%zu base 0x%llx span %llu stride %u words %08x %08x %08x %08x\n",
+                             seen.size(), static_cast<unsigned long long>(base), static_cast<unsigned long long>(span),
+                             stride, w[0], w[1], w[2], w[3]);
+        }
+        if (!(count % 8192)) {
+            std::vector<std::pair<uint64_t, uint64_t>> top;
+            for (const auto& [range, n] : by_range) top.emplace_back(n, range);
+            std::sort(top.rbegin(), top.rend());
+            std::string text;
+            char item[64];
+            for (std::size_t i = 0; i < top.size() && i < 10; ++i) {
+                std::snprintf(item, sizeof(item), "%s0x%llx00000000 x%llu", i ? "; " : "",
+                              static_cast<unsigned long long>(top[i].second), static_cast<unsigned long long>(top[i].first));
+                text += item;
+            }
+            std::fprintf(stderr, "[rt] unbacked-vsharp: %llu empty V#s, %zu distinct bases; by 4 GiB range: %s\n",
+                         static_cast<unsigned long long>(count), seen.size(), text.c_str());
+        }
     }
 
-    VsharpResult fix_vsharp(uint32_t* w, VsharpPath path) {
+    VsharpResult fix_vsharp(uint32_t* w, VsharpPath path, VsharpRecord* record = nullptr) {
         if ((w[3] >> 30) || !w[2]) return VsharpResult::unchanged; // image, empty slot or raw pointer
         const uint64_t base = uint64_t(w[0]) | (uint64_t(w[1] & 0xffff) << 32);
         const uint32_t stride = (w[1] >> 16) & 0x3fffu;
@@ -2923,8 +4741,16 @@ struct DeviceState {
         leonida::gfx10::Buffer desc{};
         const bool copy_geometry = leonida::gfx10::decode(words, desc) &&
             (path != VsharpPath::scratch || span <= kTitleWindowMax || (desc.format && leonida::gfx10::encode(desc) == words));
+        uint64_t refused = 0;
         const auto to = vsharp_address(base, span, leonida::TitleVaAliases::table_view,
-                                       path != VsharpPath::scratch, copy_geometry);
+                                       path != VsharpPath::scratch, copy_geometry, &refused);
+        if (record) {
+            // The copy's device address (mod 2^64: a buffer below the arena has a negative offset).
+            record->state = to ? leonida::ConsoleHeapSlotRecords::resolved : leonida::ConsoleHeapSlotRecords::waiting;
+            record->base = base;
+            record->span = span;
+            record->target = to ? arena.address + to : refused ? arena.address + refused : 0;
+        }
         if (!to) {
             static std::atomic_flag noted[3]{};
             if (!noted[unsigned(path)].test_and_set(std::memory_order_relaxed)) {
@@ -2933,6 +4759,7 @@ struct DeviceState {
                 std::fprintf(stderr, "[rt] d3d12: %s V# at 0x%llx (%llu bytes) has no GPU backing; zero records\n",
                              where, (unsigned long long)base, (unsigned long long)span);
             }
+            note_unbacked_vsharp(base, span, stride, w);
             w[0] = w[1] = w[2] = 0;
             return VsharpResult::empty;
         }
@@ -2942,12 +4769,14 @@ struct DeviceState {
         return VsharpResult::rebased;
     }
 
-    // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to
-    // the device's VkQueue and waited for. Created on first use.
     rt::d3d12::TitleImageUpload title_upload;  // accessed with title_upload_mutex held
     std::mutex title_upload_mutex;  // after title_texture_mutex when both are taken (the fill worker takes it alone)
+    // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to a
+    // VkQueue the game's first queues do not use and waited for (review D9): the copy family's for colour textures,
+    // the graphics family's for the rest (staged_copy). Created on first use.
     std::mutex staging_mutex;
     std::unique_ptr<leonida::VulkanQueue> staging_queue;
+    std::unique_ptr<leonida::VulkanQueue> staging_copy_queue;
 
     // The GPU address arena (docs/d3d12_vulkan.md section 3.3): one host-visible, device-addressable VkBuffer that
     // stands in for the console's GPU address space. A console VA is an offset in it, and heap_base (push-constant
@@ -3077,6 +4906,7 @@ struct DeviceState {
                              static_cast<unsigned long long>(arena.blocks.free_bytes() >> 10));
             return false;
         }
+        // The V# writers look this range up by device address (vsharp_address): an allocation registers its backing.
         backing(arena.address + out, bytes, out, true);
         ++arena.allocations;
         arena.in_use += bytes;
@@ -3098,34 +4928,44 @@ struct DeviceState {
                          (unsigned long long)va, (unsigned long long)bytes);
     }
 
-    // Printed once at device release, so a run reports the size the arena needs.
+    // Printed once at device release, so a run reports the size the arena needs; the arena line also about once a
+    // minute with a console heap's log (report_arena_peak), since a run cut short never releases its device.
     void report_arena() {
+        report_arena_peak();
+        report_title_memory();
+    }
+    void report_arena_peak() {
         std::lock_guard lock(arena.mutex);
         if (!arena.size) return;
         const double mib = 1.0 / (1 << 20);
         std::fprintf(stderr,
                      "[rt] d3d12: GPU address arena: peak end %.1f of %.1f MiB (%.1f%%), peak live %.1f MiB "
-                     "(buffers %.1f, descriptor heaps %.1f, shaders %.1f, heaps %.1f), %llu allocations, %llu refused; "
-                     "%zu free blocks (largest %.1f MiB, %.1f MiB free)\n",
+                     "(buffers %.1f, descriptor heaps %.1f of which null guards %.1f now, shaders %.1f, heaps %.1f), %llu "
+                     "allocations, %llu refused; %zu free blocks (largest %.1f MiB, %.1f MiB free)\n",
                      arena.peak_end * mib, arena.size * mib, 100.0 * double(arena.peak_end) / double(arena.size),
                      arena.peak_in_use * mib, arena.use_peak[arena_buffer] * mib,
-                     arena.use_peak[arena_descriptor_heap] * mib, arena.use_peak[arena_shader] * mib,
+                     arena.use_peak[arena_descriptor_heap] * mib,
+                     double(arena_guard_bytes.load(std::memory_order_relaxed)) * mib, arena.use_peak[arena_shader] * mib,
                      arena.use_peak[arena_heap] * mib,
                      (unsigned long long)arena.allocations, (unsigned long long)arena.failures, arena.blocks.count(),
                      arena.blocks.largest().size * mib, arena.blocks.free_bytes() * mib);
+    }
+    void report_title_memory() {
         {
             std::lock_guard windows(title_window_mutex);
             const auto geometry_spans = std::count_if(pool_spans.begin(), pool_spans.end(),
                                                       [](const PoolSpan& span) { return span.geometry; });
             std::fprintf(stderr,
-                         "[rt] d3d12: title memory: %zu windows (%llu KiB of a %llu MiB budget, %llu refused), %zu "
-                         "stream-pool extents (one mapping each, %llu KiB; %lld by geometry copy), %llu addresses "
-                         "given a zero-size view\n",
+                         "[rt] d3d12: title memory: %zu windows (%llu KiB of a %llu MiB budget, %llu refused, %llu "
+                         "retired once nothing reached them), %zu stream-pool extents (one mapping each, %llu KiB; "
+                         "%lld by geometry copy, %llu retired with their copy or window), %llu addresses given a "
+                         "zero-size view\n",
                          title_windows.size(), static_cast<unsigned long long>(title_window_bytes >> 10),
                          static_cast<unsigned long long>(title_window_cap >> 20),
-                         static_cast<unsigned long long>(title_window_refusals), pool_spans.size(),
+                         static_cast<unsigned long long>(title_window_refusals),
+                         static_cast<unsigned long long>(title_windows_retired), pool_spans.size(),
                          static_cast<unsigned long long>(pool_span_bytes >> 10),
-                         static_cast<long long>(geometry_spans),
+                         static_cast<long long>(geometry_spans), static_cast<unsigned long long>(pool_spans_retired),
                          static_cast<unsigned long long>(unbacked_requests));
         }
     }
@@ -3140,6 +4980,8 @@ struct DeviceState {
             backing(arena.address + offset, bytes, offset, false);
             arena.in_use -= bytes;
             arena.use_in_use[use] -= bytes;
+            // A heap copy re-fixes the slots that named a backing that has gone (slot_changes): the range is no view's.
+            backing(arena.address + offset, bytes, offset, false);
         }
         if (fault != leonida::ArenaBlocks::Fault::none && arena_report_due()) {
             std::fprintf(stderr,
@@ -3151,6 +4993,7 @@ struct DeviceState {
                          static_cast<unsigned long long>(arena.blocks.free_bytes() >> 10),
                          static_cast<unsigned long long>(arena.blocks.faults()));
             arena_report_suppressed("arena releases");
+
         }
         check_arena("a release");
     }
@@ -3186,8 +5029,8 @@ struct DeviceState {
         std::uint64_t console_va = 0;
         VkDeviceSize bytes = 0;
         std::uint64_t shader_va = 0;  // where shaders read it
-        VkDeviceSize guard = 0;
-        bool resource_heap = false;
+        VkDeviceSize guard = 0;       // null bytes after the GPU copy (heap_guard_bytes/heap_guard_for), its allocation
+        bool resource_heap = false;   // a CBV/SRV/UAV heap; a sampler heap's S#s are copied as written
         bool imported = false;
         std::uint8_t* copy = nullptr;  // writable GPU mirror of the console heap
         // Keep large scratch allocations out of the low addresses the title can use for its heap.
@@ -3199,17 +5042,20 @@ struct DeviceState {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         std::uint64_t pin = 0;  // the imported pages' leonida::kernel_writes pin while `memory` lives
         std::size_t scan_at = 0;  // the next slot the T# scan reads
-        uint64_t checked_generation{}, alias_generation{};
         // copy
         bool identity = false;
         ShadowPagesPtr pages;
         std::vector<std::uint8_t> mirror;  // the title's bytes as the tracker last copied them
         std::vector<std::uint8_t> made;    // the title's bytes each arena slot was last made from
         std::vector<std::uint8_t> retry;   // per slot: not settled yet (fix_console_slot), in `retries`
+        // A resource heap's V# halves: what each resolved to (fix_console_slot), so a change of the address space
+        // re-fixes the slots it touches (apply_slot_changes), and a V# whose buffer comes later is fixed when it does.
+        leonida::ConsoleHeapSlotRecords records;
         std::vector<std::uint32_t> retries;
-        std::set<std::uint32_t> empty_slots;
-        std::uint32_t next_empty = 0;
         std::size_t retry_at = 0;  // where retry_console_slots goes on
+        // fix_vsharp's answers during one pass over the heap's slots (fix_heap_vsharp), cleared after it.
+        std::unordered_map<VsharpWords, VsharpAnswer, VsharpWordsHash> answers;
+        bool answering = false;
         // fix_console_slots' budget, for the current refresh, and the slots it nulled since the last log line
         std::chrono::steady_clock::time_point fix_start{};
         bool fix_over = false;
@@ -3218,13 +5064,55 @@ struct DeviceState {
         std::uint64_t refreshes = 0, logged = 0;
         std::chrono::steady_clock::time_point log_time{};
         // Since the last log line.
-        std::uint64_t copied = 0, vsharps = 0, unbacked = 0, retried = 0;
+        std::uint64_t copied = 0, vsharps = 0, unbacked = 0, retried = 0, reused = 0;
         std::uint64_t images[5] = {};  // by TitleImage
+        std::map<std::string, std::uint64_t> refused_reasons;
         double ms = 0, pages_ms = 0, fix_ms = 0, retry_ms = 0;  // ms: all; the others its parts
+        // Changed slots by class (before the fix budget), since the last log line: all-zero, V# pair, T#, other
+        // words; V# halves whose 16 bytes were seen before (a direct-mapped memo of 65536 keys, so a lower bound of
+        // how often an exact-key translation would be found again); the slot records' work: changes applied, index
+        // entries looked at, slots fixed again, and its time.
+        std::uint64_t changed[4] = {}, vsharp_halves = 0, vsharp_repeats = 0;
+        std::uint64_t record_changes = 0, record_looked = 0, record_refixed = 0;
+        double record_ms = 0;
+        std::vector<std::array<std::uint32_t, 4>> seen_keys;
+        // LEONIDA_CONSOLE_HEAP_GPU (DeviceState::attach_console_heap_gpu): the translation pass's index of this heap
+        // (-1: fixed on the CPU), the import of `input` the pass reads, the slots holding a V# pair (translated again
+        // when a backing goes), and the slots queued for the pass since the last log line.
+        int gpu = -1;
+        VkBuffer input_buffer = VK_NULL_HANDLE;
+        VkDeviceMemory input_memory = VK_NULL_HANDLE;
+        std::vector<std::uint64_t> vsharp_bits;
+        std::uint64_t gpu_queued = 0;
+        std::uint32_t gpu_high = 0;  // one past the highest slot the title has written (a rescan's range)
     };
     std::mutex console_heap_mutex;  // taken before title_window_mutex, shadow_mutex and descriptor_mutex
     std::vector<std::unique_ptr<ConsoleHeap>> console_heaps;
 
+    // Null slots after a shader-visible resource heap's GPU copy. A directly indexed heap is read at
+    // heap VA + index * 32 with the index from data (docs/d3d12_vulkan.md section 3.4), and nothing bounds it: an
+    // index past the heap read whatever the arena held after it, and a buffer V# made of those bytes sent loads and
+    // stores to heap_base + garbage (GPU MMU faults at world start). With the guard such an index reads a null
+    // descriptor instead (loads 0, stores dropped). As VIctory does for its host heaps (crates/victory-shader/src/emit
+    // "Heap indices": at least 2^21 slots, those past the title's own null).
+    // Two shapes: `heap_guard_bytes` is the fixed reach a directly indexed heap is given (2^21 slots, bounded so the
+    // heap and its guard stay inside a 32-bit shader offset, LEONIDA_HEAP_GUARD_MB overrides), and `heap_guard_for`
+    // is the per-heap guard a console heap's copy takes - as large as the heap, at least 1 MiB, at most
+    // `heap_guard_cap()` (64 MiB by default, 0: no guard). Either comes out of the arena every default-heap buffer is
+    // placed in; a heap the arena has no room for with its guard is made without one (logged).
+    static constexpr VkDeviceSize kHeapGuardFloor = VkDeviceSize(1) << 20;
+    static VkDeviceSize heap_guard_cap() {
+        static const VkDeviceSize bytes = [] {
+            constexpr VkDeviceSize fallback = VkDeviceSize(64) << 20;
+            char text[16] = {};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_HEAP_GUARD_MB", text, sizeof(text));
+            if (n == 0 || n >= sizeof(text)) return fallback;
+            for (DWORD i = 0; i < n; ++i)
+                if (text[i] < '0' || text[i] > '9') return fallback;  // "-1" and the like: the default
+            return VkDeviceSize(std::min<unsigned long long>(std::strtoull(text, nullptr, 10), 1024)) << 20;
+        }();
+        return bytes;
+    }
     static constexpr VkDeviceSize kHeapIndexReach = VkDeviceSize(1) << 26;  // 2^21 slots of 32 bytes
     static VkDeviceSize heap_guard_bytes() {
         static const VkDeviceSize bytes = [] {
@@ -3235,6 +5123,17 @@ struct DeviceState {
         }();
         return bytes;
     }
+    // The null bytes after a heap of `bytes`: as many as the heap, at least `floor`, at most heap_guard_cap(); grown so
+    // heap and guard together end on a multiple of `align`. 0 with no cap.
+    static VkDeviceSize heap_guard_for(VkDeviceSize bytes, VkDeviceSize floor, VkDeviceSize align) {
+        const VkDeviceSize cap = heap_guard_cap();
+        if (!cap || !bytes) return 0;
+        VkDeviceSize guard = std::min(std::max(bytes, floor), cap);
+        if (align > 1) guard = (bytes + guard + align - 1) / align * align - bytes;
+        return guard;
+    }
+    std::atomic<std::uint64_t> arena_guard_bytes{0};  // the heap guards in the arena now (report_arena)
+
 
     // [start, start + bytes) of the arena, exactly. False when any of it is taken or past the arena.
     bool arena_allocate_at(VkDeviceSize start, VkDeviceSize bytes, ArenaUse use) {
@@ -3251,54 +5150,123 @@ struct DeviceState {
         return true;
     }
 
-    // Slot `slot` of a heap copy, as the title wrote it, fixed up as described above. True when it is settled: not a
-    // T# whose texture is still to come, nor a V# into the title's memory that got no copy.
+    // fix_vsharp, asked once for each distinct V# in a pass over a heap's slots (heap.answering). The title writes the
+    // same words into thousands of slots, many of them data that reads as a V# into title memory with no copy, and
+    // each such answer costs VirtualQuery calls: under Wine a third of the submitting thread's time in the world.
+    VsharpResult fix_heap_vsharp(ConsoleHeap& heap, std::uint32_t* w, VsharpPath path, VsharpRecord* record) {
+        if (!heap.answering || (w[3] >> 30) || !w[2]) return fix_vsharp(w, path, record);
+        const VsharpWords key{w[0] | std::uint64_t(w[1]) << 32, w[2] | std::uint64_t(w[3]) << 32};
+        if (const auto it = heap.answers.find(key); it != heap.answers.end()) {
+            std::memcpy(w, it->second.words, sizeof(it->second.words));
+            *record = it->second.record;
+            ++heap.reused;
+            return it->second.result;
+        }
+        const VsharpResult result = fix_vsharp(w, path, record);
+        heap.answers.emplace(key, VsharpAnswer{{w[0], w[1], w[2]}, result, *record});
+        return result;
+    }
+
+    // Slot `slot` of a heap copy, as the title wrote it, fixed up as described above, and the only writer of a
+    // resource heap's slot records. True when it is settled: not a T# whose texture is still to come. A sampler heap
+    // holds S#s: copied as written.
     bool fix_console_slot(ConsoleHeap& heap, std::size_t slot) {
         std::uint32_t w[kDescriptorSize / 4];
         std::memcpy(w, heap.previous + slot * kDescriptorSize, kDescriptorSize);
-        bool settled = true, empty = false;
-        if (!(w[3] >> 30)) {
-            const auto path = heap.scratch ? VsharpPath::scratch : VsharpPath::shadow;
-            const auto result = fix_vsharp(w, path);
-            const auto counter = fix_vsharp(w + 4, path);
+        bool settled = true, vsharp = false;
+        VsharpRecord halves[2];
+        const VsharpPath path = heap.scratch ? VsharpPath::scratch : VsharpPath::shadow;
+        if (!heap.resource_heap || !(w[0] | w[1] | w[2] | w[3])) {
+            // A sampler heap holds S#s (copied as written); an all-zero slot stays null.
+        } else if (!(w[3] >> 30)) {
+            // A buffer V#: rewritten to the address its bytes are backed at (fix_vsharp: the console shadow, or the
+            // console scratch an imported heap rewrites). A base nothing backs is written with no base and no records
+            // and recorded as waiting: a backing, alias range or title memory added over it fixes the slot again
+            // (apply_slot_changes).
+            vsharp = true;
+            const VsharpResult result = fix_heap_vsharp(heap, w, path, &halves[0]);
             if (result == VsharpResult::rebased) ++heap.vsharps;
-            if (result == VsharpResult::empty || counter == VsharpResult::empty) {
-                ++heap.unbacked;
-                empty = true;
-            }
+            // Only the GPU copy changes; the title's bytes (heap.previous) stay as written.
+            if (result == VsharpResult::empty) ++heap.unbacked;
+            // The slot's second V# is a UAV counter (raw, 4 bytes, in the descriptor's upper 16 bytes): a store to it at
+            // heap_base + a raw title address loses the device just as one through the buffer V# does. A counter with
+            // no backing is nulled and waits as the buffer V# does.
+            if (fix_heap_vsharp(heap, w + 4, path, &halves[1]) == VsharpResult::empty) ++heap.unbacked;
         } else {
             leonida::gfx10::ImageWords words;
             std::memcpy(words.data(), w, sizeof(words));
             if (leonida::gfx10::is_image(words)) {
                 const char* why = nullptr;
                 const TitleImage result = bind_title_image(*this, words, &why);
-                if (result == TitleImage::unknown || result == TitleImage::refused)
+                if (result == TitleImage::unknown || result == TitleImage::refused) {
                     note_refused_tsharp(heap, slot * kDescriptorSize, words, why);
+                    if (result == TitleImage::refused)
+                        ++heap.refused_reasons[why ? why : "?"];
+                }
                 ++heap.images[unsigned(result)];
                 settled = result != TitleImage::unknown && result != TitleImage::refused;
                 if (result == TitleImage::not_tsharp) std::memset(w, 0, 16);
             } else {
+                // Neither a buffer V# (TYPE is not 0) nor a T# the layer can decode: data the title keeps in the slot.
+                // No image is found by these words (the bindless lookup misses, as for a null T#), but a shader that
+                // takes the slot as a V# (an index from data, or one past what the title filled) adds heap_base to
+                // words that name nothing: in the GPU copy the slot is null.
                 ++heap.images[unsigned(TitleImage::not_tsharp)];
                 std::memset(w, 0, 16);
             }
         }
-        if (empty) heap.empty_slots.insert(std::uint32_t(slot));
-        else if (!heap.empty_slots.empty()) heap.empty_slots.erase(std::uint32_t(slot));
         std::memcpy(heap.copy + slot * kDescriptorSize, w, kDescriptorSize);
+        if (heap.resource_heap) {
+            if (vsharp)
+                for (unsigned half = 0; half < 2; ++half)
+                    heap.records.set(slot, half, halves[half].state, halves[half].base, halves[half].span,
+                                     halves[half].target);
+            else
+                heap.records.clear(slot);
+        }
         return settled;
+    }
+
+    // Diagnostics only: the class of a changed slot, and whether its V# halves were seen before (ConsoleHeap::changed).
+    static void note_changed_slot(ConsoleHeap& heap, const std::uint8_t* bytes) {
+        std::uint32_t w[8];
+        std::memcpy(w, bytes, sizeof(w));
+        if (!(w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7])) {
+            ++heap.changed[0];
+            return;
+        }
+        if (w[3] >> 30) {
+            leonida::gfx10::ImageWords words;
+            std::memcpy(words.data(), w, sizeof(words));
+            ++heap.changed[leonida::gfx10::is_image(words) ? 2 : 3];
+            return;
+        }
+        ++heap.changed[1];
+        if (heap.seen_keys.empty()) heap.seen_keys.resize(65536);
+        for (int half = 0; half < 2; ++half) {
+            const std::uint32_t* k = w + 4 * half;
+            if (!k[2]) continue;  // no records: nothing to translate
+            ++heap.vsharp_halves;
+            std::uint32_t h = 2166136261u;
+            for (int i = 0; i < 4; ++i) h = (h ^ k[i]) * 16777619u;
+            auto& entry = heap.seen_keys[h & 0xffffu];
+            if (entry[0] == k[0] && entry[1] == k[1] && entry[2] == k[2] && entry[3] == k[3]) ++heap.vsharp_repeats;
+            else entry = {k[0], k[1], k[2], k[3]};
+        }
     }
 
     // The slots on [offset, offset + bytes) of a heap copy's mirror, just brought up to date: each that differs from
     // what its arena slot was made from is written there and fixed up.
-    // Past LEONIDA_CONSOLE_FIX_US of fixing in one submission (4000 by default, 0: no limit), a changed slot is written
-    // as a null descriptor and left to retry_console_slots: after the story load the title rewrote up to 3.7 MiB of
-    // its heap at once and one submission spent 28 s fixing it (speed-8). A shader reads such a slot as empty until
-    // its turn comes.
+    // LEONIDA_CONSOLE_FIX_US limits the fixing in one submission (0, the default: no limit). Past it a changed slot is
+    // written as a null descriptor and left to retry_console_slots: after the story load the title rewrote up to
+    // 3.7 MiB of its heap at once and one submission spent 28 s fixing it (speed-8). A shader reads such a slot as
+    // empty until its turn comes, so a limit changes results: at the first world frame lib_cs_01144 read the size it
+    // divides by from a nulled buffer slot and its loops never ended, which lost the device.
     void fix_console_slots(ConsoleHeap& heap, std::size_t offset, std::size_t bytes) {
         static const std::uint64_t budget_us = [] {
             char text[16] = {};
             const DWORD n = GetEnvironmentVariableA("LEONIDA_CONSOLE_FIX_US", text, sizeof(text));
-            return n > 0 && n < sizeof(text) ? std::strtoull(text, nullptr, 10) : 4000ull;
+            return n > 0 && n < sizeof(text) ? std::strtoull(text, nullptr, 10) : 0ull;
         }();
         const std::size_t end = std::min<std::size_t>(offset + bytes, std::size_t(heap.bytes));
         if (!heap.resource_heap) {
@@ -3310,11 +5278,19 @@ struct DeviceState {
             const std::size_t slot = at / kDescriptorSize;
             if (!std::memcmp(heap.previous + at, heap.input + at, kDescriptorSize)) continue;
             std::memcpy(heap.previous + at, heap.input + at, kDescriptorSize);
+            note_changed_slot(heap, heap.previous + at);
             if (budget_us && !heap.fix_over && !(++heap.fix_count & 15) &&
                 std::chrono::steady_clock::now() - heap.fix_start >= std::chrono::microseconds(budget_us))
                 heap.fix_over = true;
-            if (heap.fix_over) {
+            // Buffer V#s (!(w3 >> 30)) only rebase address offsets, so they are fast and must never be
+            // deferred or nulled: at the first world frame lib_cs_01144 reads its loop bound from a buffer
+            // slot; nulling it causes an infinite loop and device loss. Only image T#s are deferred past budget.
+            std::uint32_t w3 = 0;
+            std::memcpy(&w3, heap.previous + at + 12, sizeof(w3));
+            const bool is_buffer_vsharp = !(w3 >> 30);
+            if (heap.fix_over && !is_buffer_vsharp) {
                 std::memset(heap.copy + at, 0, kDescriptorSize);
+                heap.records.clear(slot);
                 ++heap.deferred_fixes;
                 if (!heap.retry[slot]) {
                     heap.retry[slot] = 1;
@@ -3329,6 +5305,27 @@ struct DeviceState {
                 heap.retries.push_back(std::uint32_t(slot));
             }
         }
+    }
+
+    // The changes since the last submission (slot_changes), applied to a resource heap's copy: each slot whose record
+    // a change touches is fixed again - a V# whose backing, copy or alias range went, so the copy never names freed
+    // memory, and a waiting V# over which a backing, alias range or title memory was added. Only the slots near the
+    // changed ranges are looked at (ConsoleHeapSlotRecords::touched); nothing reads the copy.
+    std::vector<std::uint32_t> slot_change_scratch;  // console_heap_mutex
+    void apply_slot_changes(ConsoleHeap& heap, const std::vector<leonida::SlotChange>& changes) {
+        if (!heap.resource_heap || changes.empty()) return;
+        const auto start = std::chrono::steady_clock::now();
+        const std::uint64_t looked = heap.records.looked_at();
+        heap.records.touched(changes.data(), changes.size(), slot_change_scratch);
+        heap.record_changes += changes.size();
+        heap.record_looked += heap.records.looked_at() - looked;
+        heap.record_refixed += slot_change_scratch.size();
+        for (const std::uint32_t slot : slot_change_scratch)
+            if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
+                heap.retry[slot] = 1;
+                heap.retries.push_back(slot);
+            }
+        heap.record_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
 
     // The slots of a heap copy not settled yet: fixed again, and kept while they are still not. Round robin, for at
@@ -3365,28 +5362,16 @@ struct DeviceState {
         heap.retried += visited;
     }
 
-    // The first refused T#s of each reason, with where they sit in the heap and their words, and a count of the
-    // distinct slots refused (a slot is scanned again every pass over the heap).
     void note_refused_tsharp(ConsoleHeap& heap, std::size_t offset, const leonida::gfx10::ImageWords& words,
                              const char* why) {
-        static std::mutex mutex;
-        static std::map<std::string, unsigned> logged;
-        static std::set<std::size_t> slots;
-        std::lock_guard lock(mutex);
-        if (slots.size() >= 262144) return;  // enough to say how many
-        const bool fresh = slots.insert(offset).second;
-        unsigned& n = logged[why ? why : "?"];
-        if (!fresh || n >= 6) return;
-        ++n;
-        std::fprintf(stderr,
-                     "[rt] d3d12: unbound T# in console heap 0x%llx at +0x%zx (%zu distinct slots so far): %s: "
-                     "%08x %08x %08x %08x %08x %08x %08x %08x\n",
-                     static_cast<unsigned long long>(heap.console_va), offset, slots.size(), why ? why : "?", words[0],
-                     words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+        unbound_tsharp_tracker().note(heap.console_va, offset, words, why);
     }
 
-    void refresh_console_heap(ConsoleHeap& heap) {  // console_heap_mutex held
+    // `changes`: what changed since the last submission (refresh_console_heaps took it from slot_changes), or null for
+    // a heap's first refresh, which has no records yet.
+    void refresh_console_heap(ConsoleHeap& heap, const std::vector<leonida::SlotChange>* changes) {  // console_heap_mutex held
         if (heap.imported) return;  // directly imported sampler heap
+        if (heap.gpu >= 0) return refresh_console_heap_gpu(heap);
         using clock = std::chrono::steady_clock;
         const auto ms = [](clock::time_point a, clock::time_point b) {
             return std::chrono::duration<double, std::milli>(b - a).count();
@@ -3398,47 +5383,23 @@ struct DeviceState {
             std::memset(heap.previous + offset, 0, bytes);
             const auto first = std::uint32_t(offset / kDescriptorSize);
             const auto end = std::uint32_t((offset + bytes) / kDescriptorSize);
-            heap.empty_slots.erase(heap.empty_slots.lower_bound(first), heap.empty_slots.lower_bound(end));
             for (auto slot = first; slot < end; ++slot) heap.retry[slot] = 0;
+            if (heap.resource_heap) heap.records.clear_range(first, end);
         });
         const auto t1 = clock::now();
         heap.fix_start = t1;
         heap.fix_over = false;
         heap.fix_count = 0;
+        heap.answering = true;
         heap.pages->for_each_copied([&](std::size_t offset, std::size_t bytes) { fix_console_slots(heap, offset, bytes); });
-        const auto generation = released_backings.load(std::memory_order_acquire);
-        const auto alias_generation = leonida::title_va_aliases().invalidations();
-        if (heap.resource_heap && (generation != heap.checked_generation || alias_generation != heap.alias_generation)) {
-            heap.alias_generation = alias_generation;
-            heap.checked_generation = generation;
-            // Even an unchanged title slot may name a buffer released since the last submission.
-            for (size_t at = 0; at + kDescriptorSize <= heap.bytes; at += kDescriptorSize) {
-                auto* w = reinterpret_cast<uint32_t*>(heap.copy + at);
-                if (!(w[3] >> 30) && (w[2] || w[6])) {
-                    const auto slot = at / kDescriptorSize;
-                    if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
-                        heap.retry[slot] = 1;
-                        heap.retries.push_back(uint32_t(slot));
-                    }
-                }
-            }
-        }
+        heap.answers.clear();  // the changes below can release what an answer of the pass above named
+        // Even an unchanged title slot may name a buffer released since the last submission: the slots the changes
+        // touch are fixed again, found by their records.
+        if (changes) apply_slot_changes(heap, *changes);
+        heap.answering = false;
+        heap.answers.clear();
         const auto t2 = clock::now();
-        // A settled zero can acquire GPU backing without a CPU map event. Probe at most eight in
-        // round-robin order every 32 submissions. Keep texture and copy-budget retries independent.
-        if ((heap.refreshes & 31) == 31 && !heap.empty_slots.empty()) {
-            auto it = heap.empty_slots.lower_bound(heap.next_empty);
-            const auto count = (std::min)(std::size_t{8}, heap.empty_slots.size());
-            for (std::size_t n = 0; n < count && !heap.empty_slots.empty(); ++n) {
-                if (it == heap.empty_slots.end()) it = heap.empty_slots.begin();
-                const auto slot = *it++;
-                heap.next_empty = slot + 1;
-                if (!heap.retry[slot]) {
-                    fix_console_slot(heap, slot);
-                    ++heap.retried;
-                }
-            }
-        }
+        // T#s whose texture is not there yet, and slots the fix budget deferred.
         if (!heap.retries.empty()) retry_console_slots(heap);
         const auto t3 = clock::now();
         heap.pages_ms += ms(t0, t1);
@@ -3449,9 +5410,26 @@ struct DeviceState {
     // Before every submission, ahead of the slot-133 shadows.
     void refresh_console_heaps() {
         std::lock_guard lock(console_heap_mutex);
+        const bool heap_pass = heap_gpu && console_heap_gpu_enabled();
+        if (heap_pass) console_heap_gpu_begin();
+        else if (heap_gpu) heap_gpu->drain(context->completed_retire_ticket(), [](int, std::uint32_t, std::uint32_t) {}, [](int) {});
+        struct GpuEnd {  // after every heap's slots are queued, however the loop ends
+            DeviceState& state;
+            bool on;
+            ~GpuEnd() {
+                if (on) state.console_heap_gpu_end();
+            }
+        } gpu_end{*this, heap_pass};
+        // Every change since the last submission, for every heap; one made from now on (by another thread, or by a
+        // fix below making a window) is applied at the next submission.
+        std::vector<leonida::SlotChange> changes;
+        {
+            std::lock_guard taken(slot_change_mutex);
+            changes.swap(slot_changes);
+        }
         for (const auto& heap : console_heaps) {
             const auto start = std::chrono::steady_clock::now();
-            refresh_console_heap(*heap);
+            refresh_console_heap(*heap, &changes);
             heap->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
             ++heap->refreshes;
             // A line at the first and 64th submission, then every 10 s (a crawl logs as often as a fast run).
@@ -3466,8 +5444,9 @@ struct DeviceState {
                          "in %.3f ms on average (pages %.3f, fixing copied slots %.3f, %llu left to retries past the "
                          "budget, retrying %.3f: %.1f slots a "
                          "submission, %zu waiting), %llu write faults; %llu title V#s rebased, %llu with no copy given "
-                         "no records, T#s %llu known, %llu bound, %llu naming no texture, %llu refused, %llu words "
-                         "that are no T# (data)\n",
+                         "no records (%zu V# halves waiting for a backing), %llu answered by an earlier slot of the pass, "
+                         "T#s %llu known, %llu bound, %llu naming no texture, %llu refused, %llu words that are no "
+                         "V# or T# (data, null in the copy)\n",
                          static_cast<unsigned long long>(heap->console_va), heap->imported ? "imported" : "copy",
                          static_cast<unsigned long long>(heap->refreshes), "copied",
                          double(heap->copied) / 1024.0 / count,
@@ -3476,17 +5455,61 @@ struct DeviceState {
                          double(heap->retried) / count, heap->retries.size(),
                          static_cast<unsigned long long>(heap->pages ? heap->pages->faults() : 0),
                          static_cast<unsigned long long>(heap->vsharps),
-                         static_cast<unsigned long long>(heap->unbacked),
+                         static_cast<unsigned long long>(heap->unbacked), heap->records.waiting_count(),
+                         static_cast<unsigned long long>(heap->reused),
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::known)]),
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::bound)]),
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::unknown)]),
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::refused)]),
                          static_cast<unsigned long long>(heap->images[unsigned(TitleImage::not_tsharp)]));
-            heap->copied = heap->vsharps = heap->unbacked = heap->retried = heap->deferred_fixes = 0;
+            if (heap->resource_heap) {
+                std::uint64_t paths[kVsharpPathCount];
+                for (unsigned i = 0; i < kVsharpPathCount; ++i)
+                    paths[i] = vsharp_paths[i].exchange(0, std::memory_order_relaxed);
+                std::fprintf(stderr,
+                             "[rt] d3d12: console descriptor heap 0x%llx changed slots per submission: %.1f zero, %.1f "
+                             "V# pairs, %.1f T#s, %.1f other; V# halves %.1f, %.1f%% seen before; V# resolutions since "
+                             "the last line: alias %llu, alias refused %llu, arena %llu, geometry %llu, window %llu, "
+                             "none %llu\n",
+                             static_cast<unsigned long long>(heap->console_va), double(heap->changed[0]) / count,
+                             double(heap->changed[1]) / count, double(heap->changed[2]) / count,
+                             double(heap->changed[3]) / count, double(heap->vsharp_halves) / count,
+                             heap->vsharp_halves ? 100.0 * double(heap->vsharp_repeats) / double(heap->vsharp_halves)
+                                                 : 0.0,
+                             static_cast<unsigned long long>(paths[0]), static_cast<unsigned long long>(paths[1]),
+                             static_cast<unsigned long long>(paths[2]), static_cast<unsigned long long>(paths[3]),
+                             static_cast<unsigned long long>(paths[4]), static_cast<unsigned long long>(paths[5]));
+                // What releases, alias changes and additions cost: per submission, the changes taken, the record
+                // entries looked at to find their slots, and the slots fixed again (apply_slot_changes).
+                std::fprintf(stderr,
+                             "[rt] d3d12: console descriptor heap 0x%llx slot records per submission: %.1f changes, "
+                             "%.1f slots looked at, %.1f fixed again, %.3f ms; %zu V# halves recorded\n",
+                             static_cast<unsigned long long>(heap->console_va), double(heap->record_changes) / count,
+                             double(heap->record_looked) / count, double(heap->record_refixed) / count,
+                             heap->record_ms / count, heap->records.recorded());
+                for (auto& n : heap->changed) n = 0;
+                heap->vsharp_halves = heap->vsharp_repeats = 0;
+                heap->record_changes = heap->record_looked = heap->record_refixed = 0;
+                heap->record_ms = 0;
+            }
+            if (heap->gpu >= 0) log_console_heap_gpu(*heap, count);
+            std::string refused_breakdown;
+            for (const auto& [reason, count] : heap->refused_reasons)
+                refused_breakdown += (refused_breakdown.empty() ? "" : "; ") + reason + " " + std::to_string(count);
+            if (!refused_breakdown.empty())
+                std::fprintf(stderr, "[rt] d3d12: console descriptor heap 0x%llx unbound T#s by reason: %s\n",
+                             static_cast<unsigned long long>(heap->console_va), refused_breakdown.c_str());
+            heap->refused_reasons.clear();
+            heap->copied = heap->vsharps = heap->unbacked = heap->retried = heap->reused = heap->deferred_fixes = 0;
             for (auto& n : heap->images) n = 0;
             heap->ms = heap->pages_ms = heap->fix_ms = heap->retry_ms = 0;
+            if (start - arena_log_time >= std::chrono::seconds(60)) {
+                arena_log_time = start;
+                report_arena_peak();
+            }
         }
     }
+    std::chrono::steady_clock::time_point arena_log_time{};  // console_heap_mutex held
 
     // The heap's pages imported as host memory (see above): true with `heap` filled in, false when they cannot be
     // (no VK_EXT_external_memory_host, a page not committed or write-combined, a driver refusal, or a device address
@@ -3578,13 +5601,46 @@ struct DeviceState {
         heap->bytes = bytes;
         // Self-written V#s must be rebased without changing the title's descriptor bytes.
         // A directly indexed heap can lie outside the main arena and still fit in a 32-bit shader offset.
+        // A resource heap's copy is followed by null slots (heap_guard_bytes), rounded so the whole stays 64 KiB
+        // aligned for an import.
         heap->resource_heap = resource_heap;
         // Round the guarded import up to Wine's allocation granularity.
         if (bytes > (1ull << 32)) return false;
         const VkDeviceSize requested = resource_heap ? heap_guard_bytes() : 0;
         const VkDeviceSize guard = requested && bytes + requested <= (1ull << 32)
             ? ((bytes + requested + 65535) & ~VkDeviceSize(65535)) - bytes : 0;
-        if (resource_heap && geometry.cap()) {
+        // LEONIDA_CONSOLE_HEAP_ARENA=1 (with LEONIDA_CONSOLE_HEAP_GPU): the copy and its guard in the arena, which is
+        // device-local where the device has it (ReBAR), not in an import of host memory: every draw's descriptor
+        // fetch and the pass's writes stay on the card. The CPU never writes the copy then (the pass does); [input |
+        // previous] stay in host memory. No room in the arena: the import, as without the switch.
+        bool in_arena = false;
+        if (resource_heap && geometry.cap() && heap_gpu && console_heap_gpu_enabled() && console_heap_arena_enabled() &&
+            bytes <= SIZE_MAX / 2) {
+            VkDeviceSize offset = 0;
+            const VkDeviceSize size = bytes + guard;
+            if (arena_allocate(size, 65536, offset, arena_descriptor_heap)) {
+                heap->scratch.reset(static_cast<std::uint8_t*>(
+                    VirtualAlloc(nullptr, bytes * 2, MEM_TOP_DOWN | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)));
+                if (heap->scratch) {
+                    heap->input = heap->scratch.get();
+                    heap->previous = heap->scratch.get() + bytes;
+                    heap->shader_va = offset;
+                    heap->copy = arena.mapped + offset;
+                    heap->guard = guard;
+                    heap->imported = false;
+                    in_arena = true;
+                    std::fprintf(stderr, "[rt] d3d12: LEONIDA_CONSOLE_HEAP_ARENA: console descriptor heap 0x%llx's "
+                                         "copy and %llu MiB guard in the arena at 0x%llx (memory type %u)\n",
+                                 static_cast<unsigned long long>(console_va),
+                                 static_cast<unsigned long long>(guard >> 20),
+                                 static_cast<unsigned long long>(offset), unsigned(arena.memory_type));
+                } else {
+                    arena_release(offset, size, arena_descriptor_heap);
+                }
+            }
+        }
+        if (in_arena) {
+        } else if (resource_heap && geometry.cap()) {
             if (bytes > (SIZE_MAX - guard) / 3) return false;
             // [copy | guard | input | previous]: the import covers the copy and its guard.
             heap->scratch.reset(static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes * 3 + guard, MEM_TOP_DOWN |
@@ -3639,6 +5695,11 @@ struct DeviceState {
                 heap->previous = heap->made.data();
             }
             heap->retry.assign(std::size_t(bytes / kDescriptorSize), 0);
+            if (resource_heap) {
+                heap->records.reset(std::size_t(bytes / kDescriptorSize));
+                // Changes are kept from now on, before the first refresh writes a record.
+                slot_records_live.store(true, std::memory_order_release);
+            }
             heap->pages = make_shadow_pages(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(console_va)),
                                             heap->input, std::size_t(bytes));
         }
@@ -3646,9 +5707,13 @@ struct DeviceState {
         if (shader_va != console_va) console_heap_ranges().add(console_va, bytes, shader_va);
         const bool imported = heap->imported;
         const VkDeviceSize guarded = heap->guard;
+        arena_guard_bytes.fetch_add(guarded, std::memory_order_relaxed);
+        if (heap_gpu && console_heap_gpu_enabled() && heap->scratch && resource_heap && !imported)
+            attach_console_heap_gpu(*heap);
         {
             std::lock_guard lock(console_heap_mutex);
-            if (!imported) refresh_console_heap(*heap);
+            if (heap->gpu >= 0) gpu_heaps[std::size_t(heap->gpu)] = heap.get();
+            if (!imported) refresh_console_heap(*heap, nullptr);
             if (heap->copy) {
                 std::unique_lock ranges(console_copy_ranges_mutex);
                 console_copy_ranges.emplace_back(heap->console_va, heap->bytes);
@@ -3656,13 +5721,14 @@ struct DeviceState {
             console_heaps.push_back(std::move(heap));
         }
         std::fprintf(stderr,
-                     "[rt] d3d12: console descriptor heap 0x%llx (%llu KiB): shaders read it at heap_base + 0x%llx, %s; "
-                     "%llu KiB of null slots after it\n",
-                     static_cast<unsigned long long>(console_va), static_cast<unsigned long long>(bytes >> 10),
-                     static_cast<unsigned long long>(shader_va),
+                     "[rt] d3d12: console %s descriptor heap 0x%llx (%llu KiB): shaders read it at heap_base + 0x%llx, "
+                     "%s; %llu KiB of null slots after it%s\n",
+                     resource_heap ? "CBV/SRV/UAV" : "sampler", static_cast<unsigned long long>(console_va),
+                     static_cast<unsigned long long>(bytes >> 10), static_cast<unsigned long long>(shader_va),
                      imported ? "the title's pages imported as host memory"
                               : "a descriptor copy brought up to date before every submission",
-                     static_cast<unsigned long long>(guarded >> 10));
+                     static_cast<unsigned long long>(guarded >> 10),
+                     imported && resource_heap ? " (imported pages have no guard)" : "");
         return true;
     }
 
@@ -3689,9 +5755,21 @@ struct DeviceState {
             console_heaps.erase(it);
             std::unique_lock ranges(console_copy_ranges_mutex);
             std::erase_if(console_copy_ranges, [console_va](const auto& r) { return r.first == console_va; });
+            if (heap->gpu >= 0) {
+                heap_gpu->remove_heap(heap->gpu);
+                gpu_heaps[std::size_t(heap->gpu)] = nullptr;
+            }
         }
         console_heap_ranges().remove(console_va);
         heap->pages.reset();
+        if (heap->gpu >= 0) {
+            // A pass recorded before remove_heap may still be on its way to the queue, and then reads `input` and
+            // writes the copy: wait for it to be submitted, then for everything submitted.
+            while (heap_gpu->uncommitted()) Sleep(0);
+            context->wait_retire_ticket(context->submitted_retire_ticket());
+            if (heap->input_buffer) context->vk.vkDestroyBuffer(info.device, heap->input_buffer, nullptr);
+            if (heap->input_memory) context->vk.vkFreeMemory(info.device, heap->input_memory, nullptr);
+        }
         if (heap->buffer) {
             // As for an imported slot-133 buffer: the title may free its pages right after, so the memory goes once
             // what was submitted retires, not through the deferred queue.
@@ -3702,6 +5780,1250 @@ struct DeviceState {
         } else {
             arena_release(heap->shader_va, heap->bytes + heap->guard, arena_descriptor_heap);
         }
+        arena_guard_bytes.fetch_sub(heap->guard, std::memory_order_relaxed);
+    }
+
+    // ---- LEONIDA_CONSOLE_HEAP_GPU=1: the console heaps' V#s rebased by a compute pass (src/console_heap_gpu.h) ----
+    // Before every submission the CPU still finds the changed slots (the heap's ShadowPages, then a compare with the
+    // bytes each slot was last made from) and registers the T#s, as fix_console_slot does; every changed slot is then
+    // queued for the pass, which writes it into the copy at the start of the submission (the context's prelude). A
+    // V# half the pass's tables cannot answer is written with no records and comes back as a miss once its submission
+    // is done: resolved here with vsharp_address (which may make a geometry copy) within LEONIDA_CONSOLE_GPU_RESOLVE_US
+    // a refresh (2000 by default), its answer entered in the key table and its slots queued again. Words that got no
+    // backing are asked again every LEONIDA_CONSOLE_GPU_RETRY_MS (500), on a timer to bound the per-submission cost.
+    // When a backing or an alias range goes, the key entries that answered into it are dropped and every V# slot of
+    // the heap is translated again (on the GPU: a list of slot indices).
+    std::unique_ptr<leonida::ConsoleHeapGpu> heap_gpu;
+    std::array<ConsoleHeap*, leonida::ConsoleHeapGpu::kMaxHeaps> gpu_heaps{};  // console_heap_mutex
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> released_ranges;     // (shader VA, bytes); backing_mutex
+    struct GpuKeyHash {
+        std::size_t operator()(const leonida::ConsoleHeapKeys::Key& k) const {
+            return leonida::ConsoleHeapKeys::hash(k);
+        }
+    };
+    // The rest: console_heap_mutex. Unresolved words with the slots that missed on them (heap << 28 | slot), and
+    // whether the resolver has them.
+    struct GpuUnresolved {
+        std::vector<std::uint32_t> slots;
+        bool asked = false;
+    };
+    std::unordered_map<leonida::ConsoleHeapKeys::Key, GpuUnresolved, GpuKeyHash> gpu_unresolved;
+    // The resolver: a thread of ours that answers missed words with vsharp_address, off the submitting thread (one
+    // answer can wait milliseconds for the geometry worker's lock).
+    // Requests and answers pass under its own mutex; the refresh hands words over and takes answers, never waits.
+    struct GpuAnswer {
+        leonida::ConsoleHeapKeys::Key key;
+        std::uint64_t to, span;
+        bool retry;
+    };
+    struct GpuResolver {
+        std::mutex mutex;
+        std::condition_variable wake;
+        bool stop = false;
+        std::vector<std::pair<leonida::ConsoleHeapKeys::Key, bool>> requests;  // (words, a retry of no backing)
+        std::vector<GpuAnswer> answers;
+        // T#s to register (bind_title_image), the slot's words: the refresh only decodes them. Resolver-only state:
+        // the words registered recently (not asked again) and those whose texture is still to come (asked again).
+        std::vector<leonida::gfx10::ImageWords> tsharps;
+        std::unordered_set<std::uint64_t> registered;
+        std::deque<std::pair<std::chrono::steady_clock::time_point, leonida::gfx10::ImageWords>> waiting;
+        std::thread thread;
+        ~GpuResolver() { halt(); }
+        void halt() {
+            {
+                std::lock_guard lock(mutex);
+                stop = true;
+            }
+            wake.notify_all();
+            if (thread.joinable()) thread.join();
+        }
+    };
+    std::unique_ptr<GpuResolver> gpu_resolver;
+    std::array<std::atomic<std::uint64_t>, 5> gpu_tsharps{};  // the resolver's T# registrations, by TitleImage
+    std::size_t gpu_asked = 0;  // requests handed over and not answered yet
+    struct GpuUnbacked {
+        std::chrono::steady_clock::time_point at;  // when it may be asked again
+        leonida::ConsoleHeapKeys::Key key;
+        std::uint32_t tries = 0;  // asked again so far: the wait doubles each time, up to 64x retry_ms
+    };
+    std::deque<GpuUnbacked> gpu_unbacked;  // words answered "no backing", by when they may be asked again (roughly)
+    std::unordered_map<leonida::ConsoleHeapKeys::Key, std::uint32_t, GpuKeyHash> gpu_unbacked_tries;  // being asked
+    std::uint64_t gpu_alias_generation = ~0ull;
+    std::chrono::steady_clock::time_point gpu_ranges_at{};
+    std::vector<leonida::ConsoleHeapRange> gpu_ranges;
+    leonida::ConsoleHeapSpans gpu_backed, gpu_ask;
+    std::uint64_t gpu_backed_generation = ~0ull, gpu_ask_generation = ~0ull;
+    std::uint64_t gpu_backed_blocks = ~0ull;  // the title-window blocks' layout generations at the last rebuild
+    std::chrono::steady_clock::time_point gpu_backed_at{};
+    std::vector<std::uint32_t> gpu_queue_scratch;
+    bool gpu_rescan = false, gpu_rescan_after_resolve = false;
+    std::chrono::steady_clock::time_point gpu_rescan_asked{};
+    // LEONIDA_CONSOLE_GPU_FILTER=1 (default off): a release, an alias range that went or a word answered since asks
+    // for a rescan of the slots it touches (an interval rule, 8a22e92c8) instead of every V# slot: the GPU passes over
+    // the rest on its device-local metadata.
+    // gpu_filter_shader: shader-VA spans (released backings, alias copies that went); gpu_filter_title: title VAs
+    // (words backed since). Overflows and key resets still rescan everything.
+    static bool gpu_filter_enabled() {
+        static const bool on = [] {
+            char text[8] = {};
+            return GetEnvironmentVariableA("LEONIDA_CONSOLE_GPU_FILTER", text, sizeof(text)) && text[0] == '1';
+        }();
+        return on;
+    }
+    bool gpu_rescan_filtered = false;
+    leonida::ConsoleHeapSpans gpu_filter_shader, gpu_filter_title;
+    void request_rescan_after_resolve() {
+        if (!gpu_rescan_after_resolve) gpu_rescan_asked = std::chrono::steady_clock::now();
+        gpu_rescan_after_resolve = true;
+    }
+    struct GpuMiss {
+        leonida::ConsoleHeapKeys::Key key;
+        std::uint32_t code;  // heap << 28 | slot; UINT32_MAX once handled
+    };
+    std::vector<GpuMiss> gpu_miss_scratch;
+    struct GpuCounts {
+        std::uint64_t misses = 0, resolved = 0, none = 0, flips = 0, rescans = 0, dropped = 0, released = 0;
+        std::uint64_t known_misses = 0, put_failed = 0, backed_rebuilds = 0, backed_cuts = 0, key_resets = 0;
+        std::uint64_t retried = 0, filtered_rescans = 0;
+        double backed_ms = 0;
+        double resolve_ms = 0, begin_ms = 0;
+        double part_ms[5] = {};  // before: alias probes, drain + releases, range table, backed table, ask table
+    } gpu_counts;
+
+    // LEONIDA_SHADOW_GPU=1 copies aliased shadow pages on the GPU at the start of the submission.
+    // The source uses VK_EXT_external_memory_host to import the mapped title section. An import is
+    // made per 2 MiB-aligned window of the view, kept while xmem's map journal shows no change over it, and lives until
+    // the last pass that copies from it retires. Destinations outside the arena, and pages that will not import, are
+    // copied by the CPU as before.
+    static bool shadow_gpu_enabled() {
+        static const bool on = [] {
+            char value[4] = {};
+            return GetEnvironmentVariableA("LEONIDA_SHADOW_GPU", value, sizeof(value)) == 1 && value[0] == '1';
+        }();
+        return on;
+    }
+    struct ShadowImport {
+        DeviceState* device = nullptr;
+        std::uintptr_t base = 0;
+        std::size_t bytes = 0;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::uint64_t generation = 0;  // title_memory_map's, when last found unchanged
+        ~ShadowImport() {
+            if (buffer) device->context->vk.vkDestroyBuffer(device->info.device, buffer, nullptr);
+            if (memory) device->context->vk.vkFreeMemory(device->info.device, memory, nullptr);
+        }
+    };
+    std::mutex shadow_import_mutex;
+    std::map<std::uintptr_t, std::shared_ptr<ShadowImport>> shadow_imports;  // by base
+    std::uint64_t shadow_import_bytes = 0;
+    struct ShadowGpuCounts {
+        std::uint64_t copies = 0, bytes = 0, imports = 0, imported = 0, dropped = 0, refused = 0, outside = 0;
+    } shadow_gpu_counts;  // shadow_import_mutex
+
+    static bool shadow_gpu_copy(void* context, std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
+        return static_cast<DeviceState*>(context)->gpu_copy_shadow(to, from, bytes);
+    }
+    // Shadows with memory of their own (no room in the arena): their mapping and buffer, for gpu_copy_shadow.
+    struct CopyTarget {
+        std::size_t bytes;
+        VkBuffer buffer;
+    };
+    std::map<const std::uint8_t*, CopyTarget> copy_targets;  // shadow_import_mutex
+    void add_copy_target(const std::uint8_t* mapped, std::size_t bytes, VkBuffer buffer) {
+        if (!shadow_gpu_enabled() || !mapped || !buffer) return;
+        std::lock_guard lock(shadow_import_mutex);
+        copy_targets[mapped] = {bytes, buffer};
+    }
+    // Before the buffer goes: no copy into it is recorded after this (one already recorded runs before it is freed:
+    // the buffer goes to the deferred queue, behind the submission that recorded it).
+    void remove_copy_target(const std::uint8_t* mapped) {
+        if (!shadow_gpu_enabled() || !mapped) return;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        {
+            std::lock_guard lock(shadow_import_mutex);
+            const auto it = copy_targets.find(mapped);
+            if (it == copy_targets.end()) return;
+            buffer = it->second.buffer;
+            copy_targets.erase(it);
+        }
+        if (heap_gpu) heap_gpu->drop_copies_to(buffer);
+    }
+    // Where [to, to + n) is on the GPU: the arena, a title-window block outside it, or a shadow's own buffer.
+    bool copy_destination(const std::uint8_t* to, std::size_t n, VkBuffer& buffer, VkDeviceSize& offset) {
+        if (arena.mapped && to >= arena.mapped && to + n <= arena.mapped + arena.size) {
+            buffer = arena.buffer;
+            offset = VkDeviceSize(to - arena.mapped);
+            return true;
+        }
+        if (external_windows.find_mapped(to, n, buffer, offset)) return true;
+        auto it = copy_targets.upper_bound(to);  // shadow_import_mutex held
+        if (it == copy_targets.begin()) return false;
+        --it;
+        if (to < it->first || n > it->second.bytes || std::size_t(to - it->first) > it->second.bytes - n) return false;
+        buffer = it->second.buffer;
+        offset = VkDeviceSize(to - it->first);
+        return true;
+    }
+    bool gpu_copy_shadow(std::uint8_t* to, const std::uint8_t* from, std::size_t n) {
+        if (!heap_gpu || !n) return false;
+        std::lock_guard lock(shadow_import_mutex);
+        VkBuffer dst_buffer = VK_NULL_HANDLE;
+        VkDeviceSize dst_offset = 0;
+        if (!copy_destination(to, n, dst_buffer, dst_offset)) {
+            ++shadow_gpu_counts.outside;
+            return false;
+        }
+        const auto src = reinterpret_cast<std::uintptr_t>(from);
+        std::shared_ptr<ShadowImport> found;
+        auto it = shadow_imports.upper_bound(src);
+        if (it != shadow_imports.begin()) {
+            --it;
+            ShadowImport& cand = *it->second;
+            if (src >= cand.base && src + n <= cand.base + cand.bytes) {
+                std::uint64_t now = 0;
+                bool moved = false;
+                if (!leonida::title_memory_map::changes_since(cand.generation, now, cand.base, cand.base + cand.bytes,
+                                                              [&](std::uintptr_t, std::uintptr_t) { moved = true; }))
+                    moved = true;
+                if (moved) {
+                    shadow_import_bytes -= cand.bytes;
+                    shadow_imports.erase(it);
+                    ++shadow_gpu_counts.dropped;
+                } else {
+                    cand.generation = now;
+                    found = it->second;
+                }
+            }
+        }
+        if (!found && !(found = make_shadow_import(src, n))) {
+            ++shadow_gpu_counts.refused;
+            return false;
+        }
+        heap_gpu->queue_copy(found->buffer, src - found->base, dst_buffer, dst_offset, n, found);
+        ++shadow_gpu_counts.copies;
+        shadow_gpu_counts.bytes += n;
+        return true;
+    }
+    // An import of the committed, readable view region around [src, src + n): its 2 MiB-aligned window, inside the
+    // region. Null when it does not hold all of it, the budget (LEONIDA_SHADOW_GPU_MB, 1024) is spent, or the driver
+    // refuses. shadow_import_mutex held.
+    std::shared_ptr<ShadowImport> make_shadow_import(std::uintptr_t src, std::size_t n) {
+        static const std::uint64_t budget = [] {
+            char text[16] = {};
+            const DWORD c = GetEnvironmentVariableA("LEONIDA_SHADOW_GPU_MB", text, sizeof(text));
+            return (c > 0 && c < sizeof(text) ? std::strtoull(text, nullptr, 10) : 1024ull) << 20;
+        }();
+        const std::uint64_t generation = leonida::title_memory_map::generation();
+        MEMORY_BASIC_INFORMATION region{};
+        const auto refuse = [&](const char* why) -> std::shared_ptr<ShadowImport> {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "[rt] d3d12: LEONIDA_SHADOW_GPU: no import of 0x%llx (+%zu; state 0x%lx protect 0x%lx "
+                                     "type 0x%lx): %s; copied by the CPU\n",
+                             static_cast<unsigned long long>(src), n, static_cast<unsigned long>(region.State),
+                             static_cast<unsigned long>(region.Protect), static_cast<unsigned long>(region.Type), why);
+            return nullptr;
+        };
+        if (!VirtualQuery(reinterpret_cast<const void*>(src), &region, sizeof(region))) return refuse("no region");
+        if (region.State != MEM_COMMIT || !region.Protect ||
+            (region.Protect & (PAGE_NOACCESS | PAGE_GUARD | PAGE_WRITECOMBINE | PAGE_NOCACHE)))
+            return refuse("not committed and readable");
+        // This import path supports mapped section views.
+        if (region.Type != MEM_MAPPED) return refuse("not a section view");
+        constexpr std::uintptr_t kWindow = 2u << 20;
+        const auto region_base = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
+        const std::uintptr_t region_end = region_base + region.RegionSize;
+        const std::uintptr_t base = std::max(region_base, src & ~(kWindow - 1));
+        const std::uintptr_t end = std::min(region_end, (src + n + kWindow - 1) & ~(kWindow - 1));
+        if (src + n > end) return refuse("the run crosses the view's end");
+        if (shadow_import_bytes + (end - base) > budget) return refuse("LEONIDA_SHADOW_GPU_MB spent");
+        auto imp = std::make_shared<ShadowImport>();
+        imp->device = this;
+        imp->base = base;
+        imp->bytes = end - base;
+        imp->generation = generation;
+        VkDeviceAddress address = 0;
+        if (!import_host_range(reinterpret_cast<void*>(base), imp->bytes, imp->buffer, imp->memory, address))
+            return refuse("the driver refused the import");
+        // Older imports over these pages are stale or redundant.
+        for (auto it = shadow_imports.lower_bound(base > (64ull << 20) ? base - (64ull << 20) : 0);
+             it != shadow_imports.end() && it->first < end;) {
+            if (it->first + it->second->bytes > base) {
+                shadow_import_bytes -= it->second->bytes;
+                it = shadow_imports.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        shadow_imports[base] = imp;
+        shadow_import_bytes += imp->bytes;
+        ++shadow_gpu_counts.imports;
+        shadow_gpu_counts.imported += imp->bytes;
+        return imp;
+    }
+
+    static bool console_heap_gpu_enabled() {
+        static const bool on = [] {
+            char value[4] = {};
+            return GetEnvironmentVariableA("LEONIDA_CONSOLE_HEAP_GPU", value, sizeof(value)) == 1 && value[0] == '1';
+        }();
+        return on;
+    }
+    static bool console_heap_arena_enabled() {
+        static const bool on = [] {
+            char value[4] = {};
+            return GetEnvironmentVariableA("LEONIDA_CONSOLE_HEAP_ARENA", value, sizeof(value)) == 1 && value[0] == '1';
+        }();
+        return on;
+    }
+
+    void setup_console_heap_gpu(PFN_vkGetDeviceProcAddr get_device) {
+        if ((!console_heap_gpu_enabled() && !shadow_gpu_enabled()) || !context || !get_device) return;
+        auto gpu = std::make_unique<leonida::ConsoleHeapGpu>(get_device, info.device, memory);
+        if (!gpu->init()) {
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_CONSOLE_HEAP_GPU: the translation pass could not be made; the "
+                                 "console heaps are fixed on the CPU\n");
+            return;
+        }
+        heap_gpu = std::move(gpu);
+        heap_gpu->set_signed_offsets(signed_vsharp_offsets());
+        leonida::title_va_aliases().record_removals(true);
+        context->set_prelude([this](VkCommandBuffer cb) { return heap_gpu->record(cb); },
+                             [this](bool submitted, std::uint64_t ticket) { heap_gpu->commit(submitted, ticket); });
+        gpu_resolver = std::make_unique<GpuResolver>();
+        gpu_resolver->thread = std::thread([this, r = gpu_resolver.get()] {
+            SetThreadDescription(GetCurrentThread(), L"leonida console heap resolver");
+            const auto words_hash = [](const leonida::gfx10::ImageWords& w) {
+                std::uint64_t h = 1469598103934665603ull;
+                for (const std::uint32_t x : w) h = (h ^ x) * 1099511628211ull;
+                return h;
+            };
+            const auto bind = [&](const leonida::gfx10::ImageWords& w) {
+                const TitleImage result = bind_title_image(*this, w);
+                gpu_tsharps[unsigned(result)].fetch_add(1, std::memory_order_relaxed);
+                if (result == TitleImage::unknown || result == TitleImage::refused) {
+                    if (r->waiting.size() < 65536) r->waiting.emplace_back(std::chrono::steady_clock::now(), w);
+                } else {
+                    if (r->registered.size() > (1u << 20)) r->registered.clear();
+                    r->registered.insert(words_hash(w));
+                }
+            };
+            for (;;) {
+                std::vector<std::pair<leonida::ConsoleHeapKeys::Key, bool>> batch;
+                std::vector<leonida::gfx10::ImageWords> tsharps;
+                {
+                    std::unique_lock lock(r->mutex);
+                    // Woken for work, or every 100 ms for the T#s whose texture is still to come.
+                    r->wake.wait_for(lock, std::chrono::milliseconds(100),
+                                     [r] { return r->stop || !r->requests.empty() || !r->tsharps.empty(); });
+                    if (r->stop) return;
+                    batch.swap(r->requests);
+                    tsharps.swap(r->tsharps);
+                }
+                for (const auto& w : tsharps)
+                    if (!r->registered.count(words_hash(w))) bind(w);
+                // Those still waiting for a texture, again every 500 ms, at most 256 a round.
+                const auto now = std::chrono::steady_clock::now();
+                for (int n = 0; n < 256 && !r->waiting.empty() &&
+                                now - r->waiting.front().first >= std::chrono::milliseconds(500);
+                     ++n) {
+                    const auto w = r->waiting.front().second;
+                    r->waiting.pop_front();
+                    bind(w);
+                }
+                for (const auto& [key, retry] : batch) {
+                    std::uint64_t span = 0;
+                    const std::uint64_t to = resolve_vsharp_words(key, span);
+                    std::lock_guard lock(r->mutex);
+                    if (r->stop) return;
+                    r->answers.push_back({key, to, span, retry});
+                }
+            }
+        });
+        if (shadow_gpu_enabled()) {
+            ShadowPages::gpu_copy_context = this;
+            ShadowPages::gpu_copy = &shadow_gpu_copy;
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_SHADOW_GPU=1: slot-133 shadows' aliased pages are copied by the "
+                                 "GPU from imports of the title's pages\n");
+        }
+        if (console_heap_gpu_enabled())
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_CONSOLE_HEAP_GPU=1: console heap V#s are rebased by a compute pass "
+                                 "at the start of each submission\n");
+    }
+
+    // `bytes` of host memory at `host` as a buffer the GPU reads by its device address. False: not importable.
+    bool import_host_range(void* host, VkDeviceSize bytes, VkBuffer& buffer, VkDeviceMemory& out,
+                           VkDeviceAddress& address) {
+        auto& vk = context->vk;
+        const VkDeviceSize alignment = info.host_pointer_alignment;
+        if (!get_host_pointer_properties || !alignment || (reinterpret_cast<std::uintptr_t>(host) % alignment) ||
+            (bytes % alignment))
+            return false;
+        VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkBufferCreateInfo create{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+        create.size = bytes;
+        create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        share(create);
+        buffer = VK_NULL_HANDLE;
+        out = VK_NULL_HANDLE;
+        if (vk.vkCreateBuffer(info.device, &create, nullptr, &buffer) != VK_SUCCESS) return false;
+        const auto fail = [&] {
+            if (buffer) vk.vkDestroyBuffer(info.device, buffer, nullptr);
+            if (out) vk.vkFreeMemory(info.device, out, nullptr);
+            buffer = VK_NULL_HANDLE;
+            out = VK_NULL_HANDLE;
+            return false;
+        };
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(info.device, buffer, &requirements);
+        VkMemoryHostPointerPropertiesEXT pointer{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        if (get_host_pointer_properties(info.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host,
+                                        &pointer) != VK_SUCCESS)
+            return fail();
+        const std::uint32_t types = pointer.memoryTypeBits & requirements.memoryTypeBits;
+        if (!types || bytes < requirements.size) return fail();
+        VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+        import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        import.pHostPointer = host;
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        for (const VkMemoryPropertyFlags want :
+             {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+              VkMemoryPropertyFlags(0)}) {
+            for (std::uint32_t i = 0; i < memory.memoryTypeCount && !out; ++i) {
+                if (!(types & (1u << i)) || (memory.memoryTypes[i].propertyFlags & want) != want) continue;
+                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+                allocate.allocationSize = bytes;
+                allocate.memoryTypeIndex = i;
+                if (vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) != VK_SUCCESS) out = VK_NULL_HANDLE;
+            }
+            if (out) break;
+        }
+        if (!out || vk.vkBindBufferMemory(info.device, buffer, out, 0) != VK_SUCCESS) return fail();
+        VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        bda.buffer = buffer;
+        address = vk.vkGetBufferDeviceAddress(info.device, &bda);
+        if (!address) return fail();
+        return true;
+    }
+
+    // A resource heap with its 3x scratch (copy, input, previous) goes to the pass: `input` imported, the copy
+    // written by the pass where shaders read it (arena.address + shader_va: the scratch import or the arena range).
+    void attach_console_heap_gpu(ConsoleHeap& heap) {
+        VkDeviceAddress input = 0;
+        if (!import_host_range(heap.input, heap.bytes, heap.input_buffer, heap.input_memory, input)) {
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_CONSOLE_HEAP_GPU: console descriptor heap 0x%llx: its mirror "
+                                 "could not be imported; fixed on the CPU\n",
+                         static_cast<unsigned long long>(heap.console_va));
+            return;
+        }
+        const int index = heap_gpu->add_heap(input, arena.address + heap.shader_va,
+                                             std::uint32_t(heap.bytes / kDescriptorSize));
+        if (index < 0) {
+            context->vk.vkDestroyBuffer(info.device, heap.input_buffer, nullptr);
+            context->vk.vkFreeMemory(info.device, heap.input_memory, nullptr);
+            heap.input_buffer = VK_NULL_HANDLE;
+            heap.input_memory = VK_NULL_HANDLE;
+            return;
+        }
+        heap.gpu = index;
+        heap.vsharp_bits.assign((heap.bytes / kDescriptorSize + 63) / 64, 0);
+        std::fprintf(stderr, "[rt] d3d12: LEONIDA_CONSOLE_HEAP_GPU: console descriptor heap 0x%llx (%llu slots) is "
+                             "translated by the pass (heap %d)\n",
+                     static_cast<unsigned long long>(heap.console_va),
+                     static_cast<unsigned long long>(heap.bytes / kDescriptorSize), index);
+    }
+
+    static void set_vsharp_bit(ConsoleHeap& heap, std::size_t slot, bool on) {
+        const std::uint64_t bit = 1ull << (slot & 63);
+        auto& word = heap.vsharp_bits[slot >> 6];
+        word = on ? word | bit : word & ~bit;
+    }
+
+    // The T# in a slot's title bytes, registered as fix_console_slot does (no write: the pass copies it). 0: not
+    // settled (a T# whose texture is still to come); 1: settled; 2: settled, and the slot holds words that are no
+    // buffer pair and no T# that decodes, whose dwords 0-3 the pass writes as zeros, as fix_console_slot does.
+    int console_tsharp_check(ConsoleHeap& heap, std::size_t slot) {
+        leonida::gfx10::ImageWords words;
+        std::memcpy(words.data(), heap.previous + slot * kDescriptorSize, sizeof(words));
+        if (!(words[3] >> 30)) return 1;
+        if (!leonida::gfx10::is_image(words)) {
+            ++heap.images[unsigned(TitleImage::not_tsharp)];
+            return 2;
+        }
+        const char* why = nullptr;
+        const TitleImage result = bind_title_image(*this, words, &why);
+        if (result == TitleImage::unknown || result == TitleImage::refused) {
+            note_refused_tsharp(heap, slot * kDescriptorSize, words, why);
+            if (result == TitleImage::refused) ++heap.refused_reasons[why ? why : "?"];
+        }
+        ++heap.images[unsigned(result)];
+        if (result == TitleImage::not_tsharp) return 2;
+        return result != TitleImage::unknown && result != TitleImage::refused ? 1 : 0;
+    }
+
+    // LEONIDA_CONSOLE_GPU_TSHARPS=0 keeps T# registration on the submitting thread (fix_console_slot's way, under the
+    // fix budget); by default the resolver does it and the refresh only decodes.
+    static bool tsharps_off_thread_enabled() {
+        static const bool on = [] {
+            char value[4] = {};
+            return !(GetEnvironmentVariableA("LEONIDA_CONSOLE_GPU_TSHARPS", value, sizeof(value)) == 1 && value[0] == '0');
+        }();
+        return on;
+    }
+    std::vector<leonida::gfx10::ImageWords> tsharp_jobs;  // console_heap_mutex
+    void refresh_console_heap_gpu(ConsoleHeap& heap) {  // console_heap_mutex held
+        const bool tsharps_off_thread = tsharps_off_thread_enabled() && gpu_resolver;
+        static const std::uint64_t budget_us = [] {
+            char text[16] = {};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_CONSOLE_FIX_US", text, sizeof(text));
+            return n > 0 && n < sizeof(text) ? std::strtoull(text, nullptr, 10) : 4000ull;
+        }();
+        using clock = std::chrono::steady_clock;
+        const auto ms = [](clock::time_point a, clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        const auto t0 = clock::now();
+        heap.copied += heap.pages->refresh();
+        auto& queued = gpu_queue_scratch;
+        queued.clear();
+        // The tracker zeroed these in `input` too: the pass copies the zeros.
+        heap.pages->for_each_zeroed([&](std::size_t offset, std::size_t bytes) {
+            std::memset(heap.previous + offset, 0, bytes);
+            for (std::size_t slot = offset / kDescriptorSize;
+                 slot * kDescriptorSize < offset + bytes && slot < heap.retry.size(); ++slot) {
+                heap.retry[slot] = 0;
+                set_vsharp_bit(heap, slot, false);
+                queued.push_back(std::uint32_t(slot));
+            }
+        });
+        const auto t1 = clock::now();
+        std::uint32_t binds = 0;
+        bool over = false;
+        heap.pages->for_each_copied([&](std::size_t offset, std::size_t bytes) {
+            const std::size_t end = std::min<std::size_t>(offset + bytes, std::size_t(heap.bytes));
+            for (std::size_t at = offset & ~std::size_t(kDescriptorSize - 1); at + kDescriptorSize <= end;
+                 at += kDescriptorSize) {
+                if (!std::memcmp(heap.previous + at, heap.input + at, kDescriptorSize)) continue;
+                std::memcpy(heap.previous + at, heap.input + at, kDescriptorSize);
+                note_changed_slot(heap, heap.previous + at);
+                const std::size_t slot = at / kDescriptorSize;
+                heap.gpu_high = std::max(heap.gpu_high, std::uint32_t(slot + 1));
+                const auto* w = reinterpret_cast<const std::uint32_t*>(heap.previous + at);
+                if (!(w[3] >> 30)) {
+                    queued.push_back(std::uint32_t(slot));
+                    set_vsharp_bit(heap, slot, w[2] || w[6]);
+                    heap.retry[slot] = 0;
+                    continue;
+                }
+                set_vsharp_bit(heap, slot, false);
+                if (tsharps_off_thread) {
+                    // Only decoded here: words that are no T# are zeroed by the pass; a T# goes to the resolver to
+                    // be registered (shaders find it by its words; until then they get the fallback).
+                    leonida::gfx10::ImageWords words;
+                    std::memcpy(words.data(), w, sizeof(words));
+                    leonida::gfx10::Image image{};
+                    const bool tsharp = leonida::gfx10::is_image(words) && leonida::gfx10::decode(words, image);
+                    queued.push_back(std::uint32_t(slot) | (tsharp ? 0u : leonida::ConsoleHeapGpu::kZeroFirst));
+                    if (tsharp) tsharp_jobs.push_back(words);
+                    else ++heap.images[unsigned(TitleImage::not_tsharp)];
+                    heap.retry[slot] = 0;
+                    continue;
+                }
+                // Past LEONIDA_CONSOLE_FIX_US of registering T#s, the rest wait for retry_console_tsharps (copied as
+                // they are meanwhile).
+                if (budget_us && !over && !(++binds & 15) &&
+                    clock::now() - t1 >= std::chrono::microseconds(budget_us))
+                    over = true;
+                const int check = over ? 0 : console_tsharp_check(heap, slot);
+                queued.push_back(std::uint32_t(slot) | (check == 2 ? leonida::ConsoleHeapGpu::kZeroFirst : 0u));
+                if (check) {
+                    heap.retry[slot] = 0;
+                } else {
+                    if (over) ++heap.deferred_fixes;
+                    if (!heap.retry[slot]) {
+                        heap.retry[slot] = 1;
+                        heap.retries.push_back(std::uint32_t(slot));
+                    }
+                }
+            }
+        });
+        heap_gpu->queue(heap.gpu, queued.begin(), queued.end());
+        heap.gpu_queued += queued.size();
+        if (!tsharp_jobs.empty()) {
+            {
+                std::lock_guard lock(gpu_resolver->mutex);
+                gpu_resolver->tsharps.insert(gpu_resolver->tsharps.end(), tsharp_jobs.begin(), tsharp_jobs.end());
+            }
+            gpu_resolver->wake.notify_one();
+            tsharp_jobs.clear();
+        }
+        const auto t2 = clock::now();
+        if (!heap.retries.empty()) retry_console_tsharps(heap);
+        const auto t3 = clock::now();
+        heap.pages_ms += ms(t0, t1);
+        heap.fix_ms += ms(t1, t2);
+        heap.retry_ms += ms(t2, t3);
+    }
+
+    // retry_console_slots for the GPU mode: only T#s wait there, and nothing is written.
+    void retry_console_tsharps(ConsoleHeap& heap) {
+        static const std::uint64_t budget_us = [] {
+            char text[16] = {};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_CONSOLE_RETRY_US", text, sizeof(text));
+            return n > 0 && n < sizeof(text) ? std::strtoull(text, nullptr, 10) : 500ull;
+        }();
+        const auto start = std::chrono::steady_clock::now();
+        std::size_t i = heap.retry_at, visited = 0;
+        const std::size_t total = heap.retries.size();
+        while (visited < total && !heap.retries.empty()) {
+            if (i >= heap.retries.size()) i = 0;
+            const std::uint32_t slot = heap.retries[i];
+            ++visited;
+            const int check = heap.retry[slot] ? console_tsharp_check(heap, slot) : 1;
+            if (check == 2) heap_gpu->queue(heap.gpu, slot | leonida::ConsoleHeapGpu::kZeroFirst);
+            if (check) {
+                heap.retry[slot] = 0;
+                heap.retries[i] = heap.retries.back();
+                heap.retries.pop_back();
+            } else {
+                ++i;
+            }
+            if (budget_us && !(visited & 31) &&
+                std::chrono::steady_clock::now() - start >= std::chrono::microseconds(budget_us))
+                break;
+        }
+        heap.retry_at = i;
+        heap.retried += visited;
+    }
+
+    // What fix_vsharp's console path (VsharpPath::scratch) answers for the four words of a V# half: the shader VA, or 0
+    // (no backing). `span` gets the V#'s span.
+    std::uint64_t resolve_vsharp_words(const leonida::ConsoleHeapKeys::Key& k, std::uint64_t& span) {
+        const std::uint64_t base = std::uint64_t(k[0]) | (std::uint64_t(k[1] & 0xffff) << 32);
+        const std::uint32_t stride = (k[1] >> 16) & 0x3fffu;
+        span = std::uint64_t(k[2]) * (stride ? stride : 1);
+        const leonida::gfx10::BufferWords words{k[0], k[1], k[2], k[3]};
+        leonida::gfx10::Buffer desc{};
+        const bool copy_geometry = leonida::gfx10::decode(words, desc) &&
+                                   (span <= kTitleWindowMax || (desc.format && leonida::gfx10::encode(desc) == words));
+        return vsharp_address(base, span, leonida::TitleVaAliases::table_view, false, copy_geometry);
+    }
+
+    // vsharp_address's backed(): [offset, offset + bytes) of the shader VAs is a live allocation or geometry copy.
+    bool shader_range_backed(std::uint64_t offset, std::uint64_t bytes) {
+        constexpr std::uint64_t mask = (1ull << 48) - 1;
+        if (!bytes) return false;
+        const std::uint64_t limit = signed_vsharp_offsets() ? mask / 2 : mask;
+        const bool encodable = offset <= limit ? bytes - 1 <= limit - offset
+                                               : signed_vsharp_offsets() && offset >= UINT64_MAX - limit &&
+                                                     bytes - 1 <= limit - offset;
+        if (!encodable) return false;
+        const auto bda = arena.address + offset;
+        {
+            std::lock_guard lock(backing_mutex);
+            if (gpu_backings.covers(bda, bytes)) return true;
+        }
+        std::uint64_t host{}, room{};
+        return geometry.cap() && geometry.lookup(bda, host, room) && room >= bytes;
+    }
+
+    // The range table from the alias table: a range keeps its check while it and its backing stay; `gone` (shader
+    // VA ranges released since the last one) clears it. True when a checked range lost its backing.
+    bool rebuild_gpu_ranges(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& gone) {
+        std::vector<leonida::TitleVaAliases::Mapping> mappings;
+        leonida::title_va_aliases().mappings(mappings);
+        const auto overlaps_gone = [&](std::uint64_t start, std::uint64_t end) {
+            for (const auto& [s, n] : gone)
+                if (s < end && start < s + n) return true;
+            return false;
+        };
+        bool lost = false;
+        std::vector<leonida::ConsoleHeapRange> ranges;
+        ranges.reserve(mappings.size());
+        for (const auto& m : mappings) {
+            const std::uint64_t bytes = m.end - m.title_va;
+            const bool released = !gone.empty() && overlaps_gone(m.shader_va, m.shader_va + bytes);
+            auto it = std::lower_bound(gpu_ranges.begin(), gpu_ranges.end(), m.title_va,
+                                       [](const leonida::ConsoleHeapRange& r, std::uint64_t va) { return r.title_va < va; });
+            bool checked;
+            if (it != gpu_ranges.end() && it->title_va == m.title_va && it->end == m.end &&
+                it->shader_va == m.shader_va && !released) {
+                checked = it->checked;
+            } else {
+                checked = shader_range_backed(m.shader_va, bytes);
+                if (released && it != gpu_ranges.end() && it->title_va == m.title_va && it->checked) lost = true;
+            }
+            ranges.push_back({m.title_va, m.end, m.shader_va, checked});
+        }
+        // A checked range that is gone from the table altogether had its slots answered from it.
+        if (!lost) {
+            for (const auto& r : gpu_ranges) {
+                if (!r.checked) continue;
+                auto it = std::lower_bound(ranges.begin(), ranges.end(), r.title_va,
+                                           [](const leonida::ConsoleHeapRange& a, std::uint64_t va) { return a.title_va < va; });
+                if (it == ranges.end() || it->title_va != r.title_va || it->shader_va != r.shader_va || !it->checked) {
+                    lost = true;
+                    break;
+                }
+            }
+        }
+        gpu_ranges = ranges;
+        heap_gpu->set_ranges(std::move(ranges));
+        return lost;
+    }
+
+    // The backed table (src/console_heap_gpu.h): every live allocation's shader VAs and the geometry copies' blocks,
+    // merged, and clipped to what a V# can name. Rebuilt from gpu_backings when allocations changed, at most every
+    // 100 ms (one made since is a miss the CPU answers meanwhile); a release in between is cut out of it at once, so
+    // the pass never leaves a V# on memory that is going (an overlapping allocation that stays is then a miss too
+    // until the next rebuild).
+    void update_gpu_backed(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& gone) {
+        const auto start = std::chrono::steady_clock::now();
+        const std::uint64_t generation = backing_generation.load(std::memory_order_relaxed);
+        const std::uint64_t blocks = geometry.pool().layout_generation() + external_windows.layout_generation();
+        const bool changed = generation != gpu_backed_generation || blocks != gpu_backed_blocks;
+        if (changed && (gpu_backed_generation == ~0ull || start - gpu_backed_at >= std::chrono::milliseconds(100))) {
+            gpu_backed_generation = generation;
+            gpu_backed_blocks = blocks;
+            gpu_backed_at = start;
+            gpu_backed.clear();
+            {
+                std::lock_guard lock(backing_mutex);
+                gpu_backings.for_each([&](std::uint64_t va, std::uint64_t bytes) {
+                    const std::uint64_t offset = va - arena.address;
+                    if (bytes && offset <= UINT64_MAX - bytes) gpu_backed.emplace_back(offset, offset + bytes);
+                });
+            }
+            const auto block = [&](VkDeviceAddress address, VkDeviceSize bytes) {
+                const std::uint64_t offset = address - arena.address;
+                if (address && bytes && offset <= UINT64_MAX - bytes) gpu_backed.emplace_back(offset, offset + bytes);
+            };
+            geometry.pool().for_each_block(block);
+            external_windows.for_each_block(block);
+            leonida::merge_console_heap_spans(gpu_backed);
+            // What a V# can name: 48 bits, or +-2^47 around heap_base with signed offsets.
+            constexpr std::uint64_t k47 = 1ull << 47, k48 = 1ull << 48;
+            leonida::ConsoleHeapSpans clipped;
+            for (const auto& [a, b] : gpu_backed) {
+                if (signed_vsharp_offsets()) {
+                    if (a < k47) clipped.emplace_back(a, std::min(b, k47));
+                    else if (a >= 0ull - k47) clipped.emplace_back(a, b);
+                } else if (a < k48) {
+                    clipped.emplace_back(a, std::min(b, k48));
+                }
+            }
+            gpu_backed.swap(clipped);
+            heap_gpu->set_spans(leonida::ConsoleHeapGpu::backed_table, gpu_backed);
+            ++gpu_counts.backed_rebuilds;
+        } else if (!gone.empty() && !gpu_backed.empty()) {
+            leonida::ConsoleHeapSpans out;
+            for (const auto& [s0, bytes] : gone) {
+                const std::uint64_t e0 = bytes > UINT64_MAX - s0 ? UINT64_MAX : s0 + bytes;
+                out.clear();
+                for (const auto& [a, b] : gpu_backed) {
+                    if (b <= s0 || a >= e0) {
+                        out.emplace_back(a, b);
+                        continue;
+                    }
+                    if (a < s0) out.emplace_back(a, s0);
+                    if (b > e0) out.emplace_back(e0, b);
+                }
+                gpu_backed.swap(out);
+            }
+            heap_gpu->set_spans(leonida::ConsoleHeapGpu::backed_table, gpu_backed);
+            ++gpu_counts.backed_cuts;
+        }
+        gpu_counts.backed_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+
+    // LEONIDA_ADDRESS_GUARD=1 (docs/d3d12_vulkan.md, "Address guard"): the page table the guarded shaders read, a
+    // host-visible buffer of its own whose address minus heap_base is in the guard header at arena offset
+    // kGuardHeader. Built from the same backings as the console heap pass's backed table (gpu_backings, the
+    // geometry copies' blocks and the separate window buffers), but whole and at once: a backing made since the last
+    // submission must not read 0.
+    struct AddressGuard {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::uint32_t* words = nullptr;
+        std::unique_ptr<leonida::address_guard::AddressGuardTable> table;
+        std::uint64_t generation = ~0ull, blocks = ~0ull, heaps = ~0ull;  // heaps: the console heaps' ranges, hashed
+        std::uint32_t refused_logged = 0, overflow_logged = 0;
+        std::uint64_t updates = 0, words_written = 0;
+        std::chrono::steady_clock::time_point logged{};
+        std::mutex mutex;
+    } guard;
+
+    // Make the page table and write the header (called once the arena is mapped). False leaves the guard off: the
+    // header keeps no magic, so guarded shaders check nothing.
+    bool create_address_guard() {
+        namespace ag = leonida::address_guard;
+        if (!context || !arena.mapped || arena.size < ag::kGuardEnd) return false;
+        auto& vk = context->vk;
+        guard.table = std::make_unique<ag::AddressGuardTable>();
+        VkBufferCreateInfo create{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        create.size = guard.table->bytes();
+        create.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vk.vkCreateBuffer(info.device, &create, nullptr, &guard.buffer) != VK_SUCCESS) {
+            guard.buffer = VK_NULL_HANDLE;
+            return false;
+        }
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(info.device, guard.buffer, &requirements);
+        guard.memory = allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true);
+        void* mapped = nullptr;
+        if (!guard.memory || vk.vkBindBufferMemory(info.device, guard.buffer, guard.memory, 0) != VK_SUCCESS ||
+            vk.vkMapMemory(info.device, guard.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+            destroy_address_guard();
+            return false;
+        }
+        guard.words = static_cast<std::uint32_t*>(mapped);
+        std::memcpy(guard.words, guard.table->words().data(), guard.table->bytes());
+        VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        address.buffer = guard.buffer;
+        const VkDeviceAddress table = vk.vkGetBufferDeviceAddress(info.device, &address);
+        auto* header = reinterpret_cast<ag::AddressGuardHeader*>(arena.mapped + ag::kGuardHeader);
+        std::memset(arena.mapped + ag::kGuardHeader, 0, std::size_t(ag::kGuardEnd - ag::kGuardHeader));
+        header->limit = arena.size;
+        header->table = table - arena.address;
+        std::atomic_thread_fence(std::memory_order_release);
+        header->magic = ag::magic();  // last: a shader that sees it sees the rest
+        std::fprintf(stderr, "[rt] d3d12: address guard on (LEONIDA_ADDRESS_GUARD): %llu KiB page table, header at "
+                             "heap_base + 0x%llx; shaders translated with --address-guard read 0 from memory nothing "
+                             "backs and drop their stores there\n",
+                     static_cast<unsigned long long>(guard.table->bytes() >> 10),
+                     static_cast<unsigned long long>(ag::kGuardHeader));
+        return true;
+    }
+    void destroy_address_guard() {
+        if (!context) return;
+        auto& vk = context->vk;
+        if (guard.buffer) vk.vkDestroyBuffer(info.device, guard.buffer, nullptr);
+        if (guard.memory) vk.vkFreeMemory(info.device, guard.memory, nullptr);
+        guard.buffer = VK_NULL_HANDLE;
+        guard.memory = VK_NULL_HANDLE;
+        guard.words = nullptr;
+    }
+
+    // Before each submission: the page table says exactly what is backed now, and refusals since the last line are
+    // logged (at most once a second). Rebuilt only when a backing came or went; only changed words are written.
+    void update_address_guard() {
+        namespace ag = leonida::address_guard;
+        if (!guard.words) return;
+        // A console descriptor heap whose GPU copy lies outside the arena (an import of the title's pages, which
+        // shaders read at shader_va = its device address minus heap_base) is read through heap_base + VA like a
+        // buffer, but no gpu_backing names it: its bytes and the null guard after them are entered here. Without
+        // this the guard refused every descriptor-table load from such a heap (run 28: a 38 MB imported heap at
+        // shader VA 0x87e00000, past a 2 GiB arena). Collected before guard.mutex, in console_heap_mutex's order.
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> heap_spans;
+        std::uint64_t heap_signature = 0xcbf29ce484222325ull;
+        {
+            std::lock_guard heaps(console_heap_mutex);
+            for (const auto& h : console_heaps) {
+                if (!h || !h->bytes) continue;
+                const std::uint64_t begin = h->shader_va, end = h->shader_va + h->bytes + h->guard;
+                heap_signature = (heap_signature ^ begin) * 0x100000001b3ull;
+                heap_signature = (heap_signature ^ end) * 0x100000001b3ull;
+                if (!(begin < arena.size && end <= arena.size)) heap_spans.emplace_back(begin, end);
+            }
+        }
+        std::lock_guard lock(guard.mutex);
+        const std::uint64_t generation = backing_generation.load(std::memory_order_relaxed);
+        const std::uint64_t blocks = geometry.pool().layout_generation() + external_windows.layout_generation();
+        if (generation != guard.generation || blocks != guard.blocks || heap_signature != guard.heaps) {
+            guard.generation = generation;
+            guard.blocks = blocks;
+            guard.heaps = heap_signature;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> spans = heap_spans;
+            {
+                std::lock_guard backing_lock(backing_mutex);
+                gpu_backings.for_each([&](std::uint64_t va, std::uint64_t bytes) {
+                    const std::uint64_t offset = va - arena.address;
+                    // The arena's own ranges pass on the limit compare; only what lies outside needs pages.
+                    if (bytes && !(offset < arena.size && bytes <= arena.size - offset))
+                        spans.emplace_back(offset, offset + bytes);
+                });
+            }
+            const auto block = [&](VkDeviceAddress address, VkDeviceSize bytes) {
+                const std::uint64_t offset = address - arena.address;
+                if (address && bytes) spans.emplace_back(offset, offset + bytes);
+            };
+            geometry.pool().for_each_block(block);
+            external_windows.for_each_block(block);
+            guard.words_written += guard.table->assign(spans, [&](std::size_t i, std::uint32_t v) {
+                std::atomic_ref(guard.words[i]).store(v, std::memory_order_relaxed);
+            });
+            ++guard.updates;
+            if (guard.table->overflowed() != guard.overflow_logged) {
+                guard.overflow_logged = guard.table->overflowed();
+                std::fprintf(stderr, "[rt] d3d12: address guard: %u 4 GiB chunk(s) of backings past the page table's "
+                                     "%u blocks are not checked\n",
+                             guard.overflow_logged, guard.table->blocks_used());
+            }
+        }
+        auto* header = reinterpret_cast<ag::AddressGuardHeader*>(arena.mapped + ag::kGuardHeader);
+        const std::uint32_t refused = std::atomic_ref(header->refused).load(std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
+        if (refused != guard.refused_logged && now - guard.logged >= std::chrono::seconds(1)) {
+            guard.logged = now;
+            std::fprintf(stderr, "[rt] d3d12: address guard: %u access(es) refused so far (+%u), the last at heap "
+                                 "offset 0x%llx by module 0x%08x; %llu table update(s), %llu word(s) written\n",
+                         refused, refused - guard.refused_logged,
+                         static_cast<unsigned long long>(header->last_refused),
+                         std::atomic_ref(header->last_module).load(std::memory_order_relaxed),
+                         static_cast<unsigned long long>(guard.updates),
+                         static_cast<unsigned long long>(guard.words_written));
+            guard.refused_logged = refused;
+        }
+    }
+
+    // The ask table: the title's memory and both addresses of its GPU-window pairs. A V# base outside them that the
+    // other tables do not answer is one vsharp_address could only answer 0 for.
+    void update_gpu_ask() {
+        auto& aliases = leonida::title_va_aliases();
+        const std::uint64_t generation =
+            aliases.memory_generation() * 1000003ull + std::uint64_t(leonida::title_gpu_views::count());
+        if (generation == gpu_ask_generation) return;
+        gpu_ask_generation = generation;
+        gpu_ask = aliases.title_memory_ranges();
+        leonida::ConsoleHeapSpans views;
+        leonida::title_gpu_views::spans(views);
+        gpu_ask.insert(gpu_ask.end(), views.begin(), views.end());
+        leonida::merge_console_heap_spans(gpu_ask);
+        heap_gpu->set_spans(leonida::ConsoleHeapGpu::ask_table, gpu_ask);
+    }
+
+    // Once, when xmem's aliased pages are many: can they be imported as host memory (VK_EXT_external_memory_host)?
+    // A successful import lets the GPU copy the section. Release the diagnostic import after the check.
+    void probe_alias_imports() {
+        static bool probed = false;
+        if (probed) return;
+        std::vector<std::uintptr_t> pages;
+        const std::size_t total = leonida::title_page_aliases::sample(pages, 8);
+        if (total < 256) return;
+        probed = true;
+        int ok = 0;
+        for (const std::uintptr_t va : pages) {
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceMemory imported = VK_NULL_HANDLE;
+            VkDeviceAddress address = 0;
+            MEMORY_BASIC_INFORMATION region{};
+            VirtualQuery(reinterpret_cast<const void*>(va), &region, sizeof(region));
+            const bool done = import_host_range(reinterpret_cast<void*>(va), leonida::title_page_aliases::kPageSize,
+                                                buffer, imported, address);
+            ok += done;
+            std::fprintf(stderr,
+                         "[rt] d3d12: alias import probe: page 0x%llx (state 0x%lx protect 0x%lx type 0x%lx): %s, "
+                         "device address 0x%llx\n",
+                         static_cast<unsigned long long>(va), static_cast<unsigned long>(region.State),
+                         static_cast<unsigned long>(region.Protect), static_cast<unsigned long>(region.Type),
+                         done ? "imported" : "refused", static_cast<unsigned long long>(address));
+            if (buffer) context->vk.vkDestroyBuffer(info.device, buffer, nullptr);
+            if (imported) context->vk.vkFreeMemory(info.device, imported, nullptr);
+        }
+        std::fprintf(stderr, "[rt] d3d12: alias import probe: %d of %zu sampled pages imported (%zu aliased pages)\n", ok,
+                     pages.size(), total);
+    }
+
+    // Before the heaps of a refresh: the misses of the passes that are done, the backings and alias ranges gone, the
+    // range table. console_heap_mutex held.
+    void console_heap_gpu_begin() {
+        const auto start = std::chrono::steady_clock::now();
+        auto lap = [last = start](double& to) mutable {
+            const auto now = std::chrono::steady_clock::now();
+            to += std::chrono::duration<double, std::milli>(now - last).count();
+            last = now;
+        };
+        probe_alias_imports();
+        lap(gpu_counts.part_ms[0]);
+        auto& misses = gpu_miss_scratch;
+        misses.clear();
+        heap_gpu->drain(
+            context->completed_retire_ticket(),
+            [&](int h, std::uint32_t slot, std::uint32_t half) {
+                ConsoleHeap* heap = h >= 0 && unsigned(h) < gpu_heaps.size() ? gpu_heaps[std::size_t(h)] : nullptr;
+                ++gpu_counts.misses;
+                if (!heap || slot >= heap->retry.size()) return;
+                const auto* k = reinterpret_cast<const std::uint32_t*>(heap->previous + slot * kDescriptorSize) + 4 * half;
+                if ((k[3] >> 30) || !k[2]) return;  // rewritten since: queued by its change
+                misses.push_back({{k[0], k[1], k[2], k[3]}, (std::uint32_t(h) << 28) | slot});
+            },
+            // A list that ran over: every V# slot again once what it did hold is resolved (at once would only
+            // overflow it again with the same words).
+            [&](int) { request_rescan_after_resolve(); });
+        if (!misses.empty()) {
+            // Words the table has now (entered after that pass was recorded): only the slot again. The rest wait to
+            // be resolved.
+            std::vector<std::uint32_t> again;
+            heap_gpu->with_keys([&](leonida::ConsoleHeapKeys& keys) {
+                for (auto& m : misses)
+                    if (keys.find(m.key) >= 0) again.push_back(m.code), m.code = UINT32_MAX;
+                return 0;
+            });
+            for (const std::uint32_t code : again)
+                if (gpu_heaps[code >> 28]) heap_gpu->queue(int(code >> 28), code & ((1u << 28) - 1));
+            gpu_counts.known_misses += again.size();
+            for (const auto& m : misses) {
+                if (m.code == UINT32_MAX) continue;
+                auto& slots = gpu_unresolved[m.key].slots;
+                // Words shared by very many slots: the rest are found by the rescan after the answer.
+                if (slots.size() < 4096) slots.push_back(m.code);
+                else request_rescan_after_resolve();
+            }
+        }
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> gone, removed;
+        {
+            std::lock_guard lock(backing_mutex);
+            gone.swap(released_ranges);
+        }
+        auto& aliases = leonida::title_va_aliases();
+        aliases.take_removed(removed);
+        gpu_counts.released += gone.size() + removed.size();
+        std::size_t dropped = 0;
+        if (!gone.empty() || !removed.empty())
+            dropped = heap_gpu->with_keys([&](leonida::ConsoleHeapKeys& keys) {
+                std::size_t n = 0;
+                for (const auto& [s, bytes] : gone) n += keys.erase_overlapping(s, s + bytes);
+                for (const auto& [s, bytes] : removed) n += keys.erase_overlapping(s, s + bytes);
+                return n;
+            });
+        gpu_counts.dropped += dropped;
+        lap(gpu_counts.part_ms[1]);
+        bool lost = false;
+        const std::uint64_t generation = aliases.generation();
+        // At once when something went (the pass must not answer from it), else at most every 50 ms: a range added
+        // since is a miss the resolver answers meanwhile (the alias table changes at most submissions).
+        if ((generation != gpu_alias_generation &&
+             (!removed.empty() || start - gpu_ranges_at >= std::chrono::milliseconds(50))) ||
+            !gone.empty()) {
+            gpu_alias_generation = generation;
+            gpu_ranges_at = start;
+            lost = rebuild_gpu_ranges(gone);
+        }
+        lap(gpu_counts.part_ms[2]);
+        if (dropped || lost) {
+            if (gpu_filter_enabled()) {
+                gpu_rescan_filtered = true;
+                for (const auto& [s, bytes] : gone) gpu_filter_shader.emplace_back(s, s + bytes);
+                for (const auto& [s, bytes] : removed) gpu_filter_shader.emplace_back(s, s + bytes);
+            } else {
+                gpu_rescan = true;
+            }
+        }
+        update_gpu_backed(gone);
+        lap(gpu_counts.part_ms[3]);
+        update_gpu_ask();
+        lap(gpu_counts.part_ms[4]);
+        gpu_counts.begin_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+
+    // After the heaps: hand the missed words to the resolver, take its answers (entered in the key table, their slots
+    // queued again), ask again for words that got no backing, and translate every V# slot again when something they
+    // were answered from went. Nothing here waits for an answer.
+    void console_heap_gpu_end() {
+        static const std::uint64_t retry_ms = [] {
+            char text[16] = {};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_CONSOLE_GPU_RETRY_MS", text, sizeof(text));
+            return n > 0 && n < sizeof(text) ? std::strtoull(text, nullptr, 10) : 2000ull;
+        }();
+        using clock = std::chrono::steady_clock;
+        const auto start = clock::now();
+        std::vector<GpuAnswer> answers;
+        std::vector<std::pair<leonida::ConsoleHeapKeys::Key, bool>> requests;
+        for (auto& [key, u] : gpu_unresolved)
+            if (!u.asked) {
+                u.asked = true;
+                requests.emplace_back(key, false);
+            }
+        // Words with no backing, asked again once retry_ms old: at most 256 a refresh, and while the resolver has
+        // fewer than 4096 waiting.
+        const auto now = clock::now();
+        for (int n = 0; n < 256 && !gpu_unbacked.empty() && gpu_asked + requests.size() < 4096 &&
+                        now >= gpu_unbacked.front().at;
+             ++n) {
+            requests.emplace_back(gpu_unbacked.front().key, true);
+            gpu_unbacked_tries[gpu_unbacked.front().key] = gpu_unbacked.front().tries + 1;
+            gpu_unbacked.pop_front();
+            ++gpu_counts.retried;
+        }
+        {
+            std::lock_guard lock(gpu_resolver->mutex);
+            answers.swap(gpu_resolver->answers);
+            gpu_resolver->requests.insert(gpu_resolver->requests.end(), requests.begin(), requests.end());
+        }
+        if (!requests.empty()) gpu_resolver->wake.notify_one();
+        gpu_asked += requests.size();
+        gpu_asked -= std::min(gpu_asked, answers.size());
+        const auto queue_slots = [&](const std::vector<std::uint32_t>& slots) {
+            for (const std::uint32_t code : slots) {
+                const std::uint32_t h = code >> 28;
+                if (h < gpu_heaps.size() && gpu_heaps[h]) heap_gpu->queue(int(h), code & ((1u << 28) - 1));
+            }
+        };
+        for (const GpuAnswer& a : answers) {
+            if (a.retry) {
+                if (!a.to) {
+                    // Still no backing: asked again after twice the wait, at most 64x retry_ms.
+                    const auto t = gpu_unbacked_tries.find(a.key);
+                    const std::uint32_t tries = t == gpu_unbacked_tries.end() ? 1 : t->second;
+                    if (t != gpu_unbacked_tries.end()) gpu_unbacked_tries.erase(t);
+                    const auto wait = std::chrono::milliseconds(retry_ms << std::min<std::uint32_t>(tries, 6));
+                    gpu_unbacked.push_back({clock::now() + wait, a.key, tries});
+                    continue;
+                }
+                gpu_unbacked_tries.erase(a.key);
+                // Backed now: every slot that read "no backing" for these words, once all are in.
+                const bool entered = heap_gpu->with_keys([&](leonida::ConsoleHeapKeys& keys) {
+                    std::uint64_t to = 0;
+                    bool none = false;
+                    return keys.lookup(a.key, to, none) && none && keys.put(a.key, a.to, a.span, false);
+                });
+                if (entered) {
+                    ++gpu_counts.flips;
+                    if (gpu_filter_enabled()) {
+                        // The slots that read "no backing" for these words: those with this title base.
+                        const std::uint64_t base = a.key[0] | (std::uint64_t(a.key[1] & 0xffff) << 32);
+                        gpu_filter_title.emplace_back(base, base + 1);
+                        gpu_rescan_filtered = true;
+                    } else {
+                        gpu_rescan = true;
+                    }
+                }
+                continue;
+            }
+            ++gpu_counts.resolved;
+            const auto it = gpu_unresolved.find(a.key);
+            if (!heap_gpu->with_keys([&](leonida::ConsoleHeapKeys& keys) { return keys.put(a.key, a.to, a.span, !a.to); }))
+                ++gpu_counts.put_failed;  // every probe slot holds other words: these slots stay without records
+            else if (it != gpu_unresolved.end())
+                queue_slots(it->second.slots);
+            if (it != gpu_unresolved.end()) gpu_unresolved.erase(it);
+            if (!a.to) {
+                ++gpu_counts.none;
+                gpu_unbacked.push_back({clock::now() + std::chrono::milliseconds(retry_ms), a.key, 0});
+            }
+        }
+        while (gpu_unbacked.size() > 65536) gpu_unbacked.pop_front();  // those stay "no backing" until a rescan
+        // A key table past 60 % full: emptied at once (the next pass clears the GPU's), and every V# slot again.
+        const auto [key_count, key_capacity] = heap_gpu->with_keys(
+            [](leonida::ConsoleHeapKeys& k) { return std::pair<std::size_t, std::size_t>(k.size(), k.capacity()); });
+        if (key_count * 10 > key_capacity * 6) {
+            heap_gpu->reset_keys();
+            gpu_unbacked.clear();
+            gpu_unresolved.clear();
+            ++gpu_counts.key_resets;
+            gpu_rescan = true;
+        }
+        // Asked for after an overflow: once the misses are resolved, or a second later if new ones keep coming.
+        if (gpu_rescan_after_resolve &&
+            (gpu_unresolved.empty() || clock::now() - gpu_rescan_asked >= std::chrono::seconds(1))) {
+            gpu_rescan_after_resolve = false;
+            gpu_rescan = true;
+        }
+        if (gpu_rescan) {
+            gpu_rescan = false;
+            ++gpu_counts.rescans;
+            // On the GPU: one dispatch over the slots the title has written, pairs only (ConsoleHeapGpu::rescan).
+            for (unsigned h = 0; h < gpu_heaps.size(); ++h)
+                if (ConsoleHeap* heap = gpu_heaps[h]) heap_gpu->rescan(int(h), heap->gpu_high);
+            gpu_rescan_filtered = false;  // the full one covers it
+            gpu_filter_shader.clear();
+            gpu_filter_title.clear();
+        } else if (gpu_rescan_filtered) {
+            gpu_rescan_filtered = false;
+            ++gpu_counts.filtered_rescans;
+            // The spans go to the pass once (its change tables serve every heap).
+            bool first = true;
+            const leonida::ConsoleHeapSpans none;
+            for (unsigned h = 0; h < gpu_heaps.size(); ++h)
+                if (ConsoleHeap* heap = gpu_heaps[h]) {
+                    heap_gpu->rescan_filtered(int(h), heap->gpu_high, first ? gpu_filter_shader : none,
+                                              first ? gpu_filter_title : none);
+                    first = false;
+                }
+            gpu_filter_shader.clear();
+            gpu_filter_title.clear();
+        }
+        gpu_counts.resolve_ms += std::chrono::duration<double, std::milli>(clock::now() - start).count();
+    }
+
+    void log_console_heap_gpu(ConsoleHeap& heap, double count) {
+        const auto stats = heap_gpu->take_stats();
+        const std::size_t keys = heap_gpu->with_keys([](leonida::ConsoleHeapKeys& k) { return k.size(); });
+        std::size_t checked = 0;
+        for (const auto& r : gpu_ranges) checked += r.checked;
+        std::fprintf(stderr,
+                     "[rt] d3d12: console descriptor heap 0x%llx on the GPU: %.1f slots queued a submission; passes "
+                     "%llu (%llu slots, %llu key updates, %llu misses, %llu overflowed, %llu not submitted); resolved "
+                     "%llu words (%llu with no backing, %llu asked again, %llu answered later, %llu not entered), %llu "
+                     "misses already "
+                     "entered, %zu waiting (%zu with the resolver), %zu unbacked; %llu rescans (%llu slots), "
+                     "%llu filtered rescans (%llu slots looked at), %llu key entries dropped for %llu releases; %zu keys (%llu resets), %zu ranges (%zu checked), %zu "
+                     "backed spans (%llu rebuilds, %llu cuts, %.3f ms a submission), %zu ask spans; %.3f ms before "
+                     "and %.3f ms resolving a submission\n",
+                     static_cast<unsigned long long>(heap.console_va), double(heap.gpu_queued) / count,
+                     static_cast<unsigned long long>(stats.passes), static_cast<unsigned long long>(stats.slots),
+                     static_cast<unsigned long long>(stats.updates), static_cast<unsigned long long>(stats.misses),
+                     static_cast<unsigned long long>(stats.overflows), static_cast<unsigned long long>(stats.failed),
+                     static_cast<unsigned long long>(gpu_counts.resolved),
+                     static_cast<unsigned long long>(gpu_counts.none),
+                     static_cast<unsigned long long>(gpu_counts.retried),
+                     static_cast<unsigned long long>(gpu_counts.flips),
+                     static_cast<unsigned long long>(gpu_counts.put_failed),
+                     static_cast<unsigned long long>(gpu_counts.known_misses), gpu_unresolved.size(), gpu_asked,
+                     gpu_unbacked.size(), static_cast<unsigned long long>(gpu_counts.rescans),
+                     static_cast<unsigned long long>(stats.rescanned),
+                     static_cast<unsigned long long>(gpu_counts.filtered_rescans),
+                     static_cast<unsigned long long>(stats.filtered),
+                     static_cast<unsigned long long>(gpu_counts.dropped),
+                     static_cast<unsigned long long>(gpu_counts.released), keys,
+                     static_cast<unsigned long long>(gpu_counts.key_resets), gpu_ranges.size(), checked,
+                     gpu_backed.size(), static_cast<unsigned long long>(gpu_counts.backed_rebuilds),
+                     static_cast<unsigned long long>(gpu_counts.backed_cuts), gpu_counts.backed_ms / count,
+                     gpu_ask.size(),
+                     gpu_counts.begin_ms / count, gpu_counts.resolve_ms / count);
+        std::fprintf(stderr,
+                     "[rt] d3d12: console heap pass, before the heaps, ms a submission: alias probes %.3f, misses and "
+                     "releases %.3f, range table %.3f, backed table %.3f, ask table %.3f\n",
+                     gpu_counts.part_ms[0] / count, gpu_counts.part_ms[1] / count, gpu_counts.part_ms[2] / count,
+                     gpu_counts.part_ms[3] / count, gpu_counts.part_ms[4] / count);
+        if (tsharps_off_thread_enabled()) {
+            std::uint64_t t[5];
+            for (unsigned i = 0; i < 5; ++i) t[i] = gpu_tsharps[i].exchange(0, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                         "[rt] d3d12: console heap T#s registered by the resolver: %llu known, %llu bound, %llu naming no "
+                         "texture, %llu refused\n",
+                         static_cast<unsigned long long>(t[0]), static_cast<unsigned long long>(t[1]),
+                         static_cast<unsigned long long>(t[2]), static_cast<unsigned long long>(t[3]));
+        }
+        if (shadow_gpu_enabled()) {
+            ShadowGpuCounts c;
+            std::size_t imports = 0;
+            std::uint64_t imported_bytes = 0;
+            {
+                std::lock_guard lock(shadow_import_mutex);
+                c = std::exchange(shadow_gpu_counts, ShadowGpuCounts{});
+                imports = shadow_imports.size();
+                imported_bytes = shadow_import_bytes;
+            }
+            std::fprintf(stderr,
+                         "[rt] d3d12: slot-133 shadows on the GPU: %llu copies (%.1f KiB a submission), %llu imports made "
+                         "(%llu MiB), %llu dropped after a map change, %llu refused, %llu with no GPU destination; %zu imports "
+                         "live (%llu MiB); passes copied %llu regions\n",
+                         static_cast<unsigned long long>(c.copies), double(c.bytes) / 1024.0 / count,
+                         static_cast<unsigned long long>(c.imports), static_cast<unsigned long long>(c.imported >> 20),
+                         static_cast<unsigned long long>(c.dropped), static_cast<unsigned long long>(c.refused),
+                         static_cast<unsigned long long>(c.outside), imports,
+                         static_cast<unsigned long long>(imported_bytes >> 20),
+                         static_cast<unsigned long long>(stats.copies));
+        }
+        heap.gpu_queued = 0;
+        gpu_counts = {};
     }
 
     // LOCAL DIAGNOSTIC (desc-probe): which console-heap slots our API wrote and which the title wrote itself, what
@@ -3723,6 +7045,16 @@ struct DeviceState {
         unsigned recent_count = 0;
     };
     std::mutex probe_mutex;  // never under console_heap_mutex' callees; takes descriptor_mutex inside
+    // LEONIDA_DESC_PROBE=1 turns the diagnostic on (so does the compute input probe, which reads these records). Off
+    // by default: at every submission it hashes each slot of every bound table, and formats a line under
+    // descriptor_mutex for each slot the title wrote itself.
+    static bool probe_enabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_DESC_PROBE");
+            return (v && *v == '1') || rt::compute_probe::enabled();
+        }();
+        return on;
+    }
     std::vector<std::unique_ptr<HeapProbe>> probes;
     std::uint64_t probe_submissions = 0;
     static constexpr const char* kProbeKinds[8] = {"V# in arena", "V# title memory", "V# other", "T# key known",
@@ -3731,7 +7063,7 @@ struct DeviceState {
     std::atomic<int> probe_view_logs{0};
     // Where a Create*View / CopyDescriptors* write landed, for the first ones.
     void probe_view(const char* what, SIZE_T ptr, UINT count) {
-        if (!leonida::local_diagnostics() || probe_view_logs.fetch_add(1) >= 48) return;
+        if (!probe_enabled() || probe_view_logs.fetch_add(1) >= 48) return;
         std::lock_guard lock(probe_mutex);
         for (const auto& p : probes)
             if (ptr >= p->console_va && ptr < p->console_va + p->slots * kDescriptorSize) {
@@ -3756,8 +7088,7 @@ struct DeviceState {
         return !(q[0] | q[1] | q[2] | q[3]);
     }
     void probe_add(std::uint64_t console_va, std::uint64_t shader_va, std::size_t slots, bool shadowed) {
-        // Nothing reads a probe unless one of the two diagnostics is on; without probes the other probe_* are no-ops.
-        if (!leonida::local_diagnostics() && !rt::compute_probe::enabled()) return;
+        if (!probe_enabled() && !rt::compute_probe::enabled()) return;
         auto probe = std::make_unique<HeapProbe>();
         probe->console_va = console_va;
         probe->shader_va = shader_va;
@@ -3777,11 +7108,12 @@ struct DeviceState {
                      shader_va + slots * kDescriptorSize <= arena.size ? "inside" : "PAST");
     }
     void probe_remove(std::uint64_t console_va) {
+        if (!probe_enabled()) return;
         std::lock_guard lock(probe_mutex);
         std::erase_if(probes, [console_va](const std::unique_ptr<HeapProbe>& p) { return p->console_va == console_va; });
     }
     void probe_api(SIZE_T ptr, UINT count, const char* what = "CopyDescriptors") {
-        if (!ptr || !count) return;
+        if (!ptr || !count || !probe_enabled()) return;
         std::lock_guard lock(probe_mutex);
         for (const auto& p : probes) {
             if (ptr < p->console_va || ptr >= p->console_va + p->slots * kDescriptorSize) continue;
@@ -3853,6 +7185,7 @@ struct DeviceState {
     }
     // At a descriptor-table scan (ExecuteCommandLists): the slots a bound table in a console heap declares.
     void probe_table(std::uint64_t table_va, std::uint32_t descriptors) {
+        if (!probe_enabled()) return;
         std::lock_guard lock(probe_mutex);
         for (const auto& p : probes) {
             const std::uint64_t span = p->slots * kDescriptorSize;
@@ -3911,7 +7244,7 @@ struct DeviceState {
     }
     // Before a submission, after the console heaps' copies are refreshed: the whole heap, now and then.
     void probe_census() {
-        if (!leonida::local_diagnostics()) return;
+        if (!probe_enabled()) return;
         const std::uint64_t n = ++probe_submissions;
         if (n != 1 && n != 64 && n != 512 && n != 2048 && n % 4096) return;
         std::lock_guard lock(probe_mutex);
@@ -4366,8 +7699,14 @@ struct DeviceState {
         VkImageView sampled;
         VkImageView storage;  // the same range without a component mapping, for the storage bindings; or null
         std::uint64_t address;
+        // A 2D view of the first layer in the 2D arrays (a 2D-array image's slice 0, BindlessSet::MirrorViews); or null
+        VkImageView mirror_sampled = VK_NULL_HANDLE;
+        VkImageView mirror_storage = VK_NULL_HANDLE;
     };
     std::unique_ptr<leonida::BindlessSet> bindless;
+    // True when the loaded library's modules read the table's kind word (create_bindless, descriptor_table.h): the
+    // image inserts then record which arrays each index is bound in.
+    bool descriptor_table_tagged = false;
     std::mutex descriptor_mutex;  // the set and the containers below
     // vkDeviceWaitIdle calls made for the bindless set (none, unless LEONIDA_BINDLESS_IDLE_WAIT restores the old wait).
     std::atomic<std::uint64_t> bindless_idle_waits{0};
@@ -4378,8 +7717,10 @@ struct DeviceState {
     std::map<leonida::DescriptorKey, ImageEntry> image_entries;
     // A pending stream has a console descriptor immediately. Keep its keys (including aliases)
     // until the first complete upload. A shader hash miss selects the existing fallback image.
+    // Once the smaller mips are filled (publish_streamed_texture), only the views that start above first_mip wait.
     struct PendingImage {
         VkImage zero = VK_NULL_HANDLE;
+        std::uint32_t first_mip = UINT32_MAX;
         std::map<leonida::DescriptorKey, leonida::gfx10::Image> keys;
     };
     std::unordered_map<VkImage, PendingImage> pending_image_keys;
@@ -4454,6 +7795,10 @@ struct DeviceState {
         context->defer_destroy(leonida::DeferredDeletionQueue::Kind::bindless_slot, slot_handle);
         if (entry.sampled) context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.sampled);
         if (entry.storage) context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.storage);
+        if (entry.mirror_sampled)
+            context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.mirror_sampled);
+        if (entry.mirror_storage)
+            context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.mirror_storage);
     }
 
     struct PendingSample {
@@ -4485,7 +7830,9 @@ struct DeviceState {
 
     // Gives the T# `words` a view in set 0 and an entry in the hash table, unless it has them. `storage`: shaders
     // write through it too (an unordered-access view), so it also goes into the storage arrays, which are
-    // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
+    // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0. `why`, when
+    // given, is set to the reason when it is that set 0 has no room (or no array) for the image's dimension, and left
+    // alone otherwise (no view could be made for the T#).
     bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image, VkImage vk_image,
                     VkFormat image_format, VkImageAspectFlags aspects, bool storage,
                     bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED) {
@@ -4495,11 +7842,12 @@ struct DeviceState {
     }
     bool bind_image_locked(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image,
                            VkImage vk_image, VkFormat image_format, VkImageAspectFlags aspects, bool storage,
-                           bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED) {
+                           bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED,
+                           const char** why = nullptr) {
         namespace g = leonida::gfx10;
         if (!bindless) return false;
         auto pending = pending_image_keys.find(vk_image);
-        if (pending != pending_image_keys.end()) {
+        if (pending != pending_image_keys.end() && image.first_mip < pending->second.first_mip) {
             pending->second.keys.try_emplace(words, image);
             if (!pending->second.zero) return true;
             vk_image = pending->second.zero;
@@ -4540,7 +7888,7 @@ struct DeviceState {
         const bool sampled_only = uint_backed || (view_format != image_format && view_format != VK_FORMAT_UNDEFINED);
         return bind_image_views_locked(words, image, vk_image, view_format, channels_format,
                                        uint_backed ? image_format : view_format, aspects, true, storage, {},
-                                       sampled_only);
+                                       sampled_only, why);
     }
     // The same for a view whose formats the caller has worked out: `view_format` of the sampled view (made when
     // `sampled`), `channels_format` whose channels the T#'s swizzle selects from, `storage_format` of the storage view.
@@ -4554,13 +7902,14 @@ struct DeviceState {
     bool bind_image_views_locked(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image,
                                  VkImage vk_image, VkFormat view_format, VkFormat channels_format,
                                  VkFormat storage_format, VkImageAspectFlags aspects, bool sampled, bool storage,
-                                 VolumeSlices slices, bool sampled_only) {
+                                 VolumeSlices slices, bool sampled_only, const char** why = nullptr) {
         namespace g = leonida::gfx10;
         if (!bindless) {
             if (storage) log_once("unordered-access view needs the Vulkan bindless set; type", int(image.type));
             return false;
         }
-        if (const auto pending = pending_image_keys.find(vk_image); pending != pending_image_keys.end()) {
+        if (const auto pending = pending_image_keys.find(vk_image);
+            pending != pending_image_keys.end() && image.first_mip < pending->second.first_mip) {
             pending->second.keys.try_emplace(words, image);
             if (!pending->second.zero) return true;
             vk_image = pending->second.zero;
@@ -4631,12 +7980,10 @@ struct DeviceState {
             }
         }
         view_info.components = g::vulkan_swizzle(swizzle, channels_format);
-        // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
-        view_info.subresourceRange = {
-            VkImageAspectFlags(stencil                                   ? VK_IMAGE_ASPECT_STENCIL_BIT
-                               : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
-                                                                       : VK_IMAGE_ASPECT_COLOR_BIT),
-            image.first_mip, image.mip_count, image.first_layer, image.layer_count};
+        view_info.subresourceRange = g::vulkan_subresource_range(
+            image, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT
+                            : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                                   : VK_IMAGE_ASPECT_COLOR_BIT);
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
         if (sampled) {
             const VkResult result = vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled);
@@ -4646,13 +7993,19 @@ struct DeviceState {
             }
         }
         leonida::StorageViews views{};
+        VkImageViewCreateInfo storage_info{};
+        bool storage_info_valid = false;
+        // storage_info's pNext chain: declared out here, since the 2D mirror below copies storage_info with its chain
+        // after this block. Declared inside it, the chain dangled and the driver followed it into stale stack (the
+        // 120 s hangs of d3d12_existing_heap, d3d12_r9g9b9e5_uav and the depth-storage tests).
+        VkImageViewUsageCreateInfo storage_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        VkImageViewSlicedCreateInfoEXT sliced{VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT};
         if (storage) {
-            VkImageViewCreateInfo storage_info = view_info;
+            storage_info = view_info;
+            storage_info_valid = true;
             storage_info.components = {};
             storage_info.format = storage_format;
-            VkImageViewUsageCreateInfo storage_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
             storage_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
-            VkImageViewSlicedCreateInfoEXT sliced{VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT};
             if (slices.count) {
                 sliced.sliceOffset = slices.first;
                 sliced.sliceCount = slices.count;
@@ -4669,27 +8022,73 @@ struct DeviceState {
             (numeric == 1 ? views.as_uint : numeric == 2 ? views.as_sint : views.as_float) = entry.storage;
             if (storage_format == VK_FORMAT_R32_UINT) views.r32ui = entry.storage;
         }
+        // A 2D-array or cube image also gets a 2D view of its first layer, which the bindless set binds at the same
+        // index in the 2D arrays: a 2D instruction reading this T# addresses slice 0 (BindlessSet::MirrorViews).
+        leonida::BindlessSet::MirrorViews mirror{};
+        if (dimension == leonida::ImageDimension::dim_2d_array) {
+            const auto make_mirror = [&](const VkImageViewCreateInfo& base, VkImageView* out) {
+                VkImageViewCreateInfo layer = base;
+                layer.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                layer.subresourceRange.baseArrayLayer = image.first_layer;
+                layer.subresourceRange.layerCount = 1;
+                return vk.vkCreateImageView(info.device, &layer, nullptr, out) == VK_SUCCESS;
+            };
+            if (make_mirror(view_info, &entry.mirror_sampled)) {
+                mirror.sampled = entry.mirror_sampled;
+                mirror.sampled_layout = VK_IMAGE_LAYOUT_GENERAL;
+                if (storage_info_valid && make_mirror(storage_info, &entry.mirror_storage)) {
+                    const int numeric = numeric_class(storage_info.format);
+                    (numeric == 1 ? mirror.storage.as_uint : numeric == 2 ? mirror.storage.as_sint
+                                                                        : mirror.storage.as_float) = entry.mirror_storage;
+                    if (storage_info.format == VK_FORMAT_R32_UINT) mirror.storage.r32ui = entry.mirror_storage;
+                }
+            } else {
+                log_once("no 2D view of this image's first layer; a 2D instruction reading its T# reads the fallback",
+                         int(image.type));
+            }
+        }
         // Every state a shader can read or write the texture in is GENERAL (ResourceBinding::sampled_in_general).
-        entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views, sampled_class);
+        // `kind` says which arrays the index is bound in; a tagged module reads it from the table (insert_key).
+        entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views, sampled_class,
+                                          mirror.sampled ? &mirror : nullptr);
         if (!entry.index) {
-            if (first_diagnostic("a bindless image array is full; dimension", int(dimension))) {
+            vk.vkDestroyImageView(info.device, entry.mirror_sampled, nullptr);
+            entry.mirror_sampled = VK_NULL_HANDLE;
+            if (entry.mirror_storage) {
+                vk.vkDestroyImageView(info.device, entry.mirror_storage, nullptr);
+                entry.mirror_storage = VK_NULL_HANDLE;
+            }
+            using Refusal = leonida::BindlessSet::ImageRefusal;
+            const Refusal refusal = bindless->image_refusal(dimension, entry.storage != VK_NULL_HANDLE, sampled_class);
+            if (why)
+                *why = refusal == Refusal::no_array       ? "set 0 has no array for the T#'s dimension"
+                       : refusal == Refusal::storage_full ? "the bindless storage arrays of the T#'s dimension are full"
+                                                          : "the bindless array of the T#'s dimension is full";
+            if (refusal != Refusal::no_array &&
+                first_diagnostic("a bindless image array is full; dimension", int(dimension))) {
                 // Whether the array holds live textures or stale views: the T#s it holds, the textures they name,
-                // and the most T#s of one texture (a texture whose T#s keep changing, a streamed mip clamp say,
-                // keeps an index for each until it goes).
-                std::size_t entries = 0, replaced = 0, most = 0;
+                // the most T#s of one texture (a texture whose T#s keep changing, a streamed mip clamp say, keeps an
+                // index for each until it goes), and how many of those textures are still the one registered at
+                // their address (a texture leaves the set when the one registered there goes: forget_image).
+                std::size_t entries = 0, replaced = 0, most = 0, registered = 0;
                 std::map<std::uint64_t, std::size_t> per_texture;
                 for (const auto& [key, held] : image_entries)
                     if (held.dimension == dimension) {
                         ++entries;
                         most = std::max(most, ++per_texture[held.address]);
                     }
+                for (const auto& texture : per_texture) registered += images_by_address.count(texture.first);
                 for (const auto& held : replaced_images) replaced += held.dimension == dimension;
+                constexpr const char* names[] = {"2D", "2D array", "3D", "1D", "1D array", "2D MS", "2D MS array"};
                 std::fprintf(stderr,
-                             "[rt] d3d12: a bindless image array is full; dimension %d: %u indices, %zu T#s of %zu "
-                             "textures (at most %zu T#s of one), %zu replaced views kept; further T#s of this "
-                             "dimension read the fallback\n",
-                             int(dimension), bindless->image_capacity(dimension), entries, per_texture.size(), most,
-                             replaced);
+                             "[rt] d3d12: a bindless image array is full; dimension %d (%s)%s: %u indices, %u in the "
+                             "storage arrays, %zu T#s of %zu textures (%zu registered at their address, at most %zu "
+                             "T#s of one), %zu replaced views kept; further T#s of this dimension read the "
+                             "fallback\n",
+                             int(dimension), names[int(dimension)],
+                             refusal == Refusal::storage_full ? ", its storage range" : "",
+                             bindless->image_capacity(dimension), bindless->storage_capacity(dimension), entries,
+                             per_texture.size(), registered, most, replaced);
             }
             if (entry.sampled) vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
             if (entry.storage) vk.vkDestroyImageView(info.device, entry.storage, nullptr);
@@ -4702,7 +8101,10 @@ struct DeviceState {
             image_entries.emplace(words, entry);
             image_keys.emplace(image.address, words);
         }
-        bindless->insert_key(words, entry.index);
+        // The set derives the entry's kind from what it bound at this index (BindlessSet::image_kind_at); a plain
+        // library's modules do not read it, so they get 0 as before.
+        bindless->insert_key(words, entry.index,
+                             descriptor_table_tagged ? bindless->image_kind_at(dimension, entry.index) : 0u);
         leonida::fsdraw::note_tsharp(words.data());  // LOCAL DIAGNOSTIC
         return true;
     }
@@ -4715,6 +8117,26 @@ struct DeviceState {
     void note_image_address(std::uint64_t address, const void* resource) {
         std::lock_guard lock(descriptor_mutex);
         images_by_address[address] = resource;
+    }
+    // LEONIDA_TRACE_TEXTURE=<address>[,<address>...] (hex, the base a T# names): the resource id of an image registered
+    // at that address, so a draw's T# can be followed to the passes that write it (fsdraw rt0, UAV views, copies).
+    static void trace_image(std::uint64_t address, leonida::ResourceId id, const char* where) {
+        static const std::vector<std::uint64_t> traced = [] {
+            std::vector<std::uint64_t> out;
+            const char* v = std::getenv("LEONIDA_TRACE_TEXTURE");
+            for (const char* p = v; p && *p;) {
+                char* end = nullptr;
+                const std::uint64_t a = std::strtoull(p, &end, 16);
+                if (end == p) break;
+                out.push_back(a);
+                p = *end == ',' ? end + 1 : end;
+            }
+            return out;
+        }();
+        if (traced.empty() || std::find(traced.begin(), traced.end(), address) == traced.end()) return;
+        std::fprintf(stderr, "[rt] trace-texture: address 0x%llx is resource 0x%llx (%s)\n",
+                     static_cast<unsigned long long>(address), static_cast<unsigned long long>(id), where);
+        leonida::fsdraw::note_target(id);  // read back with the captures (numbers: mean, nonzero texels)
     }
     // The texture registered at `address` (a title-placed texture's address can be taken over by a later one).
     const void* image_owner(std::uint64_t address) {
@@ -4932,6 +8354,12 @@ struct DeviceState {
         return nullptr;
     }
 };
+// TitleBufferWindows::system_memory_types reads the memory types through these (LEONIDA_GEOMETRY_HOST): without them
+// it would leave every type allowed, the BAR included.
+static_assert(requires(const DeviceState& d) {
+    d.memory.memoryTypes[0].propertyFlags;
+    d.memory.memoryTypeCount;
+});
 
 // The Vulkan format for a texture this layer can create, with the D24 fallback; VK_FORMAT_UNDEFINED, after a log
 // line, when it cannot. Committed and placed textures share it so both refuse the same formats for the same reason.
@@ -4958,7 +8386,8 @@ Format texture_format(const DeviceState& device, const D3D12_RESOURCE_DESC& desc
 // no-op. An A8 render target's VK_FORMAT_A8_UNORM_KHR image (Format::a8_as_alpha) is in a class of its own: no
 // other format can be a view format of it, so any other castable format is refused here, before Vulkan.
 HRESULT castable_view_formats(const Format& format, DXGI_FORMAT resource_format, UINT32 count,
-                              const DXGI_FORMAT* castable, std::vector<VkFormat>& out, bool depth_uav_planes = false) {
+                              const DXGI_FORMAT* castable, std::vector<VkFormat>& out, bool depth_uav_planes = false,
+                              bool console_d16s8 = false) {
     if (!count || !castable) return S_OK;
     const bool depth = (format.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
     const leonida::BlockFormat own = leonida::block_format(format.format, format.aspects);
@@ -4975,6 +8404,13 @@ HRESULT castable_view_formats(const Format& format, DXGI_FORMAT resource_format,
             const bool valid = format.format == VK_FORMAT_D16_UNORM
                 ? view == DXGI_FORMAT_R16_TYPELESS || view == DXGI_FORMAT_D16_UNORM ||
                   view == DXGI_FORMAT_R16_UNORM || view == DXGI_FORMAT_R16_UINT
+                : (format.xbox_depth16_stencil8 || console_d16s8)
+                ? view == xbox_d16s8 || view == xbox_d16_plane || view == xbox_s8_plane ||
+                  (format.d24 && (view == DXGI_FORMAT_D24_UNORM_S8_UINT ||
+                                  view == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+                                  view == DXGI_FORMAT_X24_TYPELESS_G8_UINT)) ||
+                  view == DXGI_FORMAT_R16_TYPELESS || view == DXGI_FORMAT_R16_UNORM ||
+                  view == DXGI_FORMAT_R16_UINT || view == DXGI_FORMAT_R8_UINT
                 : view == DXGI_FORMAT_R32G8X24_TYPELESS || view == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
                   view == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS || view == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT ||
                   view == DXGI_FORMAT_R32_FLOAT || view == DXGI_FORMAT_R8_UINT;
@@ -5314,9 +8750,10 @@ public:
                                                desc_.NumDescriptors >= 65536
                                            ? DeviceState::heap_guard_bytes()
                                            : 0;
-            if (guard && device.arena_allocate(bytes + guard, 256, arena_offset_, DeviceState::arena_descriptor_heap))
+            if (guard && device.arena_allocate(bytes + guard, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
                 guard_ = guard;
-            else if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
+                device.arena_guard_bytes.fetch_add(guard, std::memory_order_relaxed);
+            } else if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); shader-visible heap size in KiB:",
                          int(std::min<VkDeviceSize>(bytes / 1024, INT_MAX)));
                 return;
@@ -5327,10 +8764,6 @@ public:
             if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
                 std::lock_guard lock(device.visible_heap_mutex);
                 device.visible_heaps[arena_offset_] = {arena_offset_ + bytes, desc.Type};
-            }
-            if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
-                std::lock_guard lock(device.cbv_heap_mutex);
-                device.cbv_heaps[arena_offset_] = arena_offset_ + bytes;
             }
         } else {
             storage_.reset(new std::byte[std::size_t(bytes)]());
@@ -5355,9 +8788,13 @@ public:
             std::lock_guard lock(device_.visible_heap_mutex);
             device_.visible_heaps.erase(arena_offset_);
         }
+        if (in_arena_ && desc_.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+            device_.forget_nulled_table_slots(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize);
+        }
         if (in_arena_) device_.arena_release(arena_offset_,
                                             VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize + guard_,
                                             DeviceState::arena_descriptor_heap);
+        if (guard_) device_.arena_guard_bytes.fetch_sub(guard_, std::memory_order_relaxed);
     }
 
     bool ok() const { return cpu_ != nullptr; }
@@ -5485,6 +8922,7 @@ public:
         device_.context->remove_resource(id());
         // Before the memory goes to the deferred queue: no submission copies into it after this.
         if (shadow_) device_.remove_shadow(shadow_);
+        if (shadow_ && !in_arena_) device_.remove_copy_target(shadow_);
         if (host_import_) {
             // VK_EXT_external_memory_host needs the caller's pages to stay valid for the imported memory's whole
             // lifetime, and a title may free them right after releasing the resource. So the memory is not left to
@@ -5583,9 +9021,9 @@ public:
     bool replay_seen() const { return replay_seen_.load(std::memory_order_relaxed); }
     bool staged_title() const { return staged_title_; }
     bool upload_staged_title(const rt::xg_xs::Texture& layout, const std::uint8_t* tiled,
-                             std::vector<std::uint64_t>& columns, bool inspect, bool& nonzero) {
+                             std::vector<std::uint64_t>& columns, bool inspect, bool& nonzero, unsigned from) {
         std::lock_guard lock(device_.title_upload_mutex);
-        return device_.title_upload.write(device_, id(), binding_, layout, tiled, columns, inspect, nonzero);
+        return device_.title_upload.write(device_, id(), binding_, layout, tiled, columns, inspect, nonzero, from);
     }
     // Map and the destructor notify the registry for a slot-133 placement.
     void mark_title_texture() { title_texture_ = true; }
@@ -5609,13 +9047,12 @@ public:
         const bool host = cpu_visible();
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.size = desc_.Width;
-        if (!host && device_.arena.mapped) {
-            if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_,
-                                        DeviceState::arena_buffer)) {
-                log_once("GPU address arena full (raise LEONIDA_ARENA_MB); buffer size in KiB:",
-                         int(desc_.Width / 1024));
-                return E_OUTOFMEMORY;
-            }
+        const bool use_arena = !host && device_.arena.mapped;
+        if (use_arena && desc_.Width > device_.arena.size) return E_OUTOFMEMORY;
+        // An otherwise valid committed buffer can outgrow the largest free slice. Give it its own
+        // addressable VkBuffer below, so the title can still use its arena-relative GPU VA.
+        if (use_arena && device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+                                                arena_offset_, DeviceState::arena_buffer)) {
             in_arena_ = true;
             std::memset(device_.arena.mapped + arena_offset_, 0, std::size_t(desc_.Width));
             va_ = arena_offset_;
@@ -5626,8 +9063,8 @@ public:
             // No host pointer: this is DEFAULT-heap arena memory the GPU may write, so its mapped bytes can be
             // stale. host_at() must not treat it as a CPU-written instance pointer list.
             // A default-heap AS resource is one of these ranges: a GENERIC acceleration structure covers it where
-            // it sits. It is named by its real device address (heap base + offset), as instance descriptors and
-            // BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
+            // it sits. It is named by its device address (heap base + offset, as the driver reports it), as instance
+            // descriptors and BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
             if (device_.info.ray_tracing &&
                 initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
                 vk.vkCreateAccelerationStructureKHR) {
@@ -5638,12 +9075,34 @@ public:
                 asci.type = VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR;
                 if (vk.vkCreateAccelerationStructureKHR(device_.info.device, &asci, nullptr, &accel_) == VK_SUCCESS) {
                     gpu_va_ = device_.arena.address + va_;
+                    // An instance names its BLAS by a value obtained from vkGetAccelerationStructureDeviceAddressKHR
+                    // (VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-12281), so ask for it, as the committed path
+                    // below does. For GENERIC the spec only promises that these addresses keep the offsets between
+                    // the structures of one buffer; drivers return buffer address + offset (vkd3d-proton checks the
+                    // same). If one ever does not, the driver's address is the one instances must hold.
+                    if (vk.vkGetAccelerationStructureDeviceAddressKHR) {
+                        VkAccelerationStructureDeviceAddressInfoKHR dai{
+                            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+                        dai.accelerationStructure = accel_;
+                        const std::uint64_t as_va =
+                            vk.vkGetAccelerationStructureDeviceAddressKHR(device_.info.device, &dai);
+                        if (as_va && as_va != gpu_va_) {
+                            log_once("GENERIC acceleration structure address is not its buffer address + offset; "
+                                     "arena offset in KiB:", int(arena_offset_ / 1024));
+                            buffer_va_ = gpu_va_;
+                            gpu_va_ = as_va;
+                        }
+                    }
                     device_.context->register_acceleration_structure(gpu_va_, accel_);
+                    if (buffer_va_ && buffer_va_ != gpu_va_)
+                        device_.context->register_acceleration_structure(buffer_va_, accel_);
                 }
             }
             device_.context->add_resource(id(), binding);
             return S_OK;
         }
+        if (use_arena)
+            log_once("GPU address arena full; using a dedicated default buffer, size in KiB:", int(desc_.Width / 1024));
         const bool addressable = device_.arena.buffer != VK_NULL_HANDLE;
         const bool need_bda = device_.info.buffer_device_address || device_.info.ray_tracing;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -5670,6 +9129,8 @@ public:
         if (heap_.Type == D3D12_HEAP_TYPE_READBACK) host_preferred = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
         if (heap_.Type == D3D12_HEAP_TYPE_UPLOAD && device_.upload_in_vram)
             host_preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        leonida::memory_breakdown::Owner owner(host ? leonida::memory_breakdown::Consumer::upload
+                                                    : leonida::memory_breakdown::current_owner());
         memory_ = host ? device_.allocate(requirements,
                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                           host_preferred, &memory_flags_, addressable || need_bda)
@@ -5681,8 +9142,8 @@ public:
             VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             address.buffer = buffer_;
             va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
-            device_.log_va(heap_.Type == D3D12_HEAP_TYPE_READBACK ? "readback buffer" : "upload buffer", va_,
-                           desc_.Width);
+            const char* name = heap_.Type == D3D12_HEAP_TYPE_READBACK ? "readback buffer" : "upload buffer";
+            device_.log_va(host ? name : "default buffer", va_, desc_.Width);
         }
         if (host) {
             if (vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_) != VK_SUCCESS)
@@ -5749,14 +9210,13 @@ public:
         const VkDeviceSize alignment = device_.info.host_pointer_alignment;
         if (!device_.get_host_pointer_properties || !alignment) return E_NOTIMPL;
         const auto start = reinterpret_cast<std::uintptr_t>(address);
-        if (!address || !desc_.Width || desc_.Width > UINT64_MAX - 2 * alignment) return E_INVALIDARG;
+        if (start & 3) return E_NOTIMPL;  // byte-unaligned copies keep the ordinary-buffer fallback
+        if (!address || !desc_.Width || alignment > UINT64_MAX / 2 ||
+            (alignment & (alignment - 1)) || desc_.Width > UINT64_MAX - 2 * alignment) return E_INVALIDARG;
         const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
-        // Apply the same backing size rule to imports. The committed-range check and Vulkan bind requirements
-        // below cover the padding as well. The import never initializes or writes the caller's padding.
+        // Keep the device-address word padding, and include the host page prefix in the backing buffer.
         const VkDeviceSize backing_size = need_bda ? align_up(desc_.Width, sizeof(std::uint32_t)) : desc_.Width;
-        // The import starts at the page that holds `address`, and the buffer is bound at the offset inside it: the
-        // title places small buffers inside a page too (a 16-byte UAV at a 64-byte-aligned address on an RTX 5090,
-        // found in review), which an import of `address` itself would refuse.
+        // Bind at zero; replay and device addresses carry the logical buffer's prefix instead.
         const std::uintptr_t base = start & ~static_cast<std::uintptr_t>(alignment - 1);
         void* const base_address = reinterpret_cast<void*>(base);
         const VkDeviceSize offset = start - base;
@@ -5800,7 +9260,7 @@ public:
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
-        info.size = backing_size;
+        info.size = offset + backing_size;
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -5834,9 +9294,8 @@ public:
                                                 &host) != VK_SUCCESS)
             return decline(E_NOTIMPL);
         const std::uint32_t types = host.memoryTypeBits & requirements.memoryTypeBits;
-        // An offset off the buffer's own alignment cannot be bound: the fallback answers.
-        if (!types || (offset % requirements.alignment) || requirements.size > bytes - offset)
-            return decline(E_NOTIMPL);
+        // The binding is at zero; requirements cover the prefix as part of the buffer.
+        if (!types || requirements.size > bytes) return decline(E_NOTIMPL);
         VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
         import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         import.pHostPointer = base_address;
@@ -5868,12 +9327,12 @@ public:
             if (memory_) break;
         }
         if (!memory_) return decline(E_OUTOFMEMORY);
-        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, offset) != VK_SUCCESS)
-            return decline(E_OUTOFMEMORY);
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS) return decline(E_OUTOFMEMORY);
         if (need_bda && vk.vkGetBufferDeviceAddress) {
             VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             bda.buffer = buffer_;
             buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
+            if (buffer_va_) buffer_va_ += offset;
             gpu_va_ = buffer_va_;
         }
         // An import the driver put below the arena cannot be named by a V#: the V# keeps 48 bits of (device address
@@ -5912,6 +9371,7 @@ public:
         leonida::ResourceBinding binding{};
         binding.buffer = buffer_;
         binding.indirect_arguments = (info.usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
+        binding.buffer_offset = offset;
         binding.size = desc_.Width;
         binding.host = static_cast<const std::uint8_t*>(address);
         binding.host_readable = true;
@@ -5989,6 +9449,7 @@ public:
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
         // As an upload buffer (D3D-96): the CPU writes it at every submission and the GPU reads it, so VRAM through
         // Resizable BAR where there is one, system memory otherwise.
+        leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::windows);
         memory_ = device_.allocate(requirements,
                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                    device_.upload_in_vram ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0, &memory_flags_,
@@ -5998,6 +9459,7 @@ public:
             vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &shadow) != VK_SUCCESS)
             return E_OUTOFMEMORY;
         shadow_ = static_cast<std::uint8_t*>(shadow);
+        device_.add_copy_target(shadow_, std::size_t(desc_.Width), buffer_);  // LEONIDA_SHADOW_GPU
         device_.add_shadow(pages, shadow_, std::size_t(desc_.Width));
         // Map() answers the title's own pages, as the imported buffer does: a write to the shadow's memory would be
         // overwritten by the next copy.
@@ -6096,6 +9558,7 @@ public:
         aspects_ = format.aspects;
         image_address_ = device_.next_image_address.fetch_add(256);
         device_.note_image_address(image_address_, this);
+        DeviceState::trace_image(image_address_, id(), "registered");
         binding_.image = image_;
         binding_.format = format_;
         binding_.aspects = aspects_;
@@ -6217,7 +9680,7 @@ public:
             const char* value = std::getenv("LEONIDA_TITLE_IMAGE_STAGING");
             return !value || std::strcmp(value, "0");
         }();
-        // Keep placed movie planes with a known linear CPU layout on the host-copy path.
+        // Keep placed movie planes with a known linear CPU layout on the host-copy path, where there is one.
         // Map on a staged placement still returns the title's pages and participates in the refresh.
         std::uint32_t xg_layout = 0;
         const bool linear_placement = origin == TitleImageOrigin::placed &&
@@ -6228,9 +9691,17 @@ public:
             const char* value = std::getenv("LEONIDA_PLACED_IMAGE_DEFER");
             return !value || std::strcmp(value, "0");
         }();
+        // A device without host copies has no other way to fill a title image: a refresh before a submission may not
+        // use a staged copy through the queue (host_copy_now). Its linear movie planes are staged too.
+        const bool no_host_copy = !device_.copy_memory_to_image && cpu_visible() && samples == 1 &&
+                                  !format.d24_as_float && !format.rgb96;
         // Private BC copies start with the exact same zero blocks as the shared image. The host
         // transition and clear complete before a private view is published, including during command prepare.
-        if (defer_placed && origin == TitleImageOrigin::placed && host_transfer_ && device_.bindless &&
+        // Without host copies the staged upload fills the private image, and the first shader submission clears what
+        // it has not filled.
+        const bool can_fill = host_transfer_ || (no_host_copy && stage_title && allow_staged_title &&
+                                                 device_.image_requirements);
+        if (defer_placed && origin == TitleImageOrigin::placed && can_fill && device_.bindless &&
             desc_.Flags == D3D12_RESOURCE_FLAG_NONE && desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
             desc_.SampleDesc.Count == 1 && asked_castable.empty() && !format.typeless &&
             leonida::block_format(format.format, format.aspects).block > 1) {
@@ -6239,17 +9710,20 @@ public:
                 shared_zero_ = device_.zero_sampled_image(desc_, format, footprint.size);
         }
         std::uint32_t plain_bits = 0;
-        if (stage_title && !shared_zero_ && allow_staged_title && origin != TitleImageOrigin::ordinary && !linear_placement &&
-            host_transfer_ && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT && device_.image_requirements) {
+        if (stage_title && (!shared_zero_ || no_host_copy) && allow_staged_title && origin != TitleImageOrigin::ordinary &&
+            (no_host_copy || (!linear_placement && host_transfer_)) && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT &&
+            device_.image_requirements) {
             for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount; ++i) {
                 const auto flags = device_.memory.memoryTypes[i].propertyFlags;
                 if ((flags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) plain_bits |= 1u << i;
             }
+            if (no_host_copy) plain_bits = UINT32_MAX;  // nothing to compare with: any memory type will do
             VkMemoryRequirements with{}, without{};
             auto staged = info;
             staged.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
-            if (plain_bits && device_.memory_requirements(info, with) && !(with.memoryTypeBits & plain_bits) &&
+            if (plain_bits && (no_host_copy || (device_.memory_requirements(info, with) &&
+                                                !(with.memoryTypeBits & plain_bits))) &&
                 device_.memory_requirements(staged, without) && (without.memoryTypeBits & plain_bits)) {
                 staged_title_ = true;
                 host_transfer_ = false;
@@ -6262,6 +9736,7 @@ public:
             image_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
             staged_title_ = false;
+            shared_zero_ = VK_NULL_HANDLE;
             log_once("no room for a staged title image; retrying host-copyable backing, format", int(info.format));
             return create_texture(format, asked_castable, origin, false);
         };
@@ -6434,6 +9909,7 @@ public:
         aspects_ = format.aspects;
         image_address_ = device_.next_image_address.fetch_add(256);
         device_.note_image_address(image_address_, this);
+        DeviceState::trace_image(image_address_, id(), "registered");
         binding.deferred_memory = deferred_attachment_.get();
         if (origin == TitleImageOrigin::placed && leonida::mem_probe::interval_seconds())
             binding.replay_seen = &replay_seen_;
@@ -6446,7 +9922,7 @@ public:
         return deferred_stream_ ? S_OK : register_bound_texture();
     }
 
-    // Called with title_texture_mutex held, after a guarded read of the complete console texture.
+    // Called with title_texture_mutex held, after a guarded read of the console texture (its smaller mips at least).
     bool back_streamed_texture() {
         if (!deferred_bytes_) return true;
         if (!image_backing_bytes_) {
@@ -6461,19 +9937,32 @@ public:
         return true;
     }
 
-    void publish_streamed_texture() {
+    // The mips from `from` on are filled: the views that start there or later get their T#s, the others wait on.
+    void publish_streamed_texture(unsigned from = 0) {
         if (!deferred_stream_) return;
         std::lock_guard lock(device_.descriptor_mutex);
-        auto pending = device_.pending_image_keys.extract(image_);
+        DeviceState::PendingImage ready;
+        if (const auto pending = device_.pending_image_keys.find(image_); pending != device_.pending_image_keys.end()) {
+            ready = pending->second;
+            std::erase_if(ready.keys, [&](const auto& key) { return key.second.first_mip < from; });
+            if (from) {
+                pending->second.first_mip = from;
+                std::erase_if(pending->second.keys, [&](const auto& key) { return key.second.first_mip >= from; });
+            } else {
+                device_.pending_image_keys.erase(pending);
+            }
+        }
         const auto owner = device_.images_by_address.find(image_address_);
-        if (!pending.empty() && owner != device_.images_by_address.end() && owner->second == this) {
-            if (pending.mapped().zero) device_.forget_image_views_locked(image_address_);
-            for (const auto& [words, image] : pending.mapped().keys)
+        if (owner != device_.images_by_address.end() && owner->second == this) {
+            if (ready.zero) device_.forget_image_views_locked(image_address_);
+            for (const auto& [words, image] : ready.keys)
                 device_.bind_image_locked(words, image, image_, format_, aspects_, false, has_view_format_list(),
                                           uint_backed_);
         }
-        deferred_stream_ = false;
+        if (!from) deferred_stream_ = false;
     }
+    // Some view still waits, or would wait, for mips not filled yet.
+    bool deferred_stream() const { return deferred_stream_; }
 
     VkDeviceSize unbound_bytes() const { return image_backing_bytes() ? 0 : deferred_bytes_; }
 
@@ -6487,6 +9976,7 @@ private:
         }
         if (shared_zero_) {
             if (host_transfer_ && !host_initialize()) return false;
+            if (!host_transfer_) device_.context->note_shader_image(id());  // zeros until something fills it
             publish_streamed_texture();
         }
         return true;
@@ -6514,6 +10004,7 @@ private:
                     vk.vkBindImageMemory, vk.vkDestroyImage, vk.vkFreeMemory, [&](VkDeviceSize size, std::uint32_t& type) {
                         auto page = pool_requirements;
                         page.size = size;
+                        leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::image_blocks);
                         return device_.allocate(page, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, false, &type);
                     });
                 if (pooled_image_) memory_flags_ = device_.memory.memoryTypes[pooled_image_->page->type].propertyFlags;
@@ -6554,10 +10045,13 @@ private:
     }
 
 public:
+    void mark_console_d16s8() { console_d16s8_ = true; }
+    bool console_d16s8() const { return console_d16s8_; }
+
     // The Xbox proxy calls this before publishing an allocated depth texture. Each storage plane owns a
     // regular color image with its own GFX10 address, so a UAV cannot replace the original SRV in set 0.
     HRESULT enable_depth_stencil_uav(D3D12_HEAP_FLAGS storage_heap_flags) {
-        const bool narrow_stencil = desc_.Format == xbox_d16s8;
+        const bool narrow_stencil = desc_.Format == xbox_d16s8 || console_d16s8_;
         const bool depth16 = desc_.Format == DXGI_FORMAT_R16_TYPELESS || narrow_stencil;
         if (!image_ || (!depth16 && desc_.Format != DXGI_FORMAT_R32G8X24_TYPELESS) ||
             !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
@@ -6574,7 +10068,10 @@ public:
             std::unique_ptr<Resource> conversion;
             if (widened) {
                 const auto blit = VK_FORMAT_FEATURE_2_BLIT_SRC_BIT | VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
-                if (format_ != VK_FORMAT_D32_SFLOAT_S8_UINT || (device_.optimal_features(VK_FORMAT_R16_UNORM) & blit) != blit ||
+                const bool d24_backing = format_ == VK_FORMAT_D24_UNORM_S8_UINT;
+                if ((format_ != VK_FORMAT_D32_SFLOAT_S8_UINT && !d24_backing) ||
+                    (d24_backing && !device_.context->has_depth24()) ||
+                    (device_.optimal_features(VK_FORMAT_R16_UNORM) & blit) != blit ||
                     (device_.optimal_features(VK_FORMAT_R32_SFLOAT) & blit) != blit) return E_NOTIMPL;
                 auto intermediate = plane_desc;
                 intermediate.Format = DXGI_FORMAT_R32_FLOAT;
@@ -6657,6 +10154,7 @@ public:
         device_.forget_image(va);  // an earlier texture placed at this address, still alive: its views are stale
         image_address_ = va;
         device_.note_image_address(image_address_, this);
+        DeviceState::trace_image(image_address_, id(), "registered");
     }
     // The title's own address for a texture Xbox slot 133 placed. The image is still the committed fallback, so its
     // pixels do not alias the title's pages yet; the address is what GetGPUVirtualAddress answers (XCL PR #168's
@@ -6728,6 +10226,27 @@ public:
     // no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped with a null pointer, before
     // WriteToSubresource/ReadFromSubresource.
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
+        // LOCAL DIAGNOSTIC: LEONIDA_LOCK_TRACE=1 logs the first 256 texture Maps with a read range: the title's
+        // texture lock passes the subresource's byte range there, computed from its XG computer's
+        // layout, and adds the range's start to the pointer this answers.
+        static const bool lock_trace = [] {
+            char value[2]{};
+            return GetEnvironmentVariableA("LEONIDA_LOCK_TRACE", value, sizeof(value)) == 1 && value[0] == '1';
+        }();
+        if (lock_trace && read && image_) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 256) {
+                const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+                std::fprintf(stderr,
+                             "[rt] d3d12: LOCAL DIAGNOSTIC: Map sub %u range 0x%llx..0x%llx of texture %llux%ux%u "
+                             "fmt %d flags 0x%x at 0x%llx, caller 0x%llx\n",
+                             subresource, static_cast<unsigned long long>(read->Begin),
+                             static_cast<unsigned long long>(read->End), static_cast<unsigned long long>(desc_.Width),
+                             desc_.Height, unsigned(desc_.DepthOrArraySize), int(desc_.Format), unsigned(desc_.Flags),
+                             static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(title_address_)),
+                             static_cast<unsigned long long>(caller));
+            }
+        }
         // A texture whose lease says its title memory is linear (title_linear_) and that also has a placement
         // address (slot 133; the video planes among them) has two answers. The placement address, with the title
         // texture registry filling the image, is the one the retail boot ran through the intro movie and the story
@@ -7088,8 +10607,12 @@ private:
         };
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(dev, staging.buffer, &requirements);
-        memory = device_.allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                  write ? 0 : VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        {
+            leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::staging);
+            memory = device_.allocate(requirements,
+                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                      write ? 0 : VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        }
         if (!memory || vk.vkBindBufferMemory(dev, staging.buffer, memory, 0) != VK_SUCCESS ||
             vk.vkMapMemory(dev, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
             return release(E_OUTOFMEMORY);
@@ -7115,14 +10638,34 @@ private:
         leonida::ReplayResult result = leonida::ReplayResult::unsupported;
         {
             std::lock_guard lock(device_.staging_mutex);
-            if (!device_.staging_queue) {
-                device_.staging_queue = std::make_unique<leonida::VulkanQueue>(*device_.context, device_.info.queue,
-                                                                               device_.info.queue_family);
+            // Review D9: a VkQueue the game's direct queue is not on. CreateCommandQueue hands each family's VkQueues
+            // out from the first, so the last one. A colour copy goes to the copy family, whose engine runs beside
+            // queued graphics work (a second graphics VkQueue may be time-sliced behind it, as on NVIDIA); a depth
+            // or stencil copy may convert D24, and an rgb96 one is repacked, by a compute shader, so they stay on
+            // the graphics family.
+            const bool copy_family =
+                !device_.info.copy_queues.empty() && aspects_ == VK_IMAGE_ASPECT_COLOR_BIT && !rgb96_;
+            auto& staging_queue = copy_family ? device_.staging_copy_queue : device_.staging_queue;
+            if (!staging_queue) {
+                if (copy_family) {
+                    staging_queue = std::make_unique<leonida::VulkanQueue>(
+                        *device_.context, device_.info.copy_queues.back(), device_.info.copy_family,
+                        leonida::VulkanQueue::QueueKind::copy);
+                } else {
+                    const auto& queues = device_.info.command_queues;
+                    const VkQueue own = queues.size() > 1 ? queues.back() : device_.info.queue;
+                    staging_queue = std::make_unique<leonida::VulkanQueue>(*device_.context, own,
+                                                                           device_.info.queue_family);
+                }
+                staging_queue->make_synchronous();  // submitted inline, then waited for (wait_submitted below)
             }
-            if (device_.staging_queue->ok()) {
+            if (staging_queue->ok()) {
                 const leonida::CommandList* lists[] = {&list};
-                result = device_.staging_queue->execute(lists);
-                if (result == leonida::ReplayResult::success && !device_.staging_queue->idle())
+                result = staging_queue->execute(lists);
+                // Only this copy's own submission (review D9: was vkQueueWaitIdle under the submit lock). Other
+                // queues need no wait: D3D12 asks the application to have seen the texture's GPU work complete before
+                // a CPU copy, and that host wait, then this submission, orders it before the copy.
+                if (result == leonida::ReplayResult::success && !staging_queue->wait_submitted())
                     result = leonida::ReplayResult::unsupported;
             }
         }
@@ -7190,11 +10733,12 @@ private:
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     std::unique_ptr<Resource> depth_conversion_;
     std::array<std::unique_ptr<Resource>, 2> storage_planes_;  // Xbox depth/stencil UAV, by plane
+    bool console_d16s8_ = false;  // created from Xbox format 118 (even when pc_format made it D24S8)
     VkImage shared_zero_ = VK_NULL_HANDLE;  // owned by the device
     std::unique_ptr<leonida::DeferredImageBinding> deferred_attachment_;
     std::atomic<bool> replay_seen_{false};
     bool staged_title_ = false;
-    std::atomic<bool> deferred_stream_{false};  // keys stay unpublished until the whole first upload succeeds
+    std::atomic<bool> deferred_stream_{false};  // keys stay unpublished until the mips they name are uploaded
     VkDeviceSize deferred_bytes_ = 0;
     std::uint32_t deferred_types_ = 0;
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
@@ -7206,10 +10750,11 @@ private:
     std::shared_ptr<const leonida::TileHeapAllocation> heap_range_;
 };
 
-// One immutable, host-zeroed BC image per exact view shape. It has the right sampled format, extent,
+// One immutable, zeroed BC image per exact view shape (zeroed on the host, or by the first shader submission). It has
+// the right sampled format, extent,
 // mip count and zero-block decoding even before the title first supplies data or copies into the placement.
 VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Format& format, VkDeviceSize bytes) {
-    if (!host_transfer_format(format.format)) return VK_NULL_HANDLE;
+    if (copy_memory_to_image && !host_transfer_format(format.format)) return VK_NULL_HANDLE;
     const ZeroShape key{d.Format, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels};
     std::lock_guard lock(zero_image_mutex);
     if (auto it = zero_images.find(key); it != zero_images.end()) return it->second ? it->second->image() : VK_NULL_HANDLE;
@@ -7218,12 +10763,13 @@ VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Form
     if (used >= limit || bytes > limit - used) return VK_NULL_HANDLE;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0, 1, 1};
     auto* zero = new Resource(*this, d, heap, D3D12_HEAP_FLAG_NONE);
-    if (FAILED(zero->create_texture(format)) || !zero->host_initialized_image() ||
+    if (FAILED(zero->create_texture(format)) || (copy_memory_to_image && !zero->host_initialized_image()) ||
         zero->image_backing_bytes() > limit - used) {
         zero->Release();
         zero_images.emplace(key, nullptr);
         return VK_NULL_HANDLE;
     }
+    if (!zero->host_initialized_image()) context->note_shader_image(zero->id());  // cleared before a shader reads it
     zero_images.emplace(key, zero);
     zero_image_bytes.fetch_add(zero->image_backing_bytes(), std::memory_order_relaxed);
     return zero->image();
@@ -7792,7 +11338,20 @@ struct PipelineStream {
     D3D12_SHADER_BYTECODE as{};
     bool has_cs = false;
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
+    bool depth_bounds = false;        // DEPTH_STENCIL1/2 DepthBoundsTestEnable (not in the plain graphics desc)
 };
+
+// What pipeline_order.log names a stream's pipeline by: the cache key, with the mesh shader's hash folded in (the
+// graphics key does not cover the MS, so two mesh pipelines that differ only there would share it).
+leonida::cached_pso::Key order_key(const PipelineStream& stream) {
+    if (stream.has_cs) return pipeline_key(stream.compute);
+    auto key = pipeline_key(stream.graphics);
+    if (stream.ms.BytecodeLength) {
+        key += leonida::sha256_hex({static_cast<const std::uint8_t*>(stream.ms.pShaderBytecode), stream.ms.BytecodeLength});
+        key = leonida::sha256_hex({reinterpret_cast<const std::uint8_t*>(key.data()), key.size()});
+    }
+    return key;
+}
 
 // Console stream retry adapted from Kokonotcu, ubiquitarianism/leonida #496 (GPL-3.0).
 bool console_stream_enum_enabled() {
@@ -7930,9 +11489,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
             D3D12_DEPTH_STENCIL_DESC1 d{};
             take(d);
-            if (ok && d.DepthBoundsTestEnable) {
-                return stream_unsupported("depth-bounds tests are not supported yet; stream subobject", int(type));
-            }
+            if (ok) out.depth_bounds = d.DepthBoundsTestEnable != FALSE;
             g.DepthStencilState = {d.DepthEnable, d.DepthWriteMask, d.DepthFunc, d.StencilEnable, d.StencilReadMask,
                                    d.StencilWriteMask, d.FrontFace, d.BackFace};
             break;
@@ -7941,9 +11498,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             D3D12_DEPTH_STENCIL_DESC2 d{};
             take(d);
             if (!ok) break;
-            if (d.DepthBoundsTestEnable) {
-                return stream_unsupported("depth-bounds tests are not supported yet; stream subobject", int(type));
-            }
+            out.depth_bounds = d.DepthBoundsTestEnable != FALSE;
             // Each face has its own read and write mask (OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported):
             // the description takes the front face's, back_stencil the back face's.
             out.back_masks = true;
@@ -8001,6 +11556,411 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
 // A pipeline state, compute (create_compute) or graphics (create_graphics): each shader is found by the SHA-256 of
 // its FSSM program in the translator's index, and the FSSM blob is copied into the arena as the shader's code base.
 std::atomic<long> live_pipeline_state_count{0};  // live_pipeline_states()
+
+// What the bindless set layout was made from, for a compute pipeline's journal name: a pipeline built against another
+// layout is another pipeline. Field by field, so padding never reaches the hash.
+void hash_bindless_layout(leonida::pipeline_journal::Hasher& hash, const leonida::BindlessFeatures& features) {
+    for (const std::uint32_t count : features.counts) hash.value(count);
+    hash.value(std::uint8_t(features.update_after_bind));
+    hash.value(std::uint8_t(features.partially_bound));
+    hash.value(std::uint8_t(features.null_descriptor));
+    for (const VkSampleCountFlagBits samples : features.ms_samples) hash.value(std::uint32_t(samples));
+}
+
+// Opt in on this branch. Async workers normally compile while other queues submit.
+std::unique_lock<leonida::SubmitMutex> compute_driver_turn(DeviceState& device) {
+    static const bool enabled = [] {
+        wchar_t value[2]{};
+        return GetEnvironmentVariableW(L"LEONIDA_COMPILE_GATE", value, 2) == 1 && value[0] == L'1';
+    }();
+    std::unique_lock turn(device.context->submit_mutex(), std::defer_lock);
+    if (enabled) turn.lock();
+    return turn;
+}
+
+// LOCAL FIX (pipeline journal, pipeline_cache_journal.h): one compute pipeline's own VkPipelineCache for the length
+// of its build. load() reads the journal file, before any driver call. In the build's one compile-gate turn,
+// create() makes the cache from the file's contents (seeded) or empty, and finish() takes the cache's data when the
+// pipeline had to be compiled and destroys the cache. publish(), after the turn, writes the file, or refreshes its
+// last use after a hit: no file I/O in the turn. Nothing else uses the cache, so it needs no synchronization beyond
+// the build's own.
+class JournalCache {
+public:
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    bool seeded = false;  // made from the file's contents
+
+    JournalCache(DeviceState& device, leonida::SubmitMutex& submits, const char* trigger, const char* name)
+        : device_(device), submits_(&submits), trigger_(trigger), name_(name) {}
+    // A build outside the submit lock's owners (the async compile workers' own turn helper): compute_driver_turn.
+    JournalCache(DeviceState& device, const char* name) : device_(device), name_(name) {}
+    JournalCache(const JournalCache&) = delete;
+    JournalCache& operator=(const JournalCache&) = delete;
+    ~JournalCache() {
+        if (!cache) return;  // finish() always destroys it; this is only for a build that left early
+        if (submits_) {
+            const DriverTurn turn(*submits_, trigger_, "vkDestroyPipelineCache", true, name_);
+            device_.context->vk.vkDestroyPipelineCache(device_.info.device, cache, nullptr);
+        } else {
+            const auto turn = compute_driver_turn(device_);
+            device_.context->vk.vkDestroyPipelineCache(device_.info.device, cache, nullptr);
+        }
+    }
+
+    bool enabled() const { return enabled_; }
+    bool has_file_data() const { return !file_.data.empty(); }
+    bool found() const { return enabled_ && built_ && !write_; }  // the pipeline came out of the journal file
+    bool written() const { return written_; }                     // publish() wrote the file
+
+    void load(std::filesystem::path path) {
+        const auto& vk = device_.context->vk;
+        if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache || !vk.vkGetPipelineCacheData) return;
+        enabled_ = true;
+        path_ = std::move(path);
+        namespace journal = leonida::pipeline_journal;
+        const auto role = compile_helper::build_host.load() ? journal::ReadRole::materialize_local : journal::ReadRole::runtime;
+        file_ = journal::read_with_seed(path_, pipeline_journal_roots().seed, device_.pso_identity, role);
+    }
+
+    // In the build's driver turn.
+    void create() {
+        if (!enabled_) return;
+        const auto& vk = device_.context->vk;
+        VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, file_.data.size(),
+                                       file_.data.empty() ? nullptr : file_.data.data()};
+        if (!file_.data.empty() && vk.vkCreatePipelineCache(device_.info.device, &info, nullptr, &cache) == VK_SUCCESS) {
+            seeded = true;
+        } else {
+            cache = VK_NULL_HANDLE;  // no file, or one the driver declined: start empty, and the build rewrites it
+            info.initialDataSize = 0;
+            info.pInitialData = nullptr;
+            if (vk.vkCreatePipelineCache(device_.info.device, &info, nullptr, &cache) != VK_SUCCESS) cache = VK_NULL_HANDLE;
+        }
+        std::vector<char>().swap(file_.data);  // the driver has its own copy
+    }
+
+    // In the build's driver turn, after the create against `cache`. `built`: that create made the pipeline; `hit`:
+    // its creation feedback; `driver_ms`: the vkCreateComputePipelines call alone.
+    void finish(bool built, int hit, std::uint64_t driver_ms) {
+        if (!cache) return;
+        const auto& vk = device_.context->vk;
+        built_ = built;
+        write_ = built && leonida::pipeline_journal::should_write(seeded, hit, driver_ms);
+        if (write_) {
+            std::size_t size = 0;
+            result_ = vk.vkGetPipelineCacheData(device_.info.device, cache, &size, nullptr);
+            if (result_ == VK_SUCCESS && size > leonida::pipeline_cache_store::header_bytes &&
+                size <= leonida::pipeline_journal::entry_read_limit) {
+                blob_.resize(size);
+                result_ = vk.vkGetPipelineCacheData(device_.info.device, cache, &size, blob_.data());
+                blob_.resize(result_ == VK_SUCCESS ? size : 0);
+            }
+            data_size_ = size;
+        }
+        vk.vkDestroyPipelineCache(device_.info.device, cache, nullptr);
+        cache = VK_NULL_HANDLE;
+    }
+
+    // The shared cache had the pipeline (FAIL_ON_PIPELINE_COMPILE_REQUIRED gave it, as a hit or quickly).
+    void found_in_shared() { report(device_.journal_shared_hits.fetch_add(1) + 1, "found in the shared cache"); }
+
+    // After the driver turn.
+    void publish() {
+        namespace journal = leonida::pipeline_journal;
+        if (!enabled_ || !built_) return;
+        if (!write_) {
+            report(device_.journal_hits.fetch_add(1) + 1, "found in their journal file");
+            journal::touch_local_hit(path_, file_, std::filesystem::file_time_type::clock::now());
+            return;
+        }
+        if (blob_.size() <= leonida::pipeline_cache_store::header_bytes) {
+            std::fprintf(stderr, "[rt] d3d12: pipeline journal: no cache data for %s (VkResult %d, %zu bytes)\n",
+                         name_, int(result_), data_size_);
+            return;
+        }
+        // A rewrite replaces the file's old size. Two builds of one name at once may both count: the next boot's
+        // tidy counts again.
+        if (journal::replace_bytes(device_.journal_bytes.load(), file_.bytes, blob_.size()) > device_.journal_budget) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "[rt] d3d12: pipeline journal: %llu bytes on disk, the %llu-byte budget "
+                                     "(LEONIDA_PIPELINE_JOURNAL_BYTES) is spent; nothing more is written this boot\n",
+                             static_cast<unsigned long long>(device_.journal_bytes.load()),
+                             static_cast<unsigned long long>(device_.journal_budget));
+            return;
+        }
+        if (const std::error_code error = journal::write_entry(path_, blob_.data(), blob_.size())) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "[rt] d3d12: pipeline journal: could not write %ls: %s\n", path_.c_str(),
+                             error.message().c_str());
+            return;
+        }
+        auto total = device_.journal_bytes.load();
+        while (!device_.journal_bytes.compare_exchange_weak(total, journal::replace_bytes(total, file_.bytes, blob_.size()))) {
+        }
+        written_ = true;
+        report(device_.journal_writes.fetch_add(1) + 1, "compiled and written to their journal file");
+    }
+
+private:
+    // The first of each kind, then every 100th, with all three counts.
+    void report(unsigned count, const char* what) const {
+        if (count != 1 && count % 100) return;
+        std::fprintf(stderr, "[rt] d3d12: pipeline journal: %u compute pipeline(s) %s (so far: %u from journal files, "
+                             "%u written, %u from the shared cache)\n", count, what,
+                     device_.journal_hits.load(), device_.journal_writes.load(), device_.journal_shared_hits.load());
+    }
+
+    DeviceState& device_;
+    leonida::SubmitMutex* submits_ = nullptr;  // null: compute_driver_turn, for a build outside the submit lock
+    const char* trigger_ = "";
+    const char* name_;
+    bool enabled_ = false;
+    bool built_ = false;
+    bool write_ = false;
+    bool written_ = false;
+    std::filesystem::path path_;
+    leonida::pipeline_journal::EntryFile file_;
+    std::vector<char> blob_;
+    std::size_t data_size_ = 0;
+    VkResult result_ = VK_SUCCESS;
+};
+
+// What one compute pipeline build did (build_compute_pipeline).
+struct ComputeBuild {
+    VkPipeline pipeline = VK_NULL_HANDLE;  // the caller's from here on
+    VkResult result = VK_ERROR_UNKNOWN;
+    std::size_t bytes = 0;     // SPIR-V
+    ULONGLONG ms = 0;          // the whole build
+    std::filesystem::path journal_path;  // its journal file's name (empty with the journal off)
+    bool skipped = false;      // ComputeBuildOptions::skip_journaled and the journal file was there: nothing built
+    bool busy = false;         // ComputeBuildOptions::mark_building and another process is building it: nothing built
+    bool deferred = false;     // asked of the compile helper without waiting: nothing built yet
+    bool journal_hit = false;  // found in its journal file
+    bool journaled = false;    // compiled and written to its journal file
+    bool from_shared = false;  // found in the shared cache
+};
+
+struct ComputeBuildOptions {
+    const char* trigger = "dispatch";       // what asked: dispatch, warmup, dispatch-worker, precompile...
+    const std::string* cache_key = nullptr;  // the title's PSO description key, for the compile trace
+    bool serialize_big = true;               // LEONIDA_SERIAL_BIG_COMPILES=1: modules over 128 KiB one at a time
+    bool skip_journaled = false;             // precompile: leave a pipeline whose journal file exists alone
+    bool use_helper = true;                  // LEONIDA_COMPILE_HELPER: a missing journal file comes from the helper
+    bool helper_wait = true;                 // wait for the helper's file (false: ask, and answer deferred)
+    std::uint64_t helper_priority = 0;       // the request's urgency: 0 a dispatch, else the warm-up's module size
+    bool mark_building = false;              // precompile, helper: claim the entry, skip it when another process has it
+    bool key_only = false;                   // only name the journal file (journal_path), build nothing
+};
+
+// A compute pipeline from a library entry: what a PSO's first dispatch, the warm-up worker and gta6rt
+// --precompile-pipelines all build, so their journal names and the driver's keys are the same. `layout` is the push
+// range of leonida::ShaderUserData, with the device's bindless set 0 when the entry declares bindings; `subgroup` is
+// leonida::decide_subgroup_size's answer for the entry.
+ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEntry& compute_entry,
+                                    VkPipelineLayout layout, const leonida::SubgroupRequest& subgroup,
+                                    const ComputeBuildOptions& options) {
+    ComputeBuild out;
+    CompileActivity activity(device.active_compiles);
+    const char* const trigger = options.trigger;
+    std::filesystem::path marked;  // mark_building: released on the way out
+    struct Unmark {
+        std::filesystem::path& path;
+        ~Unmark() {
+            if (!path.empty()) compile_helper::unmark_building(path);
+        }
+    } unmark{marked};
+    static const std::string no_key;
+    auto& vk = device.context->vk;
+    const VkDevice dev = device.info.device;
+    const leonida::ShaderLibrary* library = device.library();
+    const leonida::ShaderEntry* entry = &compute_entry;
+    if (!library) return out;
+    // The driver's compiler needs hundreds of MiB per very large module; several at once exhausted host memory. By
+    // default large modules share a memory budget (big_compile_gate, taken by the caller before any PSO lock: see
+    // PipelineState::enter_build); LEONIDA_SERIAL_BIG_COMPILES=1 compiles them one at a time here instead.
+    static std::mutex big_compile;
+    std::unique_lock<std::mutex> big_lock(big_compile, std::defer_lock);  // taken below, only for a compile here
+    auto words = library->spirv(*entry);
+    if (words.empty()) {
+        std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
+        return out;
+    }
+    const std::size_t bytes = words.size() * sizeof(std::uint32_t);
+    out.bytes = bytes;
+    VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeline_info.stage.pName = "main";
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
+    leonida::apply_subgroup_request(subgroup, required_size, pipeline_info.stage);
+    pipeline_info.layout = layout;
+    pipeline_info.flags |= fast_pipeline_flags(true);  // before the journal key, which hashes the flags
+    const VkPipelineCache shared = device.pipeline_cache();
+    auto& submits = device.context->submit_mutex();
+
+    // LOCAL FIX (pipeline journal, pipeline_cache_journal.h): the pipeline is created against its own cache, made
+    // from its journal file or empty and written back after a compile, so a boot killed or crashed later keeps it.
+    // The file is named by what the pipeline is made of and read here, before the driver turn. Without a file
+    // the shared cache (seeded from the offline corpus or the last session) is asked first, without a compile.
+    JournalCache journal(device, submits, trigger, entry->name.c_str());
+    if (const std::filesystem::path& journal_dir = pipeline_journal_dir(); !journal_dir.empty()) {
+        leonida::pipeline_journal::Hasher key;
+        key.text("cs");
+        key.value(std::uint64_t(words.size()));
+        key.bytes(words.data(), bytes);
+        key.text(pipeline_info.stage.pName);
+        key.value(std::uint32_t(pipeline_info.flags));
+        key.value(std::uint32_t(pipeline_info.stage.flags));
+        key.value(std::uint32_t(pipeline_info.stage.pNext == &required_size ? required_size.requiredSubgroupSize : 0));
+        key.value(std::uint32_t(sizeof(leonida::ShaderUserData)));
+        key.value(std::uint32_t(entry->binding_count != 0));
+        // NVIDIA's diagnostics config (LEONIDA_DEVICE_FAULT=1, Aftermath) compiles with shader debug info: other
+        // pipelines, kept apart so switching it on and off does not rewrite every file. Absent when off, so the
+        // names of ordinary boots stay as they were.
+        if (device.info.device_diagnostics_config) {
+            key.text("nv-diagnostics-config");
+            key.value(std::uint32_t(leonida::aftermath::extra_config_flags()));
+        }
+        if (entry->binding_count) hash_bindless_layout(key, device.bindless->features());
+        const auto path = leonida::pipeline_journal::entry_path(journal_dir, "cs", key.digest());
+        out.journal_path = path;
+        if (options.key_only) return out;
+        // Precompile: a usable file is there already, so the pipeline is not built (only its header is read).
+        if (options.skip_journaled && leonida::pipeline_journal::entry_usable(path, device.pso_identity)) {
+            out.skipped = true;
+            return out;
+        }
+        journal.load(path);
+        // LOCAL FIX (compile helper, d3d12_compile_helper.h): no file, so this would be a compile in this process,
+        // where the driver's lock it holds stops the title's submissions. The helper process compiles it into the file
+        // instead, and the create below is a hit. Asked without waiting, the build answers deferred and is asked
+        // again at the pipeline's next use; waited for, nothing of ours is in the driver meanwhile.
+        if (!journal.has_file_data() && options.use_helper && compile_helper::wanted(bytes)) {
+            auto& helper = compile_helper::Client::instance();
+            std::string why;
+            if (!options.helper_wait) {
+                if (helper.request(path, entry->name, options.helper_priority, device.pso_identity, &why)) {
+                    out.deferred = true;
+                    return out;
+                }
+                std::fprintf(stderr, "[rt] d3d12: compile helper: %s for %s; built here\n", why.c_str(),
+                             entry->name.c_str());
+            } else {
+                const ULONGLONG asked = GetTickCount64();
+                if (helper.build(path, entry->name, device.pso_identity, &why)) {
+                    journal.load(path);
+                    std::fprintf(stderr, "[rt] d3d12: compile helper built %s in %.1f s (%zu B SPIR-V, %s)\n",
+                                 entry->name.c_str(), double(GetTickCount64() - asked) / 1000.0, bytes, trigger);
+                } else {
+                    std::fprintf(stderr, "[rt] d3d12: compile helper: %s for %s after %.1f s; built here\n",
+                                 why.c_str(), entry->name.c_str(), double(GetTickCount64() - asked) / 1000.0);
+                }
+            }
+        }
+        // Precompile and helper: another process compiling this entry is left to it.
+        if (options.mark_building && !journal.has_file_data()) {
+            if (!compile_helper::mark_building(path)) {
+                out.busy = true;
+                return out;
+            }
+            marked = path;
+        }
+    }
+    // Only a compile here is serialized: a pipeline from its journal file takes milliseconds.
+    if (!journal.has_file_data() && options.serialize_big && big_compiles() == BigCompiles::serial && big_compute(bytes))
+        big_lock.lock();
+    const bool ask_shared = journal.enabled() && !journal.has_file_data() && shared && device.pipeline_cache_seeded &&
+                            device.info.pipeline_cache_control && device.journal_ask_shared.load();
+
+    VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    module_info.codeSize = bytes;
+    module_info.pCode = words.data();
+    VkShaderModule module = VK_NULL_HANDLE;
+    const ULONGLONG started = GetTickCount64();
+    VkPipeline built = VK_NULL_HANDLE;
+    CompileTrace trace;
+    trace.begin(pipeline_info, device.info.pipeline_creation_feedback, trigger, entry->name.c_str(), 0, bytes, options.cache_key ? *options.cache_key : no_key);
+    // Was it in the cache? Core feedback on a Vulkan 1.3 device; pipeline_cache_control implies one.
+    if (journal.enabled() && device.info.pipeline_cache_control) trace.request_feedback(pipeline_info);
+    const leonida::dev_status::Build dev_build(entry->name.c_str());
+    const leonida::pipeline_profile::DriverCall profile("cs", trigger, entry->name.c_str());
+    // LOCAL DIAGNOSTIC (early device loss): a vkQueueSubmit was measured blocking 10 s and losing the device
+    // while another thread sat in this call. Name what is building (once past the gate: in the driver), and log
+    // the start of big ones.
+    auto& compiling = leonida::driver_compile;
+    VkResult created = VK_ERROR_UNKNOWN;
+    bool from_shared = false, probe_compiled = false;
+    ULONGLONG probe_ms = 0, driver_ms = 0;
+    {
+        // Every driver call of the build (shader module, journal cache, pipeline) in one turn through the compile
+        // gate: from the journal a build takes milliseconds and the warm-up worker makes them back to back, and
+        // three warm boots lost the device in a vkQueueSubmit (no GPU fault, no TDR) while only the create was
+        // gated. No file I/O in here.
+        const DriverTurn turn(submits, trigger, "vkCreateComputePipelines", true, entry->name.c_str(),
+                              leonida::SubmitMutex::CreateKind::compute, bytes);
+        {
+            const leonida::aftermath::ShaderName named(entry->name);
+            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return out;
+        }
+        pipeline_info.stage.module = module;
+        journal.create();
+        const VkPipelineCache cache = journal.cache ? journal.cache : shared;
+        compiling.bytes.store(bytes, std::memory_order_relaxed);
+        compiling.trigger.store(trigger, std::memory_order_relaxed);
+        compiling.since_ms.store(leonida::diagnostic_ms(), std::memory_order_relaxed);
+        compiling.name.store(entry->name.c_str(), std::memory_order_release);
+        if (bytes >= 128 * 1024)
+            std::fprintf(stderr, "[rt] d3d12: compute pipeline %s (%zu B SPIR-V, %s) build starts at t=%.3f s\n",
+                         entry->name.c_str(), bytes, trigger, double(leonida::diagnostic_ms()) / 1000.0);
+        if (ask_shared) {
+            // VK_PIPELINE_COMPILE_REQUIRED (a success code, no pipeline) when the shared cache does not have it.
+            pipeline_info.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+            const ULONGLONG asked = GetTickCount64();
+            created = vk.vkCreateComputePipelines(dev, shared, 1, &pipeline_info, nullptr, &built);
+            probe_ms = GetTickCount64() - asked;
+            pipeline_info.flags &= ~VkPipelineCreateFlags(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
+            from_shared = created == VK_SUCCESS && built;
+            if (from_shared && leonida::pipeline_journal::probe_compiled(trace.hit(), probe_ms)) {
+                // NVIDIA 630.20 compiled it instead of answering VK_PIPELINE_COMPILE_REQUIRED, into the shared
+                // cache. Built once more against the journal cache below, so it is journaled; asking stops.
+                vk.vkDestroyPipeline(dev, built, nullptr);
+                from_shared = false;
+                probe_compiled = true;
+            }
+            if (!from_shared) built = VK_NULL_HANDLE;
+        }
+        if (!from_shared) {
+            const ULONGLONG at = GetTickCount64();
+            created = vk.vkCreateComputePipelines(dev, cache, 1, &pipeline_info, nullptr, &built);
+            driver_ms = GetTickCount64() - at;
+        }
+        compiling.name.store(nullptr, std::memory_order_release);
+        vk.vkDestroyShaderModule(dev, module, nullptr);  // Vulkan lets a module go once the pipeline exists
+        journal.finish(!from_shared && created == VK_SUCCESS && built, trace.hit(), driver_ms);
+    }
+    std::vector<std::uint32_t>().swap(words);
+    profile.finish(int(created));
+    trace.end(trigger, entry->name.c_str(), 0, bytes, created);
+    if (big_lock.owns_lock()) big_lock.unlock();
+    if (probe_compiled && device.journal_ask_shared.exchange(false))
+        std::fprintf(stderr, "[rt] d3d12: pipeline journal: the driver compiled %s for "
+                             "FAIL_ON_PIPELINE_COMPILE_REQUIRED (%llu ms, no cache hit); built again for its journal "
+                             "file, and the shared cache is no longer asked first\n", entry->name.c_str(),
+                     static_cast<unsigned long long>(probe_ms));
+    if (from_shared) journal.found_in_shared();
+    journal.publish();
+    out.pipeline = built;
+    out.result = created;
+    out.from_shared = from_shared;
+    out.journal_hit = journal.found();
+    out.journaled = journal.written();
+    out.ms = GetTickCount64() - started;
+    if (created == VK_SUCCESS && built && out.ms >= 2000)
+        std::fprintf(stderr, "[rt] d3d12: compute pipeline %s took %.1f s to build (%zu B SPIR-V)\n",
+                     entry->name.c_str(), double(out.ms) / 1000.0, bytes);
+    return out;
+}
 
 class PipelineState final
     : public Child<PipelineState, XboxPipelineStateStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
@@ -8066,6 +12026,16 @@ public:
     // Asks for the subgroup size the shader was translated for, where the device allows (src/subgroup_size.h): the
     // stage gets VkPipelineShaderStageRequiredSubgroupSizeCreateInfo in `storage` (which must outlive pipeline
     // creation) and, for compute, REQUIRE_FULL_SUBGROUPS. A size the device cannot give is reported, not hidden.
+    // decide_subgroup_size's answer for a compute entry, reported and recorded as subgroup_size_for does; the build
+    // applies it (build_compute_pipeline).
+    leonida::SubgroupRequest subgroup_request_for(const leonida::ShaderEntry& entry) {
+        const leonida::SubgroupRequest request = leonida::decide_subgroup_size(entry, device_.info.subgroup);
+        if (request.outcome == leonida::SubgroupOutcome::unavailable)
+            report_subgroup_unavailable(entry, request, device_.info.subgroup);
+        subgroup_requests_.push_back(request);
+        return request;
+    }
+
     void subgroup_size_for(const leonida::ShaderEntry& entry, VkPipelineShaderStageRequiredSubgroupSizeCreateInfo& storage,
                            VkPipelineShaderStageCreateInfo& stage) {
         const leonida::SubgroupRequest request = leonida::decide_subgroup_size(entry, device_.info.subgroup);
@@ -8099,6 +12069,51 @@ public:
         unregistered_ = true;
     }
     void set_cache_key(leonida::cached_pso::Key key) { cache_key_ = std::move(key); }
+    // The key pipeline_order.log names this pipeline by, where the cache key does not tell two descriptions apart (a
+    // mesh pipeline's MS is not in it). Set before create_*, only while the log is on.
+    void set_order_key(leonida::cached_pso::Key key) { order_key_ = std::move(key); }
+
+    // pipeline_order.h: the first dispatch or draw that names a pipeline and variant. Runs while a submission is
+    // prepared, so it never blocks and allocates nothing: the first-time test is one compare-and-swap (the readiness callbacks only try_lock, without waiting, on the first request of a pipeline and variant).
+    static void order_requested(void* self, std::uint32_t variant) {
+        static_cast<PipelineState*>(self)->order_request(variant);
+    }
+    void order_request(std::uint32_t variant) {
+        auto* const log = device_.order_log.get();
+        if (!log) return;
+        const auto& key = order_key_.empty() ? cache_key_ : order_key_;
+        log->request(order_hash_, key, variant, order_kind_, order_created_ms_,
+                     [&] { return order_ready(variant); },
+                     [&] { return variant == 0 ? order_build_ms_.load() : leonida::pipeline_order::unknown_ms; },
+                     order_name_hash_);
+    }
+    // Its handle existed, and nobody was building it, when it was first asked for.
+    bool order_ready(std::uint32_t variant) {
+        if (is_graphics_) {
+            if (variant == 0 && graphics_.pipeline) return true;
+            return graphics_.built && graphics_.built(variant) != VK_NULL_HANDLE;
+        }
+        return pipeline_.built ? pipeline_.built(this) != VK_NULL_HANDLE : pipeline_.pipeline != VK_NULL_HANDLE;
+    }
+    // Called at the end of create_compute / create_graphics, before the pipeline is registered with the replay.
+    // A compute pipeline passes the name of its library entry: the log then adds an E line for it.
+    void order_install(void (*&requested)(void*, std::uint32_t), void*& context, char kind,
+                       std::string_view entry_name = {}) {
+        if (!device_.order_log) return;
+        const auto& key = order_key_.empty() ? cache_key_ : order_key_;
+        if (key.empty()) return;
+        order_hash_ = leonida::pipeline_order::key_hash(key);
+        order_kind_ = kind;
+        if (!entry_name.empty()) order_name_hash_ = leonida::pipeline_order::entry_name_hash(entry_name);
+        requested = &order_requested;
+        context = this;
+    }
+    void order_note_build(std::uint32_t variant, ULONGLONG took_ms) {
+        if (!device_.order_log || !order_hash_) return;
+        const std::uint32_t ms = std::uint32_t(std::min<ULONGLONG>(took_ms, 0xfffffffeull));
+        if (variant == 0) order_build_ms_.store(ms);
+        device_.order_log->note_build(order_hash_, variant, ms);
+    }
 
     // A null pointer is accepted with S_OK, as by the PC runtime (measured on an RTX 3060 and WARP).
     HRESULT STDMETHODCALLTYPE GetCachedBlob(ID3DBlob** blob) override {
@@ -8146,6 +12161,7 @@ public:
         }
         return registered_ && (is_graphics_==graphics);
     }
+    StubPipelineKind stub_kind() const { return native_owner_ ? native_owner_->stub_kind() : stub_kind_; }
     bool compute() const { return pending_stream_kind_==2 || (registered_ && !is_graphics_); }
     bool graphics() const { return native_owner_ ? native_owner_->graphics() : pending_stream_kind_==1 || (registered_ && is_graphics_); }
     const std::vector<leonida::SubgroupRequest>& subgroup_requests() const {
@@ -8164,17 +12180,54 @@ public:
     // does for mesh PSOs), drawn by DispatchMesh. A nonempty PC AS still needs a task-stage translation.
     // `back_masks`, from a DEPTH_STENCIL2 subobject, are the back face's stencil masks; without it both faces take
     // the description's.
-    // LEONIDA_STUB_PIPELINES=1 (diagnostic): a pipeline whose translated shader is missing is created without a
-    // Vulkan pipeline. It is never registered, so SetPipelineState leaves no PSO bound and its draws and dispatches
-    // are recorded as no-ops (D3D-482). No game shader runs; the boot gets past a title that refuses to go on when
-    // pipeline creation fails.
+    // LEONIDA_STUB_PIPELINES=1 (diagnostic): a pipeline whose translated shader is missing does not fail. No game
+    // shader runs; the boot gets past a title that refuses to go on when pipeline creation fails.
+    //   - A graphics pipeline with a vertex stage (MVP-GPU-04) is a real Vulkan pipeline built from the stages in
+    //     src/stub_pipeline.h, registered like any other, so its draws run through replay and the validation layer.
+    //     Its vertex stage puts every vertex outside the clip volume: the draw rasterizes nothing. With
+    //     LEONIDA_STUB_PIPELINES=color it covers the viewport instead and writes leonida::stub_colour to every render
+    //     target, so the passes that are stubbed show on screen; the title's cull, depth, stencil, blend and logic-op
+    //     state are off for it (the write mask stays).
+    //   - A compute or mesh pipeline is created without a Vulkan pipeline and never registered, so SetPipelineState
+    //     leaves no PSO bound and its dispatches and draws are recorded as no-ops (D3D-482).
     static bool stub_pipelines() {
         wchar_t v[8] = {};
         const DWORD n = GetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", v, 8);
         return n > 0 && n < 8 && v[0] != L'0';
     }
-    HRESULT stub_or(HRESULT hr, const char* what) {
+    static bool stub_pipelines_cover() {
+        wchar_t v[8] = {};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", v, 8);
+        return n > 0 && n < 8 && _wcsicmp(v, L"color") == 0;
+    }
+    // The pixel-stage output a stub writes for a render-target format: integer for the UINT and SINT formats.
+    static leonida::StubOutput stub_output(DXGI_FORMAT format) {
+        switch (vulkan_format(format, false).format) {
+        case VK_FORMAT_UNDEFINED: return leonida::StubOutput::none;
+        case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R16_UINT:
+        case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32G32_UINT:
+        case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+            return leonida::StubOutput::uint_;
+        case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R16_SINT:
+        case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_SINT:
+        case VK_FORMAT_R32G32B32A32_SINT:
+            return leonida::StubOutput::sint_;
+        default: return leonida::StubOutput::float_;
+        }
+    }
+    // The stage table's stand-in entry for a stub stage: no bindings, no inputs, no code base, no subgroup request.
+    static const leonida::ShaderEntry& stub_entry() {
+        static const leonida::ShaderEntry entry = [] {
+            leonida::ShaderEntry e;
+            e.name = "LEONIDA_STUB_PIPELINES";
+            return e;
+        }();
+        return entry;
+    }
+    // `kind` is what the stub is to the command list (stub_pipeline_kind): its dispatches or mesh draws record nothing.
+    HRESULT stub_or(HRESULT hr, const char* what, StubPipelineKind kind) {
         if (!stub_pipelines()) return hr;
+        stub_kind_ = kind;
         static std::atomic<unsigned> stubbed{0};
         const unsigned n = ++stubbed;
         if (n == 1 || (n & (n - 1)) == 0)
@@ -8202,7 +12255,7 @@ public:
         if (seen.insert(line).second) std::fprintf(stderr, "%s\n", line);
     }
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
-                            const D3D12_SHADER_BYTECODE* as = nullptr, const StencilFaceMasks* back_masks = nullptr) {
+                            const D3D12_SHADER_BYTECODE* as = nullptr, const StencilFaceMasks* back_masks = nullptr, bool depth_bounds = false) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
@@ -8301,7 +12354,14 @@ public:
             return E_INVALIDARG;
         }
         const leonida::ShaderLibrary* library = device_.library();
-        if (!library) return stub_or(E_FAIL, "graphics");
+        // LEONIDA_STUB_PIPELINES: a vertex pipeline with a missing translation takes the built-in stages below.
+        const bool can_stub = !mesh && stub_pipelines();
+        bool stubbed = false;
+        if (!library) {
+            // Without the built-in stages (a mesh pipeline), stub_or makes it a mesh stub, or refuses with the switch off.
+            if (!can_stub) return stub_or(E_FAIL, "mesh", StubPipelineKind::mesh);
+            stubbed = true;
+        }
 
         struct Stage {
             const char* name;
@@ -8319,13 +12379,35 @@ public:
         static_assert(std::size(stages) <= std::size(decltype(recipe_.required_sizes){}),
                       "Recipe::required_sizes needs an entry per graphics stage");
         unsigned packed_color_mask=0;
+        // A LEONIDA_STUB_PIPELINES=color stub turns blending and logic ops off (below), so the packed fallback's refusal
+        // of them waits until it is known whether this pipeline is such a stub.
+        bool packed_blend_refused=false;
         for(unsigned i=0;i<desc.NumRenderTargets;++i) {
             if(desc.RTVFormats[i]==DXGI_FORMAT_B4G4R4A4_UNORM && !device_.color_attachment_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16)) {
                 const auto& blend=desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable?i:0];
-                if(blend.BlendEnable||blend.LogicOpEnable)return E_NOTIMPL;
+                if(blend.BlendEnable||blend.LogicOpEnable) {
+                    if(!can_stub||!stub_pipelines_cover())return E_NOTIMPL;
+                    packed_blend_refused=true;
+                }
                 packed_color_mask|=1u<<i;
             }
         }
+        // Dual-source blending (RT-DUAL-SOURCE-BLEND): a SRC1 factor reads the pixel shader's SV_Target1, which the
+        // translator declares at Location 1 and Vulkan takes from Location 0, Index 1 (dual_source_fragment.h).
+        bool dual_source = false;
+        for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
+            const auto& b = desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable ? i : 0];
+            const auto src1 = [](D3D12_BLEND f) {
+                return f == D3D12_BLEND_SRC1_COLOR || f == D3D12_BLEND_INV_SRC1_COLOR || f == D3D12_BLEND_SRC1_ALPHA ||
+                       f == D3D12_BLEND_INV_SRC1_ALPHA;
+            };
+            if (b.BlendEnable &&
+                (src1(b.SrcBlend) || src1(b.DestBlend) || src1(b.SrcBlendAlpha) || src1(b.DestBlendAlpha)))
+                dual_source = true;
+        }
+        // Kept for a lazy pipeline too: build() makes the fragment words again through rewrite_fragment().
+        rgba4_mask_ = packed_color_mask;
+        dual_source_ = dual_source;
         bool uses_bindless = false;  // a stage declares set-0 bindings: the layout holds the device's set 0
         std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
         // Chained from stage_infos, which the recipe keeps for variants built at draw time: so they live in the recipe.
@@ -8334,10 +12416,13 @@ public:
         // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (no D24 on the GPU): the pixel stage writes the depth D24
         // would hold, biased in D24 units and quantised (src/depth24_fragment.h, D3D-309), and the rasterizer's own
         // bias is turned off. Multisampled targets keep the old path: a FragDepth write is per pixel.
-        const bool d24_as_float = desc.DSVFormat != DXGI_FORMAT_UNKNOWN &&
-                                  vulkan_format(desc.DSVFormat, true).format == VK_FORMAT_D24_UNORM_S8_UINT &&
+        const VkFormat dsv_vk = desc.DSVFormat != DXGI_FORMAT_UNKNOWN
+                                    ? vulkan_format(desc.DSVFormat, true).format
+                                    : VK_FORMAT_UNDEFINED;
+        const bool d24_as_float = dsv_vk == VK_FORMAT_D24_UNORM_S8_UINT &&
                                   !device_.depth_usable(VK_FORMAT_D24_UNORM_S8_UINT);
-        const bool packed16_fallback=desc.DSVFormat==xbox_d16s8 && device_.depth_backing(VK_FORMAT_D16_UNORM_S8_UINT)!=VK_FORMAT_D16_UNORM_S8_UINT;
+        const bool packed16_fallback = dsv_vk == VK_FORMAT_D16_UNORM_S8_UINT &&
+                                       device_.depth_backing(VK_FORMAT_D16_UNORM_S8_UINT) != VK_FORMAT_D16_UNORM_S8_UINT;
         if(packed16_fallback && samples>1 && desc.DepthStencilState.DepthEnable) return E_NOTIMPL;
         bool depth24_fragment = (d24_as_float || packed16_fallback) && desc.DepthStencilState.DepthEnable;
         if (depth24_fragment && samples > 1) {
@@ -8349,6 +12434,7 @@ public:
                                                 desc.RasterizerState.SlopeScaledDepthBias,
                                                 desc.RasterizerState.DepthBiasClamp,packed16_fallback?65535.0f:16777215.0f};
         for (Stage& stage : stages) {
+            if (stubbed) break;
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
             const std::span<const std::uint8_t> raw_bytes{
                 static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength};
@@ -8367,7 +12453,11 @@ public:
                         std::fprintf(stderr, "[rt] d3d12: missing %s in graphics PSO %s (RTs %u, RT0 %d, DSV %d)\n",
                                      stage.name, pipeline_key(desc).c_str(), desc.NumRenderTargets,
                                      int(desc.RTVFormats[0]), int(desc.DSVFormat));
-                    return stub_or(E_INVALIDARG, "graphics");
+                    if (can_stub) {
+                        stubbed = true;
+                        break;
+                    }
+                    return stub_or(E_INVALIDARG, "mesh", StubPipelineKind::mesh);
                 }
             } else if (leonida::fspx_bare_program(raw_bytes)) {
                 // Slot 57 (DeserializeGraphicsPipelineStateX): bare RDNA2 program indexed by fspx_code_sha256 in
@@ -8382,7 +12472,11 @@ public:
                 if (!stage.entry) {
                     std::fprintf(stderr, "[rt] d3d12: no translated %s for FSPX code sha256 %s (%zu B)\n",
                                  stage.name, hash.c_str(), raw_bytes.size());
-                    return stub_or(E_INVALIDARG, "graphics");
+                    if (can_stub) {
+                        stubbed = true;
+                        break;
+                    }
+                    return stub_or(E_INVALIDARG, "mesh", StubPipelineKind::mesh);
                 }
             } else {
                 log_once("shader bytecode holds no FSSM or FSPX program; bytes", int(stage.code.BytecodeLength));
@@ -8423,7 +12517,15 @@ public:
                 code_stage = &stage;
             }
             stage.words = library->spirv(*stage.entry);
-            if(stage.bit==VK_SHADER_STAGE_FRAGMENT_BIT && packed_color_mask && !leonida::rgba4::quantize(stage.words,packed_color_mask)) return E_INVALIDARG;
+            if (stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT) {
+                std::string why;
+                if (!rewrite_fragment(stage.words, why)) {
+                    if (why.rfind("has no second colour output", 0) == 0)
+                        return stream_unsupported("a SRC1 blend factor needs the pixel shader's second colour output; "
+                                                  "this module's outputs do not fit Location 0 Index 1; stage", 0);
+                    return E_INVALIDARG;
+                }
+            }
             if (stage.words.empty()) return E_FAIL;
             const auto inner = leonida::conservative_raster::inner_coverage_requirements(stage.words);
             if (!inner.valid) return E_INVALIDARG;
@@ -8433,6 +12535,33 @@ public:
                  (inner.post_depth && !device_.conservative_post_depth_coverage))) {
                 return stream_unsupported("FullyCoveredEXT needs an enabled Tier 3 shader ABI and device properties; stage", int(stage.bit));
             }
+        }
+        const bool stub_cover = stubbed && stub_pipelines_cover();  // also overrides the fixed-function state below
+        if (packed_blend_refused && !stub_cover) return E_NOTIMPL;  // translated after all: the refusal stands
+        if (stubbed) {
+            // The built-in vertex and pixel stages replace the whole stage table: no geometry stage, no set 0, no code
+            // base, nothing read from the input layout. The rasterizer keeps the description's depth bias (no D24
+            // fragment patch), and the colour needs no 4-bit quantisation (exact in every UNORM format).
+            const bool cover = stub_cover;
+            static std::atomic<unsigned> stubbed_count{0};
+            const unsigned n = ++stubbed_count;
+            if (n == 1 || (n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12: LEONIDA_STUB_PIPELINES: graphics pipeline without a translated shader "
+                                     "uses the built-in %s stages (%u so far)\n", cover ? "colour" : "empty", n);
+            std::vector<leonida::StubOutput> outputs(desc.NumRenderTargets, leonida::StubOutput::none);
+            for (UINT i = 0; i < desc.NumRenderTargets; ++i) outputs[i] = stub_output(desc.RTVFormats[i]);
+            for (Stage& stage : stages) {
+                stage.entry = nullptr;
+                stage.fssm.clear();
+                stage.words.clear();
+            }
+            stages[0].entry = &stub_entry();
+            stages[0].words = leonida::stub_vertex_stage(cover, topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT);
+            stages[2].entry = &stub_entry();
+            stages[2].words = leonida::stub_pixel_stage(outputs);
+            uses_bindless = false;
+            code_stage = nullptr;
+            depth24_fragment = false;
         }
         if (std::getenv("LEONIDA_LOG_EXE_PIPELINES")) log_exe_pipeline(stages[0].entry, stages[2].entry, desc);
         // --f16-interp-fallback (SHADER-378): align/synthesize VS decoded f16 halves for this (VS, PS) pair before
@@ -8448,8 +12577,8 @@ public:
         if (vs_stage.entry && ps_stage.entry && !gs_stage.entry &&
             (!ps_stage.entry->f16_halves.empty() || !vs_stage.entry->f16_halves.empty())) {
             std::string link_error;
-            if (!leonida::link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
-                                          &link_error, device_.f16_half_top_location)) {
+            if (!link_f16_halves(vs_stage.words, *vs_stage.entry, ps_stage.words, *ps_stage.entry,
+                                 &link_error)) {
                 std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
                 return E_FAIL;
             }
@@ -8457,7 +12586,7 @@ public:
         }
         // A lazy pipeline keeps where each stage's words come from, not the words or a module: build() makes them
         // again, the same way, and drops them once the pipeline exists.
-        lazy_ = lazy_graphics_pipelines();
+        lazy_ = !stubbed && lazy_graphics_pipelines();  // a lazy build reads its stages from the library again
         depth24_bias_ = depth24_bias;
         rgba4_mask_ = packed_color_mask;
         // A stage that declares a storage image or buffer it may write needs a device feature outside compute
@@ -8646,8 +12775,11 @@ public:
                 log_once("conservative rasterization needs enabled VK_EXT_conservative_rasterization and Tier 1 precision", 1);
                 return E_INVALIDARG;
             }
-            if (r.FillMode != D3D12_FILL_MODE_SOLID ||
-                topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return E_INVALIDARG;
+            // A mesh pipeline has no input assembler, so its stream need not set the topology type: what is rasterized
+            // is the module's output, and it has to be triangles as well.
+            if (r.FillMode != D3D12_FILL_MODE_SOLID) return E_INVALIDARG;
+            if (mesh ? !leonida::conservative_raster::mesh_outputs_triangles(stages[0].words)
+                     : topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return E_INVALIDARG;
             // Target-independent rasterization is a separate pipeline path; do not silently ignore its count.
             if (r.ForcedSampleCount)
                 return stream_unsupported("target-independent rasterization; forced sample count", int(r.ForcedSampleCount));
@@ -8674,7 +12806,7 @@ public:
 
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         multisample.rasterizationSamples = VkSampleCountFlagBits(samples);
-        const VkSampleMask sample_mask = desc.SampleMask;
+        VkSampleMask sample_mask = desc.SampleMask;  // all samples for a =color stub (below)
         multisample.pSampleMask = &sample_mask;
         multisample.alphaToCoverageEnable = desc.BlendState.AlphaToCoverageEnable;
 
@@ -8687,6 +12819,10 @@ public:
         depth.front = stencil_face(ds.FrontFace, ds.StencilReadMask, ds.StencilWriteMask);
         depth.back = back_masks ? stencil_face(ds.BackFace, back_masks->read, back_masks->write)
                                 : stencil_face(ds.BackFace, ds.StencilReadMask, ds.StencilWriteMask);
+        // The depth-bounds test (DEPTH_STENCIL1/2): the bounds are dynamic, set from OMSetDepthBounds at each draw.
+        depth.depthBoundsTestEnable = depth_bounds ? VK_TRUE : VK_FALSE;
+        depth.minDepthBounds = 0.0f;
+        depth.maxDepthBounds = 1.0f;
 
         std::vector<VkPipelineColorBlendAttachmentState> blends(desc.NumRenderTargets);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
@@ -8726,10 +12862,33 @@ public:
             blend.logicOpEnable = VK_TRUE;
             blend.logicOp = logic_op(first.LogicOp);
         }
+        // LEONIDA_STUB_PIPELINES=color: the cover triangle has one fixed winding at z = 0 and the pixel stage writes
+        // one colour, so the title's state would often hide it: the D3D12 default back-face cull, wireframe fill, a
+        // zero sample mask, a reverse-Z GREATER test against a clear of 0, a failing stencil test, SRC1 blend factors
+        // (the stub writes no second output), a logic op. All of that is off for the stub; the write mask stays, so a
+        // target the title does not write keeps its contents.
+        if (stub_cover) {
+            raster.polygonMode = VK_POLYGON_MODE_FILL;
+            raster.cullMode = VK_CULL_MODE_NONE;
+            sample_mask = ~VkSampleMask{0};
+            multisample.alphaToCoverageEnable = VK_FALSE;
+            depth.depthTestEnable = VK_FALSE;
+            depth.depthWriteEnable = VK_FALSE;
+            depth.stencilTestEnable = VK_FALSE;
+            for (auto& b : blends) b.blendEnable = VK_FALSE;
+            blend.logicOpEnable = VK_FALSE;
+        }
 
         // State that needs a Vulkan feature the device did not enable (VulkanDeviceInfo::features) is refused, rather
         // than handed to the driver against the spec.
         const VkPhysicalDeviceFeatures& features = device_.info.features;
+        if (depth_bounds && !features.depthBounds)
+            return stream_unsupported("depth-bounds tests need depthBounds, which the device lacks; stream subobject", 21);
+        if (depth_bounds) {  // how many PSOs use the test (they were all refused before)
+            static std::atomic<unsigned> made{0};
+            const unsigned n = ++made;
+            if ((n & (n - 1)) == 0) std::fprintf(stderr, "[rt] d3d12: depth-bounds PSO #%u\n", n);
+        }
 
         if (raster.polygonMode != VK_POLYGON_MODE_FILL && !features.fillModeNonSolid)
             return stream_unsupported("wireframe fill needs fillModeNonSolid, which the device lacks; fill mode", r.FillMode);
@@ -8853,6 +13012,7 @@ public:
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
+        graphics_.depth_bounds = depth_bounds;
         recipe_.mesh = mesh;
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
@@ -8870,13 +13030,18 @@ public:
         if (!lazy_) {
             VkResult compile_status = VK_SUCCESS;
             const bool cache_only = device_.info.cold_graphics_compile;
+            const ULONGLONG build_started = device_.order_log ? GetTickCount64() : 0;
             graphics_.pipeline = build(0, "graphics-create",
                                        cache_only ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0,
                                        &compile_status);
+            if (graphics_.pipeline && device_.order_log)
+                order_build_ms_.store(std::uint32_t(std::min<ULONGLONG>(GetTickCount64() - build_started, 0xfffffffeull)));
             // A cache-only create that the driver would have to compile stays null: the first draw builds it.
             if (!graphics_.pipeline && !(cache_only && compile_status == VK_PIPELINE_COMPILE_REQUIRED)) return E_FAIL;
         }  // lazy: graphics_.pipeline stays null and the first draw builds it as variant 0
-        graphics_.async_build = async_replay_compile();
+        // LEONIDA_ASYNC_MIN_BYTES_GRAPHICS (unset: LEONIDA_ASYNC_MIN_BYTES): a pipeline smaller than that (all its
+        // stages) is built where a draw needs it.
+        graphics_.async_build = async_replay_compile(true, spirv_bytes);
         graphics_.variant = [this](std::uint32_t unbound) {
             return replay_pipeline("draw", [&] {
                 return graphics_.async_build ? queue_build(false, unbound) : variant(unbound, "draw");
@@ -8888,7 +13053,9 @@ public:
             const auto it = variants_.find(unbound);
             return it == variants_.end() ? VkPipeline(VK_NULL_HANDLE) : it->second;
         };
-        graphics_.large = spirv_bytes >= leonida::PipelineCompiles::large_spirv_bytes;
+        graphics_large_module_ = spirv_bytes >= leonida::PipelineCompiles::large_spirv_bytes;
+        graphics_.large = graphics_large_module_ && big_compiles() != BigCompiles::unlimited;
+        graphics_.estimate = leonida::large_module_estimate(spirv_bytes);
 
         if (code_stage) {
             VkDeviceSize offset = 0;
@@ -8898,8 +13065,7 @@ public:
             code_base_ = offset;
             graphics_.code_base = offset;
         }
-        // LOCAL DIAGNOSTIC: what this pipeline is, for the fsdraw probe's draw lines
-        if (leonida::local_diagnostics()) {
+        if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC: what this pipeline is, for the fsdraw probe's draw lines
             const auto& rt0 = desc.BlendState.RenderTarget[0];
             char text[640];
             std::snprintf(text, sizeof text,
@@ -8920,6 +13086,7 @@ public:
                           int(desc.PrimitiveTopologyType), desc.SampleDesc.Count);
             leonida::fsdraw::note_pipeline(id(), text);
         }
+        order_install(graphics_.requested, graphics_.request_context, graphics_.mesh ? 'm' : 'g');
         if (device_.info.device_checkpoints) {
             leonida::CheckpointShaders shaders{};
             for (std::size_t i = 0; i < std::size(stages); ++i)
@@ -8930,6 +13097,7 @@ public:
         }
         registered_ = true;
         is_graphics_ = true;
+        prewarm_queue(std::size_t((std::max)(spirv_bytes, std::uint64_t{1})));
         return S_OK;
     }
 
@@ -8952,7 +13120,7 @@ public:
             return E_INVALIDARG;
         }
         const leonida::ShaderLibrary* library = device_.library();
-        if (!library) return stub_or(E_FAIL, "compute");
+        if (!library) return stub_or(E_FAIL, "compute", StubPipelineKind::compute);
         // A binding-free entry wins over one with bindings for the same program (pick_entry).
         // An FSPX program from a container is matched on its kind-0 state too; a bare kind-6 program whose
         // translations differ is ambiguous without that state and is refused (program_candidates).
@@ -8970,7 +13138,7 @@ public:
             std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
                          fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
                          leonida::sha256_hex(program.bytes).c_str());
-            return stub_or(E_INVALIDARG, "compute");
+            return stub_or(E_INVALIDARG, "compute", StubPipelineKind::compute);
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
         // shader declares bindings has it in its layout and has it bound at every dispatch.
@@ -9018,6 +13186,7 @@ public:
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
         compute_entry_ = entry;
         stage_bytes_ = spirv_bytes;
+        pipeline_.estimate = leonida::large_module_estimate(spirv_bytes);
         // The title creates hundreds of compute pipelines from job threads during startup and one of its init tasks
         // waits for all of them; some modules (wave64-emulated ray-tracing resolves, 4 MiB of SPIR-V) take the driver
         // minutes each. So the Vulkan pipeline is built on first use (build_compute): at the first dispatch that names
@@ -9040,7 +13209,8 @@ public:
             };
             pipeline_.build_context = this;
         } else if (lazy_compute) {
-            pipeline_.async_build = async_replay_compile();
+            // LEONIDA_ASYNC_MIN_BYTES: a module smaller than that is built where a dispatch needs it.
+            pipeline_.async_build = async_replay_compile(false, spirv_bytes);
             pipeline_.build = [](void* self) {
                 auto* pso = static_cast<PipelineState*>(self);
                 return replay_pipeline("dispatch", [&] {
@@ -9053,7 +13223,7 @@ public:
                 std::unique_lock lock(pso->variants_mutex_, std::try_to_lock);  // held: another thread is compiling it
                 return lock.owns_lock() ? pso->pipeline_.pipeline : VkPipeline(VK_NULL_HANDLE);
             };
-            pipeline_.large = serial_big_compile(spirv_bytes);
+            pipeline_.large = big_compute(spirv_bytes) && big_compiles() != BigCompiles::unlimited;
         } else if (!build_compute("compute-create")) {
             return E_FAIL;
         }
@@ -9066,6 +13236,7 @@ public:
             code_bytes_ = code.size();
             pipeline_.code_base = code_base_;
         }
+        if (!pipeline_.skipped) order_install(pipeline_.requested, pipeline_.request_context, 'c', entry->name);
         device_.context->add_pipeline(id(), pipeline_,
                                       device_.info.device_fault_diagnostics ? entry->name.c_str() : nullptr);
         registered_ = true;
@@ -9074,70 +13245,91 @@ public:
     }
 
 private:
+    using Work = leonida::LargeModuleGate::Work;
+
+    // Locks the PSO (`lock`, on variants_mutex_) for a build and, with an `estimate`, takes the build's place at the gate. A
+    // thread that waits for its place holds no PSO's lock, and one that has its place waits for none: another thread may be
+    // building that PSO, with a place of its own. Returns without a place when the PSO is `built` already.
+    template<typename Built>
+    leonida::LargeModuleGate::Ticket enter_build(std::unique_lock<std::mutex>& lock, std::uint64_t estimate, Work work,
+                                                 Built&& built) {
+        for (;;) {
+            lock.lock();
+            if (!estimate || built()) return {};
+            lock.unlock();
+            leonida::LargeModuleGate::Ticket place(big_compile_gate(), estimate, work);
+            if (lock.try_lock()) return place;
+        }
+    }
+
     // The compute pipeline, built once: by create_compute (LEONIDA_LAZY_COMPUTE=0), by the first dispatch that names
     // it (the replay layer calls ComputePipeline::build) or by the warm-up thread. Null when it cannot be built; the
     // failure is logged and not retried.
-    VkPipeline build_compute(const char* trigger) {
-        CompileActivity activity(device_.active_compiles);
-        std::lock_guard lock(variants_mutex_);
+    VkPipeline build_compute(const char* trigger, Work work = Work::demand) {
+        // A large module's place at the compile gate is taken before the PSO's lock (enter_build): a thread that waits
+        // for memory holds no PSO lock.
+        std::unique_lock lock(variants_mutex_, std::defer_lock);
+        const bool budgeted = big_compute(stage_bytes_) && big_compiles() == BigCompiles::budget;
+        auto place = enter_build(lock, budgeted ? pipeline_.estimate : 0, work,
+                                 [this] { return pipeline_.pipeline || compute_failed_; });
         if (pipeline_.pipeline || compute_failed_) return pipeline_.pipeline;
-        compute_failed_ = true;  // until the pipeline exists
-        auto& vk = device_.context->vk;
-        const VkDevice dev = device_.info.device;
-        const leonida::ShaderLibrary* library = device_.library();
         const leonida::ShaderEntry* entry = compute_entry_;
-        if (!library || !entry) return VK_NULL_HANDLE;
-        static std::mutex big_compile;
-        std::unique_lock<std::mutex> big_lock(big_compile, std::defer_lock);
-        if (serial_big_compile(stage_bytes_)) big_lock.lock();
-        auto words = library->spirv(*entry);
-        if (words.empty()) {
-            std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
+        if (!device_.library() || !entry) {
+            compute_failed_ = true;
             return VK_NULL_HANDLE;
         }
-        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        module_info.codeSize = words.size() * 4;
-        module_info.pCode = words.data();
-        VkShaderModule module = VK_NULL_HANDLE;
-        {
-            const leonida::aftermath::ShaderName named(entry->name);
-            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return VK_NULL_HANDLE;
+        // LOCAL FIX (compile helper, d3d12_compile_helper.h): asynchronous builds and warm-ups only ask the helper and
+        // are deferred (queue_build publishes nothing for them, so their next use asks again). While the helper is
+        // still making the file this answers at once, without reading the module; a use asks with replay's priority.
+        // Only replay's own and the warm-up's triggers may answer deferred: compute-create (LEONIDA_LAZY_COMPUTE=0) is
+        // a create whose caller needs a pipeline now, so it waits for the file as a dispatch does in a strict replay
+        // (LOCAL FIX, review: with LEONIDA_ASYNC_PIPELINES=1 it was deferred and returned E_FAIL).
+        const bool warmup = !std::strcmp(trigger, "warmup");
+        const bool replay_trigger = !std::strcmp(trigger, "dispatch") || !std::strcmp(trigger, "dispatch-worker");
+        // An asynchronous pipeline only (one under LEONIDA_ASYNC_MIN_BYTES waits for the file, as without them).
+        const bool helper_nowait = warmup || (replay_trigger && pipeline_.async_build);
+        if (!helper_file_.empty()) {
+            auto& helper = compile_helper::Client::instance();
+            std::string why;
+            const auto state = helper.state(helper_file_, device_.pso_identity, &why);
+            if (state == compile_helper::Client::State::pending) {
+                if (!warmup) helper.request(helper_file_, entry->name, 0, device_.pso_identity, nullptr);
+                if (helper_nowait) {
+                    helper_deferred_ = true;
+                    return VK_NULL_HANDLE;
+                }
+            } else if (state != compile_helper::Client::State::ready) {
+                std::fprintf(stderr, "[rt] d3d12: compile helper: %s for %s; built here\n", why.c_str(),
+                             entry->name.c_str());
+                helper_refused_ = true;
+            }
+            helper_file_.clear();
         }
-        const auto bytes = module_info.codeSize;
-        std::vector<std::uint32_t>().swap(words);  // vkCreateShaderModule consumed pCode
-        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipeline_info.stage.module = module;
-        pipeline_info.stage.pName = "main";
-        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
-        subgroup_size_for(*entry, required_size, pipeline_info.stage);
-        pipeline_info.layout = pipeline_.layout;
-        const VkPipelineCache cache = device_.pipeline_cache();
-
-        const ULONGLONG started = GetTickCount64();
-        VkPipeline built = VK_NULL_HANDLE;
-        CompileTrace trace;
-        trace.begin(pipeline_info, device_.info.pipeline_creation_feedback, trigger, entry->name.c_str(), 0, bytes, cache_key_);
-        const leonida::pipeline_profile::DriverCall profile("cs", trigger, entry->name.c_str());
-        const VkResult created = vk.vkCreateComputePipelines(dev, cache, 1, &pipeline_info, nullptr, &built);
-        profile.finish(int(created));
-        trace.end(trigger, entry->name.c_str(), 0, bytes, created);
-        if (big_lock.owns_lock()) big_lock.unlock();
-        vk.vkDestroyShaderModule(dev, module, nullptr);  // Vulkan lets a module go once the pipeline exists
-        const ULONGLONG took = GetTickCount64() - started;
-        if (created != VK_SUCCESS || !built) {
+        compute_failed_ = true;  // until the pipeline exists
+        ComputeBuildOptions options;
+        options.trigger = trigger;
+        options.cache_key = &cache_key_;
+        options.use_helper = !helper_refused_;
+        options.helper_wait = !helper_nowait;
+        options.helper_priority = warmup ? stage_bytes_ : 0;
+        const ComputeBuild build = build_compute_pipeline(device_, *entry, pipeline_.layout, subgroup_request_for(*entry),
+                                                          options);
+        if (build.deferred) {
+            compute_failed_ = false;
+            helper_file_ = build.journal_path;
+            helper_deferred_ = true;
+            return VK_NULL_HANDLE;
+        }
+        if (build.result != VK_SUCCESS || !build.pipeline) {
             std::fprintf(stderr, "[rt] d3d12: compute pipeline %s could not be built (VkResult %d); its dispatches are "
-                                 "dropped\n", entry->name.c_str(), int(created));
+                                 "dropped\n", entry->name.c_str(), int(build.result));
             return VK_NULL_HANDLE;
         }
-        if (took >= 2000)
-            std::fprintf(stderr, "[rt] d3d12: compute pipeline %s took %.1f s to build (%zu B SPIR-V)\n",
-                         entry->name.c_str(), double(took) / 1000.0, bytes);
-        maybe_checkpoint(cache);
-        pipeline_.pipeline = built;
+        maybe_checkpoint(device_.pipeline_cache());
+        pipeline_.pipeline = build.pipeline;
         compute_failed_ = false;
-        return built;
+        order_note_build(0, build.ms);
+        return build.pipeline;
     }
 
     // Lazy compute pipelines are also built in the background, smallest module first, so most exist before their
@@ -9167,37 +13359,55 @@ private:
         if (!queued) device_.next_checkpoint.store(now + 120000);  // refused after an exit stop, or out of memory
     }
 
-    VkPipeline queue_build(bool compute, std::uint32_t unbound, std::size_t warm_bytes = 0) {
+    // Asynchronous builds (LEONIDA_ASYNC_PIPELINES=1): replay asks here at prepare, with the resource lock held. The
+    // handle once built; otherwise a compile-worker job is queued (once) and null answered, so the draw or dispatch is
+    // skipped and a later submission uses the pipeline. `warm_bytes`: a warm-up, queued by module size. `count_skip`:
+    // false for a request made at record time (request_early), which skips nothing.
+    // `priority`: where a warm-up goes among the others (PipelineCompiler); 0: by `warm_bytes`, the module size.
+    VkPipeline queue_build(bool compute, std::uint32_t unbound, std::size_t warm_bytes = 0, bool count_skip = true,
+                           std::size_t priority = 0) {
         static std::mutex publication;  // ready handles only; no compiler call holds this lock
         const bool warm = warm_bytes != 0;
-        // After an exit stop (stop_pipeline_compiles) nothing is queued: a warm-up is skipped, and a draw or dispatch
-        // builds in place, as without LEONIDA_ASYNC_PIPELINES, rather than waiting for a build that never comes.
+        // After an exit stop (stop_pipeline_compiles) nothing is queued: a warm-up or an early request is skipped,
+        // and a draw or dispatch builds in place, as without LEONIDA_ASYNC_PIPELINES, rather than waiting for a build
+        // that never comes.
         if (PipelineCompiler::instance().closed()) {
-            if (warm) return VK_NULL_HANDLE;
+            if (warm || !count_skip) return VK_NULL_HANDLE;
             return compute ? build_compute("dispatch") : variant(unbound, "draw");
         }
         std::lock_guard lock(publication);
         if (!warm) {
             if (!requested_) requested_ = std::make_unique<Requests>();
             auto [it, inserted] = requested_->try_emplace(unbound);
-            if (!it->second.handle) ++it->second.skips;
+            if (!it->second.handle && count_skip) ++it->second.skips;
             if (!inserted) return it->second.handle;
         }
         bool queued = false;
         try {
-            queued = PipelineCompiler::instance().submit(compile_owner(), &device_, warm_bytes, [this, compute, warm, unbound] {
+            queued = PipelineCompiler::instance().submit(compile_owner(), &device_, warm && priority ? priority : warm_bytes,
+                                                         [this, compute, warm, unbound, warm_bytes] {
+                // A big warm-up while the title submits is left to the pipeline's first use (warmup_waits_for_quiet).
+                if (warm && warmup_waits_for_quiet(warm_bytes)) return;
                 VkPipeline built{};
                 try {
-                    built = compute ? build_compute(warm ? "warmup" : "dispatch-worker")
+                    built = compute ? build_compute(warm ? "warmup" : "dispatch-worker",
+                                                    warm ? Work::speculative : Work::demand)
                                     : variant(unbound, "draw-worker");
-                    if (async_replay_compile()) {
+                    // The compile helper is still making the journal file (build_compute): not built, so nothing is
+                    // published and the next use asks again.
+                    const bool deferred = compute && helper_deferred_.exchange(false);
+                    if (compute ? pipeline_.async_build : graphics_.async_build) {
                         unsigned long long skipped = 0;
                         {
                             std::lock_guard publish(publication);
                             if (!requested_) requested_ = std::make_unique<Requests>();
-                            auto& entry = (*requested_)[unbound];
-                            if (!entry.handle) skipped = entry.skips;
-                            entry.handle = built;
+                            if (deferred) {
+                                if (!warm) requested_->erase(unbound);
+                            } else {
+                                auto& entry = (*requested_)[unbound];
+                                if (!entry.handle) skipped = entry.skips;
+                                entry.handle = built;
+                            }
                         }
                         if (skipped && trace_pipeline_compile())
                             std::fprintf(stderr, "[rt] pipeline-deferred type=%s skipped=%llu ready=%d\n",
@@ -9206,13 +13416,98 @@ private:
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "[rt] pipeline compile worker failed: %s\n", e.what());
                 }
-            });
+            }, !compute,  // a graphics build may also take the graphics worker
+               compute ? big_compute(stage_bytes_) : graphics_large_module_);  // the pool's heavy count
         } catch (...) {
         }
         // Not queued (refused by a stop that came after the check above, or out of memory): no request stays
         // recorded, so the next use asks again instead of waiting for a build that never comes.
         if (!queued && !warm) requested_->erase(unbound);
         return VK_NULL_HANDLE;
+    }
+
+    // LEONIDA_PIPELINE_PREWARM_ORDER: the variants an earlier run asked this graphics pipeline for, queued as warm-ups at
+    // their recorded rank (pipeline_prewarm.h): after every demanded build, one warm-up at a time and none while a
+    // demanded build runs (PipelineCompiler). A queued one holds no reference: a release first drops it (last_release).
+    void prewarm_queue(std::size_t bytes) {
+        const auto* plan = device_.prewarm_plan.get();
+        if (!plan) return;
+        const auto& key = order_key_.empty() ? cache_key_ : order_key_;
+        const auto* entries = key.empty() ? nullptr : plan->find(key);
+        if (!entries) return;
+        for (const auto& entry : *entries) {
+            if (entry.variant == 0 && graphics_.pipeline) continue;  // built at create
+            queue_build(false, entry.variant, bytes, true, leonida::pipeline_prewarm::priority(entry.rank));
+        }
+    }
+
+public:
+    // A console stream kept for its first bind (LEONIDA_PIPELINE_COMPILE=on-demand, set_pending_stream) is parsed only
+    // when it is first resolved, and create_graphics queues the prewarm from there: no lead at all. When the plan has
+    // the stream's pipeline, the parse is queued here as its first prewarm job instead, at the rank of its first
+    // recorded variant, on a compile worker rather than the title's thread; create_graphics then queues the variants
+    // with their ranks as for any other PSO. A bind meanwhile waits for that parse (resolve_type's call_once), which it
+    // would otherwise have done itself. Like any queued build it holds no reference (last_release drops it).
+    void prewarm_pending_stream() {
+        const auto* plan = device_.prewarm_plan.get();
+        if (!plan || pending_stream_kind_ != 1) return;
+        const auto& key = order_key_.empty() ? cache_key_ : order_key_;
+        const auto* entries = key.empty() ? nullptr : plan->find(key);
+        if (!entries || entries->empty()) return;
+        try {
+            PipelineCompiler::instance().submit(compile_owner(), &device_,
+                                                leonida::pipeline_prewarm::priority(entries->front().rank),
+                                                [this] { resolve_type(true); }, true);
+        } catch (...) {
+        }
+    }
+
+    // Record time (SetPipelineState for compute, a draw for graphics, with the render-target slots it binds and
+    // whether it binds a depth buffer): asynchronous builds start on the compile worker before the list is submitted.
+    // Never waits; nothing to do when the variant is the last one asked for here.
+    void request_early(std::uint32_t bound_targets, bool depth_bound) {
+        if (!async_replay_compile() || !registered_) return;
+        // A pipeline under LEONIDA_ASYNC_MIN_BYTES is built where it is needed, as without asynchronous builds.
+        if (!(is_graphics_ ? graphics_.async_build : pipeline_.async_build)) return;
+        std::uint32_t unbound = 0;
+        if (is_graphics_) {
+            for (std::size_t slot = 0; slot < graphics_.color_formats.size() && slot < 8; ++slot)
+                if (graphics_.color_formats[slot] != VK_FORMAT_UNDEFINED && !(bound_targets & (1u << slot)))
+                    unbound |= 1u << slot;
+            if (graphics_.depth_format != VK_FORMAT_UNDEFINED && !depth_bound)
+                unbound |= leonida::GraphicsPipeline::unbound_depth;
+            if (!unbound && graphics_.pipeline) return;
+        } else if (!pipeline_.build || pipeline_.skipped) {
+            return;  // an eager pipeline has no build
+        }
+        if (early_.exchange(unbound + 1, std::memory_order_relaxed) == unbound + 1) return;
+        queue_build(!is_graphics_, unbound, 0, false);
+    }
+
+private:
+    // LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES=<n> (opt-in; unset or 0: no limit, the warm-up builds every module as on
+    // main): a warm-up of a module over n bytes of SPIR-V is not started while the title submits (a submission in the
+    // last second); it is left to the pipeline's first use. A create holds the compile gate (SubmitMutex::CompileTurn)
+    // for its whole length and every submission waits behind it; on NVIDIA 630.20 the modules over 640 KiB take 4-25 s
+    // each. Measured in a native boot past the story load (with 131072): 694 warm-ups of modules over 128 KiB against
+    // 25 such builds a dispatch asked for, and one run's submissions waited 140 s in all at the gate behind warm-ups.
+    static bool warmup_waits_for_quiet(std::size_t bytes) {
+        static const std::size_t limit = [] {
+            char text[32]{};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES", text, sizeof(text));
+            return (n > 0 && n < sizeof(text)) ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10))
+                                               : std::size_t{0};
+        }();
+        if (!limit || bytes <= limit || !leonida::pipeline_wait::title_submitting()) return false;
+        if (compile_helper::wanted(bytes)) return false;  // the helper compiles it, in its own process
+        if (leonida::pipeline_wait::warmups_left().fetch_add(1, std::memory_order_relaxed) == 0) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true))
+                std::fprintf(stderr, "[rt] d3d12: compute warm-ups over %zu KiB are left to their first use while the "
+                                     "title submits (LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES), from t=%.3f s\n",
+                             limit >> 10, double(leonida::diagnostic_ms()) / 1000.0);
+        }
+        return true;
     }
 
     static void warmup_enqueue(PipelineState* pso, std::size_t bytes) {
@@ -9312,6 +13607,7 @@ private:
         dyn_list[dyn_count++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
         dyn_list[dyn_count++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;
         if (!r.mesh && !r.bindings.empty()) dyn_list[dyn_count++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
+        if (r.depth.depthBoundsTestEnable) dyn_list[dyn_count++] = VK_DYNAMIC_STATE_DEPTH_BOUNDS;
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
         dynamic.dynamicStateCount = dyn_count;
         dynamic.pDynamicStates = dyn_list;
@@ -9416,6 +13712,7 @@ private:
         info.pDynamicState = &dynamic;
         info.flags=flags;
         info.layout = graphics_.layout;
+        info.flags |= fast_pipeline_flags(false);
         VkPipeline pipeline = VK_NULL_HANDLE;
         const auto cache = device_.pipeline_cache();
         const char* program = "-", *fragment = "-";
@@ -9428,9 +13725,29 @@ private:
         }
         CompileTrace trace;
         trace.begin(info, device_.info.pipeline_creation_feedback, trigger, profile_shaders_.c_str(), unbound, bytes, cache_key_);
+        const leonida::dev_status::Build dev_build(r.mesh ? "mesh pipeline" : "graphics pipeline");
         const leonida::pipeline_profile::DriverCall profile(r.mesh ? "ms" : "vs", lazy_ ? "lazy" : "eager",
                                                          program, fragment, unbound);
-        const auto result = device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &info, nullptr, &pipeline);
+        // Through the compile gate as a graphics create (a mesh pipeline is one): on NVIDIA 621.40 a vkQueueSubmit
+        // sat in the driver for as long as a mesh create was in it (54 s) and lost the device. Not with the classic
+        // gate (the default), which keeps graphics creates out of it as before.
+        const char* gate_name = nullptr;
+        for (const auto& source : sources_)
+            if (source.entry && source.slot == 0) gate_name = source.entry->name.c_str();
+        VkResult result = VK_ERROR_UNKNOWN;
+        {
+            std::optional<DriverTurn> turn;
+            if (leonida::SubmitMutex::compile_gate_graphics())
+                turn.emplace(device_.context->submit_mutex(), trigger,
+                             r.mesh ? "vkCreateGraphicsPipelines (mesh)" : "vkCreateGraphicsPipelines", true, gate_name,
+                             leonida::SubmitMutex::CreateKind::graphics, bytes);
+            result = device_.create_pipeline(flags, [&](VkPipelineCache with, VkPipelineCreateFlags f) {
+                info.flags = f;
+                pipeline = VK_NULL_HANDLE;
+                return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, with, 1, &info, nullptr,
+                                                                     &pipeline);
+            });
+        }
         if (status) *status = result;
         profile.finish(int(result));
         trace.end(trigger, profile_shaders_.c_str(), unbound, bytes, result);
@@ -9447,10 +13764,37 @@ private:
     // stages (VS or MS, GS, PS) read again, the f16 halves linked, the D24 fragment patch, then the generated stages
     // (the rectangle-list geometry stage from the vertex stage, the depth-only fragment stage). False with `why` when
     // a file went missing since.
+    // The rewrites a pixel shader's words get for this pipeline, the same at creation and in a lazy build():
+    // quantising B4G4R4A4 targets stored as RGBA8, then moving SV_Target1 to Location 0, Index 1 for a SRC1 blend
+    // factor (RT-DUAL-SOURCE-BLEND).
+    bool rewrite_fragment(std::vector<std::uint32_t>& words, std::string& why) const {
+        if (rgba4_mask_ && !leonida::rgba4::quantize(words, rgba4_mask_)) {
+            why = "could not be quantised for a B4G4R4A4 target stored as RGBA8";
+            return false;
+        }
+        if (dual_source_ && !leonida::dual_source::remap(words)) {
+            why = "has no second colour output at Location 1 for a SRC1 blend factor";
+            return false;
+        }
+        return true;
+    }
+
+    bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const leonida::ShaderEntry& vs_entry,
+                         std::vector<std::uint32_t>& ps_words, const leonida::ShaderEntry& ps_entry,
+                         std::string* error) const {
+        return leonida::link_f16_halves(vs_words, vs_entry, ps_words, ps_entry, error,
+                                        device_.f16_half_top_location);
+    }
+
+public:
     bool stage_words(std::vector<std::vector<std::uint32_t>>& words, std::string& why) const {
         const leonida::ShaderLibrary* library = device_.library();
         if (!library) {
             why = "no shader library";
+            return false;
+        }
+        if (sources_.empty()) {
+            why = "not a lazy pipeline";
             return false;
         }
         words.assign(sources_.size(), {});
@@ -9463,8 +13807,8 @@ private:
                 why = source.entry->name + ".spv is missing or not SPIR-V";
                 return false;
             }
-            if (source.slot == 2 && rgba4_mask_ && !leonida::rgba4::quantize(words[i], rgba4_mask_)) {
-                why = source.entry->name + " could not be quantised for a B4G4R4A4 target stored as RGBA8";
+            if (source.slot == 2 && !rewrite_fragment(words[i], why)) {
+                why = source.entry->name + ": " + why;
                 return false;
             }
             if (source.slot == 0) vs = i;
@@ -9472,7 +13816,7 @@ private:
         }
         if (f16_linked_) {
             if (vs == SIZE_MAX || ps == SIZE_MAX ||
-                !leonida::link_f16_halves(words[vs], *sources_[vs].entry, words[ps], *sources_[ps].entry, &why))
+                !link_f16_halves(words[vs], *sources_[vs].entry, words[ps], *sources_[ps].entry, &why))
                 return false;
         }
         for (std::size_t i = 0; i < sources_.size(); ++i) {
@@ -9495,11 +13839,17 @@ private:
         return true;
     }
 
+private:
     // Built on first use and kept until the PSO is released (replay may call this from any queue).
     VkPipeline variant(std::uint32_t unbound, const char* trigger) {
-        std::lock_guard lock(variants_mutex_);
+        std::unique_lock lock(variants_mutex_, std::defer_lock);
+        const bool budgeted = graphics_.large && big_compiles() == BigCompiles::budget;
+        const auto place = enter_build(lock, budgeted ? graphics_.estimate : 0, Work::demand,
+                                       [&] { return variants_.contains(unbound); });
         if (const auto it = variants_.find(unbound); it != variants_.end()) return it->second;
+        const ULONGLONG build_started = device_.order_log ? GetTickCount64() : 0;
         const VkPipeline pipeline = build(unbound, trigger);
+        if (pipeline && device_.order_log) order_note_build(unbound, GetTickCount64() - build_started);
         if (!pipeline) {
             if (leonida::pipeline_profile::enabled())
                 std::fprintf(stderr, "[rt] pso-variant failed stage=%s mask=%u\n", recipe_.mesh ? "ms" : "vs", unbound);
@@ -9529,12 +13879,22 @@ private:
     bool f16_linked_ = false; // graphics: the VS and PS words had their f16 halves linked
     leonida::Depth24Bias depth24_bias_{};
     unsigned rgba4_mask_ = 0;  // graphics: the B4G4R4A4 targets stored as RGBA8 that the pixel shader is quantised for
+    bool dual_source_ = false; // graphics: a SRC1 blend factor; the pixel shader's SV_Target1 is Location 0, Index 1
     std::vector<StageSource> sources_;
     struct Request { VkPipeline handle{}; unsigned long long skips = 0; };
     using Requests = std::map<std::uint32_t, Request>;
     std::unique_ptr<Requests> requested_;
+    // Compile helper (build_compute, under variants_mutex_): the journal file asked for and not there yet; whether
+    // the helper gave up on this pipeline (it is then built here); a build just deferred (read by queue_build).
+    std::filesystem::path helper_file_;
+    bool helper_refused_ = false;
+    std::atomic<bool> helper_deferred_{false};
+    std::atomic<std::uint32_t> early_{0};             // request_early: the last mask asked for, plus one
     std::string profile_shaders_;  // populated only with compile tracing enabled
     std::size_t stage_bytes_ = 0;
+    // A graphics pipeline of PipelineCompiles::large_spirv_bytes or more, whatever LEONIDA_SERIAL_BIG_COMPILES says:
+    // the compile pool's heavy count (CompilePool) caps these and large compute builds alike.
+    bool graphics_large_module_ = false;
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
     VkShaderModule module_ = VK_NULL_HANDLE;
@@ -9555,6 +13915,7 @@ private:
     bool registered_ = false;
     bool unregistered_ = false;  // taken out of the context's registry (unregister)
     bool is_graphics_ = false;
+    StubPipelineKind stub_kind_ = StubPipelineKind::none;  // set by stub_or: a compute or mesh stub (never registered)
     std::vector<leonida::SubgroupRequest> subgroup_requests_;  // one per stage, in creation order
     unsigned pending_stream_kind_=0;
     std::once_flag resolve_stream_once_;
@@ -9562,6 +13923,12 @@ private:
     bool native_source_ready_ = false;
     std::shared_ptr<PipelineState> native_owner_;
     leonida::cached_pso::Key cache_key_;
+    leonida::cached_pso::Key order_key_;  // see set_order_key; empty: cache_key_
+    std::uint64_t order_hash_ = 0;        // 0: this pipeline is not in the order log
+    char order_kind_ = 'c';
+    std::uint64_t order_name_hash_ = 0;   // compute: the hash of its library entry's name (E line); 0: none
+    std::uint32_t order_created_ms_ = device_.order_log ? DeviceState::order_now_ms() : 0;
+    std::atomic<std::uint32_t> order_build_ms_{leonida::pipeline_order::unknown_ms};  // variant 0, once built
 };
 
 void key_root_signature(leonida::cached_pso::KeyBuilder& key, ID3D12RootSignature* signature) {
@@ -10078,8 +14445,13 @@ struct TitleTexture {
     // misses. Video planes, rewritten whole every frame, are caught by the sampled one first.
     std::uint64_t full_hash = 0;
     bool full_hashed = false;
-    bool every_byte() const { return mapped && layout.layout.size <= (4u << 20); }
+    bool every_byte() const { return mapped && (async_texture_refresh() || layout.layout.size <= (4u << 20)); }
     std::uint64_t fills = 0;
+    unsigned view_mip = 0;                  // first mip of the last slot-70 view
+    // The last probe: the first mip readable with every smaller one (the mip count: none; only a 2D texture of one
+    // slice has other values than 0 and the mip count). memory.pending(): above fill_limit, no use yet.
+    unsigned readable_from = 0;
+    unsigned filled_from = 0;               // fills > 0: the image holds the mips from here on
 };
 
 // The layout of a slot-133 texture as the title's own XG computer for its shape says (title_xg_layouts): how the title
@@ -10109,12 +14481,18 @@ bool title_xg_layout(const Resource& r, rt::xg_xs::Texture& out, std::array<std:
     return true;
 }
 
+void DeviceState::index_texture(const TitleTexture& t) {
+    if (async_texture_refresh())
+        texture_ranges.set(t.address, t.cpu, t.layout_known && !t.gpu_written ? t.layout.layout.size : 0);
+}
+
 void DeviceState::title_texture_mapped(const void* resource, std::uint64_t address) {
     std::lock_guard lock(title_texture_mutex);
     const auto it = title_textures.find(address);
     if (it == title_textures.end() || it->second->resource != resource) return;
     TitleTexture& t = *it->second;
     t.mapped = true;
+    if (async_texture_refresh() && !t.gpu_written) mapped_title_textures[address] = it->second;
     t.memory.retry();
     // The title computes the layout of what it writes right before it maps: take it when no view gave one.
     if (!t.gpu_written && (t.layout_guessed || !t.layout_known) &&
@@ -10122,6 +14500,7 @@ void DeviceState::title_texture_mapped(const void* resource, std::uint64_t addre
         t.layout_known = true;
         t.layout_guessed = false;
         t.layout_from_xg = true;
+        index_texture(t);
         t.hashed = false;
     }
     static std::atomic<int> logged{0};
@@ -10154,13 +14533,42 @@ void DeviceState::title_texture_unmapped(const void* resource, std::uint64_t add
 }
 
 void DeviceState::title_texture_gone(const void* resource, std::uint64_t address) {
+    if (t_in_title_textures) {  // this thread holds title_texture_mutex
+        {
+            // Never held here: ~Resource takes descriptor_mutex itself (image_owner, forget_image). The submit path
+            // reads gpu_placements under descriptor_mutex alone, so the placement must not outlive the resource.
+            std::lock_guard descriptors(descriptor_mutex);
+            gpu_placements.remove(address, resource);
+        }
+        const auto it = title_textures.find(address);
+        if (it != title_textures.end() && it->second->resource == resource) it->second->resource = nullptr;
+        titles_gone.push_back({resource, address});
+        titles_gone_pending.store(true, std::memory_order_release);
+        return;
+    }
     std::lock_guard lock(title_texture_mutex);
     {
         std::lock_guard descriptors(descriptor_mutex);
         gpu_placements.remove(address, resource);
     }
     const auto it = title_textures.find(address);
-    if (it != title_textures.end() && it->second->resource == resource) title_textures.erase(it);
+    if (it != title_textures.end() && it->second->resource == resource) {
+        texture_ranges.erase(address);
+        mapped_title_textures.erase(address);
+        it->second->resource = nullptr;
+        title_textures.erase(it);
+    }
+}
+
+void DeviceState::drain_titles_gone() {
+    if (!titles_gone_pending.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(title_texture_mutex);
+    for (const auto& [resource, address] : titles_gone) {
+        const auto it = title_textures.find(address);
+        if (it != title_textures.end() && !it->second->resource) title_textures.erase(it);
+    }
+    titles_gone.clear();
+    titles_gone_pending.store(false, std::memory_order_release);
 }
 
 // The T# of a view: what the shader gets to know about it, in the structure the console's shaders read.
@@ -10172,6 +14580,57 @@ void DeviceState::title_texture_gone(const void* resource, std::uint64_t address
 // these words, as write_image_descriptor does. Every field the layer does not encode (tiling, compression,
 // performance hints) only makes the key differ, so a title-built T# still finds its texture. Checked against the
 // texture first: a view of mips, layers or a dimension it lacks would be an invalid Vulkan view.
+// LEONIDA_UNKNOWN_TSHARP=1 (diagnostic): one line for each distinct base address a title-written T# names with no
+// texture there (its shape, the tiling bits SW_MODE = dword 3 bits 20..24 by the GFX10 layout, unverified, and whether
+// the address is title memory), up to 300 addresses, and every 8192 such lookups a summary by format, type and tiling.
+// What a texture made from the T# on its first read would have to create.
+void note_unknown_tsharp(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image) {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_UNKNOWN_TSHARP");
+        return v && *v == '1';
+    }();
+    if (!on) return;
+    struct Shape {
+        std::uint32_t format, type, sw, width, height, depth, mips, layers;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, Shape> seen;
+    static std::map<std::string, std::uint64_t> by_shape;
+    static std::uint64_t lookups = 0, in_title = 0;
+    const Shape s{image.format, std::uint32_t(image.type), (words[3] >> 20) & 0x1f, image.width, image.height,
+                  image.depth, image.resource_mips, image.layer_count};
+    std::uint64_t lo = 0, hi = 0;
+    const bool title = leonida::title_va_aliases().title_memory(image.address, lo, hi);
+    std::lock_guard lock(mutex);
+    ++lookups;
+    if (seen.emplace(image.address, s).second) {
+        in_title += title;
+        char key[64];
+        std::snprintf(key, sizeof(key), "fmt %u type %u sw %u", s.format, s.type, s.sw);
+        ++by_shape[key];
+        if (seen.size() <= 300)
+            std::fprintf(stderr,
+                         "[rt] unknown-tsharp: #%zu base 0x%llx fmt %u type %u sw %u %ux%ux%u mips %u layers %u%s\n",
+                         seen.size(), static_cast<unsigned long long>(image.address), s.format, s.type, s.sw, s.width,
+                         s.height, s.depth, s.mips, s.layers, title ? " (title memory)" : " (not title memory)");
+        if (seen.size() <= 24)
+            std::fprintf(stderr, "[rt] unknown-tsharp: #%zu words %08x %08x %08x %08x %08x %08x %08x %08x\n", seen.size(),
+                         words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    }
+    if (!(lookups % 8192)) {
+        std::vector<std::pair<std::uint64_t, std::string>> top;
+        for (const auto& [k, n] : by_shape) top.emplace_back(n, k);
+        std::sort(top.rbegin(), top.rend());
+        std::string text;
+        for (std::size_t i = 0; i < top.size() && i < 10; ++i)
+            text += (i ? "; " : "") + top[i].second + " x" + std::to_string(top[i].first);
+        std::fprintf(stderr,
+                     "[rt] unknown-tsharp: %llu lookups, %zu distinct addresses (%llu in title memory); by shape: %s\n",
+                     static_cast<unsigned long long>(lookups), seen.size(), static_cast<unsigned long long>(in_title),
+                     text.c_str());
+    }
+}
+
 TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWords& words, const char** why) {
     namespace g = leonida::gfx10;
     const auto refuse = [why](const char* reason) {
@@ -10188,6 +14647,8 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
         std::lock_guard lock(device.descriptor_mutex);
         if (!device.bindless) return refuse("no bindless set");
         if (device.image_entries.count(words)) return TitleImage::known;
+        if (g::has_hardware_volume_uav_slice_offset(words, image))
+            return refuse("a title-written 3D UAV with a slice offset is not supported");
         auto found = device.images_by_address.find(image.address);
         // Memory of the texture stream pool has two addresses, the CPU view's and the GPU-only alias the title hands
         // to the GPU (title_gpu_views): a T# naming either finds a texture registered under the other.
@@ -10201,7 +14662,11 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
             const auto alias = leonida::title_gpu_views::other_view(image.address);
             if (auto* candidate = device.gpu_placements.find(image.address, alias, matches)) owner = candidate;
         }
-        if (!owner) return TitleImage::unknown;
+        if (!owner) {
+            if (why) *why = "no texture at T# address";
+            note_unknown_tsharp(words, image);
+            return TitleImage::unknown;
+        }
         const Resource& r = *owner;
         image.address = r.image_address();  // release this key with its actual owner
         const D3D12_RESOURCE_DESC& d = r.desc();
@@ -10217,15 +14682,16 @@ TitleImage bind_title_image(DeviceState& device, const leonida::gfx10::ImageWord
         if (!r.descriptor_image()) return refuse("the texture has no image");
         if (!type_fits) return refuse("T# type or samples do not fit the texture");
         if (!msaa && image.first_mip + image.mip_count > d.MipLevels) return refuse("T# names mips the texture lacks");
+        if (image.type == g::ImageType::cube && !(r.format() && layers >= 6))
+            return refuse("cube T# on fewer than six layers");
         if (!volume && image.first_layer + image.layer_count > layers)
             return refuse("T# names layers the texture lacks");
-        if (image.type == g::ImageType::cube && !(r.format() && image.layer_count >= 6))
-            return refuse("cube T# on fewer than six layers");
         const bool storage = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !msaa &&
                              r.aspects() == VK_IMAGE_ASPECT_COLOR_BIT;
+        const char* unbound = "no view for the T#'s format or range";  // unless set 0 has no room (bind_image)
         if (!device.bind_image_locked(words, image, r.descriptor_image(), r.format(), r.aspects(), storage,
-                                      r.has_view_format_list(), r.uint_backed()))
-            return refuse("no view for the T#'s format or range");
+                                      r.has_view_format_list(), r.uint_backed(), &unbound))
+            return refuse(unbound);
         r.note_shader_view();  // Include descriptors written directly into title heaps.
         if (r.sparse_image()) sparse = r.id();
     }
@@ -10567,11 +15033,17 @@ public:
             break;
         }
         case h::so_statistics:
-            // The layer has no stream output: a graphics PSO with StreamOutput entries is refused (E_NOTIMPL) and
-            // SOSetTargets is not implemented, so no primitive ever reaches a stream and every query of this heap
-            // counts 0 written and 0 needed. That needs no Vulkan pool: Begin/EndQuery run nothing and a resolve fills zeros. When stream
-            // output lands, this becomes a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool (D3D-302).
-            return register_pool(desc);
+            // D3D-302: with VK_EXT_transform_feedback enabled, an SO_STATISTICS heap is a real transform-feedback
+            // pool whose queries begin/end on a stream (vkCmdBeginQueryIndexedEXT); a resolve copies 16 bytes per
+            // query (NumPrimitivesWritten, PrimitivesStorageNeeded), in the same order. StreamOutput PSOs are still
+            // refused and SOSetTargets is still not implemented, so no primitive reaches a stream yet and every
+            // query counts 0. The pool needs the transformFeedbackQueries property and at least one stream; without
+            // them (or without the feature) the heap is made without a pool and every query resolves to zero.
+            if (!device_.info.transform_feedback || !device_.info.transform_feedback_queries ||
+                !device_.info.max_transform_feedback_streams)
+                return register_pool(desc);
+            info.queryType = VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT;
+            break;
         case h::pipeline_statistics:
             if (!device_.info.pipeline_statistics_query) {
                 log_once("pipeline-statistics query heap: pipelineStatisticsQuery not enabled; type", desc.Type);
@@ -10600,6 +15072,9 @@ private:
         pool.count = desc.Count;
         pool.precise = device_.info.occlusion_query_precise;
         pool.ended.assign(desc.Count, false);
+        // D3D-302: a real transform-feedback pool queries streams below maxTransformFeedbackStreams; D3D12 has four.
+        if (pool_ && desc.Type == leonida::d3d12_query_heap::so_statistics)
+            pool.streams = std::min<std::uint32_t>(4, device_.info.max_transform_feedback_streams);
         device_.context->add_query_pool(id(), pool);
         registered_ = true;
         return S_OK;
@@ -10615,6 +15090,23 @@ private:
     VkQueryPool pool_ = VK_NULL_HANDLE;  // null for a stream-output heap (no Vulkan query behind it)
     bool registered_ = false;            // added to the context, so removed from it on destruction
 };
+
+// The live devices whose session pipeline cache an ending process writes (save_pipeline_caches_at_exit). A title
+// never releases its device, so ~Device, the only other writer, does not run in a real boot: without this, a run that
+// ends (normally, at a console close or in a crash) keeps none of what it compiled. Timed, so a crash handler that
+// finds it held gives up instead of hanging the process.
+std::timed_mutex exit_cache_mutex;
+std::vector<DeviceState*> exit_cache_devices;
+std::atomic<bool> exit_cache_saved{false};
+
+// VK_EXT_memory_budget read from a device's info: the reader a device publishes for the title HUD and the dev overlay
+// (src/memory_figures.h), and vulkan_vram_budget. Not available without the extension.
+leonida::VramBudget read_vram_budget(const VulkanDeviceInfo& info) {
+    if (!info.memory_budget || !info.get_instance_proc || !info.instance) return {};
+    const auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+        info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties2"));
+    return leonida::query_vram_budget(get, info.physical);
+}
 
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
 struct OwnedRuntime {
@@ -10642,6 +15134,15 @@ public:
         // worker still has a warm-up to run is one too high. The proxy's count waits for the pool.
         rt::d3d12_xs::set_reference_settler([] { PipelineCompiler::instance().wait_idle(); });
         state_.info = info;
+        {
+            std::lock_guard lock(exit_cache_mutex);
+            exit_cache_devices.push_back(&state_);
+        }
+        // The GPU memory figure of the title HUD and the dev overlay: the newest device with VK_EXT_memory_budget.
+        if (info.memory_budget)
+            leonida::memory_figures::publish_vram_reader(
+                [](const void* context) { return read_vram_budget(static_cast<const DeviceState*>(context)->info); },
+                &state_);
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
         copy_users_.resize(info.copy_queues.size(), 0);
@@ -10738,6 +15239,8 @@ public:
                 state_.pso_identity.device = props.deviceID;
                 state_.pso_identity.driver = props.driverVersion;
                 std::memcpy(state_.pso_identity.cache_uuid, props.pipelineCacheUUID, VK_UUID_SIZE);
+                state_.load_prewarm_plan();  // first: the order log may append this run to the same file
+                state_.start_order_log();
                 if (state_.info.max_push_constants_size == 0) {
                     state_.info.max_push_constants_size = props.limits.maxPushConstantsSize;
                     state_.info.push_constants_need_fallback = (state_.info.max_push_constants_size < 144);
@@ -10751,8 +15254,10 @@ public:
                     VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT | VK_SAMPLE_COUNT_16_BIT;
                 state_.no_output_sample_counts =
                     static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kD3D12SampleCounts);
-                state_.f16_half_top_location = leonida::f16_half_top_location(
-                    props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents);
+                state_.f16_half_top_location = info.f16_half_top_location != 0
+                    ? info.f16_half_top_location
+                    : leonida::f16_half_top_location(
+                          props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents);
             }
             if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
@@ -10781,6 +15286,8 @@ public:
             .first_instance = info.draw_indirect_first_instance, .multiple = info.multi_draw_indirect,
             .count_buffer = info.draw_indirect_count_enabled, .max_count = info.max_draw_indirect_count,
             .robust_index_view = info.robust_index_view, .require_clamp = leonida::indirect_clamp_enabled()};
+        // Before the context: its SubmitMutex takes the gate's mode and limits when it is made.
+        decide_auto_compile_gate(info, get_device, state_.pso_identity);
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering, info.ray_tracing,
@@ -10789,7 +15296,8 @@ public:
                                                                   indirect);
         if (info.device_fault_diagnostics) {
             state_.context->configure_device_fault(get_device,
-                {info.device_fault_info, info.device_checkpoints, info.device_diagnostics_config});
+                {info.device_fault_info, info.device_checkpoints, info.device_diagnostics_config, info.device_markers},
+                &state_.memory);
             state_.context->add_diagnostic_queue(info.queue);
             for (auto queue : info.command_queues) state_.context->add_diagnostic_queue(queue);
             for (auto queue : info.compute_queues) state_.context->add_diagnostic_queue(queue);
@@ -10803,6 +15311,9 @@ public:
             if (auto* fault = state_.context->device_fault())
                 fault->set_lost_hook([this] { rt::compute_probe::recheck(state_); });
         }
+        if (async_texture_refresh()) start_title_filler();
+        state_.setup_console_heap_gpu(get_device);  // LEONIDA_CONSOLE_HEAP_GPU: the context's prelude
+        state_.context->set_after_execute([this] { state_.geometry_execute_end(); });
         state_.context->set_before_execute([this] {
             namespace phases = leonida::submit_phases;
             // LEONIDA_REFRESH_PER_FRAME (for runs that only need the title to go on): 1 = the slot-133 shadows, title
@@ -10815,12 +15326,15 @@ public:
                 const char* v = std::getenv("LEONIDA_REFRESH_PER_FRAME");
                 return v && *v ? std::atoi(v) : 0;
             }();
+            state_.geometry_execute_begin();
             bool full = true;
             if (per_frame) {
                 const std::uint64_t serial = phases::totals().present_serial.load(std::memory_order_relaxed);
                 full = refreshed_present_.exchange(serial, std::memory_order_relaxed) != serial;
             }
+            state_.drain_geometry_releases();
             state_.refresh_shadows(full || per_frame < 2, full);
+            state_.retire_orphan_windows();
             // LEONIDA_GEOMETRY_ASYNC=1 (for runs that only need the title to go on): the geometry copies are brought
             // up to date on a worker of ours, started here and not waited for, instead of on the title's GPU submit
             // thread (speed-27: 230-330 ms a refresh after the load, a VirtualQuery and VirtualProtect per written
@@ -10835,8 +15349,17 @@ public:
                 const phases::Scope timed(phases::geometry);
                 state_.geometry.refresh(DeviceState::copy_geometry);
             }
+            // Last, once the heap refresh, the windows and the geometry copies have made what this submission reads.
+            state_.update_address_guard();
             const phases::Scope timed(phases::textures);
-            refresh_title_textures();
+            if (async_texture_refresh()) {
+                if (!t_in_title_textures) {
+                    fill_first_mapped_textures();
+                    request_title_refresh();
+                }
+            } else {
+                refresh_title_textures();
+            }
         });
         {
             char text[16] = {};
@@ -10857,6 +15380,10 @@ public:
                              threads.count);
             if (threads.count)
                 state_.context->set_pipeline_workers(std::make_unique<leonida::PipelineWorkers>(threads.count));
+            if (big_compiles() == BigCompiles::budget)
+                state_.context->set_large_compiles(
+                    [] { return big_compile_gate().budget(); },
+                    [] { return std::make_shared<leonida::LargeModuleGate::Demand>(big_compile_gate()); });
         }
         leonida::title_va_aliases().set_hooks(
             &state_,
@@ -10866,12 +15393,18 @@ public:
             [](void* device, std::uint64_t table, std::uint32_t descriptors) {
                 static_cast<DeviceState*>(device)->scan_title_table(table, descriptors);
             });
+        leonida::title_va_aliases().set_noter([](void* device, std::uint64_t va, std::uint64_t bytes) {
+            static_cast<DeviceState*>(device)->note_title_write(va, bytes);
+        });
+        // Every device, hooks or not: its console heaps' slot records follow the alias table's changes.
+        leonida::title_va_aliases().add_listener(&state_, &DeviceState::alias_changed);
         state_.image_memory = std::make_unique<leonida::ImageMemory>(
             [device = info.device, make = state_.context->vk.vkAllocateMemory](std::uint32_t type, std::uint64_t bytes) {
                 VkMemoryAllocateInfo block{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
                 block.allocationSize = bytes;
                 block.memoryTypeIndex = type;
                 VkDeviceMemory out = VK_NULL_HANDLE;
+                leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::image_blocks);
                 return make(device, &block, nullptr, &out) == VK_SUCCESS ? out : VkDeviceMemory(VK_NULL_HANDLE);
             },
             [device = info.device, free = state_.context->vk.vkFreeMemory](VkDeviceMemory block) {
@@ -10975,6 +15508,21 @@ public:
                               (unsigned long long)shadows, leonida::fsdraw::pipeline_count());
                 return std::string(text);
             };
+            facts.share = [this] {
+                leonida::memory_breakdown::DeviceShare share;
+                DeviceState& d = state_;
+                if (d.arena.buffer) {
+                    share.arena = true;
+                    std::lock_guard lock(d.arena.mutex);
+                    share.arena_reserved = d.arena.size;
+                    share.arena_bound = d.arena.size;  // one allocation behind the whole range
+                    share.arena_in_use = d.arena.in_use;
+                    for (std::size_t i = 0; i < share.arena_use.size(); ++i) share.arena_use[i] = d.arena.use_in_use[i];
+                }
+                std::lock_guard lock(d.descriptor_mutex);  // the bindless set's lock (ExecuteCommandLists' flush)
+                if (const auto* bindless = d.bindless.get()) share.bindless_table_bytes = bindless->table_buffer_bytes();
+                return share;
+            };
             leonida::mem_probe::start(std::move(facts));
         }
         if (info.conditional_rendering) {
@@ -11005,12 +15553,16 @@ public:
         // device addresses the same scratch holds the triangle indices of indexed quad lists (quad_index_expand.h):
         // a compute pass writes them through the chunk's address and the draw binds the chunk as its index buffer.
         const bool index_scratch = info.buffer_device_address;
+        const VkBufferUsageFlags scratch_extra =
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            (index_scratch ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0);
         state_.context->enable_copy_scratch(
             get_device,
             [this, index_scratch](const VkMemoryRequirements& requirements) {
+                leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::staging);
                 return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, index_scratch);
             },
-            index_scratch ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0, state_.families);
+            scratch_extra, state_.families);
         if (info.buffer_device_address && info.physical && info.get_instance_proc) {
             if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"))) {
@@ -11025,7 +15577,8 @@ public:
                                                           return state_.allocate(requirements, 0,
                                                                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                                                                                  nullptr, /*device_address=*/true);
-                                                      });
+                                                      },
+                                                      state_.families);
             }
         }
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h), and so do the copies of
@@ -11157,6 +15710,41 @@ public:
             std::fprintf(stderr, "[rt] d3d12: descriptor hash: %s (all %zu modules)\n",
                          leonida::descriptor_hash_kind_name(descriptor_hash), hash_modules.total());
         }
+        // Which entry layout the loaded modules read (descriptor_table.h): a tagged module reads the kind word next to
+        // each index and uses it to tell which array that index is bound in (a 3D T# read by a 2D op is not another
+        // image), and the inserts below fill it. A plain library reads only the index, exactly as before. The kind
+        // word is additive, so one tagged module needs the tagged layout whatever the plain count (the library's
+        // vote); chosen once here, like the hash kind, and LEONIDA_DESCRIPTOR_TABLE overrides.
+        leonida::DescriptorTableCensus table_modules{};
+        leonida::DescriptorTableLayout descriptor_table = leonida::DescriptorTableLayout::plain;
+        if (const leonida::ShaderLibrary* library = state_.library()) {
+            table_modules = library->descriptor_table_census();
+            descriptor_table = library->descriptor_table_layout();
+        }
+        leonida::DescriptorTableLayout override_table = descriptor_table;
+        if (leonida::descriptor_table_layout_from_env(std::getenv("LEONIDA_DESCRIPTOR_TABLE"), &override_table)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12: descriptor table: %s (LEONIDA_DESCRIPTOR_TABLE; %zu tagged / %zu plain modules)\n",
+                         leonida::descriptor_table_layout_name(override_table), table_modules.tagged,
+                         table_modules.plain);
+            descriptor_table = override_table;
+            // Under a plain table a tagged module reads no kind at all, so every image an instruction reads through
+            // another dimension's array takes that array's fallback. That is what the override asks for; say so.
+            if (override_table == leonida::DescriptorTableLayout::plain && table_modules.tagged)
+                std::fprintf(stderr,
+                             "[rt] d3d12: LEONIDA_DESCRIPTOR_TABLE forces the plain descriptor table while %zu "
+                             "module(s) read the kind word; their image lookups through another dimension's array "
+                             "take the fallback\n",
+                             table_modules.tagged);
+        } else if (table_modules.tagged && table_modules.plain) {
+            std::fprintf(stderr, "[rt] d3d12: descriptor table: %zu tagged / %zu plain modules; using %s\n",
+                         table_modules.tagged, table_modules.plain,
+                         leonida::descriptor_table_layout_name(descriptor_table));
+        } else {
+            std::fprintf(stderr, "[rt] d3d12: descriptor table: %s (all %zu modules)\n",
+                         leonida::descriptor_table_layout_name(descriptor_table), table_modules.total());
+        }
+        state_.descriptor_table_tagged = descriptor_table == leonida::DescriptorTableLayout::tagged;
         const auto get_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
             state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceProperties2"));
         if (get_properties) {
@@ -11231,6 +15819,7 @@ public:
                 // after it, so the generations flush() retires are free at once.
                 {
                     std::lock_guard submit(context.submit_mutex());
+                    const leonida::SubmitMutex::SubmitTurn turn(context.submit_mutex(), false);  // the compile gate
                     context.observe_result(context.vk.vkDeviceWaitIdle(state_.info.device), "vkDeviceWaitIdle");
                 }
                 state_.bindless_idle_waits.fetch_add(1, std::memory_order_relaxed);
@@ -11320,7 +15909,14 @@ public:
         if (!vk.vkGetBufferDeviceAddress) return false;
         char text[16] = {};
         size_t length = 0;
-        const bool set = getenv_s(&length, text, "LEONIDA_ARENA_MB") == 0 && length > 1;
+        bool set = getenv_s(&length, text, "LEONIDA_ARENA_MB") == 0 && length > 1;
+        // A value the CRT's copy of the environment does not give (or one past this buffer): asked of Windows too,
+        // then report the size applied to the arena.
+        if (!set) {
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_ARENA_MB", text, sizeof(text));
+            set = n > 0 && n < sizeof(text);
+            if (set) std::fprintf(stderr, "[rt] d3d12: LEONIDA_ARENA_MB was read from the process environment, not the CRT's\n");
+        }
         const leonida::ArenaLimits limits{state_.info.max_buffer_size, state_.info.max_memory_allocation_size};
         leonida::ArenaSize size = leonida::decide_arena_size(set ? text : nullptr, limits);
         auto& arena = state_.arena;
@@ -11362,14 +15958,40 @@ public:
                 return false;
             }
         }
+        // With Resizable BAR, keep the arena where its buffer may still use DEVICE_LOCAL | HOST_VISIBLE memory
+        // A large buffer can exclude that type, or require more bytes than its heap can hold.
+        if (leonida::resizable_bar(state_.memory)) {
+            const VkDeviceSize asked = info.size;
+            const VkDeviceSize fitted = leonida::device_local_arena_bytes(asked, [&](VkDeviceSize bytes) {
+                if (bytes == asked) return leonida::device_local_arena_fits(state_.memory, requirements);
+                VkBufferCreateInfo probe = info;
+                probe.size = bytes;
+                VkBuffer buffer = VK_NULL_HANDLE;
+                if (vk.vkCreateBuffer(state_.info.device, &probe, nullptr, &buffer) != VK_SUCCESS) return false;
+                VkMemoryRequirements r{};
+                vk.vkGetBufferMemoryRequirements(state_.info.device, buffer, &r);
+                vk.vkDestroyBuffer(state_.info.device, buffer, nullptr);
+                return (!limits.max_allocation_size || r.size <= limits.max_allocation_size) &&
+                       leonida::device_local_arena_fits(state_.memory, r);
+            });
+            if (fitted != asked) {
+                vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
+                info.size = fitted;
+                if (!create_buffer()) return false;
+                size.bytes = fitted;
+                size.capped |= leonida::arena_cap_bar;
+            }
+        }
         if (size.capped)
             std::fprintf(stderr, "[rt] d3d12: GPU address arena: %llu MiB of the %llu MiB asked for, capped by the "
                                  "device's %s\n",
                          static_cast<unsigned long long>(size.bytes >> 20),
                          static_cast<unsigned long long>(size.requested >> 20), leonida::arena_cap_name(size.capped));
-        arena.memory = state_.allocate(requirements,
-                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true, &arena.memory_type);
+        {
+            leonida::memory_breakdown::Owner owner(leonida::memory_breakdown::Consumer::arena);
+            arena.memory = state_.allocate(requirements, leonida::kArenaRequiredMemory,
+                                           leonida::kArenaPreferredMemory, nullptr, true, &arena.memory_type);
+        }
         void* mapped = nullptr;
         if (!arena.memory || vk.vkBindBufferMemory(state_.info.device, arena.buffer, arena.memory, 0) != VK_SUCCESS ||
             vk.vkMapMemory(state_.info.device, arena.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
@@ -11382,6 +16004,8 @@ public:
             return false;
         }
         arena.mapped = static_cast<std::uint8_t*>(mapped);
+        std::fprintf(stderr, "[rt] d3d12: GPU address arena: %llu MiB (LEONIDA_ARENA_MB %s)\n",
+                     static_cast<unsigned long long>(info.size >> 20), set ? text : "unset");
         // LEONIDA_ARENA_NULL_MB=<n> (for compute-on boots): the first n MiB of the arena, at heap_base + 0, are zeroed
         // and never handed out, and the zero page and the quad indices move above them. A translated shader whose
         // address arithmetic starts from a null base (a scalar or flat load the translator does not bounds-check)
@@ -11420,19 +16044,26 @@ public:
             // Under the arena's lock: an insert rebalances the tree and rewrites child links, which a walk on
             // another thread must not see half done.
             std::lock_guard lock(arena.mutex);
-            arena.blocks.reset(null_bytes + kArenaReserved, arena.size);
-            arena.first = null_bytes + kArenaReserved;
+            // LEONIDA_ADDRESS_GUARD: the guard header and sinks at [0x70000, 0x80000) are never handed out either
+            // (inside the null region when there is one, else just past the quad indices).
+            arena.first = std::max<VkDeviceSize>(null_bytes + kArenaReserved,
+                                                 address_guard_enabled() ? leonida::address_guard::kGuardEnd : 0);
+            arena.blocks.reset(arena.first, arena.size);
             char check[2] = {};
             size_t check_length = 0;
             arena.check_all = getenv_s(&check_length, check, "LEONIDA_ARENA_CHECK") == 0 && check_length > 1 &&
                               check[0] != '0';
         }
-        arena.peak_end = null_bytes + kArenaReserved;
+        arena.peak_end = arena.first;
+        if (address_guard_enabled() && !state_.create_address_guard())
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_ADDRESS_GUARD=1 but the address guard could not be set up; "
+                                 "guarded shaders check nothing\n");
         char log[4] = {};
         length = 0;
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address, arena.size);
         leonida::fsdraw::note_arena(arena.mapped, arena.size);  // LOCAL DIAGNOSTIC
+        leonida::fsdraw::backing_hook().store(&fsdraw_backing, std::memory_order_release);
         state_.context->set_zero_page(arena.buffer, null_bytes, kZeroPage);
         state_.context->set_quad_indices(arena.buffer, null_bytes + kZeroPage, kQuadIndexCount);
         // Copy only registered title data. Each immutable upload stays alive in the queue command slot
@@ -11469,6 +16100,13 @@ public:
     }
 
     ~Device() override {
+        leonida::memory_figures::withdraw_vram_reader(&state_);  // waits for a read of this device in progress
+        {
+            // Before anything goes: an exit save in progress finishes with this device first.
+            std::lock_guard lock(exit_cache_mutex);
+            std::erase(exit_cache_devices, &state_);
+        }
+        state_.close_order_log();  // the pipelines are gone by now (each held this device)
         leonida::value_sink::clear_arena(&state_);  // first: it waits for a value write into the arena in progress
         raw_images_.clear();
         geometry_refresher_.reset();  // its refresh uses state_.geometry
@@ -11489,6 +16127,7 @@ public:
             compiler_use_.release();
         }
         leonida::title_va_aliases().clear_hooks(&state_);
+        leonida::title_va_aliases().remove_listener(&state_);
         {
             std::lock_guard lock(state_.title_window_mutex);
             for (const auto& window : state_.title_windows)
@@ -11500,6 +16139,7 @@ public:
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
+                const leonida::SubmitMutex::SubmitTurn turn(state_.context->submit_mutex(), false);  // the compile gate
                 state_.context->observe_result(state_.context->vk.vkDeviceWaitIdle(state_.info.device),
                                               "vkDeviceWaitIdle");
             }
@@ -11509,12 +16149,15 @@ public:
             state_.context->set_bindless_current(nullptr);  // the retired generations go with state_.bindless below
         }
         if (state_.context) {
+            if (state_.gpu_resolver) state_.gpu_resolver->halt();  // it calls into the geometry copies
+            ShadowPages::gpu_copy = nullptr;
             state_.geometry.release(state_);
             state_.external_windows.release(state_);
             std::lock_guard upload(state_.title_upload_mutex);
             state_.title_upload.release(state_);
         }
-        state_.staging_queue.reset();  // it uses the context
+        state_.staging_queue.reset();  // they use the context
+        state_.staging_copy_queue.reset();
         if (state_.context && state_.bindless) {
             // Every texture is gone by now (each held this device), and its views with it; samplers remain.
             std::lock_guard lock(state_.descriptor_mutex);
@@ -11524,19 +16167,21 @@ public:
             state_.bindless.reset();
         }
         state_.report_arena();
+        state_.destroy_address_guard();
         if (state_.context && state_.arena.buffer) {
             leonida::fsdraw::forget_arena(state_.arena.mapped);
             auto& vk = state_.context->vk;
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
             if (state_.arena.memory) vk.vkFreeMemory(state_.info.device, state_.arena.memory, nullptr);
         }
+        state_.finish_heavy_cache();
         if (state_.pipeline_cache_handle) {
             // Nothing should be building into the cache now (the compiler's jobs for this device are gone, and so
             // is every PSO). If something is, its pipelines are half in the cache: keep the previous session file.
             if (const unsigned building = state_.active_compiles.load())
                 std::fprintf(stderr, "[rt] d3d12: %u pipeline build(s) still running at device teardown; "
                                      "pipeline_cache.session.bin not written\n", building);
-            else
+            else if (!compile_helper::build_host)
                 save_session_pipeline_cache(state_.context->vk, state_.info.device, state_.pipeline_cache_handle);
             state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
         }
@@ -11547,6 +16192,8 @@ public:
     }
 
     bool ok() const { return state_.context && state_.context->loaded(); }
+    // gta6rt --precompile-pipelines builds against the device's own state (precompile_compute_pipelines).
+    DeviceState& build_state() { return state_; }
     const VulkanDeviceInfo& info() const { return state_.info; }
     // Acceleration-structure resources work: KHR builds, or the XDXR records (which need the GPU address arena).
     bool acceleration_structures() const {
@@ -11555,6 +16202,7 @@ public:
     bool upload_in_vram() const { return state_.upload_in_vram; }
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
+    DeviceState& state() { return state_; }
     const DeviceState& state() const { return state_; }
     HRESULT create_native_graphics(const leonida::native_pso::GraphicsDesc& desc, REFIID iid, void** out) {
         const auto* shaders = state_.library();
@@ -11598,8 +16246,10 @@ public:
         auto* pipeline=new PipelineState(state_);
         pipeline->attach_device(identity());
         pipeline->set_cache_key(stream.has_cs?pipeline_key(stream.compute):pipeline_key(stream.graphics));
+        if(state_.order_log||state_.prewarm_plan) pipeline->set_order_key(order_key(stream));
         if(!rt::d3d12_xs::attach_pso_record(pipeline,std::move(record))){pipeline->Release();return E_OUTOFMEMORY;}
         pipeline->set_pending_stream(stream.has_cs);
+        pipeline->prewarm_pending_stream();
         return hand_out(pipeline,iid,out);
     }
     HRESULT shared_native_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc, D3D12_SHADER_BYTECODE mesh,
@@ -11723,8 +16373,10 @@ public:
                              d.height, unsigned(d.depth_or_array), d.format, unsigned(srv.Format), unsigned(d.mips), unsigned(written));
             if (!written && stats.refusals == refusals) refuse_title_view("no reason recorded", d, address);
             if (!written) ++stats.null_views;
-            if (stats.views == 64 || !(stats.views % 2048)) log_title_census("slot-70 texture views");
+            if (leonida::fsdraw::enabled() && (stats.views == 64 || !(stats.views % 2048)))
+                log_title_census("slot-70 texture views");
         }
+        state_.drain_titles_gone();
         return written;
     }
 
@@ -11819,6 +16471,8 @@ public:
             }
             auto& slot = state_.title_textures[address];
             if (slot && slot->owned) retire_title_texture(*slot);
+            state_.mapped_title_textures.erase(address);
+            state_.index_texture(*entry);
             slot = std::move(entry);
             ++title_stats_.registered;
         }
@@ -11858,21 +16512,29 @@ public:
         std::unique_lock lock(state_.title_texture_mutex, std::try_to_lock);
         if (!lock.owns_lock()) return;  // a slot-70 view is filling one; next time
         title_refreshed_.store(ticks, std::memory_order_relaxed);
-        const InTitleTextures inside;
+        std::optional<InTitleTextures> inside(std::in_place);
         TitleTextureStats& stats = title_stats_;
         ++stats.passes;
-        // A fill this pass makes can submit, and a submission destroys a retired image, whose destructor erases its
-        // registry entry (title_texture_gone). The registry mutex is recursive for its owner on Windows, so that
-        // erase lands inside this pass: every walk below visits a snapshot, never an iterator into the registry.
-        const auto entries = leonida::title_texture_snapshot(state_.title_textures);
+        // A fill this pass makes can submit, and a submission destroys a retired image, whose destructor reaches
+        // title_texture_gone while this thread holds the registry mutex: the entry stops naming the resource and is
+        // erased by drain_titles_gone after the pass. Every walk below visits a snapshot, never an iterator into the
+        // registry, and skips an entry without a resource.
+        // The worker gives journal hits priority. Rotate a small slice for direct writes with no notification.
+        const bool async = async_texture_refresh();
+        const auto entries = async ? leonida::title_texture_snapshot(state_.title_textures, title_slice_, 128)
+                                   : leonida::title_texture_snapshot(state_.title_textures);
+        if (async) title_slice_ = entries.size() == 128 ? entries.back().first + 1 : 0;
         title_pass_ = true;
+        title_partial_bytes_ = 0;
+        for (const auto& entry : entries)
+            if (entry.second->fills && entry.second->filled_from) title_partial_bytes_ += entry.second->backing_bytes;
         std::uint64_t checked = 0, filled = 0, fill_pass_ns = 0;
         const auto visit = [&](TitleTexture& t) {
             // A slot-133 texture's guessed layout (no slot-70 view yet) is only used once the title maps it.
             if (t.gpu_written || !t.layout_known || !t.resource ||
                 ((t.layout_guessed || t.layout_from_xg) && !t.mapped && !t.stale))
                 return;
-            const std::uint64_t span = t.layout.layout.size;
+            std::uint64_t span = fill_bytes(t);
             const bool always = t.mapped && refresh_mapped_pages();
             // Out of this pass's fill budget (bytes or time): a texture known to need a fill (stale) waits for the
             // next pass unprobed and unhashed; hashing it now would only find it changed again (measured: 10,000
@@ -11886,20 +16548,54 @@ public:
             }
             std::uint64_t hash = 0;
             if (!title_texture_readable(t)) return;
-            checked += hashed_bytes(span);
+            span = fill_bytes(t);  // the probe may have found more mips, or fewer
+            const bool full_mapped = async && always;
+            checked += full_mapped ? span : hashed_bytes(span);
             ++stats.checked;
             const auto* bytes = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(t.cpu));
             const auto timed_hash = [&](std::uint64_t& out, bool all = false) {
                 const auto start = clock::now();
-                const bool ok = hash_guarded(bytes, std::size_t(span), out, all);
+                // Every byte of write-combined memory goes through a streaming copy (copy_guarded): ordinary loads
+                // from it are not cached, and hashing a 4 MiB mapped texture in place took 36 ms on average and up to
+                // 78 ms each sixth pass, one to two frames of a title that paces itself for 30 Hz.
+                bool ok;
+                if (all && title_memory_write_combined(t.cpu)) {
+                    title_tiled_.resize(std::size_t(span));
+                    ok = copy_guarded(title_tiled_.data(), bytes, std::size_t(span), true) &&
+                         hash_guarded(title_tiled_.data(), std::size_t(span), out, true);
+                } else {
+                    ok = hash_guarded(bytes, std::size_t(span), out, all);
+                }
                 stats.hash_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
                 return ok;
             };
-            if (!timed_hash(hash)) {
+            if (full_mapped) {
+                // Direct writes through a persistent Map have no journal entry. Check every byte on the
+                // worker. A large mapped plane must not hold up view creation while its hash is computed.
+                const auto address = t.address, fills = t.fills;
+                const auto start = clock::now();
+                title_pass_ = false;
+                lock.unlock();
+                const bool ok = hash_guarded(bytes, std::size_t(span), hash, true);
+                lock.lock();
+                title_pass_ = true;
+                stats.hash_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
+                const auto it = state_.title_textures.find(address);
+                if (it == state_.title_textures.end() || it->second.get() != &t || !t.resource ||
+                    !t.layout_known || fill_bytes(t) != span || t.fills != fills) return;
+                ++stats.mapped_checks;
+                if (!ok) {
+                    t.memory.defer();
+                    t.stale = true;
+                    return;
+                }
+                if (t.hashed && t.full_hashed && t.full_hash == hash && !t.stale) return;
+                ++stats.mapped_changed;
+            } else if (!timed_hash(hash)) {
                 t.memory.defer();
                 return;
             }
-            if (t.hashed && hash == t.hash && !t.stale) {
+            if (!full_mapped && t.hashed && hash == t.hash && !t.stale) {
                 if (!t.every_byte() || stats.passes % 6) return;
                 std::uint64_t full = 0;
                 checked += span;
@@ -11916,7 +16612,10 @@ public:
                 return;
             }
             const auto fill_start = clock::now();
-            filled += fill_title_texture(t, false);
+            const auto uploaded = fill_title_texture(t, false);
+            filled += uploaded;
+            if (full_mapped && uploaded) ++stats.mapped_fills;
+            if (async && t.stale) queue_title_fill(t.address);  // generic staging needs an outer fill
             const std::uint64_t fill_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - fill_start).count();
             stats.fill_ns += fill_ns;
@@ -11942,34 +16641,99 @@ public:
         if (!written.empty() || overflow || map_all || !title_map_changes_.empty()) {
             stats.written_ranges += written.size();
             leonida::merge_title_writes(written);
-            for (const auto& entry : entries) {
-                TitleTexture& t = *entry.second;
-                if (t.gpu_written || !t.layout_known) continue;
-                const std::uint64_t begin = t.cpu, end = t.cpu + t.layout.layout.size;
-                if (map_all || leonida::title_write_overlaps(title_map_changes_, begin, end)) t.memory.retry();
-                if (leonida::title_write_overlaps(written, begin, end)) {
-                    t.memory.retry();
+            const auto invalidate = [&](TitleTexture& t, bool write, bool remapped) {
+                if (t.gpu_written || !t.layout_known) return;
+                t.memory.retry();
+                // Pages that came without a noted write: a texture not filled, or not all of it, is filled in this
+                // pass's round of stale ones; the sweep reached it many passes later.
+                if (partial_mips() && remapped && !t.stale && t.resource && !t.layout_guessed &&
+                    !t.layout_from_xg && (!t.fills || t.filled_from) && title_texture_readable(t) &&
+                    (!t.fills || t.readable_from < t.filled_from))
                     t.stale = true;
+                if (write) t.stale = true;
+                if (overflow) t.hashed = false;
+            };
+            if (!async || overflow || map_all) {
+                // No fills or callbacks during invalidation; registry iterators stay valid.
+                for (const auto& [key, ptr] : state_.title_textures) {
+                    auto& t = *ptr;
+                    const auto end = t.cpu + t.layout.layout.size;
+                    const bool write = leonida::title_write_overlaps(written, t.cpu, end);
+                    const bool remapped = leonida::title_write_overlaps(title_map_changes_, t.cpu, end);
+                    if (write || map_all || overflow || remapped) invalidate(t, write, remapped || map_all);
                 }
-                if (overflow) {
-                    t.memory.retry();
-                    t.hashed = false;
-                }
+            } else {
+                const auto apply = [&](const auto& ranges, bool write) {
+                    for (const auto& [from, to] : ranges)
+                        state_.texture_ranges.overlapping(from, to, [&](auto key) {
+                            auto& t = *state_.title_textures.at(key);
+                            invalidate(t, write, !write);
+                            if (t.stale) queue_title_fill(key);
+                        });
+                };
+                apply(title_map_changes_, false);
+                apply(written, true);
             }
         }
         const auto every_start = clock::now();
         stats.written_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(every_start - now).count();
-        for (const auto& entry : entries)
-            if (entry.second->mapped || entry.second->stale) {
+        // LEONIDA_TITLE_EVERY_BUDGET_US (0, the default: no limit, as before) limits the synchronous pass, the one that
+        // runs before a submission on the title's submitting thread: the mapped and stale textures are visited for at
+        // most this long a pass, in address order from where the last pass stopped, instead of all of them every pass
+        // (thousands during a streaming burst on retail, 30-75 ms a pass). The texture that crosses the limit is
+        // finished; one not reached keeps its mark and waits for a later pass. With LEONIDA_TEXTURE_REFRESH_ASYNC the
+        // pass runs on the refresh worker, and the limit does not apply.
+        static const std::uint64_t every_budget_us = setting("LEONIDA_TITLE_EVERY_BUDGET_US", 0);
+        if (async) {
+            // Poll every persistent mapping each pass, independently of the bounded stale sweep.
+            const auto mapped = leonida::title_texture_snapshot(state_.mapped_title_textures);
+            for (const auto& [address, entry] : mapped) {
+                if (!entry->resource) continue;
+                const auto it = state_.title_textures.find(address);
+                if (it == state_.title_textures.end() || it->second != entry) continue;
                 ++stats.every_pass_visits;
-                visit(*entry.second);
+                visit(*entry);
             }
+            for (const auto& entry : entries)
+                if (!entry.second->mapped && entry.second->stale) {
+                    const auto it = state_.title_textures.find(entry.first);
+                    if (it == state_.title_textures.end() || it->second != entry.second) continue;
+                    ++stats.every_pass_visits;
+                    visit(*entry.second);
+                }
+        } else if (!every_budget_us) {
+            for (const auto& entry : entries)
+                if (entry.second->mapped || entry.second->stale) {
+                    ++stats.every_pass_visits;
+                    visit(*entry.second);
+                }
+        } else {
+            leonida::visit_marked_title_textures(
+                entries, title_every_cursor_,
+                [&](TitleTexture& t) {
+                    ++stats.every_pass_visits;
+                    visit(t);
+                },
+                // A mapped texture never filled yet does not wait for its turn: the title has written it and the GPU
+                // has nothing of it (a video plane of #1827 would show frozen until its turn came).
+                [](const TitleTexture& t) { return t.mapped && !t.fills; },
+                [&] { return clock::now() - every_start >= std::chrono::microseconds(every_budget_us); });
+        }
         stats.every_pass_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - every_start).count();
-        // The budget is the round robin's: mapped and stale textures above are checked every pass whatever it is.
+        // The budget is the round robin's: mapped and stale textures above are checked every pass whatever it is
+        // (unless LEONIDA_TITLE_EVERY_BUDGET_US limits them).
         const auto first_bytes = checked, first_hash_ns = stats.hash_ns;
         if (check_budget) {
             const auto sweep_start = clock::now();
-            leonida::poll_title_textures(entries, title_refresh_cursor_, visit, [&] {
+            // The normal hash sweep has its own cursor: a byte/time cutoff in a slice must not
+            // skip the remainder next time just because the stale-texture sweep moved ahead.
+            decltype(leonida::title_texture_snapshot(state_.title_textures)) background;
+            if (async) {
+                if (!state_.title_textures.empty() && title_refresh_cursor_ > state_.title_textures.rbegin()->first)
+                    title_refresh_cursor_ = 0;
+                background = leonida::title_texture_snapshot(state_.title_textures, title_refresh_cursor_, 128);
+            }
+            leonida::poll_title_textures(async ? background : entries, title_refresh_cursor_, visit, [&] {
                 if (checked - first_bytes >= check_budget ||
                     (hash_budget_us && (stats.hash_ns - first_hash_ns) / 1000 >= hash_budget_us)) return true;
                 if (!sweep_budget_us) return false;
@@ -11993,20 +16757,33 @@ public:
         stats.max_refresh_ns = std::max(stats.max_refresh_ns, pass_ns);
         if (now - stats.last_log >= std::chrono::seconds(10)) {
             stats.last_log = now;
-            log_title_census("refresh");
+            if (async) {
+                std::fprintf(stderr, "[rt] async texture refresh: %llu mapped checks, %llu changed or stale, %llu uploaded in pass\n",
+                             static_cast<unsigned long long>(stats.mapped_checks),
+                             static_cast<unsigned long long>(stats.mapped_changed),
+                             static_cast<unsigned long long>(stats.mapped_fills));
+                stats.mapped_checks = stats.mapped_changed = stats.mapped_fills = 0;
+            }
+            if (leonida::fsdraw::enabled()) log_title_census("refresh");
         }
+        inside.reset();
         lock.unlock();
+        state_.drain_titles_gone();
         for (Resource* r : release) r->Release();
     }
 
 private:
     struct TitleTextureStats {
+        std::uint64_t mapped_checks = 0, mapped_changed = 0, mapped_fills = 0;
         // (format, Layout word, dimension, mips) of the slot-70 texture views -> views
         std::map<std::array<std::uint32_t, 4>, std::uint64_t> asked;
         std::map<std::string, std::uint64_t> refused;  // why a view is a null view -> views
         std::uint64_t views = 0, null_views = 0, of_slot133 = 0, of_cache = 0, made = 0, retired = 0, registered = 0,
                       refusals = 0, written_ranges = 0, unmaps = 0, unreadable = 0, pending_views = 0;
         std::uint64_t fills = 0, fill_bytes = 0, fill_failures = 0;
+        // Fills of some mips only; textures whose first fill was one; those that got larger mips later; first fills
+        // refused by LEONIDA_TITLE_PARTIAL_MIPS_MB.
+        std::uint64_t partial_fills = 0, partial_textures = 0, partial_upgrades = 0, partial_refused = 0;
         std::uint64_t staged_fills = 0, staged_ns = 0;
         // refresh_title_textures, since the last log line
         std::uint64_t passes = 0, checked = 0, hashed = 0, changed = 0, deferred = 0, filled_bytes = 0,
@@ -12042,7 +16819,7 @@ private:
         std::condition_variable wake;
         std::deque<std::uint64_t> queue;  // texture addresses
         std::unordered_set<std::uint64_t> queued;
-        bool stop = false;
+        bool stop = false, refresh = false;
         std::thread thread;
         std::uint64_t filled = 0, skipped = 0;
         std::vector<std::uint8_t> tiled;      // the worker's own snapshot of a texture's bytes (fill_unlocked)
@@ -12058,12 +16835,49 @@ private:
     };
     std::unique_ptr<TitleFiller> title_filler_;
     std::once_flag title_filler_once_;
-    void queue_title_fill(std::uint64_t address) {
+    void start_title_filler() {
         std::call_once(title_filler_once_, [this] {
             title_filler_ = std::make_unique<TitleFiller>();
             TitleFiller* f = title_filler_.get();
             f->thread = std::thread([this, f] { run_title_filler(*f); });
         });
+    }
+    // LEONIDA_TEXTURE_REFRESH_ASYNC=1, before a submission: a mapped texture that has never been filled (a video plane
+    // the title maps, writes and draws right away) is filled here, on the submitting thread, so its first draw does not
+    // sample an empty image while the worker has not come to it yet. Everything else stays on the worker. Only when
+    // the registry is free: the worker may hold it for a fill that needs this queue, so waiting here could deadlock.
+    void fill_first_mapped_textures() {
+        std::unique_lock lock(state_.title_texture_mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return;
+        std::vector<std::shared_ptr<TitleTexture>> first;
+        for (const auto& [address, t] : state_.mapped_title_textures)
+            if (t->resource && !t->fills && !t->gpu_written && t->layout_known) first.push_back(t);
+        if (first.empty()) return;
+        {
+            const InTitleTextures inside;
+            for (const auto& t : first) {
+                // A fill can submit and retire an image (title_texture_gone): look each one up again.
+                const auto it = state_.title_textures.find(t->address);
+                if (it == state_.title_textures.end() || it->second != t || !t->resource || t->fills) continue;
+                fill_title_texture(*t, false);
+                if (t->stale) queue_title_fill(t->address);  // generic staging needs an outer fill (the worker's)
+            }
+        }
+        lock.unlock();
+        state_.drain_titles_gone();
+    }
+
+    void request_title_refresh() {
+        {
+            // A busy queue can take the next submission's request. Dirty entries stay on the worker.
+            std::unique_lock lock(title_filler_->mutex, std::try_to_lock);
+            if (!lock.owns_lock() || title_filler_->refresh) return;
+            title_filler_->refresh = true;
+        }
+        title_filler_->wake.notify_one();
+    }
+    void queue_title_fill(std::uint64_t address) {
+        start_title_filler();
         {
             std::lock_guard lock(title_filler_->mutex);
             if (!title_filler_->queued.insert(address).second) return;
@@ -12076,14 +16890,21 @@ private:
         auto since = clock::now();
         for (;;) {
             std::uint64_t address = 0;
+            bool refresh = false, fill = false;
             {
                 std::unique_lock lock(f.mutex);
-                f.wake.wait(lock, [&] { return f.stop || !f.queue.empty(); });
+                f.wake.wait(lock, [&] { return f.stop || f.refresh || !f.queue.empty(); });
                 if (f.stop) return;
-                address = f.queue.front();
-                f.queue.pop_front();
-                f.queued.erase(address);
+                refresh = std::exchange(f.refresh, false);
+                fill = !f.queue.empty();
+                if (fill) {
+                    address = f.queue.front();
+                    f.queue.pop_front();
+                    f.queued.erase(address);
+                }
             }
+            if (refresh) refresh_title_textures();
+            if (!fill) continue;
             bool filled = false;
             // A staged texture is filled without the registry lock (the title's threads creating views wait for
             // it: speed-31, 12 % of the main thread): its bytes, layout and resource are taken under the lock, the
@@ -12092,6 +16913,7 @@ private:
             Resource* r = nullptr;
             rt::xg_xs::Texture layout{};
             std::uint64_t cpu = 0, fills = 0;
+            unsigned from = 0;
             bool every_byte = false;
             {
                 std::lock_guard lock(state_.title_texture_mutex);
@@ -12108,15 +16930,17 @@ private:
                             layout = t.layout;
                             cpu = t.cpu;
                             fills = t.fills;
+                            from = fill_from(t);
                             every_byte = t.every_byte();
                         } else {
                             filled = fill_title_texture(t, true) != 0;
+                            if (!filled) t.stale = true;
                         }
                     }
                 }
             }
             if (r) {
-                filled = fill_unlocked(address, *r, layout, cpu, fills, every_byte, f);
+                filled = fill_unlocked(address, *r, layout, cpu, fills, from, every_byte, f);
                 r->Release();
             }
             std::size_t left = 0;
@@ -12140,8 +16964,8 @@ private:
     // The fill worker's fill of a staged texture: copy, hash and upload without the registry lock, then the result
     // under it, if the registry still names `r` at `address` and nobody filled it meanwhile.
     bool fill_unlocked(std::uint64_t address, Resource& r, const rt::xg_xs::Texture& layout, std::uint64_t cpu,
-                       std::uint64_t fills, bool every_byte, TitleFiller& f) {
-        const std::uint64_t span = layout.layout.size;
+                       std::uint64_t fills, unsigned from, bool every_byte, TitleFiller& f) {
+        const std::uint64_t span = rt::xg_xs::mip_chain_bytes(layout, from);
         f.tiled.resize(std::size_t(span));
         const bool copied = copy_guarded(f.tiled.data(), reinterpret_cast<const std::uint8_t*>(cpu), std::size_t(span),
                                          title_memory_write_combined(cpu));
@@ -12152,7 +16976,7 @@ private:
             hash_guarded(f.tiled.data(), f.tiled.size(), hash);
             full_hashed = every_byte && hash_guarded(f.tiled.data(), f.tiled.size(), full, true);
             const auto start = std::chrono::steady_clock::now();
-            ok = r.upload_staged_title(layout, f.tiled.data(), f.columns, false, nonzero);
+            ok = r.upload_staged_title(layout, f.tiled.data(), f.columns, false, nonzero, from);
             staged_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
                             .count();
         }
@@ -12175,7 +16999,7 @@ private:
         }
         ++title_stats_.staged_fills;
         if (t.fills != fills) return true;  // another fill recorded itself in between: its hash is as good
-        if (t.owned && !t.fills) r.publish_streamed_texture();
+        note_filled_from(t, from);
         t.hash = hash;
         t.hashed = true;
         t.full_hash = full;
@@ -12225,11 +17049,14 @@ private:
         }
         geometry_refresher_->wake.notify_one();
     }
+    std::uint64_t title_slice_ = 0;  // next registry slice on the async worker
     std::uint64_t title_refresh_cursor_ = 0;                       // under title_texture_mutex
+    std::uint64_t title_every_cursor_ = 0;                         // likewise: LEONIDA_TITLE_EVERY_BUDGET_US's resume point
     std::uint64_t title_map_generation_ = 0;                       // likewise: the map changes the passes have seen
     std::chrono::steady_clock::time_point title_retry_all_{};      // likewise
     leonida::TitleWriteRanges title_map_changes_;                  // likewise, scratch
     VkDeviceSize retired_backing_ = 0;
+    VkDeviceSize title_partial_bytes_ = 0;  // likewise: image memory of the textures filled in part, as of this pass
     std::vector<std::pair<std::chrono::steady_clock::time_point, Resource*>> retired_title_textures_;  // likewise
     std::vector<std::uint8_t> title_tiled_, title_linear_;         // scratch, under title_texture_mutex
     std::vector<std::uint64_t> title_columns_;
@@ -12295,8 +17122,10 @@ private:
             return written;
         };
         auto& textures = state_.title_textures;
+        const unsigned view_mip = srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D ? srv.Texture2D.MostDetailedMip : 0;
         const auto it = textures.find(address);
-        TitleTexture* t = it == textures.end() ? nullptr : it->second.get();
+        // An entry without a resource is one destroyed inside the registry, waiting for drain_titles_gone.
+        TitleTexture* t = it == textures.end() || !it->second->resource ? nullptr : it->second.get();
         if (!t || !TitleGpuPlacements<Resource>::matches(d, *t->resource)) {
             if (Resource* gpu = matching_gpu_placement(d, address)) {
                 ++title_stats_.of_slot133;
@@ -12320,6 +17149,7 @@ private:
                     t->layout = layout;
                     t->desc = words;
                     t->layout_known = true;
+                    state_.index_texture(*t);
                     t->layout_guessed = t->layout_from_xg = false;
                     t->hashed = false;
                 } else {
@@ -12338,13 +17168,18 @@ private:
                        rt::xg_xs::format_info(t->desc[8]).side == rt::xg_xs::format_info(words[8]).side;
             }();
             retire_title_texture(*t);
+            state_.texture_ranges.erase(address);
             textures.erase(address);
-            t = make_title_texture(d, words, srv, address, same_shape ? formats : std::vector<DXGI_FORMAT>{});
+            t = make_title_texture(d, words, srv, address, view_mip, same_shape ? formats : std::vector<DXGI_FORMAT>{});
         } else if (t) {
             ++title_stats_.of_cache;
+            if (t->view_mip != view_mip) {
+                t->view_mip = view_mip;
+                if (!t->fills) t->memory.retry();  // what is readable may do for this view
+            }
             refresh_title_texture(*t);
         } else {
-            t = make_title_texture(d, words, srv, address, {});
+            t = make_title_texture(d, words, srv, address, view_mip, {});
         }
         return t && write(*t);
     }
@@ -12358,7 +17193,7 @@ private:
 
     TitleTexture* make_title_texture(const rt::xg_xs::ResourceDesc& d, const std::array<std::uint32_t, 14>& words,
                                      const D3D12_SHADER_RESOURCE_VIEW_DESC& srv, std::uint64_t address,
-                                     std::vector<DXGI_FORMAT> formats) {
+                                     unsigned view_mip, std::vector<DXGI_FORMAT> formats) {
         namespace xg = rt::xg_xs;
         if (d.flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
@@ -12368,11 +17203,10 @@ private:
         auto entry = std::make_shared<TitleTexture>();
         const char* why = nullptr;
         if (!title_layout(d, entry->layout, why)) return refuse_title_view(why, d, address), nullptr;
-        const std::uint64_t span = entry->layout.layout.size;
         entry->cpu = leonida::title_gpu_views::to_cpu(address);
         // A streamed texture can have views before its pages arrive. Keep the descriptor stable across its first fill.
         entry->memory.check(0, check_pages_before_read(),
-                            [&] { return probe_title_memory(entry->cpu, span, false); });
+                            [&] { return probe_title_texture(*entry, false); });
         title_stats_.unreadable += entry->memory.pending();
         // The image takes the view's format too when the element is the same size (five-star-recomp does the same);
         // views in other formats of the same description add theirs (place_title_view).
@@ -12430,15 +17264,20 @@ private:
         entry->set_resource(r);
         entry->owned = true;
         entry->formats = std::move(formats);
+        entry->view_mip = view_mip;
+        if (entry->memory.pending() && entry->readable_from <= fill_limit(*entry))
+            entry->memory.retry();  // some mips do for this view
+        const bool readable = title_texture_readable(*entry);
         if (title_fill_async()) {
             entry->stale = true;  // filled by the fill worker (queued below, once it is in the registry)
-        } else if (!entry->memory.pending()) {
+        } else if (readable) {
             fill_title_texture(*entry, true);
         }
         ++title_stats_.made;
         TitleTexture* t = entry.get();
+        state_.index_texture(*entry);
         state_.title_textures[address] = std::move(entry);
-        if (title_fill_async() && !t->memory.pending()) queue_title_fill(address);
+        if (title_fill_async() && readable) queue_title_fill(address);
         return t;
     }
 
@@ -12451,6 +17290,49 @@ private:
         retired_title_textures_.emplace_back(std::chrono::steady_clock::now(), t.resource);
         t.resource = nullptr;
         ++title_stats_.retired;
+    }
+
+    // LEONIDA_TITLE_PARTIAL_MIPS=1 (off by default). A slot-70 2D texture whose larger mips are not readable is filled from the
+    // first mip that is, with every smaller one, when its last view starts there or later. The T#s of views that start
+    // above stay on the fallback (PendingImage::first_mip), so no shader samples a mip that was not filled. Larger
+    // mips come with a later fill; one whose filled mips are gone keeps them.
+    // shortcut: the image has memory for every mip, LEONIDA_TITLE_PARTIAL_MIPS_MB in all; make it without the missing
+    // mips when that limit is what keeps textures on the fallback.
+    static bool partial_mips() {
+        static const bool enabled = [] {
+            const char* v = std::getenv("LEONIDA_TITLE_PARTIAL_MIPS");
+            return v && std::strcmp(v, "1") == 0;
+        }();
+        return enabled;
+    }
+    static VkDeviceSize partial_mips_budget() {
+        static const VkDeviceSize bytes = [] {
+            const char* v = std::getenv("LEONIDA_TITLE_PARTIAL_MIPS_MB");
+            return VkDeviceSize(v && *v ? std::strtoull(v, nullptr, 10) : 2048) << 20;
+        }();
+        return bytes;
+    }
+    // Only an image whose T#s are published with its fills (deferred_stream) may hold a part of its mips.
+    static bool partial_texture(const TitleTexture& t) {
+        return partial_mips() && t.owned && t.resource && t.resource->deferred_stream() &&
+               t.layout.layout.dimension == rt::xg_xs::kTexture2D && t.layout.array == 1;
+    }
+    // The largest first mip a fill may start at: what is filled already is never left half old.
+    static unsigned fill_limit(const TitleTexture& t) {
+        if (!partial_texture(t)) return 0;
+        return t.fills ? t.filled_from : std::min(t.view_mip, t.layout.layout.mips - 1);
+    }
+    static unsigned fill_from(const TitleTexture& t) { return std::min(t.readable_from, fill_limit(t)); }
+    static std::uint64_t fill_bytes(const TitleTexture& t) { return rt::xg_xs::mip_chain_bytes(t.layout, fill_from(t)); }
+
+    // After an upload of the mips from `from` on, before ++t.fills.
+    void note_filled_from(TitleTexture& t, unsigned from) {
+        if (t.owned && (!t.fills || from < t.filled_from)) t.resource->publish_streamed_texture(from);
+        title_stats_.partial_fills += from != 0;
+        title_stats_.partial_textures += from && !t.fills;
+        title_stats_.partial_upgrades += t.fills && from < t.filled_from;
+        if (from && !t.fills) title_partial_bytes_ += t.backing_bytes;
+        t.filled_from = from;
     }
 
     static bool texture_probe() {
@@ -12477,11 +17359,13 @@ private:
         return enabled;
     }
 
-    // texture_memory_readable, timed and counted (TitleTextureStats::probes).
-    bool probe_title_memory(std::uint64_t cpu, std::uint64_t span, bool waited,
-                            leonida::TexturePageCommitter commit = nullptr) {
+    // texture_memory_readable_bytes, timed and counted (TitleTextureStats::probes).
+    // True when a fill can use what is readable; t.readable_from says what that is.
+    bool probe_title_texture(TitleTexture& t, bool waited, leonida::TexturePageCommitter commit = nullptr) {
         const auto start = std::chrono::steady_clock::now();
-        const bool readable = leonida::texture_memory_readable(cpu, span, commit);
+        t.readable_from = rt::xg_xs::first_mip_within(
+            t.layout, leonida::texture_memory_readable_bytes(std::uintptr_t(t.cpu), t.layout.layout.size, commit));
+        const bool readable = t.readable_from <= fill_limit(t);
         const std::size_t where = title_pass_ ? 0 : 1;
         TitleTextureStats& s = title_stats_;
         s.probe_ns[where] += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -12497,12 +17381,14 @@ private:
         const bool guard = check_pages_before_read();
         if (!guard && !t.memory.pending()) return true;
         const bool mapped = t.mapped && refresh_mapped_pages();
+        if (!title_pass_ && guard && !mapped)
+            t.memory.sync_map(title_map_generation_, static_cast<std::uintptr_t>(t.cpu), t.layout.layout.size);
         const auto commit = mapped ? leonida::kernel_writes::state().committer.load(std::memory_order_acquire) : nullptr;
         const bool waited = t.memory.pending();
         // The answer is kept (generation 0) until a map change over the texture, a write into it or the periodic
         // retry of refresh_title_textures asks again.
         return t.memory.check(0, guard && !mapped,
-                              [&] { return probe_title_memory(t.cpu, t.layout.layout.size, waited, commit); },
+                              [&] { return probe_title_texture(t, waited, commit); },
                               guard && !mapped);
     }
 
@@ -12529,14 +17415,15 @@ private:
         std::uint64_t hash = 0;
         if (!title_texture_readable(t)) return;
         if (!hash_guarded(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(t.cpu)),
-                          std::size_t(t.layout.layout.size), hash)) {
+                          std::size_t(fill_bytes(t)), hash)) {
             t.memory.defer();
             return;
         }
         if (!t.hashed || hash != t.hash || t.stale) fill_title_texture(t, true);
     }
 
-    // Snapshot the whole footprint before uploading any subresource. A concurrent unmap defers the fill.
+    // Snapshot the footprint (that of the mips the fill is for) before uploading any subresource. A concurrent unmap
+    // defers the fill.
     // Private title staging bypasses the D3D12 submit callbacks. Generic staged copies require an outer fill.
     std::uint64_t fill_title_texture(TitleTexture& t, bool staged) {
         const rt::xg_xs::Texture& layout = t.layout;
@@ -12547,8 +17434,14 @@ private:
                     t.stale = true;
                     return 0;
                 }
-        const std::uint64_t span = layout.layout.size;
         if (!title_texture_readable(t)) return 0;
+        const unsigned from = fill_from(t);
+        const std::uint64_t span = fill_bytes(t);
+        if (from && t.unbound_bytes && title_partial_bytes_ + t.unbound_bytes > partial_mips_budget()) {
+            ++title_stats_.partial_refused;
+            t.stale = false;  // the sweep and its views ask again
+            return 0;
+        }
         title_tiled_.resize(std::size_t(span));
         if (!copy_guarded(title_tiled_.data(), reinterpret_cast<const std::uint8_t*>(t.cpu), std::size_t(span),
                           title_memory_write_combined(t.cpu))) {
@@ -12580,14 +17473,14 @@ private:
         bool ok = true;
         if (t.resource->staged_title()) {
             const auto start = std::chrono::steady_clock::now();
-            ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, trace_pool, nonzero);
+            ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, trace_pool, nonzero, from);
             title_stats_.staged_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start).count();
             if (ok) ++title_stats_.staged_fills;
             if (!ok) log_once("staged title texture upload failed, format", int(t.resource->format()));
         } else {
             for (std::uint32_t slice = 0; slice < slices && ok; ++slice) {
-                for (std::uint32_t level = 0; level < mips && ok; ++level) {
+                for (std::uint32_t level = from; level < mips && ok; ++level) {
                     const auto& mip = layout.layout.plane[0].mips[level];
                     const std::uint32_t row_pitch = mip.width_elements * layout.format.bytes;
                     const std::uint32_t slice_pitch = row_pitch * mip.height_elements;
@@ -12615,7 +17508,7 @@ private:
             std::fprintf(stderr, "[rt] ds-pool-fill cpu=%llx size=%llu staged=%d nonzero=%d\n",
                          static_cast<unsigned long long>(t.cpu), static_cast<unsigned long long>(span),
                          int(staged), int(nonzero));
-        if (t.owned && !t.fills) t.resource->publish_streamed_texture();
+        note_filled_from(t, from);
         t.hash = hash;
         t.hashed = true;
         t.stale = false;
@@ -12682,7 +17575,7 @@ private:
         VkDeviceSize owned_bytes = 0, placed_bytes = 0, host_heap_bytes = 0;
         for (const auto& [address, t] : state_.title_textures) {
             (t->owned ? owned : slot133) += 1;
-            if (!t->owned && t->unbound_bytes) t->set_resource(t->resource);
+            if (!t->owned && t->resource && t->unbound_bytes) t->set_resource(t->resource);
             mapped += t->mapped;
             filled += t->fills > 0;
             (t->owned ? owned_bytes : placed_bytes) += t->backing_bytes;
@@ -12710,6 +17603,24 @@ private:
                      static_cast<unsigned long long>(s.registered), mapped, filled,
                      static_cast<unsigned long long>(s.fills), double(s.fill_bytes) / 1048576.0,
                      static_cast<unsigned long long>(s.fill_failures));
+        if (s.partial_fills || s.partial_refused) {
+            std::size_t now = 0;
+            VkDeviceSize held = 0, used = 0;
+            for (const auto& [address, t] : state_.title_textures)
+                if (t->fills && t->filled_from) {
+                    ++now;
+                    held += t->backing_bytes;
+                    used += rt::xg_xs::mip_chain_bytes(t->layout, t->filled_from);
+                }
+            std::fprintf(stderr, "[rt] d3d12: title textures filled in part: %zu now (%.1f MiB of image memory, %.1f MiB "
+                                 "filled), %llu in all, %llu partial fills, %llu got larger mips later, %llu refused by "
+                                 "LEONIDA_TITLE_PARTIAL_MIPS_MB\n",
+                         now, double(held) / 1048576.0, double(used) / 1048576.0,
+                         static_cast<unsigned long long>(s.partial_textures),
+                         static_cast<unsigned long long>(s.partial_fills),
+                         static_cast<unsigned long long>(s.partial_upgrades),
+                         static_cast<unsigned long long>(s.partial_refused));
+        }
         const auto host = state_.context->host_texture_stats();
         std::fprintf(stderr, "[rt] d3d12: ordered title host copies %llu, GPU waits %llu; "
                              "slot-70 views awaiting readable memory: %llu\n",
@@ -13678,9 +18589,10 @@ public:
         if (FAILED(parsed)) return finish(parsed);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
+        if (state_.order_log || state_.prewarm_plan) pipeline->set_order_key(order_key(stream));
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
                                          : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as,
-                                                                     stream.back_masks ? &stream.back_stencil : nullptr);
+                                                                     stream.back_masks ? &stream.back_stencil : nullptr, stream.depth_bounds);
         if (FAILED(hr)) {
             pipeline->Release();
             return finish(hr);
@@ -13958,8 +18870,7 @@ public:
             words[3] = 0x0002403Cu;
         }
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
-        // LOCAL DIAGNOSTIC: the CBVs the title makes, where they go and what V# they get
-        if (leonida::local_diagnostics()) {
+        if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC: the CBVs the title makes, where they go and what V# they get
             static std::atomic<std::uint64_t> made{0};
             const std::uint64_t n = ++made;
             if (n <= 8 || n % 600 == 0 || n % 600 == 1)
@@ -14164,8 +19075,7 @@ public:
             }
         }
         write_image_descriptor(*r, view, destination, ImageViewUse::sampled);
-        // LOCAL DIAGNOSTIC: the texture SRVs the title makes, where they go and the T# they get
-        if (leonida::local_diagnostics()) {
+        if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC: the texture SRVs the title makes, where they go and the T# they get
             static std::atomic<std::uint64_t> made{0};
             const std::uint64_t n = ++made;
             if (n <= 8 || n % 600 == 0 || n % 600 == 1) {
@@ -14375,7 +19285,7 @@ public:
                 return;
             }
             const Resource* storage = r->depth_stencil_uav(view.plane);
-            const bool raw_narrow = storage && r->desc().Format == xbox_d16s8 && view.plane == 0 &&
+            const bool raw_narrow = storage && (r->desc().Format == xbox_d16s8 || r->console_d16s8()) && view.plane == 0 &&
                                     (view.format == DXGI_FORMAT_R16_UINT ||
                                      (storage->desc().Format == DXGI_FORMAT_R16_TYPELESS && view.format == DXGI_FORMAT_R16_UNORM));
             if (!storage || (!raw_narrow && view.format != storage->desc().Format)) {
@@ -14805,7 +19715,7 @@ public:
     // imported, or a shadow copied from them before every submission) and kept until the device goes, up to
     // LEONIDA_TITLE_BUFFERS_MB (512 by default).
     void make_title_buffer(std::uint64_t va, std::uint64_t bytes) {
-        if (!state_.context) return;
+        if (!&context()) return;
         static const bool check_size = [] {
             wchar_t flag[2]{};
             return !(GetEnvironmentVariableW(L"LEONIDA_TITLE_BUFFER_COVERAGE", flag, 2) == 1 && flag[0] == L'0');
@@ -15111,9 +20021,17 @@ public:
         if (out) *out = nullptr;
         auto* heap = Heap::from<Heap>(heap_interface);
         if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
+        const bool from_xbox_d16s8 = desc->Format == xbox_d16s8;
         D3D12_RESOURCE_DESC canonical = *desc;
         canonical.Format = pc_format(canonical.Format);  // the console's D16S8 family as D24S8
         desc = &canonical;
+        // Its clear value too, or the clear format's family (118) would not match the resource's (D24S8) below.
+        D3D12_CLEAR_VALUE canonical_clear{};
+        if (clear) {
+            canonical_clear = *clear;
+            canonical_clear.Format = pc_format(canonical_clear.Format);
+            clear = &canonical_clear;
+        }
         if (heap->host_address()) {
             // An existing heap is not an arena range, and the placed path addresses resources by arena offset.
             log_once("a placed resource in an existing heap (OpenExistingHeapFromAddress) is not supported yet; "
@@ -15201,6 +20119,7 @@ public:
         // create_texture makes for 1D, 2D and 3D alike (arrays and mips included), as for a committed texture.
         const VkDeviceSize placed_va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? heap->offset() + heap_offset : 0;
         auto* resource = new Resource(state_, *desc, heap->properties(), heap->flags(), placed_va);
+        if (from_xbox_d16s8) resource->mark_console_d16s8();
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (buffer) {
@@ -15212,7 +20131,8 @@ public:
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
-                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats);
+                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats, false,
+                                           from_xbox_d16s8);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
@@ -15472,7 +20392,7 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS2)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2*>(data);
             *opts = {};
-            opts->DepthBoundsTestSupported = FALSE;
+            opts->DepthBoundsTestSupported = state_.info.features.depthBounds ? TRUE : FALSE;
             opts->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
             return d3d12_trace::result(method, S_OK);
         }
@@ -16480,6 +21400,7 @@ private:
                              TitleImageOrigin origin = TitleImageOrigin::ordinary) {
         if (out) *out = nullptr;
         if (!heap || !desc) return E_INVALIDARG;
+        const bool from_xbox_d16s8 = desc->Format == xbox_d16s8;
         D3D12_RESOURCE_DESC canonical = *desc;
         canonical.Format = pc_format(canonical.Format);  // the console's D16S8 family as D24S8
         desc = &canonical;
@@ -16488,6 +21409,7 @@ private:
             return E_INVALIDARG;
         }
         auto* resource = new Resource(state_, *desc, *heap, heap_flags);
+        if (from_xbox_d16s8) resource->mark_console_d16s8();
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -16524,7 +21446,8 @@ private:
                 hr = E_INVALIDARG;
             } else {
                 std::vector<VkFormat> cast_formats;
-                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats, storage_heap_flags.has_value());
+                hr = castable_view_formats(format, desc->Format, castable_count, castable, cast_formats,
+                                           storage_heap_flags.has_value(), from_xbox_d16s8);
                 if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats, origin);
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
                 if (SUCCEEDED(hr) && storage_heap_flags) hr = resource->enable_depth_stencil_uav(*storage_heap_flags);
@@ -16798,6 +21721,68 @@ bool stop_pipeline_compiles(unsigned wait_ms) {
     return idle;
 }
 
+// How long an exit save waits for the write itself (save_session_pipeline_cache). Measured fill and publish: a 77 MiB
+// cache about 36 ms; 1.87 GB 1.4 s and 2.9 GB 1.3-1.6 s (NVIDIA, Windows 11, NVMe), so about 2.2 s at the 4 GiB
+// default limit. The wait ends with the write; the bound only covers a driver or disk that blocks.
+constexpr unsigned kExitCacheWriteMs = 6000;
+
+bool save_pipeline_caches_at_exit(unsigned wait_ms) {
+    if (exit_cache_saved.exchange(true)) return false;  // once: a crash during the normal exit's save does not redo it
+    std::unique_lock lock(exit_cache_mutex, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::milliseconds(wait_ms))) {
+        std::fprintf(stderr, "[rt] d3d12: device list busy for %u ms at exit; pipeline_cache.session.bin not written\n",
+                     wait_ms);
+        return false;
+    }
+    bool wrote = false;
+    // After the cache write, so that the order log's final append (a join and a write) never delays the cache. It
+    // appends the last lines and prints the counts; no cache file is touched.
+    const auto close_order_logs = [] {
+        for (DeviceState* d : exit_cache_devices) d->close_order_log();
+    };
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+    for (DeviceState* d : exit_cache_devices) {
+        if (!d->context || !d->pipeline_cache_handle) continue;
+        // A build still running (a large one takes minutes; at a crash the faulting thread may be inside one) is
+        // given until the deadline, then the cache is written without it. Unlike at teardown, the previous file is
+        // not kept instead: the process is ending, so waiting longer is not possible and keeping the old file throws
+        // away everything this run compiled (measured: a 1,308 s boot that ended in a title fault with 2 builds
+        // running). The cache is not created EXTERNALLY_SYNCHRONIZED, so reading it during a build is valid; the
+        // snapshot holds the pipelines finished so far.
+        while (d->active_compiles.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (const unsigned building = d->active_compiles.load())
+            std::fprintf(stderr, "[rt] d3d12: %u pipeline build(s) still running at exit; writing the pipelines "
+                                 "finished so far\n", building);
+        // On a thread of its own: a driver that holds the cache until a build ends would otherwise hold the ending
+        // process too. Past the deadline the process goes on ending; the file is published by a rename
+        // (CacheStagingFile), so a write cut off there leaves the previous file whole.
+        struct Write {
+            std::mutex mutex;
+            std::condition_variable done_cv;
+            bool done = false;
+        };
+        auto write = std::make_shared<Write>();
+        std::thread([write, d] {
+            save_session_pipeline_cache(d->context->vk, d->info.device, d->pipeline_cache_handle, false, "exit");
+            std::lock_guard done_lock(write->mutex);
+            write->done = true;
+            write->done_cv.notify_all();
+        }).detach();
+        std::unique_lock write_lock(write->mutex);
+        if (!write->done_cv.wait_for(write_lock, std::chrono::milliseconds(kExitCacheWriteMs),
+                                     [&] { return write->done; })) {
+            std::fprintf(stderr, "[rt] d3d12: pipeline cache still being written after %u ms at exit; the process "
+                                 "ends without waiting for it\n", kExitCacheWriteMs);
+            close_order_logs();
+            return wrote;  // the device list stays as it is: the write still uses this device
+        }
+        wrote = true;
+    }
+    close_order_logs();
+    return wrote;
+}
+
 HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -16934,9 +21919,32 @@ std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline) {
     return p && p->resolve_type(true) ? p->id() : 0;
 }
 
+void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool depth_bound) {
+    if (!id || !async_replay_compile()) return;
+    // The id is the PSO's own ID3D12PipelineState pointer (PipelineState::id), which the list keeps a reference to.
+    auto* pso = static_cast<PipelineState*>(reinterpret_cast<ID3D12PipelineState*>(id));
+    pso->request_early(bound_targets, depth_bound);
+}
+
+StubPipelineKind stub_pipeline_kind(ID3D12PipelineState* pipeline, IUnknown* device) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (!p || (device && p->attached_device() != device)) return StubPipelineKind::none;
+    return p->stub_kind();
+}
+
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {
     const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
     return p && (p->compute() || p->graphics()) ? &p->subgroup_requests() : nullptr;
+}
+
+bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector<std::uint32_t>>& words,
+                          std::string& why) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (!p) {
+        why = "not a PipelineState";
+        return false;
+    }
+    return p->stage_words(words, why);
 }
 
 long live_pipeline_states() { return live_pipeline_state_count.load(); }
@@ -16959,6 +21967,10 @@ bool write_placed_texture_view(ID3D12Device* device, bool unordered, const std::
 
 D3D12_GPU_VIRTUAL_ADDRESS console_descriptor_table_va(D3D12_GPU_VIRTUAL_ADDRESS va) {
     return console_heap_ranges().shader_va(va);
+}
+
+bool console_descriptor_heap_range(D3D12_GPU_VIRTUAL_ADDRESS va, std::uint64_t& console_va, std::uint64_t& bytes) {
+    return console_heap_ranges().range_of(va, console_va, bytes);
 }
 
 // The device a command list of this module belongs to: its attached device is the d3d12_xs proxy when the title made
@@ -17050,6 +22062,11 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
     return nullptr;
 }
 
+leonida::VramBudget vulkan_vram_budget(ID3D12Device* device) {
+    const VulkanDeviceInfo* info = vulkan_device_info(device);
+    return info ? read_vram_budget(*info) : leonida::VramBudget{};
+}
+
 std::uint64_t title_shadow_refresh_queries(ID3D12Device* device) {
     auto* d = Device::from<Device>(device);
     if (!d) return 0;
@@ -17065,6 +22082,19 @@ std::uint64_t title_host_imports(ID3D12Device* device) {
     return d ? d->state().host_imports.load(std::memory_order_relaxed) : 0;
 }
 
+TitleWindows title_windows(ID3D12Device* device) {
+    TitleWindows windows;
+    auto* d = Device::from<Device>(device);
+    if (!d) return windows;
+    auto& state = d->state();
+    std::lock_guard lock(state.title_window_mutex);
+    windows.count = state.title_windows.size();
+    windows.bytes = state.title_window_bytes;
+    windows.retired = state.title_windows_retired;
+    std::lock_guard retired(state.retired_window_mutex);
+    windows.waiting = state.retired_windows.size();
+    return windows;
+}
 std::uint64_t title_shadow_trackers(ID3D12Device* device) {
     auto* d = Device::from<Device>(device);
     if (!d) return 0;
@@ -17686,6 +22716,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceRayQueryFeaturesKHR rq_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT transform_feedback_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+    VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback_properties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT};
     {
         std::uint32_t extension_count = 0;
         vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
@@ -17710,10 +22744,28 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 vkGetPhysicalDeviceFeatures2(info.physical, &features);
                 info.mesh_shader = mesh_features.meshShader == VK_TRUE;
                 info.mesh_shader_queries = mesh_features.meshShaderQueries == VK_TRUE;
+            } else if (!std::strcmp(e.extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                                   &transform_feedback_features};
+                vkGetPhysicalDeviceFeatures2(info.physical, &features);
+                info.transform_feedback = transform_feedback_features.transformFeedback == VK_TRUE;
+                info.transform_feedback_geometry_streams = transform_feedback_features.geometryStreams == VK_TRUE;
+                // D3D-302: the queries and the stream count are properties, not features.
+                VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                                       &transform_feedback_properties};
+                vkGetPhysicalDeviceProperties2(info.physical, &properties);
+                info.transform_feedback_queries = transform_feedback_properties.transformFeedbackQueries == VK_TRUE;
+                info.max_transform_feedback_streams = transform_feedback_properties.maxTransformFeedbackStreams;
             }
         }
         if (!info.mesh_shader)
             std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_mesh_shader: mesh-shader PSOs are unsupported\n");
+        if (!info.transform_feedback)
+            std::fprintf(stderr,
+                         "[rt] d3d12: the GPU has no VK_EXT_transform_feedback: SO_STATISTICS query pools read zero\n");
+        else if (!info.transform_feedback_queries || !info.max_transform_feedback_streams)
+            std::fprintf(stderr, "[rt] d3d12: the GPU has no transform-feedback queries (transformFeedbackQueries, "
+                                 "maxTransformFeedbackStreams): SO_STATISTICS query pools read zero\n");
         if (has_as && has_dho && has_rq && chosen12.bufferDeviceAddress) {
             as_features.pNext = &rq_features;
             VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &as_features};
@@ -17749,10 +22801,21 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     // The mesh-primitives query, which counts the primitives a mesh shader emits (D3D-MESH-CLIPPING-COUNTER).
     enable_mesh.meshShaderQueries = info.mesh_shader_queries ? VK_TRUE : VK_FALSE;
 
+    // D3D-302: real SO_STATISTICS queries need transformFeedback; geometryStreams is only requested when the device
+    // already offers it, so the enable chain matches vk_pipeline_check's (a driver keys the pipeline cache on it).
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT enable_transform_feedback{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+    enable_transform_feedback.transformFeedback = VK_TRUE;
+    enable_transform_feedback.geometryStreams = info.transform_feedback_geometry_streams ? VK_TRUE : VK_FALSE;
+
     void* ext_chain = nullptr;
     if (info.mesh_shader) {
         enable_mesh.pNext = ext_chain;
         ext_chain = &enable_mesh;
+    }
+    if (info.transform_feedback) {
+        enable_transform_feedback.pNext = ext_chain;
+        ext_chain = &enable_transform_feedback;
     }
     if (info.ray_tracing) {
         enable_rq.pNext = ext_chain;
@@ -17769,8 +22832,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                                       v13.compute_full_subgroups, info.subgroup);
     const char* compile_mode = std::getenv("LEONIDA_PIPELINE_COMPILE");
     const auto mode = compile_mode ? std::string_view(compile_mode) : std::string_view{};
-    v13.enable_pipeline_cache_control = mode == "cache-only" && v13.core && v13.pipeline_cache_control;
-    info.cold_graphics_compile = v13.enable_pipeline_cache_control;
+    // pipelineCreationCacheControl: for LEONIDA_PIPELINE_COMPILE=cache-only, and for the heavy pipeline cache unless
+    // LEONIDA_HEAVY_PIPELINE_CACHE_MS=0 turns it off.
+    v13.enable_pipeline_cache_control =
+        (mode == "cache-only" || heavy_pipeline_cache_ms()) && v13.core && v13.pipeline_cache_control;
+    info.cold_graphics_compile = mode == "cache-only" && v13.enable_pipeline_cache_control;
+    info.heavy_pipeline_cache = heavy_pipeline_cache_ms() && v13.enable_pipeline_cache_control;
     info.prepare_on_bind = mode == "on-demand";
     void* v13_chain = v13.enable(ext_chain);
     // D3D-78 uses the core robustness and format-feature flags. Leave the Vulkan 1.2 extension path unchanged.
@@ -17951,13 +23018,17 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         vkGetPhysicalDeviceFeatures2(info.physical, &query);
     }
     const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
-    info.host_image_copy = has_host_image_copy && host_copy.hostImageCopy;
+    // LEONIDA_HOST_IMAGE_COPY (src/host_image_copy_policy.h). Off, the extension is neither enabled nor chained, so no
+    // image gets host-transfer usage and every CPU texture copy takes the staging submit, as on a device without it.
+    const leonida::HostImageCopyChoice host_copy_choice = leonida::host_image_copy_choice(
+        std::getenv("LEONIDA_HOST_IMAGE_COPY"), has_host_image_copy && host_copy.hostImageCopy, chosen.vendorID);
+    info.host_image_copy = host_copy_choice.use;
     if (info.host_image_copy) {
         host_copy.pNext = *v13.next();  // after the conditional rendering features, if any
         *v13.next() = &host_copy;
-    } else {
-        std::fprintf(stderr, "[rt] d3d12: no VK_EXT_host_image_copy; CPU texture copies use a staging submit\n");
     }
+    std::fprintf(stderr, "[rt] d3d12: host image copy: %s (%s)%s\n", info.host_image_copy ? "on" : "off",
+                 host_copy_choice.reason, info.host_image_copy ? "" : "; CPU texture copies use a staging submit");
 
     const auto has_device_extension = [&](const char* name) {
         return std::any_of(extensions.begin(), extensions.end(),
@@ -18084,6 +23155,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     enable.logicOp = chosen_features.logicOp;
     enable.depthClamp = chosen_features.depthClamp;
     enable.multiViewport = chosen_features.multiViewport;
+    enable.depthBounds = chosen_features.depthBounds;  // DEPTH_STENCIL1/2 DepthBoundsTestEnable, OMSetDepthBounds
     enable.geometryShader = chosen_features.geometryShader;  // translated geometry shaders (195 in the corpus)
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
     // 26,503 entries), doubles, 16-bit integers, clip and cull distances in a few vertex shaders, formatless image
@@ -18224,6 +23296,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     v13.add_extensions(device_extensions);
     if (info.depth_range_unrestricted) device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     info.pipeline_creation_feedback = v13.core || has_device_extension(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+    info.pipeline_cache_control = v13.core && v13.pipeline_creation_cache_control;
     if (trace_pipeline_compile() && !v13.core && info.pipeline_creation_feedback)
         device_extensions.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
     if (info.conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
@@ -18256,6 +23329,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
     if (info.mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    if (info.transform_feedback) device_extensions.push_back(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
@@ -18266,18 +23340,28 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.null_descriptor || info.robust_index_view) device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    // Optional: VK_EXT_memory_budget gives the GPU memory in use and the budget (vulkan_vram_budget, the title HUD).
+    info.memory_budget = has_device_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (info.memory_budget) device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     leonida::DeviceFaultFeatures fault_features;
     const bool aftermath = leonida::aftermath::enable();  // already on, before the instance: see above
     char device_fault[2]{};
+    // LEONIDA_DEVICE_FAULT=1: fault info, checkpoints and NVIDIA's diagnostics config. =2: fault info and checkpoints
+    // only — the diagnostics config compiles pipelines with debug info under other cache keys, so =2 keeps the warmed
+    // pipeline journal usable for a boot that only wants the fault report.
     if (GetEnvironmentVariableA("LEONIDA_DEVICE_FAULT", device_fault, sizeof(device_fault)) == 1 &&
-        device_fault[0] == '1') {
+        (device_fault[0] == '1' || device_fault[0] == '2')) {
         info.device_fault_diagnostics = true;
+        const bool with_config = device_fault[0] == '1';
+        // LEONIDA_DEVICE_MARKERS=1: also VK_AMD_buffer_marker, for the AMD breadcrumbs (vulkan_device_markers.h).
         const auto fault = fault_features.enable(info.physical, vkGetPhysicalDeviceFeatures2, extensions,
                                                  device_extensions, device_info,
-                                                 {true, true, leonida::aftermath::extra_config_flags()});
+                                                 {true, with_config, leonida::aftermath::extra_config_flags(),
+                                                  leonida::device_markers_requested()});
         info.device_fault_info = fault.fault;
         info.device_checkpoints = fault.checkpoints;
         info.device_diagnostics_config = fault.diagnostics_config;
+        info.device_markers = fault.markers;
     } else if (aftermath) {
         // The diagnostics config alone: shader debug info, resource tracking and automatic checkpoints in the dump.
         const auto fault = fault_features.enable(info.physical, vkGetPhysicalDeviceFeatures2, extensions,
@@ -18285,6 +23369,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                                                  {false, true, leonida::aftermath::extra_config_flags()});
         info.device_diagnostics_config = fault.diagnostics_config;
     }
+    if (leonida::device_markers_requested() && !info.device_fault_diagnostics)
+        std::fprintf(stderr, "[rt] device-markers: unavailable: LEONIDA_DEVICE_MARKERS=1 needs LEONIDA_DEVICE_FAULT=1 "
+                             "or 2\n");
     if (aftermath && !info.device_diagnostics_config)
         std::fprintf(stderr, "[rt] aftermath: VK_NV_device_diagnostics_config unavailable; the dump has no shader "
                              "debug info, resource tracking or checkpoints\n");
@@ -18341,6 +23428,556 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     return hand_out(device, riid, out);
 }
 
+// A Vulkan device made as `gta6rt --run` makes it, for building the library's compute pipelines with no title
+// (--precompile-pipelines, --compile-server), with the two layouts create_compute makes.
+class BuildHost {
+public:
+    explicit BuildHost(const char* tag) : tag_(tag) {}
+    BuildHost(const BuildHost&) = delete;
+    BuildHost& operator=(const BuildHost&) = delete;
+    ~BuildHost() {
+        if (!d3d_) return;
+        if (device_) {
+            auto& vk = device_->context->vk;
+            if (plain_) vk.vkDestroyPipelineLayout(device_->info.device, plain_, nullptr);
+            if (with_set0_) vk.vkDestroyPipelineLayout(device_->info.device, with_set0_, nullptr);
+        }
+        d3d_->Release();
+    }
+
+    bool open() {
+        // The GPU address arena holds nothing here and does not change a pipeline: 64 MB, not a title's 2 GB.
+        _putenv_s("LEONIDA_ARENA_MB", "64");
+        compile_helper::build_host = true;
+        if (FAILED(create_vulkan_device_standalone(__uuidof(ID3D12Device), reinterpret_cast<void**>(&d3d_),
+                                                   QueueTestSettings::ignore)) || !d3d_) {
+            d3d_ = nullptr;
+            std::fprintf(stderr, "%s the Vulkan device could not be created\n", tag_);
+            return false;
+        }
+        Device* device = Device::from<Device>(d3d_);
+        if (!device) return false;
+        device_ = &device->build_state();
+        DeviceState& state = *device_;
+        library_ = state.library();
+        if (!library_) {
+            std::fprintf(stderr, "%s no translated shader library (LEONIDA_SHADERS)\n", tag_);
+            return false;
+        }
+        if (pipeline_journal_dir().empty())
+            std::fprintf(stderr, "%s the pipeline journal is off (LEONIDA_PIPELINE_JOURNAL=0 or "
+                                 "LEONIDA_PIPELINE_CACHE_BYTES=0): only the driver's own cache is filled\n", tag_);
+        state.pipeline_cache();  // the shared cache and the journal's upkeep, as at a title's first pipeline
+        // Every pipeline goes into a journal file: one found in the shared cache would not be.
+        state.journal_ask_shared = false;
+        auto& vk = state.context->vk;
+        const VkDevice dev = state.info.device;
+        if (state.info.max_push_constants_size && state.info.max_push_constants_size < sizeof(leonida::ShaderUserData)) {
+            std::fprintf(stderr, "%s maxPushConstantsSize %u is under the shaders' %zu bytes: the runtime builds no "
+                                 "compute pipeline on this device\n",
+                         tag_, state.info.max_push_constants_size, sizeof(leonida::ShaderUserData));
+            return false;
+        }
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
+        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &push;
+        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &plain_) != VK_SUCCESS) return false;
+        if (state.bindless) {
+            const VkDescriptorSetLayout set0 = state.bindless->layout();
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &set0;
+            if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &with_set0_) != VK_SUCCESS)
+                with_set0_ = VK_NULL_HANDLE;
+        }
+        if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                state.info.get_instance_proc
+                    ? state.info.get_instance_proc(state.info.instance, "vkGetPhysicalDeviceProperties")
+                    : nullptr)) {
+            VkPhysicalDeviceProperties props{};
+            get_props(state.info.physical, &props);
+            max_shared_ = props.limits.maxComputeSharedMemorySize;
+        }
+        return true;
+    }
+
+    DeviceState& state() { return *device_; }
+    const leonida::ShaderLibrary* library() const { return library_; }
+
+    // Why create_compute could not build the entry on this device, or null. LEONIDA_SKIP_COMPUTE is not a reason here:
+    // it drops a program's dispatches at play, and each caller decides whether it also keeps the program unbuilt.
+    const char* unbuildable(const leonida::ShaderEntry& entry, std::size_t bytes) const {
+        if (!bytes) return "no .spv";
+        if (entry.binding_count && !with_set0_) return "set-0 bindings and no bindless set";
+        if (entry.lds_bytes && max_shared_ && entry.lds_bytes > max_shared_) return "workgroup memory over the limit";
+        return nullptr;
+    }
+
+    ComputeBuild build(const leonida::ShaderEntry& entry, const ComputeBuildOptions& options) {
+        const leonida::SubgroupRequest subgroup = leonida::decide_subgroup_size(entry, device_->info.subgroup);
+        return build_compute_pipeline(*device_, entry, entry.binding_count ? with_set0_ : plain_, subgroup, options);
+    }
+
+    void destroy(VkPipeline pipeline) {
+        if (pipeline) device_->context->vk.vkDestroyPipeline(device_->info.device, pipeline, nullptr);
+    }
+
+private:
+    const char* tag_;
+    ID3D12Device* d3d_ = nullptr;
+    DeviceState* device_ = nullptr;
+    const leonida::ShaderLibrary* library_ = nullptr;
+    VkPipelineLayout plain_ = VK_NULL_HANDLE, with_set0_ = VK_NULL_HANDLE;
+    std::uint32_t max_shared_ = 0;
+};
+
+// gta6rt --precompile-pipelines (d3d12_precompile.h).
+int precompile_compute_pipelines(const PrecompileOptions& options) {
+    using Clock = std::chrono::steady_clock;
+    const auto began = Clock::now();
+    BuildHost host("[precompile]");
+    if (!host.open()) return 1;
+    const leonida::ShaderLibrary* library = host.library();
+
+    // What to build: every compute entry the runtime could create a pipeline for. LEONIDA_SKIP_COMPUTE is a setting
+    // for play (the game drops the listed programs' dispatches); the journal is kept for every program unless
+    // --skip-listed asks to leave them out too, so a later run without the list finds them built.
+    struct Job {
+        const leonida::ShaderEntry* entry;
+        std::size_t bytes;
+    };
+    std::vector<Job> jobs;
+    std::size_t not_buildable = 0, filtered = 0, listed = 0, listed_left_out = 0;
+    for (const leonida::ShaderEntry* entry : library->stage_entries("cs")) {
+        if (!options.filters.empty() &&
+            std::none_of(options.filters.begin(), options.filters.end(),
+                         [&](const std::string& part) { return entry->name.find(part) != std::string::npos; })) {
+            ++filtered;
+            continue;
+        }
+        const std::size_t bytes = library->spirv_bytes(*entry);
+        if ((options.min_bytes && bytes < options.min_bytes) || (options.max_bytes && bytes > options.max_bytes)) {
+            ++filtered;
+            continue;
+        }
+        if (skip_compute(entry->name)) {
+            ++listed;
+            if (options.skip_listed) {
+                ++listed_left_out;
+                std::fprintf(stderr, "[precompile] %s: not built (LEONIDA_SKIP_COMPUTE, --skip-listed)\n",
+                             entry->name.c_str());
+                continue;
+            }
+        }
+        if (const char* why = host.unbuildable(*entry, bytes)) {
+            ++not_buildable;
+            std::fprintf(stderr, "[precompile] %s: not built (%s)\n", entry->name.c_str(), why);
+            continue;
+        }
+        jobs.push_back({entry, bytes});
+    }
+    std::stable_sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
+        return options.smallest_first ? a.bytes < b.bytes : a.bytes > b.bytes;
+    });
+    if (options.limit && jobs.size() > options.limit) {
+        filtered += jobs.size() - options.limit;
+        jobs.resize(options.limit);
+    }
+    std::uint64_t total_bytes = 0;
+    for (const Job& job : jobs) total_bytes += job.bytes;
+    const unsigned threads = (std::max)(1u, options.threads);
+    const unsigned big_threads = options.big_threads ? (std::min)(options.big_threads, threads) : threads;
+    if (listed && !options.skip_listed)
+        std::fprintf(stderr, "[precompile] LEONIDA_SKIP_COMPUTE names %zu of the entries: built anyway, since the list "
+                             "drops their dispatches at play only (--skip-listed leaves them out of this run)\n",
+                     listed);
+    std::fprintf(stderr, "[precompile] %zu compute entries to build (%.1f MB of SPIR-V; %zu filtered out, %zu left "
+                         "out by --skip-listed, %zu not buildable), %s first, %u thread(s), at most %u on modules over "
+                         "%zu bytes; journal %ls\n",
+                 jobs.size(), double(total_bytes) / 1e6, filtered, listed_left_out, not_buildable,
+                 options.smallest_first ? "smallest" : "largest", threads, big_threads, options.big_bytes,
+                 pipeline_journal_dir().c_str());
+    if (options.dry_run) {
+        for (const Job& job : jobs) std::printf("%zu %s\n", job.bytes, job.entry->name.c_str());
+        return 0;
+    }
+
+    std::atomic<std::size_t> next{0};
+    std::mutex progress_mutex;
+    std::size_t done = 0, compiled = 0, skipped = 0, hits = 0, failed = 0, journaled = 0, elsewhere = 0;
+    std::uint64_t done_bytes = 0;
+    std::mutex big_mutex;
+    std::condition_variable big_free;
+    unsigned big_running = 0;
+    auto worker = [&] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        for (;;) {
+            const std::size_t i = next.fetch_add(1);
+            if (i >= jobs.size()) return;
+            const Job& job = jobs[i];
+            const bool big = job.bytes > options.big_bytes;
+            if (big) {
+                std::unique_lock lock(big_mutex);
+                big_free.wait(lock, [&] { return big_running < big_threads; });
+                ++big_running;
+            }
+            ComputeBuildOptions build_options;
+            build_options.trigger = "precompile";
+            build_options.serialize_big = false;  // nothing else is building; big_threads bounds them instead
+            build_options.skip_journaled = !options.rebuild;
+            build_options.use_helper = options.via_helper;
+            build_options.mark_building = !options.via_helper;  // an entry another process is compiling is left to it
+            ComputeBuild build;
+            try {
+                build = host.build(*job.entry, build_options);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[precompile] %s: %s\n", job.entry->name.c_str(), e.what());
+            }
+            host.destroy(build.pipeline);
+            if (big) {
+                std::lock_guard lock(big_mutex);
+                --big_running;
+                big_free.notify_one();
+            }
+            std::lock_guard lock(progress_mutex);
+            ++done;
+            done_bytes += job.bytes;
+            const char* what = "failed";
+            if (build.skipped) ++skipped, ++journaled, what = "journaled already";
+            else if (build.busy) ++skipped, ++elsewhere, what = "being built by another process";
+            else if (build.result != VK_SUCCESS || (!build.pipeline && !build.skipped)) ++failed;
+            else if (build.journal_hit || build.from_shared) ++hits, what = "found in a cache";
+            else ++compiled, what = build.journaled ? "compiled and journaled" : "compiled (not journaled)";
+            const double elapsed = std::chrono::duration<double>(Clock::now() - began).count();
+            const double eta = done_bytes ? elapsed / double(done_bytes) * double(total_bytes - done_bytes) : 0.0;
+            // Skips are not logged one by one (a resumed run skips thousands); every 100th is, with the counts.
+            if (!build.skipped || done % 100 == 0 || done == jobs.size())
+                std::fprintf(stderr, "[precompile] %zu/%zu %s (%zu B): %s in %.1f s (VkResult %d) | %zu compiled, %zu "
+                                     "from a cache, %zu skipped, %zu failed; %.0f s elapsed, ~%.0f s left by size\n",
+                             done, jobs.size(), job.entry->name.c_str(), job.bytes, what, double(build.ms) / 1000.0,
+                             int(build.result), compiled, hits, skipped, failed, elapsed, eta);
+        }
+    };
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker);
+    for (std::thread& t : pool) t.join();
+    // One line for the whole run: what was built, what was there already, and what was left out and why.
+    std::fprintf(stderr, "[precompile] done: %zu built (%zu compiled, %zu from a cache), %zu journaled already, %zu "
+                         "being built by another process, %zu failed; left out: %zu of %zu listed in "
+                         "LEONIDA_SKIP_COMPUTE%s, %zu not buildable, %zu filtered out; in %.0f s\n",
+                 compiled + hits, compiled, hits, journaled, elsewhere, failed, listed_left_out, listed,
+                 options.skip_listed ? " (--skip-listed)" : "", not_buildable, filtered,
+                 std::chrono::duration<double>(Clock::now() - began).count());
+    return failed ? 2 : 0;
+}
+
+// What a compute pipeline's journal name depends on besides its module: a name remembered for a module is good for
+// another run while this is unchanged (compile_server's index).
+std::uint64_t journal_name_context(DeviceState& state) {
+    leonida::pipeline_journal::Hasher hash;
+    hash.text("journal-name-context");
+    hash.value(std::uint32_t(sizeof(leonida::ShaderUserData)));
+    const leonida::SubgroupSizeCaps& sub = state.info.subgroup;
+    hash.value(std::uint32_t(sub.subgroup_size_control));
+    hash.value(std::uint32_t(sub.compute_full_subgroups));
+    hash.value(sub.min_size);
+    hash.value(sub.max_size);
+    hash.value(sub.default_size);
+    hash.value(std::uint32_t(sub.required_stages));
+    hash.value(std::uint32_t(state.info.device_diagnostics_config));
+    if (state.info.device_diagnostics_config) hash.value(std::uint32_t(leonida::aftermath::extra_config_flags()));
+    if (state.bindless) hash_bindless_layout(hash, state.bindless->features());
+    return hash.digest();
+}
+
+// gta6rt --compile-server (d3d12_compile_helper.h): builds what the games using this journal ask for, most urgent
+// first, and with nothing asked fills the rest of the library, smallest module first, at idle priority.
+int compile_server(const CompileServerOptions& options) {
+    namespace helper = compile_helper;
+    namespace journal = leonida::pipeline_journal;
+    const std::filesystem::path& dir = pipeline_journal_dir();
+    if (dir.empty()) {
+        std::fprintf(stderr, "[compile-server] the pipeline journal is off: nothing to serve\n");
+        return 1;
+    }
+    const auto requests = helper::requests_dir(dir);
+    std::error_code ec;
+    std::filesystem::create_directories(requests, ec);
+    // One helper per journal: a second (two games, or one started by hand) leaves the requests to the first.
+    journal::Hasher dir_hash;
+    dir_hash.text(dir.string().c_str());
+    const std::wstring mutex_name = L"Local\\leonida-compile-server-" + std::to_wstring(dir_hash.digest());
+    const HANDLE single = CreateMutexW(nullptr, TRUE, mutex_name.c_str());
+    if (!single || GetLastError() == ERROR_ALREADY_EXISTS) {
+        std::fprintf(stderr, "[compile-server] another helper serves %ls\n", dir.c_str());
+        return 0;
+    }
+    // It ends with the game that started it, at once: whatever it was building is in no file yet, and a file is
+    // written whole or not at all. A .building marker it leaves names a dead process and is taken over.
+    if (options.parent_pid) {
+        const HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, options.parent_pid);
+        if (!parent) {
+            std::fprintf(stderr, "[compile-server] process %lu is gone\n", options.parent_pid);
+            return 0;
+        }
+        std::thread([parent] {
+            WaitForSingleObject(parent, INFINITE);
+            TerminateProcess(GetCurrentProcess(), 0);
+        }).detach();
+    }
+    BuildHost host("[compile-server]");
+    if (!host.open()) return 1;
+    const leonida::ShaderLibrary* library = host.library();
+    const std::vector<const leonida::ShaderEntry*> entries = library->stage_entries("cs");
+    std::map<std::string, const leonida::ShaderEntry*> by_name;
+    for (const leonida::ShaderEntry* entry : entries) by_name.emplace(entry->name, entry);
+    const unsigned threads = (std::max)(1u, options.threads);
+    const unsigned idle_threads = (std::min)(options.idle_threads, threads - 1);  // one is always free for a request
+    std::fprintf(stderr, "[compile-server] serving %ls: %u thread(s) for requests, %u of them filling the library "
+                         "when nothing is asked, %zu compute entries\n", requests.c_str(), threads, idle_threads,
+                 entries.size());
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::vector<helper::Request> pending;  // the last listing, most urgent first
+    std::set<std::string> busy;            // stems being built here
+    std::map<std::string, std::chrono::steady_clock::time_point> elsewhere;  // stems another process is building
+    bool stop = false;
+    std::atomic<unsigned> requests_done{0}, filled{0};
+
+    // A request this helper can take: listed, not being built here, not one another process was building a moment ago.
+    auto take_locked = [&](helper::Request& out) {
+        const auto now = std::chrono::steady_clock::now();
+        for (const helper::Request& request : pending) {
+            if (busy.count(request.stem)) continue;
+            if (const auto it = elsewhere.find(request.stem); it != elsewhere.end() && now - it->second < std::chrono::seconds(5))
+                continue;
+            busy.insert(request.stem);
+            out = request;
+            return true;
+        }
+        return false;
+    };
+    auto build_entry = [&](const leonida::ShaderEntry& entry, const char* trigger) {
+        ComputeBuildOptions build_options;
+        build_options.trigger = trigger;
+        build_options.serialize_big = false;
+        build_options.skip_journaled = true;
+        build_options.use_helper = false;
+        build_options.mark_building = true;
+        ComputeBuild build = host.build(entry, build_options);
+        host.destroy(build.pipeline);
+        build.pipeline = VK_NULL_HANDLE;
+        return build;
+    };
+    auto serve = [&] {  // normal priority: a title waits for these
+        for (;;) {
+            helper::Request request;
+            {
+                std::unique_lock lock(mutex);
+                wake.wait_for(lock, std::chrono::milliseconds(100), [&] { return stop || take_locked(request); });
+                if (stop) return;
+                if (request.stem.empty()) continue;
+            }
+            std::string failure;
+            bool leave = false;  // another process is building it: its file answers the request
+            const auto it = by_name.find(request.name);
+            const leonida::ShaderEntry* entry = it == by_name.end() ? nullptr : it->second;
+            const std::size_t bytes = entry ? library->spirv_bytes(*entry) : 0;
+            if (!entry) failure = "no compute entry of that name in this library";
+            else if (skip_compute(entry->name)) failure = "LEONIDA_SKIP_COMPUTE";  // the game drops its dispatches
+            else if (const char* why = host.unbuildable(*entry, bytes)) failure = why;
+            // LOCAL FIX (compile helper: the journal name was checked after the build): the name is hashed from the
+            // module and this device's environment, which costs no driver call. A request from a game whose environment
+            // differs is answered before a compile is spent on a file that game never reads; the build below would only
+            // have found the same mismatch.
+            if (failure.empty()) {
+                ComputeBuildOptions key_options;
+                key_options.trigger = "compile-server";
+                key_options.key_only = true;
+                key_options.use_helper = false;
+                const std::filesystem::path key_path = host.build(*entry, key_options).journal_path;
+                if (!key_path.empty() && key_path.stem().string() != request.stem)
+                    failure = "its journal name here is " + key_path.stem().string() +
+                              ": the helper's environment differs from the game's";
+            }
+            if (failure.empty()) {
+                ComputeBuild build;
+                try {
+                    build = build_entry(*entry, "compile-server");
+                } catch (const std::exception& e) {
+                    failure = e.what();
+                }
+                if (failure.empty()) {
+                    if (build.busy)
+                        leave = true;
+                    else if (!build.skipped && (build.result != VK_SUCCESS || !(build.journaled || build.journal_hit)))
+                        failure = "not built or not journaled (VkResult " + std::to_string(int(build.result)) + ")";
+                    else if (!leonida::pipeline_journal::entry_usable(build.journal_path, host.state().pso_identity))
+                        failure = "requested writable journal file is missing or incompatible";
+                    else
+                        std::fprintf(stderr, "[compile-server] %s (%zu B, priority %llu): %s in %.1f s\n",
+                                     request.name.c_str(), bytes, static_cast<unsigned long long>(request.priority),
+                                     build.skipped ? "journaled already" : "built and journaled",
+                                     double(build.ms) / 1000.0);
+                }
+            }
+            std::error_code ignored;
+            // LOCAL FIX (compile helper: a .failed left with its .request listed): the .req goes first. A request with
+            // no .req and no .failed is one the game reads as answered, so it builds the pipeline itself instead of
+            // waiting for a file that is not coming (Client::state).
+            if (!leave) std::filesystem::remove(requests / (request.stem + ".req"), ignored);
+            if (!failure.empty()) {
+                helper::write_line(requests / (request.stem + ".failed"), failure);
+                std::fprintf(stderr, "[compile-server] %s: %s\n", request.name.c_str(), failure.c_str());
+            }
+            if (!leave) ++requests_done;
+            std::lock_guard lock(mutex);
+            busy.erase(request.stem);
+            if (leave) elsewhere[request.stem] = std::chrono::steady_clock::now();
+        }
+    };
+
+    // The rest of the library, smallest module first, while nothing is asked. The journal names of modules looked at
+    // before are kept in requests/names.idx (with each module's size and time, and what the names depend on), so a
+    // later helper finds what is missing without reading every module again.
+    struct Indexed {
+        std::uint64_t size = 0;
+        long long mtime = 0;
+        std::string stem;
+    };
+    std::map<std::string, Indexed> index;
+    std::mutex index_mutex;
+    const auto index_file = requests / "names.idx";
+    const std::string signature = "v1 " + std::to_string(journal_name_context(host.state()));
+    {
+        std::ifstream in(index_file, std::ios::binary);
+        std::string line;
+        if (std::getline(in, line) && line == signature) {
+            while (std::getline(in, line)) {
+                const auto t1 = line.find('\t'), t2 = line.find('\t', t1 + 1), t3 = line.find('\t', t2 + 1);
+                if (t3 == std::string::npos) continue;
+                index[line.substr(0, t1)] = {std::strtoull(line.c_str() + t1 + 1, nullptr, 10),
+                                             std::strtoll(line.c_str() + t2 + 1, nullptr, 10), line.substr(t3 + 1)};
+            }
+        }
+    }
+    auto save_index = [&] {
+        std::string text = signature + "\n";
+        std::lock_guard lock(index_mutex);
+        for (const auto& [name, item] : index)
+            text += name + "\t" + std::to_string(item.size) + "\t" + std::to_string(item.mtime) + "\t" + item.stem + "\n";
+        journal::write_entry(index_file, text.data(), text.size());
+    };
+    std::vector<const leonida::ShaderEntry*> fill_order = entries;
+    std::vector<std::size_t> fill_bytes(fill_order.size());
+    {
+        std::vector<std::pair<std::size_t, const leonida::ShaderEntry*>> sized;
+        for (const leonida::ShaderEntry* entry : entries) sized.emplace_back(library->spirv_bytes(*entry), entry);
+        std::stable_sort(sized.begin(), sized.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+        for (std::size_t i = 0; i < sized.size(); ++i) {
+            fill_order[i] = sized[i].second;
+            fill_bytes[i] = sized[i].first;
+        }
+    }
+    std::atomic<std::size_t> fill_next{0};
+    std::atomic<unsigned> fill_unsaved{0};
+    auto fill = [&] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+        for (;;) {
+            {
+                // Requests first: wait while one is listed that this helper could take.
+                std::unique_lock lock(mutex);
+                wake.wait_for(lock, std::chrono::milliseconds(200), [&] {
+                    if (stop) return true;
+                    for (const helper::Request& request : pending)
+                        if (!busy.count(request.stem)) return false;
+                    return true;
+                });
+                if (stop) return;
+                bool asked = false;
+                for (const helper::Request& request : pending)
+                    if (!busy.count(request.stem)) asked = true;
+                if (asked) continue;
+            }
+            const std::size_t i = fill_next.fetch_add(1);
+            if (i >= fill_order.size()) {
+                if (i == fill_order.size()) {
+                    save_index();
+                    std::fprintf(stderr, "[compile-server] the library is in the journal (%u built while idle)\n",
+                                 filled.load());
+                }
+                return;
+            }
+            const leonida::ShaderEntry& entry = *fill_order[i];
+            if (skip_compute(entry.name) || host.unbuildable(entry, fill_bytes[i])) continue;
+            std::error_code stat;
+            const auto spv = library->spirv_file(entry);
+            const long long mtime = static_cast<long long>(std::filesystem::last_write_time(spv, stat).time_since_epoch().count());
+            std::filesystem::path path;
+            {
+                std::lock_guard lock(index_mutex);
+                const auto it = index.find(entry.name);
+                if (it != index.end() && it->second.size == fill_bytes[i] && it->second.mtime == mtime)
+                    path = dir / (it->second.stem + ".bin");
+            }
+            if (path.empty()) {
+                ComputeBuildOptions key_options;
+                key_options.key_only = true;
+                key_options.use_helper = false;
+                path = host.build(entry, key_options).journal_path;
+                if (path.empty()) continue;
+                {
+                    std::lock_guard lock(index_mutex);
+                    index[entry.name] = {fill_bytes[i], mtime, path.stem().string()};
+                }
+                if (++fill_unsaved % 200 == 0) save_index();
+            }
+            if (journal::entry_usable(path, host.state().pso_identity)) continue;
+            ComputeBuild build;
+            try {
+                build = build_entry(entry, "idle-fill");
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[compile-server] %s: %s\n", entry.name.c_str(), e.what());
+                continue;
+            }
+            if (!build.skipped && !build.busy && build.result == VK_SUCCESS && build.journaled) {
+                ++filled;
+                std::fprintf(stderr, "[compile-server] idle: %s (%zu B) built and journaled in %.1f s (%zu/%zu)\n",
+                             entry.name.c_str(), fill_bytes[i], double(build.ms) / 1000.0, i + 1, fill_order.size());
+            }
+        }
+    };
+
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < threads - idle_threads; ++t) pool.emplace_back(serve);
+    for (unsigned t = 0; t < idle_threads; ++t) pool.emplace_back(fill);
+    auto quiet_since = std::chrono::steady_clock::now();
+    for (;;) {
+        auto listing = helper::list_requests(requests);
+        {
+            std::lock_guard lock(mutex);
+            pending = std::move(listing);
+            if (!pending.empty() || !busy.empty()) quiet_since = std::chrono::steady_clock::now();
+        }
+        wake.notify_all();
+        if (options.idle_exit_s &&
+            std::chrono::steady_clock::now() - quiet_since > std::chrono::seconds(options.idle_exit_s))
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    {
+        std::lock_guard lock(mutex);
+        stop = true;
+    }
+    wake.notify_all();
+    for (std::thread& t : pool) t.join();
+    save_index();
+    std::fprintf(stderr, "[compile-server] nothing asked for %u s: done (%u requests, %u built while idle)\n",
+                 options.idle_exit_s, requests_done.load(), filled.load());
+    return 0;
+}
+
 bool has_global_realtime_privilege() {
     const int override_state = g_global_realtime_privilege_override.load(std::memory_order_relaxed);
     if (override_state >= 0) return override_state != 0;
@@ -18386,6 +24023,38 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
     return d->create_console_descriptor_heap(desc, console_address, console_size, riid, out);
+}
+
+UnboundTsharpStats unbound_tsharp_stats() {
+    return unbound_tsharp_tracker().stats();
+}
+
+void reset_unbound_tsharp_stats() {
+    unbound_tsharp_tracker().reset();
+}
+
+void note_refused_tsharp_for_test(std::uint64_t heap_va, std::size_t offset,
+                                  const std::array<std::uint32_t, 8>& words, const char* why) {
+    leonida::gfx10::ImageWords w;
+    std::memcpy(w.data(), words.data(), sizeof(w));
+    unbound_tsharp_tracker().note(heap_va, offset, w, why);
+}
+
+TitleImage test_bind_title_image(ID3D12Device* device, const std::array<std::uint32_t, 8>& words,
+                                 const char** why) {
+    if (!device) return TitleImage::not_tsharp;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return TitleImage::not_tsharp;
+    leonida::gfx10::ImageWords w;
+    std::memcpy(w.data(), words.data(), sizeof(w));
+    return bind_title_image(d->state(), w, why);
+}
+
+std::uint64_t resource_image_address(ID3D12Resource* resource) {
+    if (!resource) return 0;
+    const Resource* r = Resource::from<Resource>(resource);
+    return r ? r->image_address() : 0;
 }
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {

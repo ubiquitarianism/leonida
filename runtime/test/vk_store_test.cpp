@@ -29,6 +29,7 @@
 #include "vk_shader_fma.h"
 #include "vk_pc_tail.h"
 #include "spirv_capability.h"
+#include "../src/descriptor_table.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <cmath>
@@ -54,7 +55,10 @@ static uint32_t key_hash(const uint32_t k[8]) {     // same FNV-1a as the transl
     return h;
 }
 
-static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32_t index) {
+// `kind` is what the translated modules read next to the index (descriptor_table.h): the arrays this image is
+// bound in, sampled and storage.
+static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32_t index,
+                        uint32_t kind) {
     uint32_t mask = t[0], h = key_hash(key);
     for (uint32_t k = 0; k < 8; k++) {
         uint32_t base = ((h + k) & mask) * 10;
@@ -63,6 +67,7 @@ static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32
         if (used) continue;
         for (int j = 0; j < 8; j++) t[base + 1 + j] = key[j];
         t[base + 9] = index;
+        t[base + 10] = kind;
         return;
     }
 }
@@ -236,10 +241,10 @@ int main(int argc, char** argv) {
     for (uint32_t k = 0; k < 3; k++) {
         uint32_t t[8] = {0x1000 * (k + 1), fmts[k] << 20};
         for (int j = 2; j < 8; j++) t[j] = 0x11 * (k + 1);
-        table_insert(table, t, k + 1);     // its index in the 2D arrays; 0 is the fallback, as in the runtime
+        table_insert(table, t, k + 1, leonida::kind_sampled_bit(0) | leonida::kind_storage_bit(0));     // its index in the 2D arrays; 0 is the fallback, as in the runtime
         if (cube_mode) {   // the cube T# (cs_imgstore_cube.asm): word3 also has TYPE = 0xB, index k + 1 of the 2D arrays
             t[3] |= 0xB0000000u;
-            table_insert(table, t, k + 1);
+            table_insert(table, t, k + 1, leonida::kind_sampled_bit(0) | leonida::kind_storage_bit(0));
         }
     }
     // Index 4: a 16x4 rgba8 image with its whole mip chain (16x4, 8x2, 4x1, 2x1, 1x1) for image_get_resinfo. Its key
@@ -249,13 +254,13 @@ int main(int argc, char** argv) {
     wide_desc.address = 0x400000; wide_desc.format = fmts[0]; wide_desc.width = WIDE_W; wide_desc.height = WIDE_H;
     wide_desc.mip_count = wide_desc.resource_mips = WIDE_MIPS;
     const leonida::gfx10::ImageWords wide_key = leonida::gfx10::encode(wide_desc);
-    table_insert(table, wide_key.data(), 4);
+    table_insert(table, wide_key.data(), 4, leonida::kind_sampled_bit(0));   // image_get_resinfo reads binding 0
     // The volume of the 3D atomics: index 1 of the 3D arrays, behind a T# of the 2D images' pattern (k = 4).
     const uint32_t VOL = 4;
     {
         // The volume uses the D3D12 layer's whole-mip UAV tag (FirstWSlice=0, WSize=4).
         uint32_t t[8] = {0x5000, fmts[1] << 20, 0x55, 0x55, 0x80000055, 0x55, 0x55, 0xd7801800};
-        table_insert(table, t, 1);
+        table_insert(table, t, 1, leonida::kind_sampled_bit(2) | leonida::kind_storage_bit(2));
     }
     VkBuffer tb; void* tbp;
     CHECK(make_buffer(table.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tb, &tbp));

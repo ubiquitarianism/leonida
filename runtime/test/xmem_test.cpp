@@ -741,7 +741,19 @@ void test_copy_page_mappings_cpu_view(const PhysicalApi& api) {
     check(readable(other) && page_holds(other, 0x7300u),
           "a GPU-only source page unmapped there is looked up at its CPU range");
 
-    // A null source unmaps both ranges.
+    // A CPU page the title mapped itself is the title's: a copy onto its GPU-only page, or an unmap of it, changes the
+    // GPU-only page alone (the console's CopyPageMappingsBatchX edits only that range's page table).
+    check(copy(gpu + 2 * kPage64k, pool + kPage64k, 1, false), "a copy onto a GPU-only page whose CPU page is the title's");
+    check(readable(gpu + 2 * kPage64k) && page_holds(gpu + 2 * kPage64k, 0x7301u),
+          "the GPU-only page shows the copied pool page");
+    check(readable(cpu + 2 * kPage64k) && page_holds(cpu + 2 * kPage64k, 0x7300u),
+          "the title's own mapping at the paired CPU page is kept, not replaced by the copy");
+    check(copy(gpu + 2 * kPage64k, nullptr, 1, false), "a null source unmaps a GPU-only page whose CPU page is the title's");
+    check(!readable(gpu + 2 * kPage64k), "the GPU-only page is unmapped");
+    check(readable(cpu + 2 * kPage64k) && page_holds(cpu + 2 * kPage64k, 0x7300u),
+          "the title's own mapping at the paired CPU page survives the unmap");
+
+    // A null source unmaps both ranges where the CPU pages are the copy's own.
     check(copy(gpu, nullptr, kPool, false), "a null source unmaps the GPU-only range");
     check(!readable(gpu) && !readable(cpu) && !readable(cpu + kPage64k), "the paired CPU range is unmapped with it");
 
@@ -1544,6 +1556,38 @@ void test_physical_pages_commit_on_touch(const PhysicalApi& api) {
     check(read_ok, "ReadFile fills a page that commit_physical_range committed");
 
     check(api.map(second, 2, nullptr) == second && api.map(window, kMapped, nullptr) == window, "they unmap");
+    {
+        // A host guarded read (outside the title image at 0x140000000) of an unmapped window page exits as
+        // passed_guarded without counting as left_to_title; a title read still counts as left_to_title.
+        void* const stub_page = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        const uint8_t mov_eax_rcx_ret[] = {0x8b, 0x01, 0xc3};
+        DWORD stub_old = 0;
+        bool stub_ready = false;
+        if (stub_page) {
+            std::memcpy(stub_page, mov_eax_rcx_ret, sizeof(mov_eax_rcx_ret));
+            stub_ready = VirtualProtect(stub_page, 4096, PAGE_EXECUTE_READ, &stub_old) != FALSE;
+            FlushInstructionCache(GetCurrentProcess(), stub_page, sizeof(mov_eax_rcx_ret));
+        }
+        const auto host_read_faults = [&](const void* p) {
+            __try {
+                reinterpret_cast<uint32_t (*)(const void*)>(stub_page)(p);
+                return false;
+            } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                          : EXCEPTION_CONTINUE_SEARCH) {
+                return true;
+            }
+        };
+        const uint64_t guarded_before = rt::xmem::fault_exits(rt::xmem::FaultExit::passed_guarded);
+        const uint64_t left_before = rt::xmem::fault_exits(rt::xmem::FaultExit::left_to_title);
+        check(stub_ready && host_read_faults(second) &&
+                  rt::xmem::fault_exits(rt::xmem::FaultExit::passed_guarded) == guarded_before + 1 &&
+                  rt::xmem::fault_exits(rt::xmem::FaultExit::left_to_title) == left_before,
+              "a host guarded read of an unmapped window page exits as passed_guarded");
+        check(access_faults(reinterpret_cast<volatile uint32_t*>(second), false) &&
+                  rt::xmem::fault_exits(rt::xmem::FaultExit::left_to_title) == left_before + 1,
+              "a title read of an unmapped window page still exits as left_to_title");
+        if (stub_page) VirtualFree(stub_page, 0, MEM_RELEASE);
+    }
     check(api.free_pages(count, pages.data()) == TRUE, "XMemFreePhysicalPages frees them");
 }
 

@@ -114,6 +114,14 @@ inline uint32_t align_up(uint32_t value, uint32_t alignment) {
 // contracts by floor division, while physical pitch/height use ShiftCeil on
 // the base extent in elements. A slice stores the tail block, then its
 // unpacked mips from smallest to largest.
+//
+// A render-target or depth-stencil flag only matters when the layout word
+// leaves the mode to XG (select_mode then picks a Z/R mode this model lacks);
+// with an explicit mode the layout is that mode's, as on the console.
+//
+// A linear 3D texture is thin (addrlib's HwlComputeSurfaceInfoLinear): every
+// depth slice holds the whole mip chain, rows aligned to 256 bytes, so the
+// slices are plane.slice_bytes apart and a mip's size spans all its slices.
 inline bool build_texture(const ResourceDesc& desc, Texture& texture) {
     // Exposure readback uses the explicit linear Series layout, including the
     // console flag set by its render-target descriptor builder.
@@ -145,8 +153,12 @@ inline bool build_texture(const ResourceDesc& desc, Texture& texture) {
     default: return false;
     }
     const bool volume = desc.dimension == kTexture3D;
-    if (volume && mode != k4kbS) return false;
-    if (volume && (mips != 1 || format.side != 1)) {
+    if (volume && mode != k4kbS && mode != kLinear) return false;
+    // Linear 3D is measured with one mip only (256-byte rows, slice after slice). Whether a linear 3D chain is laid
+    // out slice-major or mip-major is not measured, and the two put mips 1+ at different offsets: refused, as before.
+    if (volume && mode == kLinear && mips > 1) return false;
+    const bool thick = volume && mode != kLinear;  // GFX10 3D S modes: blocks span tile_depth slices
+    if (thick && (mips != 1 || format.side != 1)) {
         static const bool enabled = [] {
             const char* value = std::getenv("LEONIDA_VOLUME_MIPS");
             return !value || std::strcmp(value, "0") != 0;
@@ -169,7 +181,7 @@ inline bool build_texture(const ResourceDesc& desc, Texture& texture) {
     texture.tile_width = tw;
     texture.tile_height = th;
     texture.array = volume ? 1u : desc.depth_or_array;
-    if (volume) {
+    if (thick) {
         // Dimensions in elements (4x4 blocks for BC formats).
         constexpr uint32_t blocks[5][3] = {{16, 16, 16}, {8, 16, 16}, {8, 16, 8}, {8, 8, 8}, {4, 8, 8}};
         texture.tile_width = tw = blocks[element_bits][0];
@@ -189,11 +201,11 @@ inline bool build_texture(const ResourceDesc& desc, Texture& texture) {
     plane.standard_mips = mips;
     // AMD addrlib Gfx10Lib::ComputeSurfaceInfoMacroTiled and Lib::GetMipTailDim.
     // A 4 KiB thick block has five tail levels and halves height. BC extents are in blocks.
-    const unsigned max_tail = volume ? 5u : tile_bits - 4;
-    uint32_t tail_w = volume ? tw : tw / 2, tail_h = volume ? th / 2 : th;
+    const unsigned max_tail = thick ? 5u : tile_bits - 4;
+    uint32_t tail_w = thick ? tw : tw / 2, tail_h = thick ? th / 2 : th;
     constexpr uint32_t micro3d[5][3] = {{8,4,8}, {4,4,8}, {4,4,4}, {4,2,4}, {2,2,4}};
-    const uint32_t micro_w = volume ? micro3d[element_bits][0] : 1u << ((8 - element_bits + 1) / 2);
-    const uint32_t micro_h = volume ? micro3d[element_bits][1] : 256 / (format.bytes * micro_w);
+    const uint32_t micro_w = thick ? micro3d[element_bits][0] : 1u << ((8 - element_bits + 1) / 2);
+    const uint32_t micro_h = thick ? micro3d[element_bits][1] : 256 / (format.bytes * micro_w);
     uint32_t tail_depth = 0;
 
     uint64_t chain_bytes = 0;
@@ -222,7 +234,7 @@ inline bool build_texture(const ResourceDesc& desc, Texture& texture) {
         if (mip.in_tail) {
             const unsigned index = max_tail - 1 - (i - plane.standard_mips);
             mip.offset = index > 6 ? 16u << index : index * 256u;
-            if (volume) {
+            if (thick) {
                 texture.volume_mips[i].tail_x = ((index >> 1) & 1u) * micro_w;
                 texture.volume_mips[i].tail_y = ((index & 1u) | ((index >> 1) & 2u)) * micro_h;
                 mip.offset *= align_up(tail_depth, micro3d[element_bits][2]) / micro3d[element_bits][2];
@@ -244,7 +256,7 @@ inline bool build_texture(const ResourceDesc& desc, Texture& texture) {
         mip.slice_bytes = uint64_t(mip.pitch_bytes) * mip.padded_height;
         mip.size = mip.slice_bytes * (volume ? mip.padded_depth : 1u);
     }
-    if (volume) {
+    if (thick) {
         uint64_t macro = chain_bytes;
         chain_bytes *= align_up(tail_depth, texture.tile_depth) / texture.tile_depth;
         for (unsigned i = plane.standard_mips; i > 0; --i) {
@@ -262,13 +274,29 @@ inline bool build_texture(const ResourceDesc& desc, Texture& texture) {
     for (unsigned i = plane.standard_mips; i > 0; --i) {
         auto& mip = plane.mips[i - 1];
         mip.offset = chain_bytes;
-        chain_bytes += mip.size;
+        chain_bytes += mip.slice_bytes;  // one slice's share: a linear 3D mip's size spans every depth slice
     }
     plane.slice_bytes = chain_bytes;
-    plane.size = layout.size = chain_bytes * texture.array;
+    plane.size = layout.size = chain_bytes * (volume ? desc.depth_or_array : texture.array);
     return true;
 }
 
+// The bytes from the texture's base that hold the mips from `first` on (the whole texture for 0). Only a 2D texture of
+// one slice stores its chain from the smallest mips to the largest, so only there is a part of it a prefix.
+inline uint64_t mip_chain_bytes(const Texture& t, unsigned first) {
+    const auto& plane = t.layout.plane[0];
+    if (!first || first >= t.layout.mips || t.layout.dimension != kTexture2D || t.array != 1) return t.layout.size;
+    if (first >= plane.standard_mips) return t.layout.alignment;  // the tail is one block
+    return plane.mips[first].offset + plane.mips[first].size;
+}
+
+// The first mip that is held, with every smaller one, by the `bytes` readable bytes from the texture's base; the mip
+// count when not even the smallest is.
+inline unsigned first_mip_within(const Texture& t, uint64_t bytes) {
+    for (unsigned m = 0; m < t.layout.mips; ++m)
+        if (mip_chain_bytes(t, m) <= bytes) return m;
+    return t.layout.mips;
+}
 
 // These RB+ equation rows come directly from AMD addrlib. The other two
 // non-XOR modes already have equations in Leonida's GFX10 detiler.

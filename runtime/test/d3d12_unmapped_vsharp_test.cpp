@@ -152,7 +152,6 @@ int check_inline_table(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fe
         std::memcpy(cpu + slot * kDescriptor, w.data(), sizeof(w));
     };
     put(0, raw_vsharp(unmapped));
-    for (int i = 4; i < 131; ++i) put(i, raw_vsharp(unmapped));
     put(1, raw_vsharp(b.arena_va));
     put(2, raw_vsharp(b.upload_va & 0xFFFFFFFFFFFFull));
     auto image_like = raw_vsharp(unmapped);
@@ -233,8 +232,9 @@ int check_console_heap(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fe
     EXPECT(!(copy[3][0] | copy[3][1] | copy[3][2] | copy[3][3]));  // the data slot's descriptor half is null
     for (int i = 0; i < 4; ++i) EXPECT(!std::memcmp(title + i * kDescriptor, before[i], kDescriptor));
 
-    // 128 cold descriptors share one absent range. Publishing its alias leaves the title bytes
-    // unchanged. Only the bounded round-robin probes should discover it in the first 64 submits.
+    // 128 descriptors wait on one absent range; the title's bytes never change. Publishing its alias fixes every one
+    // of them at the next submission (the heap's slot records: an addition over a waiting V#), not one round-robin
+    // probe at a time.
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
     EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
@@ -242,23 +242,78 @@ int check_console_heap(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fe
                                                IID_PPV_ARGS(&list.p))));
     EXPECT(SUCCEEDED(list->Close()));
     ID3D12CommandList* lists[] = {list.p};
-    for (unsigned pass = 0; pass < 64; ++pass) {
-        if (pass == 1) leonida::title_va_aliases().add(unmapped, kViewBytes, b.arena_va);
+    const auto submit = [&] {
         queue->ExecuteCommandLists(1, lists);
-        EXPECT(SUCCEEDED(queue->Signal(fence, ++fence_value)));
-        EXPECT(SUCCEEDED(fence->SetEventOnCompletion(fence_value, nullptr)));
-    }
+        return SUCCEEDED(queue->Signal(fence, ++fence_value)) &&
+               SUCCEEDED(fence->SetEventOnCompletion(fence_value, nullptr));
+    };
+    const auto count_restored = [&](unsigned& restored) {
+        restored = 0;
+        for (unsigned slot = 0; slot < 131; ++slot) {
+            if (slot > 0 && slot < 4) continue;
+            std::uint32_t words[8];
+            if (!rt::d3d12::read_arena(device, shader_va + slot * kDescriptor, words, sizeof(words))) return false;
+            if (base_of(words) == b.arena_va && words[2]) ++restored;
+            else if (!zero_size(words)) return false;
+        }
+        return true;
+    };
     unsigned restored = 0;
-    for (unsigned slot = 0; slot < 131; ++slot) {
-        if (slot > 0 && slot < 4) continue;
-        std::uint32_t words[8];
-        EXPECT(rt::d3d12::read_arena(device, shader_va + slot * kDescriptor, words, sizeof(words)));
-        if (base_of(words) == b.arena_va && words[2]) ++restored;
-        else EXPECT(zero_size(words));
-    }
-    EXPECT(restored == 16);
-    std::printf("128 settled zero descriptors, %u restored in 64 submissions\n", restored);
+    EXPECT(submit());
+    EXPECT(count_restored(restored) && restored == 0);
+    leonida::title_va_aliases().add(unmapped, kViewBytes, b.arena_va);
+    EXPECT(submit());
+    EXPECT(count_restored(restored) && restored == 128);
+    // A slot written now with the words the first refresh had no copy for: the refresh that copies the write asks
+    // for them again rather than reuse that answer (fix_vsharp's answers last one pass over the heap).
+    put(140, raw_vsharp(unmapped));
+    EXPECT(submit());
+    std::uint32_t rewritten[8];
+    EXPECT(rt::d3d12::read_arena(device, shader_va + 140 * kDescriptor, rewritten, sizeof(rewritten)));
+    EXPECT(base_of(rewritten) == b.arena_va && rewritten[2]);
+    std::printf("128 waiting zero descriptors, all restored at the first submission after their alias came, a "
+                "rewritten one at once\n");
+    // The alias goes: at the next submission none of them names its copy any more.
     leonida::title_va_aliases().remove(unmapped, b.arena_va);
+    EXPECT(submit());
+    EXPECT(count_restored(restored) && restored == 0);
+
+    // A released buffer: the slots that named it are null at the next submission, the others keep their V#s. The
+    // title's bytes stay as written (each slot is rewritten through its page, as the title does, so the heap's write
+    // tracking sees it).
+    {
+        Ref<ID3D12Resource> gone;
+        const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+        const auto gone_desc = buffer_desc(64 * 1024);
+        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &gone_desc,
+                                                         D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&gone.p))));
+        const std::uint64_t gone_va = gone->GetGPUVirtualAddress();
+        for (int i = 140; i < 150; ++i) put(i, raw_vsharp(gone_va + std::uint64_t(i - 140) * kViewBytes));
+        for (int i = 150; i < 160; ++i) put(i, raw_vsharp(b.arena_va));
+        EXPECT(submit());
+        std::uint32_t words[8];
+        for (unsigned slot = 140; slot < 160; ++slot) {
+            EXPECT(rt::d3d12::read_arena(device, shader_va + slot * kDescriptor, words, sizeof(words)));
+            EXPECT(words[2] && base_of(words) == (slot < 150 ? gone_va + (slot - 140) * kViewBytes : b.arena_va));
+        }
+        gone.reset();
+        // The arena range goes once the device has retired the buffer: a few submissions at most.
+        bool nulled = false;
+        for (int pass = 0; pass < 8 && !nulled; ++pass) {
+            EXPECT(submit());
+            nulled = true;
+            for (unsigned slot = 140; slot < 150; ++slot) {
+                EXPECT(rt::d3d12::read_arena(device, shader_va + slot * kDescriptor, words, sizeof(words)));
+                nulled &= zero_size(words);
+            }
+        }
+        EXPECT(nulled);
+        for (unsigned slot = 150; slot < 160; ++slot) {
+            EXPECT(rt::d3d12::read_arena(device, shader_va + slot * kDescriptor, words, sizeof(words)));
+            EXPECT(words[2] && base_of(words) == b.arena_va);
+        }
+        std::printf("released buffer: the 10 slots that named it are null at the next submissions, 10 others kept\n");
+    }
 
     // The null guard: past the heap's last slot, up to kHeapIndexReach from its start, every byte reads 0.
     constexpr std::uint64_t reach = 64ull << 20;

@@ -30,6 +30,7 @@
 #include "resource_tiling.h"
 #include "pipeline_profile.h"
 #include "submit_phases.h"
+#include "pipeline_wait.h"
 #include "title_va_alias.h"
 #include "xdxr_build.h"
 
@@ -124,13 +125,14 @@ struct VulkanDeviceFunctions {
     X(vkCmdPushConstants) X(vkCmdDispatch)                                                                     \
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetViewportWithCount) X(vkCmdSetScissorWithCount)                                                   \
-    X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
+    X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData) X(vkMergePipelineCaches)   \
-    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
+    X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawMeshTasksIndirectEXT) X(vkCmdDrawMeshTasksIndirectCountEXT) \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
-    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
+    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)                                                            \
+    X(vkCmdBeginQueryIndexedEXT) X(vkCmdEndQueryIndexedEXT)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -165,6 +167,9 @@ struct VulkanDeviceFunctions {
         return vkCmdBeginRendering && vkCmdEndRendering && vkCmdBindVertexBuffers2 && vkCmdSetPrimitiveTopology &&
                vkCmdSetPrimitiveRestartEnable;
     }
+    // VK_EXT_transform_feedback is enabled on the device: the indexed-query entry points are loaded, so an
+    // SO_STATISTICS heap can be a real transform-feedback pool (D3D-302).
+    bool transform_feedback = false;
 };
 
 // Both kinds of compute resolve use the same storage buffer, descriptor set and pipeline layout.
@@ -618,6 +623,8 @@ inline Stats& stats(int kind) {
     static Stats s[3];
     return s[kind < 0 || kind > 2 ? 0 : kind];
 }
+inline void held_tick(int kind);  // below: the held-operations line, due on the same 10 s
+
 inline void done(int kind, std::chrono::steady_clock::time_point submitted) {
     using clock = std::chrono::steady_clock;
     const auto now = clock::now();
@@ -641,36 +648,66 @@ inline void done(int kind, std::chrono::steady_clock::time_point submitted) {
         s.sum_ms = s.max_ms = s.busy_ms = 0;
         s.since = now;
     }
+    held_tick(kind);
 }
 // A held queue operation (Wait before Signal), released: how long it waited on the CPU before it could run.
-inline void held(int kind, int op, std::chrono::steady_clock::time_point at) {
+// A held queue operation (Wait before Signal), released: how long it waited on the CPU before it could run, and for
+// the longest one of the window the fence (semaphore handle) and value it waited for, so the slow signaller can be
+// named. The line is due every 10 s: held() prints it, and so does done() (held_tick), so a window with nothing
+// released still reports.
+struct HeldStats {
+    std::mutex mutex;
+    std::uint64_t count[3] = {};
+    double sum_ms = 0, max_ms = 0;
+    std::uint64_t max_fence = 0, max_value = 0;
+    int max_op = 0;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+inline HeldStats& held_stats(int kind) {
+    static HeldStats h[3];
+    return h[kind < 0 || kind > 2 ? 0 : kind];
+}
+// held_stats(kind).mutex held.
+inline void held_report_locked(int kind, HeldStats& s, std::chrono::steady_clock::time_point now) {
+    if (now - s.since < std::chrono::seconds(10)) return;
+    const std::uint64_t all = s.count[0] + s.count[1] + s.count[2];
+    std::fprintf(stderr, "[rt] gpu latency (%s): %llu held operations released in %.0f s (%llu batches, %llu "
+                         "signals, %llu markers), held %.2f ms on average, %.1f ms the longest",
+                 kind == 0 ? "direct" : kind == 1 ? "compute" : "copy", static_cast<unsigned long long>(all),
+                 std::chrono::duration<double>(now - s.since).count(), static_cast<unsigned long long>(s.count[0]),
+                 static_cast<unsigned long long>(s.count[1]), static_cast<unsigned long long>(s.count[2]),
+                 all ? s.sum_ms / double(all) : 0.0, s.max_ms);
+    if (all && s.max_fence)
+        std::fprintf(stderr, " (a %s waiting for fence 0x%llx value %llu)",
+                     s.max_op == 0 ? "batch" : s.max_op == 1 ? "Signal" : "marker",
+                     static_cast<unsigned long long>(s.max_fence), static_cast<unsigned long long>(s.max_value));
+    std::fputc('\n', stderr);
+    s.count[0] = s.count[1] = s.count[2] = 0;
+    s.sum_ms = s.max_ms = 0;
+    s.max_fence = s.max_value = 0;
+    s.since = now;
+}
+inline void held(int kind, int op, std::chrono::steady_clock::time_point at, std::uint64_t fence = 0,
+                 std::uint64_t value = 0) {
     using clock = std::chrono::steady_clock;
-    struct Held {
-        std::mutex mutex;
-        std::uint64_t count[3] = {};
-        double sum_ms = 0, max_ms = 0;
-        clock::time_point since = clock::now();
-    };
-    static Held h[3];
-    Held& s = h[kind < 0 || kind > 2 ? 0 : kind];
+    HeldStats& s = held_stats(kind);
     const auto now = clock::now();
     const double ms = std::chrono::duration<double, std::milli>(now - at).count();
     std::lock_guard lock(s.mutex);
     ++s.count[op < 0 || op > 2 ? 0 : op];
     s.sum_ms += ms;
-    s.max_ms = (std::max)(s.max_ms, ms);
-    if (now - s.since >= std::chrono::seconds(10)) {
-        const std::uint64_t all = s.count[0] + s.count[1] + s.count[2];
-        std::fprintf(stderr, "[rt] gpu latency (%s): %llu held operations released in %.0f s (%llu batches, %llu "
-                             "signals, %llu markers), held %.2f ms on average, %.1f ms the longest\n",
-                     kind == 0 ? "direct" : kind == 1 ? "compute" : "copy", static_cast<unsigned long long>(all),
-                     std::chrono::duration<double>(now - s.since).count(), static_cast<unsigned long long>(s.count[0]),
-                     static_cast<unsigned long long>(s.count[1]), static_cast<unsigned long long>(s.count[2]),
-                     all ? s.sum_ms / double(all) : 0.0, s.max_ms);
-        s.count[0] = s.count[1] = s.count[2] = 0;
-        s.sum_ms = s.max_ms = 0;
-        s.since = now;
+    if (ms > s.max_ms) {
+        s.max_ms = ms;
+        s.max_fence = fence;
+        s.max_value = value;
+        s.max_op = op;
     }
+    held_report_locked(kind, s, now);
+}
+inline void held_tick(int kind) {
+    HeldStats& s = held_stats(kind);
+    std::lock_guard lock(s.mutex);
+    held_report_locked(kind, s, std::chrono::steady_clock::now());
 }
 }  // namespace gpu_latency
 
@@ -1090,6 +1127,8 @@ public:
                   GraphicsIndirectCapabilities indirect = {})
         : device_(device), tracker_(separate_depth_stencil_layouts), ray_tracing_(ray_tracing) {
         loaded_ = vk.load(get, device);
+        // VK_EXT_transform_feedback: enabled on the device when its indexed-query entry points resolved (D3D-302).
+        vk.transform_feedback = vk.vkCmdBeginQueryIndexedEXT && vk.vkCmdEndQueryIndexedEXT;
         if (loaded_ && gpu_labels_.initialize(device, get)) {
             replay_.gpu_label = [this](VkCommandBuffer cb, const label::Write& write) { gpu_labels_.record(cb, write); };
         }
@@ -1125,6 +1164,11 @@ public:
         replay_.reset_query_pool = vk.vkCmdResetQueryPool;
         replay_.begin_query = vk.vkCmdBeginQuery;
         replay_.end_query = vk.vkCmdEndQuery;
+        // VK_EXT_transform_feedback (D3D-302), loaded when the device enabled it: indexed SO_STATISTICS queries.
+        if (vk.transform_feedback) {
+            replay_.begin_query_indexed = vk.vkCmdBeginQueryIndexedEXT;
+            replay_.end_query_indexed = vk.vkCmdEndQueryIndexedEXT;
+        }
         replay_.write_timestamp = vk.vkCmdWriteTimestamp;
         replay_.copy_query_pool_results = vk.vkCmdCopyQueryPoolResults;
         replay_.bind_pipeline = vk.vkCmdBindPipeline;
@@ -1148,8 +1192,11 @@ public:
         replay_.set_primitive_restart_enable = vk.vkCmdSetPrimitiveRestartEnable;
         replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
         replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
+        replay_.set_depth_bounds = vk.vkCmdSetDepthBounds;
         replay_.draw = vk.vkCmdDraw;
         replay_.draw_mesh_tasks = vk.vkCmdDrawMeshTasksEXT;  // null unless VK_EXT_mesh_shader is enabled
+        replay_.draw_mesh_tasks_indirect = vk.vkCmdDrawMeshTasksIndirectEXT;
+        replay_.draw_mesh_tasks_indirect_count = vk.vkCmdDrawMeshTasksIndirectCountEXT;
         replay_.draw_indexed = vk.vkCmdDrawIndexed;
         replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
             const auto it = graphics_pipelines_.find(id);
@@ -1278,8 +1325,12 @@ public:
 
     bool loaded() const { return loaded_; }
 
-    void configure_device_fault(PFN_vkGetDeviceProcAddr get, DeviceFaultExtensions enabled) {
-        device_fault_ = std::make_unique<DeviceFaultDiagnostics>(get, device_, enabled);
+    // `memory`: the physical device's memory types, for the AMD marker buffer (enabled.markers).
+    void configure_device_fault(PFN_vkGetDeviceProcAddr get, DeviceFaultExtensions enabled,
+                                const VkPhysicalDeviceMemoryProperties* memory = nullptr) {
+        device_fault_ = std::make_unique<DeviceFaultDiagnostics>(get, device_, enabled, memory,
+                                                                 vk.vkCmdPipelineBarrier2 != nullptr);
+        device_fault_->set_submit_lock(&submit_mutex_);
         if (fence_dispatcher_) fence_dispatcher_->set_device_fault(device_fault_.get());
         if (loaded_) progress_watch_ = std::jthread([this](std::stop_token stop) { watch_queue_progress(stop); });
     }
@@ -1326,14 +1377,19 @@ public:
     // device-local memory, and must set VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT. LEONIDA_INDIRECT_CLAMP=0 turns the
     // pass off at replay time.
     void enable_indirect_clamp(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceMemoryProperties& memory,
-                               const VkPhysicalDeviceLimits& limits, ScratchBuffers::Allocate allocate) {
+                               const VkPhysicalDeviceLimits& limits, ScratchBuffers::Allocate allocate,
+                               std::vector<std::uint32_t> families = {}) {
         std::unique_lock lock(resource_mutex_);
+        // An enabled clamp is required: a call whose scratch preparation fails is refused (unsupported) instead of
+        // reading the application's argument buffer, which may hold a record no compute pass wrote. Off, or on a
+        // device the pass cannot run on, the replay keeps the application's buffer as before.
         replay_.require_indirect_clamp = indirect_clamp_enabled();
         if (!replay_.require_indirect_clamp) return;
         indirect_clamp_ = std::make_unique<IndirectArgumentClamp>(get, device_, memory, limits, std::move(allocate),
-                                                                 device_fault_.get());
+                                                                 device_fault_.get(), std::move(families));
         if (!indirect_clamp_->loaded()) {
             indirect_clamp_.reset();
+            replay_.require_indirect_clamp = false;
             return;
         }
         // The preparation callback needs this submission's counter-slot batch, so it is set per ExecuteCommandLists
@@ -1545,32 +1601,42 @@ public:
     }
 
     // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
+    // Guarded by pipeline_mutex_ (separate from resource_mutex_) so shader compilation on one queue does not block
+    // resource registration or destruction on the render thread.
     void add_pipeline(std::uintptr_t id, const ComputePipeline& pipeline, const char* shader = nullptr) {
-        std::unique_lock lock(resource_mutex_);
+        std::unique_lock lock(pipeline_mutex_);
         pipelines_[id] = pipeline;
         if (shader && device_fault_) device_fault_->pipeline_names[id] = {shader};
     }
     void remove_pipeline(std::uintptr_t id) {
-        std::unique_lock lock(resource_mutex_);
+        std::unique_lock lock(pipeline_mutex_);
         pipelines_.erase(id);
         graphics_pipelines_.erase(id);
         if (device_fault_) device_fault_->pipeline_names.erase(id);
     }
     void add_graphics_pipeline(std::uintptr_t id, const GraphicsPipeline& pipeline,
                                const CheckpointShaders* shaders = nullptr) {
-        std::unique_lock lock(resource_mutex_);
+        std::unique_lock lock(pipeline_mutex_);
         graphics_pipelines_[id] = pipeline;
         if (shaders && device_fault_) device_fault_->pipeline_names[id] = *shaders;
     }
-    // Workers for the pipelines a submission needs and that are not built yet. Null (the default): each is built where
-    // prepare() meets it, on the submitting thread. Replacing it waits for submissions that are compiling, and ends the
-    // workers it had.
+    // Workers for the pipelines a submission needs and that are not built yet. Null (the default): compiled serially on
+    // the submitting thread once resource_mutex_ is released. Replacing it waits for submissions that are compiling, and
+    // ends the workers it had.
     void set_pipeline_workers(std::unique_ptr<PipelineWorkers> workers) {
-        std::unique_lock lock(resource_mutex_);
+        std::unique_lock lock(pipeline_mutex_);
         pipeline_workers_.swap(workers);
     }
+    // For the large pipelines of a submission: the memory they may use while they compile together
+    // (PipelineCompiles::build), and what is kept while they do (LargeModuleGate::Demand). None (the default): they compile
+    // one after another.
+    void set_large_compiles(std::function<std::uint64_t()> budget, std::function<std::shared_ptr<void>()> demand) {
+        std::unique_lock lock(pipeline_mutex_);
+        large_compile_budget_ = std::move(budget);
+        large_compile_demand_ = std::move(demand);
+    }
     PipelineWorkers::Stats pipeline_worker_stats() {
-        std::shared_lock lock(resource_mutex_);
+        std::shared_lock lock(pipeline_mutex_);
         return pipeline_workers_ ? pipeline_workers_->stats() : PipelineWorkers::Stats{};
     }
     // Configure before queue creation, when the selected queue family supports compute.
@@ -1584,6 +1650,44 @@ public:
         return host_texture_stats_;
     }
 
+    // LOCAL FIX (deadlock on the first-run pages): the texture writes below used vkDeviceWaitIdle with the submit
+    // lock held. The device is idle only once every queue has run all it was given, and a queue whose submitted
+    // work waits on a value a later submission signals never gets there while this thread keeps the lock: a native
+    // boot sat 270 s in vkDeviceWaitIdle (title staging), then lost the device. Instead: wait for the queue
+    // timelines to pass what was submitted so far, at most `timeout`; on VK_TIMEOUT the caller skips this write (the
+    // title-texture pass tries it again) rather than freeze the title. Not covered, unlike the device wait: present
+    // and probe submissions, which have their own fences outside the retirement timelines (a present reading the
+    // image). The staged write is ordered behind them anyway (same queue, an ALL_COMMANDS barrier); the host copy
+    // is not, so a presented title texture can be written while a present still reads it (a torn frame, no fault).
+    // With submit_mutex_ held.
+    VkResult wait_submitted_locked(std::uint64_t timeout_ns, const char* what) {
+        if (is_device_lost()) return VK_ERROR_DEVICE_LOST;  // a queue's timeline may be gone already
+        const auto pending = retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire));
+        if (pending.empty()) return VK_SUCCESS;
+        std::vector<VkSemaphore> semaphores;
+        std::vector<std::uint64_t> values;
+        for (const auto& [semaphore, value] : pending) {
+            semaphores.push_back(semaphore);
+            values.push_back(value);
+        }
+        VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wait.semaphoreCount = std::uint32_t(semaphores.size());
+        wait.pSemaphores = semaphores.data();
+        wait.pValues = values.data();
+        const VkResult r = observe_result(vk.vkWaitSemaphores(device_, &wait, timeout_ns), what);
+        if (r == VK_TIMEOUT) {
+            static std::atomic<std::uint64_t> timeouts{0};
+            const std::uint64_t n = timeouts.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (!(n & (n - 1)))
+                std::fprintf(stderr, "[rt] vulkan: %s: submitted work not done within %llu ms (%llu time(s)); the "
+                                     "write is skipped this time\n", what,
+                             static_cast<unsigned long long>(timeout_ns / 1000000), static_cast<unsigned long long>(n));
+        }
+        return r;
+    }
+    // Short: a timeout is certain when the awaited work needs this thread's lock, and the write is only skipped.
+    static constexpr std::uint64_t kTitleWriteWaitNs = 250'000'000;  // 250 ms
+
     // CPU writes to a title texture have no application fence. Prevent another queue from
     // claiming a new layout or submitting work between the completion check and the host copy.
     // An unsatisfied console Wait lives in QueueHolds, outside the Vulkan queues.
@@ -1594,7 +1698,13 @@ public:
         if (tracker_.layout(id, subresource) != VK_IMAGE_LAYOUT_GENERAL) return VK_NOT_READY;
         if (image_work_pending_) {
             ++host_texture_stats_.waits;
-            const auto result = observe_result(vk.vkDeviceWaitIdle(device_), "vkDeviceWaitIdle (title texture upload)");
+            // A device wait is a queue operation: it passes the compile gate, so it never waits in the driver behind a
+            // long pipeline create (the starved wait that loses the device after 10 s).
+            const SubmitMutex::SubmitTurn turn(submit_mutex_, false);
+            const auto result = wait_submitted_locked(kTitleWriteWaitNs, "vkWaitSemaphores (title texture upload)");
+            // Not done in time: VK_NOT_READY, so the caller takes its staged path (ordered on the queue) or tries
+            // again later, and the skip is not counted as a failed fill.
+            if (result == VK_TIMEOUT) return VK_NOT_READY;
             if (result != VK_SUCCESS) return result;
             image_work_pending_ = false;
         }
@@ -1612,7 +1722,8 @@ public:
         LayoutPieces pieces;
         if (!tracker_.pieces(id, range, pieces) || pieces.empty()) return VK_ERROR_UNKNOWN;
         if (image_work_pending_) {
-            const auto r = observe_result(vk.vkDeviceWaitIdle(device_), "vkDeviceWaitIdle (title staging)");
+            const SubmitMutex::SubmitTurn turn(submit_mutex_, false);  // a queue operation: the compile gate (as above)
+            const auto r = wait_submitted_locked(kTitleWriteWaitNs, "vkWaitSemaphores (title staging)");
             if (r != VK_SUCCESS) return r;
             image_work_pending_ = false;
         }
@@ -1696,6 +1807,7 @@ public:
             XdxrTriangles g;
             g.vertices = t.vertex_va ? base + t.vertex_va : 0;
             g.vertex_stride = t.vertex_stride;
+            g.vertex_count = t.vertex_count;
             g.xy_only = t.vertex_format == VK_FORMAT_R32G32_SFLOAT;
             g.indices = t.index_type && t.index_va ? base + t.index_va : 0;
             g.index_type = t.index_type;
@@ -1737,7 +1849,6 @@ public:
     // `before` is called at the start of every submission of command lists (a held batch: when it is released),
     // before any lock here is taken: the device re-copies its slot-133 shadow buffers from the title's pages there.
     // Set once, before the first queue exists.
-    void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
 
     // Table VAs are offsets in this device's arena. Install its scanner before creating any queues.
     // (The per-device scan is from the patch descriptor-table-refresh, part 2, of
@@ -1774,10 +1885,24 @@ public:
         return true;
     }
     const char* diagnostic_compute_name(std::uintptr_t id) {
-        std::shared_lock lock(resource_mutex_);
+        std::shared_lock lock(pipeline_mutex_);
         if (!device_fault_) return nullptr;
         const auto it = device_fault_->pipeline_names.find(id);
         return it == device_fault_->pipeline_names.end() ? nullptr : it->second[0];
+    }
+    void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
+    // Called at the end of every ExecuteCommandLists replay that called before_execute_, however it returns: by then
+    // the submissions it made are recorded, so submitted_retire_ticket() covers them.
+    void set_after_execute(std::function<void()> after) { after_execute_ = std::move(after); }
+    // GPU work the lists of a submission depend on, recorded at the start of its command buffer by a queue that can
+    // run compute (the console heap translation pass, src/console_heap_gpu.h): `record` returns true when it recorded
+    // something, and `commit` follows that submit (true: it reached the queue; the ticket is a retire ticket at or
+    // after it). Every other queue's next submission then waits for that one, as for a bindless table upload: a
+    // queue that records nothing itself may run lists that read what the pass wrote. Called with tracker_mutex_
+    // held, so passes and those waits follow submission order. Set once, before the first queue exists.
+    void set_prelude(std::function<bool(VkCommandBuffer)> record, std::function<void(bool, std::uint64_t)> commit) {
+        prelude_record_ = std::move(record);
+        prelude_commit_ = std::move(commit);
     }
 
     void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
@@ -1800,6 +1925,11 @@ public:
         replay_.depth24_run = [this](VkCommandBuffer command_buffer, const Depth24Job& job) {
             depth24_->run(command_buffer, job);
         };
+    }
+
+    bool has_depth24() {
+        std::shared_lock lock(resource_mutex_);
+        return depth24_ != nullptr;
     }
 
     // Copies the replay stages through a buffer (depth <-> colour, vulkan_replay.h) take device-local scratch from
@@ -1933,10 +2063,17 @@ public:
     VulkanDeviceFunctions vk;
 
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
-    std::mutex& submit_mutex() { return submit_mutex_; }
+    SubmitMutex& submit_mutex() { return submit_mutex_; }
+
+    // vkQueueSubmit through the compile gate (SubmitMutex::SubmitTurn): it waits here, not in the driver, while a
+    // pipeline create is in the driver. Called with the submit lock held; the caller observes the result.
+    VkResult queue_submit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+        const SubmitMutex::SubmitTurn turn(submit_mutex_);
+        return vk.vkQueueSubmit(queue, count, submits, fence);
+    }
 
     void mark_device_lost(const char* where = "a Vulkan call returned VK_ERROR_DEVICE_LOST") noexcept {
-        set_device_lost(device_lost_, where);
+        if (set_device_lost(device_lost_, where)) submit_mutex_.report_creates_on_loss();  // which creates were in it
         run_device_lost_hook();  // LEONIDA_AFTERMATH: the GPU crash dump is written before waiters wake
         if (fence_dispatcher_) {
             try {
@@ -2103,19 +2240,32 @@ private:
         using Watch = SubmissionProgressWatch;
         Watch watch;
         std::uint64_t retired = 0;
+        std::int64_t reported_hold = -1;
+        std::int64_t busy_since = -1;
+        SubmitMutex::GateStats gate_logged;
+        unsigned tick = 0;
         std::mutex timer_mutex;
         std::condition_variable_any timer;
         std::unique_lock timer_lock(timer_mutex);
+        // LOCAL DIAGNOSTIC (post-load GPU hangs): with the device-fault report on, sample every 250 ms, so a loss the
+        // driver has already reset is seen (and its checkpoints read) before a watchdog outside kills the process.
+        const auto period = device_fault_ ? std::chrono::milliseconds(250) : std::chrono::milliseconds(1000);
+        const unsigned per_10s = unsigned(std::chrono::seconds(10) / period);
         while (!stop.stop_requested()) {
-            timer.wait_for(timer_lock, stop, std::chrono::seconds(1), [] { return false; });
+            timer.wait_for(timer_lock, stop, period, [] { return false; });
             if (stop.stop_requested() || is_device_lost()) break;
             auto state = Watch::State::submit_lock_busy;
             VkResult result = VK_SUCCESS;
             std::uint64_t submitted;
             {
                 // Keep queue timelines alive as in completed_retire_ticket(). A submit or idle wait
-                // blocked inside the driver can hold this mutex indefinitely.
+                // blocked inside the driver can hold this mutex indefinitely. Under heavy submission one try finds
+                // it busy most of the time: a few more within a millisecond or two.
                 std::unique_lock lock(submit_mutex_, std::try_to_lock);
+                for (int retry = 0; !lock.owns_lock() && retry < 20; ++retry) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    if (lock.try_lock()) break;
+                }
                 submitted = submitted_retire_ticket();
                 if (lock.owns_lock()) {
                     if (is_device_lost()) break;
@@ -2123,12 +2273,50 @@ private:
                     state = retired < submitted ? Watch::State::pending : Watch::State::idle;
                 }
             }
+            // LOCAL DIAGNOSTIC (early device loss): a submission unfinished for 4 s dumps the recent submissions with
+            // their semaphore counters (unreadable once the device is lost); a hold of the submit lock of 3 s names
+            // its thread and prints its call chain, once per hold.
+            // A vkQueueSubmit stuck in the driver (measured: 10 s, then VK_ERROR_DEVICE_LOST) also blocks
+            // vkGetSemaphoreCounterValue, so with the lock busy the watch stays out of the driver: the holder report
+            // samples stacks only, and the counters are read once the lock is free again.
+            if (state == Watch::State::submit_lock_busy) {
+                const std::uint32_t owner = submit_mutex_.owner();
+                const std::int64_t since = submit_mutex_.since_ms();
+                const std::int64_t held = diagnostic_ms() - since;
+                if (owner && held >= 3000 && since != reported_hold) {
+                    reported_hold = since;
+                    device_fault_->report_submit_lock_holder(owner, held);
+                }
+                // Busy at every sample but changing hands: contended, not stuck. Only a hold that lasts (the same
+                // holder since the same time) counts toward the 15 s stall report.
+                if (since != busy_since) {
+                    busy_since = since;
+                    state = Watch::State::idle;
+                }
+            } else {
+                device_fault_->check_submit_progress();
+            }
             if (result == VK_ERROR_DEVICE_LOST) {
                 mark_device_lost();
                 break;
             }
             // A failed counter query does not measure GPU progress.
             if (result != VK_SUCCESS) state = Watch::State::idle;
+            // Every 10 s while it changes: what the compile gate has cost so far (SubmitMutex::CompileTurn).
+            if (++tick % per_10s == 0) {
+                const SubmitMutex::GateStats gate = submit_mutex_.gate_stats();
+                if (gate.submits != gate_logged.submits || gate.creates != gate_logged.creates) {
+                    gate_logged = gate;
+                    std::fprintf(stderr, "[rt] compile-gate: t=%.0f s: %llu submissions waited for pipeline creates "
+                                         "(%lld ms in all, longest %lld ms, %llu went ahead at the limit); %llu creates "
+                                         "waited behind a submission (%lld ms in all, longest %lld ms)\n",
+                                 double(diagnostic_ms()) / 1000.0, static_cast<unsigned long long>(gate.submits),
+                                 static_cast<long long>(gate.submit_ms), static_cast<long long>(gate.submit_max_ms),
+                                 static_cast<unsigned long long>(gate.ahead),
+                                 static_cast<unsigned long long>(gate.creates), static_cast<long long>(gate.create_ms),
+                                 static_cast<long long>(gate.create_max_ms));
+                }
+            }
             // LEONIDA_HANG_EXIT_S=<s> (for boots): work pending and retirement still for s seconds is a GPU hang
             // the driver may recover from without Vulkan ever reporting the device lost (Xid 109: the title then
             // waits forever, the window frozen). The stall is reported (with the checkpoints under
@@ -2156,7 +2344,9 @@ private:
             }
             if (watch.sample(state, retired, Watch::Clock::now()))
                 device_fault_->report_stall(state == Watch::State::pending ? "queue retirement has not advanced"
-                                                                          : "could not sample the submit lock",
+                                            : submit_mutex_.gate_waiter() && submit_mutex_.gate_waiter() == submit_mutex_.owner()
+                                                ? "could not sample the submit lock (its holder waits at the compile gate)"
+                                                : "could not sample the submit lock",
                                             submitted, retired);
         }
     }
@@ -2166,10 +2356,17 @@ private:
     bool ray_tracing_ = false;
     std::unique_ptr<XdxrBuilder> xdxr_;   // set: acceleration structures are XDXR BVH4 records
     std::atomic<bool> device_lost_{false};
+    alignas(64) std::shared_mutex pipeline_mutex_;  // shared for prepare/compile/emit pipeline lookups, unique for add/remove/workers
     alignas(64) std::shared_mutex resource_mutex_;  // shared for prepare lookups, unique for add/remove
     alignas(64) std::mutex tracker_mutex_;
     alignas(64) std::mutex views_mutex_;
-    alignas(64) std::mutex submit_mutex_;
+    // Lock hierarchy (see VulkanQueue::execute): resource_mutex_ -> tracker_mutex_ -> submit_mutex_. A PSO build
+    // (shims/d3d12_vulkan_device.cpp, PipelineState::build_compute / build) holds its variants_mutex_ and the
+    // static big_compile mutex while it waits for the submit lock (SubmitMutex::let_submit_finish) or at the compile
+    // gate: variants_mutex_ -> big_compile -> submit_mutex_, and nothing holding submit_mutex_ takes either. The
+    // gate's own mutex is a leaf; a submission waits at the gate with submit_mutex_ held, for creates already in the
+    // driver only (SubmitMutex::CompileTurn).
+    alignas(64) SubmitMutex submit_mutex_;
     bool image_work_pending_ = false;  // under submit_mutex_
     HostTextureStats host_texture_stats_;  // under submit_mutex_
     RetireTickets<VkSemaphore> retire_tickets_;
@@ -2185,6 +2382,8 @@ private:
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unique_ptr<PipelineWorkers> pipeline_workers_;
+    std::function<std::uint64_t()> large_compile_budget_;
+    std::function<std::shared_ptr<void>()> large_compile_demand_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
     std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ and zero_pending_ only
@@ -2206,6 +2405,7 @@ private:
         resolve_passes_;
     std::map<std::tuple<VkImage, VkImage, VkImageView, VkImageView, VkRenderPass>, VkFramebuffer> resolve_framebuffers_;
     std::function<void()> before_execute_;
+    std::function<void()> after_execute_;
     InputProbe input_probe_;
     TableScanner table_scanner_;
     GeometryProvider geometry_provider_;
@@ -2219,6 +2419,11 @@ private:
     VkSemaphore bindless_upload_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t bindless_upload_value_ = 0;
     std::uint64_t bindless_upload_version_ = 0;
+    std::function<bool(VkCommandBuffer)> prelude_record_;
+    std::function<void(bool, std::uint64_t)> prelude_commit_;
+    VkSemaphore prelude_semaphore_ = VK_NULL_HANDLE;  // the queue whose submission recorded the last prelude
+    std::uint64_t prelude_value_ = 0;
+    std::uint64_t prelude_version_ = 0;
     std::unique_ptr<Depth24Converter> depth24_;
     std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
     std::function<void(bool)> bindless_commit_;
@@ -2256,7 +2461,19 @@ public:
     }
     ~VulkanFence() {
         if (!semaphore_) return;
+        // LOCAL DIAGNOSTIC (early device loss): a fence released while a Signal the GPU has not run yet names it.
+        if (!context_.is_device_lost()) {
+            const std::uint64_t submitted = context_.holds().submitted_value(semaphore_);
+            std::uint64_t reached = 0;
+            if (submitted && context_.vk.vkGetSemaphoreCounterValue(context_.device(), semaphore_, &reached) == VK_SUCCESS &&
+                reached < submitted)
+                std::fprintf(stderr, "[rt] d3d12: fence semaphore %p destroyed with a Signal pending (submitted %llu, "
+                                     "reached %llu) at t=%.3f s\n",
+                             static_cast<void*>(semaphore_), static_cast<unsigned long long>(submitted),
+                             static_cast<unsigned long long>(reached), double(diagnostic_ms()) / 1000.0);
+        }
         context_.holds().remove_fence(semaphore_);  // batches held on it can never run: dropped and reported
+        if (DeviceFaultDiagnostics* ring = context_.device_fault()) ring->forget(semaphore_);  // no report reads it
         context_.vk.vkDestroySemaphore(context_.device(), semaphore_, nullptr);
     }
     VulkanFence(const VulkanFence&) = delete;
@@ -2390,16 +2607,24 @@ public:
 
     ~VulkanQueue() {
         auto& vk = context_.vk;
+        stop_async();  // LEONIDA_SUBMIT_ASYNC: what is queued runs first
+        std::fprintf(stderr, "[rt] d3d12: queue %p (progress %p) destroyed at t=%.3f s\n", static_cast<void*>(queue_),
+                     static_cast<void*>(progress_), double(diagnostic_ms()) / 1000.0);
         context_.holds().detach(this);  // no thread releases into this queue from here on
         report_held_at_teardown();
         context_.holds().pump_ready();  // presents queued behind what was just dropped can run
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
             const VkResult idle_result = context_.observe_result(vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle");
             if (idle_result == VK_SUCCESS) {
                 if (progress_) context_.retire_queue_idle_locked(progress_);
             } else {
+                // Any failure here makes every fence read ~0 from now on: say so when it is not a real loss.
+                if (idle_result != VK_ERROR_DEVICE_LOST)
+                    std::fprintf(stderr, "[rt] d3d12: vkQueueWaitIdle at queue teardown returned %d; the device is "
+                                         "treated as lost\n", int(idle_result));
                 context_.mark_device_lost();
             }
         }
@@ -2414,9 +2639,15 @@ public:
             // finished: the next submission on another queue must not wait on a semaphore that is about to go.
             std::lock_guard lock(context_.storage_mutex_);
             if (context_.storage_init_semaphore_ == progress_) context_.storage_init_semaphore_ = VK_NULL_HANDLE;
+            // The same for the bindless table upload: a queue that had not seen its version yet would otherwise
+            // wait on this destroyed semaphore in its next vkQueueSubmit.
+            if (context_.bindless_upload_semaphore_ == progress_) context_.bindless_upload_semaphore_ = VK_NULL_HANDLE;
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
-        if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
+        if (progress_) {
+            if (DeviceFaultDiagnostics* ring = context_.device_fault()) ring->forget(progress_);  // no report reads it
+            vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
+        }
         destroy_khr_stages(khr_stage_pool_);
         destroy_khr_as_queries(khr_as_query_pool_);
         for (auto& slot : buffers_) {
@@ -2431,6 +2662,8 @@ public:
     VulkanQueue& operator=(const VulkanQueue&) = delete;
 
     bool ok() const { return ok_; }
+    // A queue of the runtime's own whose caller waits for each call (a staging copy): never on a worker.
+    void make_synchronous() { synchronous_ = true; }
 
     // Entries kept between executions. Execute only uses the first lists.size(); a larger count is retained storage,
     // not work the next submission will replay (vk_queue_test checks both halves of that contract).
@@ -2439,6 +2672,7 @@ public:
     template<typename GetHeap>
     bool update_tiles(ResourceId id, std::span<const TileRegion> regions,
                       std::span<const TileRange> ranges, GetHeap&& get_heap) {
+        flush_async();  // after the calls queued before it (LEONIDA_SUBMIT_ASYNC)
         std::lock_guard state(state_mutex_);  // outermost: held batches are released from other threads
         std::unique_lock lock(context_.resource_mutex_);
         const auto it = context_.sparse_resources_.find(id);
@@ -2486,6 +2720,7 @@ public:
 
     bool copy_tile_mappings(ResourceId dst, std::span<const TileRegion> dst_regions, ResourceId src,
                             std::span<const TileRegion> src_regions) {
+        flush_async();
         std::lock_guard state(state_mutex_);
         std::unique_lock lock(context_.resource_mutex_);
         const auto source = context_.sparse_resources_.find(src), target = context_.sparse_resources_.find(dst);
@@ -2518,8 +2753,23 @@ public:
     using PinFn = std::function<std::shared_ptr<void>()>;
 
     ReplayResult execute(std::span<const CommandList* const> lists, const PinFn& pin = {}) {
+        pipeline_wait::note_submission();  // big compute warm-ups are left to their first use while the title submits
         auto* diagnostics = context_.device_fault();
         const auto execute_call = diagnostics ? diagnostics->next_execute_call() : 0;
+        if (async_on()) {  // copied and queued: the worker replays it (a failure is reported as a held one's)
+            Call call;
+            call.kind = Call::Kind::execute;
+            call.execute_call = execute_call;
+            call.lists.reserve(lists.size());
+            for (const CommandList* list : lists) call.lists.push_back(*list);
+            if (pin) call.pin = pin();
+            enqueue(std::move(call));
+            return ReplayResult::success;
+        }
+        return execute_sync(lists, pin, execute_call);
+    }
+
+    ReplayResult execute_sync(std::span<const CommandList* const> lists, const PinFn& pin, std::uint64_t execute_call) {
         ReplayResult result = ReplayResult::success;
         bool held = false;
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
@@ -2550,6 +2800,19 @@ public:
     // held operations, so the fence does not run ahead of the work it follows. `pin` (called only when the Signal is
     // held) keeps the fence object alive until it has been submitted, as D3D12 does.
     bool signal(VkSemaphore fence, std::uint64_t value, const PinFn& pin = {}) {
+        if (async_on()) {
+            Call call;
+            call.kind = Call::Kind::signal;
+            call.fence = fence;
+            call.value = value;
+            if (pin) call.pin = pin();
+            enqueue(std::move(call));
+            return true;
+        }
+        return signal_sync(fence, value, pin);
+    }
+
+    bool signal_sync(VkSemaphore fence, std::uint64_t value, const PinFn& pin) {
         bool ok = true;
         std::vector<std::shared_ptr<void>> retired;
         {
@@ -2563,6 +2826,10 @@ public:
                 hold(std::move(op));
             } else {
                 ok = submit(VK_NULL_HANDLE, fence, value);
+                // As for a held Signal (release_held): the fence object, and so its semaphore, stays alive until the
+                // GPU has run the signal. Destroying a semaphore a pending submission signals is undefined
+                // (VUID-vkDestroySemaphore-semaphore-05149), and a title may release a fence right after Signal.
+                if (ok && pin) pin_queue_.push_back({submitted_, pin()});
             }
             drain_pins(retired);
         }
@@ -2575,6 +2842,19 @@ public:
     // batch, so it is kept and attached to the next submission (held on the CPU if no Signal reaches it yet).
     // `pin` returns what keeps the fence object alive until then (a D3D12 queue holds its fences).
     void wait(VkSemaphore fence, std::uint64_t value, const PinFn& pin = {}) {
+        if (async_on()) {
+            Call call;
+            call.kind = Call::Kind::wait;
+            call.fence = fence;
+            call.value = value;
+            if (pin) call.pin = pin();
+            enqueue(std::move(call));
+            return;
+        }
+        wait_sync(fence, value, pin);
+    }
+
+    void wait_sync(VkSemaphore fence, std::uint64_t value, const PinFn& pin) {
         std::vector<std::shared_ptr<void>> retired;  // fences whose submission has completed: released unlocked
         {
             std::lock_guard state(state_mutex_);
@@ -2595,6 +2875,18 @@ public:
     // ID3D12CommandQueue::SetMarker/BeginEvent/EndEvent: queue labels, between the submissions around them. An end
     // with no begin open on this queue is dropped, as Vulkan requires a matching begin. No-ops without the extension.
     void marker(DebugMarker::Kind kind, const char* label) {
+        if (async_on()) {
+            Call call;
+            call.kind = Call::Kind::marker;
+            call.marker_kind = kind;
+            call.label = label ? label : "";
+            enqueue(std::move(call));
+            return;
+        }
+        marker_sync(kind, label);
+    }
+
+    void marker_sync(DebugMarker::Kind kind, const char* label) {
         std::vector<std::shared_ptr<void>> retired;
         std::lock_guard state(state_mutex_);
         drain_pins(retired);  // destroyed after the lock (reverse declaration order)
@@ -2610,8 +2902,35 @@ public:
     }
 
     bool idle() {
+        flush_async();
         std::lock_guard lock(context_.submit_mutex());
+        const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
         return context_.observe_result(context_.vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle") == VK_SUCCESS;
+    }
+
+    // Waits on the CPU until what this queue has submitted so far is done: its own timeline, without the device's
+    // submit lock, so other queues keep submitting, and without waiting for anything submitted after (review D9;
+    // idle() waits for the whole VkQueue, which D3D12 queues may share, and blocks every submission meanwhile).
+    bool wait_submitted() {
+        std::uint64_t value = 0;
+        {
+            std::lock_guard state(state_mutex_);
+            value = submitted_;
+        }
+        if (!value) return true;
+        VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wait.semaphoreCount = 1;
+        wait.pSemaphores = &progress_;
+        wait.pValues = &value;
+        constexpr std::uint64_t slice_ns = 100'000'000;  // 100 ms
+        for (;;) {  // bounded slices: a lost device wakes the wait
+            if (context_.is_device_lost()) return false;
+            const VkResult res = context_.vk.vkWaitSemaphores(context_.device(), &wait, slice_ns);
+            if (res == VK_SUCCESS) return true;
+            if (res == VK_TIMEOUT) continue;
+            if (res == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+            return false;
+        }
     }
 
 private:
@@ -2871,6 +3190,12 @@ private:
             if (context_.is_device_lost() || !wait_for_room()) return queue_unsupported(__LINE__);
         }
         if (context_.before_execute_) context_.before_execute_();
+        struct AfterExecute {
+            VulkanContext& context;
+            ~AfterExecute() {
+                if (context.after_execute_) context.after_execute_();
+            }
+        } after_execute{context_};
         // The rest of this call is the replay phase; the submission is counted when it returns, however it returns.
         struct Replayed {
             std::int64_t start = submit_phases::now_ns();
@@ -2899,11 +3224,15 @@ private:
             }
         } khr_guard{this};
         std::function<void(bool)> bindless_commit;
-        // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
-        // Shared read-lock allows concurrent prepare() across queues; tracker_mutex_ is acquired lazily during
-        // prepare() only if a list actually converts a depth24_as_float copy, and otherwise right before
-        // bindless_prepare_/emit() through submit() so bindless flushes, layout emits, and submissions stay in order.
-        std::shared_lock resource_lock(context_.resource_mutex_);
+        // Lock hierarchy: state_mutex_ -> pipeline_mutex_ -> resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
+        // Shared pipeline_lock keeps registered pipelines, pipeline_names, and pipeline_workers_ alive across
+        // preparation, compilation, and emit. Shared resource_lock allows concurrent prepare() across queues and is
+        // released while unbuilt pipelines compile so add_resource()/remove_resource() never stall behind shader
+        // compiles; tracker_mutex_ is acquired lazily during prepare() only if a list uses a shared helper, and
+        // otherwise right before bindless_prepare_/emit() through submit() so bindless flushes, layout emits, and
+        // submissions stay in order.
+        std::shared_lock pipeline_lock(context_.pipeline_mutex_);
+        std::shared_lock resource_lock(context_.resource_mutex_, std::defer_lock);
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
         // Declared after tracker_lock so any early return after depth24_->prepare() retires uncommitted scratch/pools
         // with ticket 0 while tracker_lock is still held.
@@ -2914,7 +3243,7 @@ private:
             ~Depth24Guard() {
                 if (active && d24) d24->retire(progress, 0);
             }
-        } depth24_guard{context_.depth24_.get(), progress_, false};
+        } depth24_guard{nullptr, progress_, false};
         struct ScratchGuard {  // the same for the copy scratch
             ScratchBuffers* scratch = nullptr;
             VkSemaphore progress = VK_NULL_HANDLE;
@@ -2922,7 +3251,7 @@ private:
             ~ScratchGuard() {
                 if (active && scratch) scratch->retire(progress, 0);
             }
-        } scratch_guard{context_.scratch_.get(), progress_, false};
+        } scratch_guard{nullptr, progress_, false};
         struct ClampGuard {  // and for the ExecuteIndirect clamp's record scratch
             IndirectArgumentClamp* clamp = nullptr;
             VkSemaphore progress = VK_NULL_HANDLE;
@@ -2930,9 +3259,8 @@ private:
             ~ClampGuard() {
                 if (active && clamp) clamp->retire(progress, 0);
             }
-        } clamp_guard{context_.indirect_clamp_.get(), progress_, false};
+        } clamp_guard{nullptr, progress_, false};
         const bool transfer_only = family_ == context_.transfer_only_family_;
-        if (!transfer_only) bindless_commit = context_.bindless_commit_;
         // Kept between executions: prepare refills each list's entries in the storage the last execution left, where
         // making them fresh for every command was about half the layer's CPU cost per command (replay_cpu_bench).
         auto& prepared = prepared_;
@@ -2940,42 +3268,9 @@ private:
         // a queue that sees 8 lists and then 1 in every frame would rebuild them on each execution. The loops below
         // use only the first lists.size() entries, so stale entries are never prepared, queried or emitted.
         if (prepared.size() < lists.size()) prepared.resize(lists.size());
-        ReplayFunctions replay = context_.replay_;
+        ReplayFunctions replay{};
         unsigned mesh_draws = 0;
-        if (pipeline_profile::enabled()) replay.mesh_draw_count = &mesh_draws;
         std::vector<VulkanContext::GeometryUpload> geometry;
-        if (context_.geometry_provider_) {
-            replay.title_memory = [&](std::uint64_t va, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
-                if (!va || !bytes || bytes>UINT64_MAX-va) return false;
-                for (const auto& upload : geometry) {
-                    if (va < upload.source || va-upload.source > upload.size || bytes > upload.size-(va-upload.source)) continue;
-                    buffer=upload.buffer; offset=upload.offset+(va-upload.source);
-                    return true;
-                }
-                VulkanContext::GeometryUpload upload;
-                if (!context_.geometry_provider_(va,bytes,upload)) return false;
-                buffer=upload.buffer;offset=upload.offset;
-                geometry.push_back(std::move(upload));
-                return true;
-            };
-        }
-        replay.graphics_family = family_ == context_.graphics_family_;
-        replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
-                              : kind_ == QueueKind::compute ? detail::queue_stages_compute
-                                                            : 0;
-        replay.prepare_khr_instances = [this, &replay, &khr_guard](const BuildAccelerationStructure& build,
-                                                                   VkDeviceAddress& address) {
-            return stage_khr_instances(replay, build, khr_guard.stages, address);
-        };
-        replay.prepare_xdxr_table = [this, &khr_guard](VkDeviceAddress& address, std::uint32_t& count) {
-            return stage_xdxr_table(khr_guard.stages, address, count);
-        };
-        if (replay.write_acceleration_structures_properties) {
-            replay.prepare_khr_postbuild = [this, &khr_guard](std::uint32_t count, VkQueryPool& pool,
-                                                              std::uint32_t& first) {
-                return allocate_khr_as_queries(count, khr_guard.as_queries, pool, first);
-            };
-        }
         std::uint64_t captures = 0;
         for (const auto* list : lists)
             for (const auto& command : list->commands())
@@ -2984,149 +3279,239 @@ private:
         std::unique_ptr<PredicatedBufferCopier::Batch> copy_batch;
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_batch;
         std::unique_ptr<IndirectArgumentClamp::Batch> clamp_batch;
-        if (captures) {
-            if (kind_ == QueueKind::copy || !context_.predicate_reducer_ || family_ != context_.predicate_family_)
-                return queue_unsupported(__LINE__);
-            // The helper's lazy pipeline is shared by queues. Serialize preparation with the tracker lock,
-            // retaining main's resource -> tracker -> submit lock order through emit and submission.
-            if (!tracker_lock.owns_lock()) tracker_lock.lock();
-            batch = context_.predicate_reducer_->batch(captures);
-            if (!batch) return queue_unsupported(__LINE__);
-            replay.prepare_predicate = [&](VkBuffer buffer, VkDeviceSize offset, PredicateCapture& out) {
-                return batch->prepare(buffer, offset, out);
-            };
-            replay.capture_predicate = [&](VkCommandBuffer cb, const PredicateCapture& p) {
-                context_.predicate_reducer_->capture(cb, p);
-            };
-            if (context_.predicated_copier_) {
-                copy_batch = context_.predicated_copier_->batch();
-                replay.prepare_predicated_copy = [&](VkBuffer source, VkBuffer destination, VkDeviceSize src,
-                                                     VkDeviceSize dst, VkDeviceSize size,
-                                                     std::vector<PredicatedCopyDispatch>& out) {
-                    return copy_batch->prepare(source, destination, src, dst, size, out);
-                };
-                replay.emit_predicated_copy = [&](VkCommandBuffer cb, const std::vector<PredicatedCopyDispatch>& jobs) {
-                    context_.predicated_copier_->emit(cb, jobs);
-                };
-            }
-        }
-        if (context_.scratch_) {
-            replay.copy_scratch = [this, &tracker_lock, &scratch_guard](VkDeviceSize bytes, VkBuffer& buffer,
-                                                                        VkDeviceSize& offset) {
-                if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                if (!scratch_guard.active) {
-                    context_.scratch_->collect();
-                    scratch_guard.active = true;
-                }
-                return context_.scratch_->get(bytes, buffer, offset);
-            };
-        }
-        if (kind_ != QueueKind::copy && context_.indirect_clamp_) {
-            // The record scratch belongs to this submission: collected here, retired below with its ticket. The
-            // counter slots are read back once that ticket completes (the batch's destructor).
-            replay.prepare_indirect_clamp = [this, &tracker_lock, &clamp_batch, &clamp_guard](
-                                                VkBuffer arguments, VkDeviceSize argument_offset, VkBuffer count,
-                                                VkDeviceSize count_offset, std::uint32_t kind, std::uint32_t stride,
-                                                std::uint32_t max_count, ClampedIndirect& out) {
-                // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
-                if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                if (!clamp_batch) clamp_batch = context_.indirect_clamp_->batch();
-                if (!clamp_guard.active) {
-                    context_.indirect_clamp_->collect();
-                    clamp_guard.active = true;
-                }
-                return clamp_batch->prepare(arguments, argument_offset, count, count_offset, kind, stride, max_count,
-                                            out);
-            };
-        }
-        if (kind_ != QueueKind::copy && context_.counted_dispatch_) {
-            replay.prepare_counted_dispatch = [this, &tracker_lock, &counted_batch](
-                VkBuffer args, VkDeviceSize args_offset, VkBuffer count, VkDeviceSize count_offset,
-                std::uint32_t stride, std::uint32_t maximum, CountedDispatch& out) {
-                // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
-                if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                if (!counted_batch) counted_batch = context_.counted_dispatch_->batch();
-                return counted_batch->prepare(args, args_offset, count, count_offset, stride, maximum, out);
-            };
-            replay.emit_counted_dispatch = [this](VkCommandBuffer cb, const CountedDispatch& job) {
-                context_.counted_dispatch_->emit(cb, job);
-            };
-        }
-        if (kind_ != QueueKind::copy && context_.quad_indices_ && context_.scratch_) {
-            replay.prepare_quad_indices = [this, &tracker_lock](
-                VkBuffer indices, VkDeviceSize offset, VkIndexType type, std::uint64_t readable, std::uint32_t quads,
-                VkBuffer scratch, VkDeviceSize scratch_offset, QuadIndexExpansion& out) {
-                // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
-                if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                return context_.quad_indices_->prepare(indices, offset, type, readable, quads, scratch,
-                                                       scratch_offset, out);
-            };
-            replay.emit_quad_indices = [this](VkCommandBuffer cb, const QuadIndexExpansion& job) {
-                context_.quad_indices_->emit(cb, job);
-            };
-        }
-        if (context_.depth24_ && !transfer_only) {
-            replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
-                                                                           std::vector<Depth24Job>& parts) {
-                if (!tracker_lock.owns_lock()) tracker_lock.lock();
-                if (!depth24_guard.active) {
-                    context_.depth24_->collect();
-                    depth24_guard.active = true;
-                }
-                return context_.depth24_->prepare(job, parts);
-            };
-        }
         const auto& occlusion_memory = context_.occlusion_resolve_memory_;
         const bool can_resolve_occlusion = occlusion_memory.memoryTypeCount != 0;
-        if (can_resolve_occlusion) {
-            replay.sum_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
-                                          std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
-                occlusion_resolve_->sum(cb, pool, first, count, dst, offset);
-            };
-            replay.resolve_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
-                                                      std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
-                occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
-            };
-            replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, VkQueryPool mesh_pool,
-                                           VkQueryPool primitives_pool, const std::uint8_t* mesh,
-                                           std::uint32_t first, std::uint32_t count, VkBuffer dst,
-                                           VkDeviceSize offset) {
-                occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, primitives_pool, mesh, first, count, dst,
-                                                  offset);
-            };
-            replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
-                                                 std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
-                occlusion_resolve_->sum_binary(cb, pool, first, count, dst, offset);
-            };
-        }
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
         std::uint32_t segments = 0, statistics_segments = 0;
         bool has_queries = false;
-        // With workers, the pipelines the lists need and that are not built yet are compiled together below instead of
-        // one after another in prepare(). resource_lock is held until they are all built, which keeps the pipeline
-        // states that own them alive (remove_pipeline takes it uniquely).
-        PipelineCompiles compiles;
-        if (context_.pipeline_workers_) replay.compiles = &compiles;
-        ReplayResult prepare_result = ReplayResult::success;
-        for (std::size_t i = 0; i < lists.size(); ++i) {
-            const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
-            if (result != ReplayResult::success) {
-                prepare_result = result;
-                break;
+        const auto run_compiles = [this](std::size_t count, const std::function<void(std::size_t)>& job) {
+            context_.pipeline_workers_->run(count, job);
+        };
+        PipelineCompiles prior_compiles;
+        bool has_prior_compiles = false;
+        for (int pass = 0;; ++pass) {
+            resource_lock.lock();
+            bindless_commit = !transfer_only ? context_.bindless_commit_ : std::function<void(bool)>{};
+            replay = context_.replay_;
+            mesh_draws = 0;
+            if (pipeline_profile::enabled()) replay.mesh_draw_count = &mesh_draws;
+            if (context_.geometry_provider_) {
+                replay.title_memory = [&](std::uint64_t va, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
+                    if (!va || !bytes || bytes>UINT64_MAX-va) return false;
+                    for (const auto& upload : geometry) {
+                        if (va < upload.source || va-upload.source > upload.size || bytes > upload.size-(va-upload.source)) continue;
+                        buffer=upload.buffer; offset=upload.offset+(va-upload.source);
+                        return true;
+                    }
+                    VulkanContext::GeometryUpload upload;
+                    if (!context_.geometry_provider_(va,bytes,upload)) return false;
+                    buffer=upload.buffer;offset=upload.offset;
+                    geometry.push_back(std::move(upload));
+                    return true;
+                };
             }
-            if (prepared[i].segment_count > UINT32_MAX - segments ||
-                prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
-                return queue_unsupported(__LINE__);
-            segments += prepared[i].segment_count;
-            statistics_segments += prepared[i].statistics_segment_count;
-            has_queries = has_queries || !prepared[i].queries.empty();
+            replay.graphics_family = family_ == context_.graphics_family_;
+            replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
+                                  : kind_ == QueueKind::compute ? detail::queue_stages_compute
+                                                                : 0;
+            replay.prepare_khr_instances = [this, &replay, &khr_guard](const BuildAccelerationStructure& build,
+                                                                       VkDeviceAddress& address) {
+                return stage_khr_instances(replay, build, khr_guard.stages, address);
+            };
+            replay.prepare_xdxr_table = [this, &khr_guard](VkDeviceAddress& address, std::uint32_t& count) {
+                return stage_xdxr_table(khr_guard.stages, address, count);
+            };
+            if (replay.write_acceleration_structures_properties) {
+                replay.prepare_khr_postbuild = [this, &khr_guard](std::uint32_t count, VkQueryPool& pool,
+                                                                  std::uint32_t& first) {
+                    return allocate_khr_as_queries(count, khr_guard.as_queries, pool, first);
+                };
+            }
+            if (captures) {
+                if (kind_ == QueueKind::copy || !context_.predicate_reducer_ || family_ != context_.predicate_family_)
+                    return queue_unsupported(__LINE__);
+                // The helper's lazy pipeline is shared by queues. Serialize preparation with the tracker lock,
+                // retaining pipeline -> resource -> tracker -> submit lock order through emit and submission.
+                if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                batch = context_.predicate_reducer_->batch(captures);
+                if (!batch) return queue_unsupported(__LINE__);
+                replay.prepare_predicate = [&](VkBuffer buffer, VkDeviceSize offset, PredicateCapture& out) {
+                    return batch->prepare(buffer, offset, out);
+                };
+                replay.capture_predicate = [&](VkCommandBuffer cb, const PredicateCapture& p) {
+                    context_.predicate_reducer_->capture(cb, p);
+                };
+                if (context_.predicated_copier_) {
+                    copy_batch = context_.predicated_copier_->batch();
+                    replay.prepare_predicated_copy = [&](VkBuffer source, VkBuffer destination, VkDeviceSize src,
+                                                         VkDeviceSize dst, VkDeviceSize size,
+                                                         std::vector<PredicatedCopyDispatch>& out) {
+                        return copy_batch->prepare(source, destination, src, dst, size, out);
+                    };
+                    replay.emit_predicated_copy = [&](VkCommandBuffer cb, const std::vector<PredicatedCopyDispatch>& jobs) {
+                        context_.predicated_copier_->emit(cb, jobs);
+                    };
+                }
+            }
+            if (context_.scratch_) {
+                replay.copy_scratch = [this, &tracker_lock, &scratch_guard](VkDeviceSize bytes, VkBuffer& buffer,
+                                                                            VkDeviceSize& offset) {
+                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                    if (!scratch_guard.active) {
+                        scratch_guard.scratch = context_.scratch_.get();
+                        context_.scratch_->collect();
+                        scratch_guard.active = true;
+                    }
+                    return context_.scratch_->get(bytes, buffer, offset);
+                };
+            }
+            if (kind_ != QueueKind::copy && context_.indirect_clamp_) {
+                // The record scratch belongs to this submission: collected here, retired below with its ticket. The
+                // counter slots are read back once that ticket completes (the batch's destructor).
+                replay.prepare_indirect_clamp = [this, &tracker_lock, &clamp_batch, &clamp_guard](
+                                                    VkBuffer arguments, VkDeviceSize argument_offset, VkBuffer count,
+                                                    VkDeviceSize count_offset, std::uint32_t kind, std::uint32_t stride,
+                                                    std::uint32_t max_count, ClampedIndirect& out) {
+                    // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
+                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                    if (!clamp_batch) clamp_batch = context_.indirect_clamp_->batch();
+                    if (!clamp_guard.active) {
+                        clamp_guard.clamp = context_.indirect_clamp_.get();
+                        context_.indirect_clamp_->collect();
+                        clamp_guard.active = true;
+                    }
+                    return clamp_batch->prepare(arguments, argument_offset, count, count_offset, kind, stride,
+                                                max_count, out);
+                };
+            }
+            if (kind_ != QueueKind::copy && context_.counted_dispatch_) {
+                replay.prepare_counted_dispatch = [this, &tracker_lock, &counted_batch](
+                    VkBuffer args, VkDeviceSize args_offset, VkBuffer count, VkDeviceSize count_offset,
+                    std::uint32_t stride, std::uint32_t maximum, CountedDispatch& out) {
+                    // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
+                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                    if (!counted_batch) counted_batch = context_.counted_dispatch_->batch();
+                    return counted_batch->prepare(args, args_offset, count, count_offset, stride, maximum, out);
+                };
+                replay.emit_counted_dispatch = [this](VkCommandBuffer cb, const CountedDispatch& job) {
+                    context_.counted_dispatch_->emit(cb, job);
+                };
+            }
+            if (kind_ != QueueKind::copy && context_.quad_indices_ && context_.scratch_) {
+                replay.prepare_quad_indices = [this, &tracker_lock](
+                    VkBuffer indices, VkDeviceSize offset, VkIndexType type, std::uint64_t readable, std::uint32_t quads,
+                    VkBuffer scratch, VkDeviceSize scratch_offset, QuadIndexExpansion& out) {
+                    // Pipeline creation is lazy and shared across queues; serialize it with other replay preparation.
+                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                    return context_.quad_indices_->prepare(indices, offset, type, readable, quads, scratch,
+                                                           scratch_offset, out);
+                };
+                replay.emit_quad_indices = [this](VkCommandBuffer cb, const QuadIndexExpansion& job) {
+                    context_.quad_indices_->emit(cb, job);
+                };
+            }
+            if (context_.depth24_ && !transfer_only) {
+                replay.depth24_prepare = [this, &tracker_lock, &depth24_guard](Depth24Job& job,
+                                                                               std::vector<Depth24Job>& parts) {
+                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                    if (!depth24_guard.active) {
+                        depth24_guard.d24 = context_.depth24_.get();
+                        context_.depth24_->collect();
+                        depth24_guard.active = true;
+                    }
+                    return context_.depth24_->prepare(job, parts);
+                };
+            }
+            if (can_resolve_occlusion) {
+                replay.sum_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                              std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                    occlusion_resolve_->sum(cb, pool, first, count, dst, offset);
+                };
+                replay.resolve_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                                          std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                    occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
+                };
+                replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, VkQueryPool mesh_pool,
+                                               VkQueryPool primitives_pool, const std::uint8_t* mesh,
+                                               std::uint32_t first, std::uint32_t count, VkBuffer dst,
+                                               VkDeviceSize offset) {
+                    occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, primitives_pool, mesh, first, count, dst,
+                                                      offset);
+                };
+                replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
+                                                     std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
+                    occlusion_resolve_->sum_binary(cb, pool, first, count, dst, offset);
+                };
+            }
+            segments = 0;
+            statistics_segments = 0;
+            has_queries = false;
+            // Collect unbuilt pipelines via PipelineCompiles (whether pipeline_workers_ is enabled or serial).
+            // On pass 0, if any pipeline must be compiled, release pass-0 transient state along with tracker_lock
+            // and resource_lock before invoking the compiler (keeping pipeline_lock so registered pipelines and
+            // workers stay alive), then re-prepare on pass 1 against current resources.
+            PipelineCompiles compiles;
+            replay.compiles = &compiles;
+            ReplayResult prepare_result = ReplayResult::success;
+            for (std::size_t i = 0; i < lists.size(); ++i) {
+                const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
+                if (result != ReplayResult::success) {
+                    prepare_result = result;
+                    break;
+                }
+                if (prepared[i].segment_count > UINT32_MAX - segments ||
+                    prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
+                    return queue_unsupported(__LINE__);
+                segments += prepared[i].segment_count;
+                statistics_segments += prepared[i].statistics_segment_count;
+                has_queries = has_queries || !prepared[i].queries.empty();
+            }
+            if (pass == 0 && !compiles.empty()) {
+                if (depth24_guard.active) {
+                    context_.depth24_->retire(progress_, 0);
+                    depth24_guard.active = false;
+                }
+                if (scratch_guard.active) {
+                    context_.scratch_->retire(progress_, 0);
+                    scratch_guard.active = false;
+                }
+                if (clamp_guard.active) {
+                    context_.indirect_clamp_->retire(progress_, 0);
+                    clamp_guard.active = false;
+                }
+                batch.reset();
+                copy_batch.reset();
+                counted_batch.reset();
+                clamp_batch.reset();
+                if (tracker_lock.owns_lock()) tracker_lock.unlock();
+                resource_lock.unlock();
+                recycle_khr_stages(khr_guard.stages);
+                recycle_khr_as_queries(khr_guard.as_queries);
+                geometry.clear();
+
+                std::shared_ptr<void> demand;
+                if (context_.large_compile_demand_ && compiles.any_large()) demand = context_.large_compile_demand_();
+                if (context_.pipeline_workers_)
+                    compiles.build(run_compiles, context_.large_compile_budget_);
+                else
+                    compiles.build_serial();
+                demand.reset();
+                const ReplayResult compile_result = check_compiled_pipelines(compiles, prepare_result);
+                if (compile_result != ReplayResult::success) return compile_result;
+                prior_compiles = std::move(compiles);
+                has_prior_compiles = true;
+                continue;
+            }
+            const PipelineCompiles* prior = has_prior_compiles ? &prior_compiles : nullptr;
+            prepare_result = context_.pipeline_workers_
+                                 ? build_pipelines(compiles, std::span(prepared).first(lists.size()), prepare_result,
+                                                   run_compiles, context_.large_compile_budget_, prior)
+                                 : build_pipelines_serial(compiles, std::span(prepared).first(lists.size()),
+                                                          prepare_result, prior);
+            replay.compiles = nullptr;
+            if (prepare_result != ReplayResult::success) return prepare_result;
+            break;
         }
-        prepare_result = build_pipelines(
-            compiles, std::span(prepared).first(lists.size()), prepare_result,
-            [this](std::size_t count, const std::function<void(std::size_t)>& job) {
-                context_.pipeline_workers_->run(count, job);
-            });
-        if (prepare_result != ReplayResult::success) return prepare_result;
         const auto segment_pool = [this](VkQueryType type, std::uint32_t count,
                                          std::shared_ptr<OcclusionSegmentPool>& out) {
             const auto& vk = context_.vk;
@@ -3253,6 +3638,7 @@ private:
             const bool ended = context_.observe_result(context_.vk.vkEndCommandBuffer(command_buffer),
                                                       "vkEndCommandBuffer") == VK_SUCCESS;
             resource_lock.unlock();
+            pipeline_lock.unlock();
             const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
             if (!submitted) discard();
             if (depth24_guard.active) {
@@ -3330,6 +3716,25 @@ private:
             auto pieces = detail::current(&next_tracker, id, range, VK_IMAGE_LAYOUT_UNDEFINED);
             detail::initialize(replay, command_buffer, *image, id, pieces, VK_IMAGE_LAYOUT_GENERAL, &next_tracker);
         }
+        // The prelude (set_prelude): recorded here, after the set's upload and before the lists, and in either case
+        // after the last submission of another queue that recorded one (its pass writes what these lists read, and
+        // a pass here must not overtake it).
+        const bool prelude = !transfer_only && context_.prelude_record_ && context_.prelude_record_(command_buffer);
+        // LEONIDA_PRELUDE_QUEUE_WAIT=0 (an experiment): no wait for another queue's pass, so the queues do not
+        // serialise on each other's whole submissions; a list may then read what that pass has not written yet.
+        static const bool cross_wait = [] {
+            const char* v = std::getenv("LEONIDA_PRELUDE_QUEUE_WAIT");
+            return !(v && v[0] == '0' && v[1] == 0);
+        }();
+        {
+            std::lock_guard lock(context_.storage_mutex_);
+            if (cross_wait && context_.prelude_semaphore_ && context_.prelude_semaphore_ != progress_ &&
+                context_.prelude_version_ != prelude_seen_) {
+                waits_.push_back(context_.prelude_semaphore_);
+                wait_values_.push_back(context_.prelude_value_);
+            }
+            prelude_seen_ = context_.prelude_version_;
+        }
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
@@ -3386,7 +3791,8 @@ private:
         }
         const bool ended = context_.observe_result(context_.vk.vkEndCommandBuffer(command_buffer),
                                                   "vkEndCommandBuffer") == VK_SUCCESS;
-        resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
+        resource_lock.unlock();  // release resource_mutex_ and pipeline_mutex_ before vkQueueSubmit while keeping tracker_lock held
+        pipeline_lock.unlock();
         const bool wait_previous = ordered_timestamps && submitted_;
         if (wait_previous) {
             waits_.push_back(progress_);
@@ -3416,6 +3822,16 @@ private:
             context_.bindless_upload_value_ = submitted_;
             ++context_.bindless_upload_version_;
             bindless_upload_seen_ = context_.bindless_upload_version_;
+        }
+        if (prelude) {
+            if (submitted) {
+                std::lock_guard lock(context_.storage_mutex_);
+                context_.prelude_semaphore_ = progress_;
+                context_.prelude_value_ = submitted_;
+                ++context_.prelude_version_;
+                prelude_seen_ = context_.prelude_version_;
+            }
+            if (context_.prelude_commit_) context_.prelude_commit_(submitted, context_.submitted_retire_ticket());
         }
         if (wait_previous && !submitted && !waits_.empty()) {  // a failed submit keeps the waits for the next one
             waits_.pop_back();
@@ -3537,7 +3953,9 @@ private:
 
     // Appends `op`, which takes the pending waits with it (a marker has none). Called with state_mutex_ held.
     void hold(Deferred&& op) {
-        op.seq = context_.holds().next_seq();
+        // A call the worker runs (LEONIDA_SUBMIT_ASYNC) keeps the number it was queued with: what was registered
+        // behind it (a Present) still waits for it.
+        op.seq = async_seq_ ? async_seq_ : context_.holds().next_seq();
         if (op.kind != Deferred::Kind::marker) {
             op.waits = std::move(waits_);
             op.wait_values = std::move(wait_values_);
@@ -3548,6 +3966,7 @@ private:
         }
         if (gpu_latency::enabled()) op.held_at = std::chrono::steady_clock::now();
         held_.push_back(std::move(op));
+        held_front_seq_.store(held_.front().seq, std::memory_order_release);
         context_.holds().held_changed(1);
     }
 
@@ -3594,7 +4013,21 @@ private:
     bool ready(const Deferred& op) const { return !waits_pending(op.waits, op.wait_values); }
 
     // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held).
+    // With LEONIDA_SUBMIT_ASYNC another thread does not run this queue's held work: it asks the queue's worker,
+    // which releases it and then pumps the holds itself (so a Present behind it still runs after it).
     bool release_ready() override {
+        if (async_started_.load(std::memory_order_acquire) && t_worker_of_ != this) {
+            {
+                std::lock_guard lock(inbox_mutex_);
+                release_requested_ = true;
+            }
+            inbox_cv_.notify_one();
+            return false;
+        }
+        return release_held();
+    }
+
+    bool release_held() {
         std::vector<std::shared_ptr<void>> retired;
         bool released = false;
         {
@@ -3603,8 +4036,19 @@ private:
                 Deferred op = std::move(held_.front());
                 held_.pop_front();
                 context_.holds().held_changed(-1);
-                if (gpu_latency::enabled()) gpu_latency::held(int(kind_), int(op.kind), op.held_at);
+                if (gpu_latency::enabled()) {
+                    // The wait that was pending when it was held: the fence whose Signal let it go.
+                    std::uint64_t fence = 0, value = 0;
+                    for (std::size_t i = 0; i < op.waits.size(); ++i)
+                        if (op.wait_values[i] > value) {
+                            fence = std::uint64_t(reinterpret_cast<std::uintptr_t>(op.waits[i]));
+                            value = op.wait_values[i];
+                        }
+                    gpu_latency::held(int(kind_), int(op.kind), op.held_at, fence, value);
+                }
                 if (!context_.is_device_lost()) run(op);
+                // Only now: until it has run, the operation still counts as the oldest held one.
+                held_front_seq_.store(held_.empty() ? 0 : held_.front().seq, std::memory_order_release);
                 released = true;
             }
             drain_pins(retired);
@@ -3629,13 +4073,22 @@ private:
                 it = held_.erase(it);
                 context_.holds().held_changed(-1);
             }
+            held_front_seq_.store(held_.empty() ? 0 : held_.front().seq, std::memory_order_release);
         }
     }
 
     // Holder: the sequence number of the oldest held operation.
     std::uint64_t oldest_held_seq() override {
-        std::lock_guard state(state_mutex_);
-        return held_.empty() ? 0 : held_.front().seq;
+        if (!async_on()) {
+            std::lock_guard state(state_mutex_);
+            return held_.empty() ? 0 : held_.front().seq;
+        }
+        // Not under state_mutex_, which the worker holds while it replays: the front's number is kept apart.
+        std::uint64_t oldest = held_front_seq_.load(std::memory_order_acquire);
+        std::lock_guard lock(inbox_mutex_);
+        const std::uint64_t queued = running_seq_ ? running_seq_ : inbox_.empty() ? 0 : inbox_.front().seq;
+        if (queued && (!oldest || queued < oldest)) oldest = queued;
+        return oldest;
     }
 
     // A queue destroyed with held work. Reported, not waited for: nothing was submitted for it, so the VkQueue is
@@ -3661,6 +4114,7 @@ private:
                 if (op.kind == Deferred::Kind::signal) context_.cancel_fence_waits(op.fence);
             context_.holds().held_changed(-static_cast<std::int64_t>(held_.size()));
             dropped.swap(held_);
+            held_front_seq_.store(0, std::memory_order_release);
         }
         // The pins (fences, pipeline states) are released here, outside the lock.
     }
@@ -3795,8 +4249,12 @@ private:
         pending_bindings_.push_back(std::move(pending));
         {
             std::lock_guard lock(context_.submit_mutex());
-            const auto result = context_.observe_result(vk.vkQueueBindSparse(queue_, 1, &info, VK_NULL_HANDLE),
-                                                        "vkQueueBindSparse");
+            VkResult bound;
+            {
+                const SubmitMutex::SubmitTurn turn(context_.submit_mutex());  // a queue operation: the compile gate
+                bound = vk.vkQueueBindSparse(queue_, 1, &info, VK_NULL_HANDLE);
+            }
+            const auto result = context_.observe_result(bound, "vkQueueBindSparse");
             if (result != VK_SUCCESS) {
                 if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
                 pending_bindings_.pop_back();
@@ -3985,8 +4443,7 @@ private:
             semaphores = sparse_waits;
             values = sparse_values;
         }
-        const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-        VkResult res = VK_SUCCESS;
+        const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);        VkResult res = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
             VkSemaphore signals[2]{progress_, VK_NULL_HANDLE};
@@ -4020,10 +4477,32 @@ private:
             if (diagnostics) pass_trace(*diagnostics);
             // Publish before the driver can execute a marker or a concurrent fence wait can see the loss.
             if (diagnostics) context_.device_fault()->publish(std::move(*diagnostics));
-            const auto label_fence=context_.gpu_labels_.submit_fence(command_buffer);
-            res = context_.observe_result(context_.vk.vkQueueSubmit(queue_, 1, &submit, label_fence),
+            DeviceFaultDiagnostics* const ring = context_.device_fault();
+            std::size_t ring_at = 0;
+            const std::int64_t submit_start = diagnostic_ms();
+            if (ring) {
+                SubmitRecord record;
+                record.at_ms = submit_start;
+                record.queue = queue_;
+                record.kind = kind_ == QueueKind::direct ? "direct" : kind_ == QueueKind::compute ? "compute" : "copy";
+                record.progress = progress_;
+                record.ticket = ticket;
+                record.buffers = submit.commandBufferCount;
+                if (signals_fence) {
+                    record.fence = fence;
+                    record.fence_value = value;
+                }
+                record.waits = std::uint32_t(semaphores.size());
+                for (std::size_t i = 0; i < semaphores.size() && i < SubmitRecord::max_waits; ++i) {
+                    record.wait_semaphores[i] = semaphores[i];
+                    record.wait_values[i] = values[i];
+                }
+                ring_at = ring->begin_submit(record);
+            }
+            res = context_.observe_result(context_.queue_submit(queue_, 1, &submit, context_.gpu_labels_.submit_fence(command_buffer)),
                                           "vkQueueSubmit");
-            context_.gpu_labels_.submitted(command_buffer,res==VK_SUCCESS);
+            context_.gpu_labels_.submitted(command_buffer, res == VK_SUCCESS);
+            if (ring) ring->end_submit(ring_at, diagnostic_ms() - submit_start, res);
             if (res == VK_SUCCESS) {
                 context_.record_submit_locked(progress_, ticket);
                 if (signals_fence) context_.holds().signaled(fence, value);
@@ -4062,6 +4541,7 @@ private:
     std::unique_ptr<OcclusionResolve> occlusion_resolve_;
     std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
     std::uint64_t bindless_upload_seen_ = 0;  // the bindless_upload_version_ this queue has waited for
+    std::uint64_t prelude_seen_ = 0;  // the prelude_version_ this queue has waited for (or recorded)
     std::uint64_t last_sparse_ = 0;
     std::deque<PendingBindings> pending_bindings_;
     std::vector<VkSemaphore> waits_;
@@ -4071,8 +4551,260 @@ private:
     std::vector<PreparedList> prepared_;
     std::uint32_t open_labels_ = 0;  // queue labels begun and not ended
     bool ok_ = false;
-    // Wait-before-Signal. state_mutex_ is outermost (before resource_mutex_ -> tracker_mutex_ -> submit_mutex_) and
-    // guards the members above that execute, signal, wait and marker touch.
+    // ---- LEONIDA_SUBMIT_ASYNC=<n>: the queue's calls run on a worker of its own -----------------------------------
+    // ExecuteCommandLists, Signal, Wait and the markers are queued in call order and return at once; one worker per
+    // queue runs each through the synchronous path (execute_sync & co.), so the replay, the before-submission
+    // refreshes and vkQueueSubmit leave the caller's thread and overlap with its next frame. At most n batches wait per
+    // queue; the caller of the next one waits for room (the in-flight bound). A queued call counts as held work
+    // (QueueHolds), numbered when it was called, so a Present behind it still waits for it and cross-queue order is
+    // the call order. Calls that use the queue's state at once (tile mappings, idle, the destructor) first wait for
+    // what is queued. A batch that fails is reported as a held one is (stderr, take_held_failure()). Off (0) by
+    // default: every call runs on the caller's thread, as before.
+    static unsigned async_depth() {
+        static const unsigned depth = [] {
+            const char* v = std::getenv("LEONIDA_SUBMIT_ASYNC");
+            const int n = v && *v ? std::atoi(v) : 0;
+            return n > 0 ? unsigned(n) : 0u;
+        }();
+        return depth;
+    }
+
+    bool async_on() const { return async_depth() && !synchronous_; }
+
+    struct Call {
+        enum class Kind : std::uint8_t { execute, signal, wait, marker };
+        Kind kind = Kind::execute;
+        std::uint64_t seq = 0, execute_call = 0, value = 0;
+        std::vector<CommandList> lists;  // copies: the application may Reset its lists after the call
+        std::shared_ptr<void> pin;       // the fence, or the lists' pipeline states and root signatures
+        VkSemaphore fence = VK_NULL_HANDLE;
+        DebugMarker::Kind marker_kind = DebugMarker::Kind::set;
+        std::string label;
+        std::chrono::steady_clock::time_point queued_at{};
+    };
+
+    struct AsyncStats {  // under inbox_mutex_, since the last line
+        std::uint64_t calls = 0, batches = 0, room_waits = 0, room_wait_ns = 0, run_ns = 0, lag_ns = 0, lag_max_ns = 0;
+        std::size_t depth_max = 0;
+        std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    };
+
+    void enqueue(Call&& call) {
+        const bool batch = call.kind == Call::Kind::execute;
+        std::unique_lock lock(inbox_mutex_);
+        if (!worker_.joinable()) {
+            worker_ = std::thread([this] { async_worker(); });
+            async_started_.store(true, std::memory_order_release);
+        }
+        // n batches, and 4n calls of any kind (a title that signals after every small job must not queue Signals
+        // without bound). n = 1 makes each caller wait for the batch before it: n should be 2 or more.
+        const auto room = [this, batch] {
+            return async_stop_ ||
+                   ((!batch || inbox_batches_ < async_depth()) && inbox_.size() < 4 * std::size_t(async_depth()));
+        };
+        if (!room()) {
+            const auto start = std::chrono::steady_clock::now();
+            room_cv_.wait(lock, room);
+            ++async_stats_.room_waits;
+            async_stats_.room_wait_ns += std::uint64_t(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        }
+        if (batch) {
+            ++inbox_batches_;
+            ++async_stats_.batches;
+        }
+        ++async_stats_.calls;
+        call.seq = context_.holds().next_seq();
+        call.queued_at = std::chrono::steady_clock::now();
+        context_.holds().held_changed(1);
+        inbox_.push_back(std::move(call));
+        async_stats_.depth_max = std::max(async_stats_.depth_max, inbox_.size());
+        lock.unlock();
+        inbox_cv_.notify_one();
+    }
+
+    void async_worker() {
+        t_worker_of_ = this;
+        for (;;) {
+            Call call;
+            bool have = false, release = false;
+            {
+                std::unique_lock lock(inbox_mutex_);
+                inbox_cv_.wait(lock, [this] { return !inbox_.empty() || release_requested_ || async_stop_; });
+                release = std::exchange(release_requested_, false);
+                if (!inbox_.empty()) {
+                    call = std::move(inbox_.front());
+                    inbox_.pop_front();
+                    running_seq_ = call.seq;
+                    have = true;
+                } else if (!release) {
+                    return;  // stopping, nothing queued
+                }
+                worker_busy_ = true;
+            }
+            if (release) release_held();
+            std::uint64_t ran_ns = 0;
+            if (have) {
+                const auto start = std::chrono::steady_clock::now();
+                run_call(call);
+                const auto end = std::chrono::steady_clock::now();
+                ran_ns = std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+                const auto lag = std::uint64_t(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(start - call.queued_at).count());
+                std::lock_guard lock(inbox_mutex_);
+                async_stats_.run_ns += ran_ns;
+                async_stats_.lag_ns += lag;
+                async_stats_.lag_max_ns = std::max(async_stats_.lag_max_ns, lag);
+            }
+            {
+                std::lock_guard lock(inbox_mutex_);
+                running_seq_ = 0;
+                worker_busy_ = false;
+                if (have && call.kind == Call::Kind::execute) --inbox_batches_;
+                if (have) room_cv_.notify_all();
+                idle_cv_.notify_all();
+                report_async_locked();
+            }
+            if (have) context_.holds().held_changed(-1);
+            call = Call{};  // the copies and pins go before the pump, outside the lock
+            context_.holds().pump_ready();
+        }
+    }
+
+    // An exception on the worker would end the process (std::terminate) and leave the queue's callers waiting: it is
+    // turned into a held failure and a lost device instead, as a failed submission would be, and the worker goes on
+    // (each later call fails at once on the lost device).
+    void run_call(Call& call) {
+        try {
+            run_call_unguarded(call);
+        } catch (const std::exception& e) {
+            worker_threw(call, e.what());
+        } catch (...) {
+            worker_threw(call, "not a std::exception");
+        }
+        async_seq_ = 0;
+    }
+
+    void worker_threw(const Call& call, const char* what) {
+        int none = static_cast<int>(ReplayResult::success);
+        held_failure_.compare_exchange_strong(none, static_cast<int>(ReplayResult::unsupported));
+        std::fprintf(stderr, "[rt] d3d12: the queue's worker caught an exception running a queued %s (%s); the device is "
+                             "marked lost\n",
+                     call.kind == Call::Kind::execute ? "ExecuteCommandLists"
+                     : call.kind == Call::Kind::signal ? "Signal"
+                     : call.kind == Call::Kind::wait   ? "Wait"
+                                                       : "marker",
+                     what);
+        context_.mark_device_lost();
+    }
+
+    void run_call_unguarded(Call& call) {
+        async_seq_ = call.seq;
+        const PinFn pin = call.pin ? PinFn([&call] { return call.pin; }) : PinFn{};
+        switch (call.kind) {
+        case Call::Kind::execute: {
+            std::vector<const CommandList*> lists;
+            lists.reserve(call.lists.size());
+            for (const CommandList& list : call.lists) lists.push_back(&list);
+            const ReplayResult result = execute_sync(lists, pin, call.execute_call);
+            if (result != ReplayResult::success) {
+                int none = static_cast<int>(ReplayResult::success);
+                held_failure_.compare_exchange_strong(none, static_cast<int>(result));
+                std::fprintf(stderr, "[rt] d3d12: a queued ExecuteCommandLists failed on the queue's worker (result "
+                                     "%d); nothing was submitted for it\n",
+                             static_cast<int>(result));
+            }
+            break;
+        }
+        case Call::Kind::signal:
+            if (!signal_sync(call.fence, call.value, pin)) {
+                int none = static_cast<int>(ReplayResult::success);
+                held_failure_.compare_exchange_strong(none, static_cast<int>(ReplayResult::unsupported));
+                std::fprintf(stderr, "[rt] d3d12: a queued Signal failed on the queue's worker\n");
+            }
+            break;
+        case Call::Kind::wait: wait_sync(call.fence, call.value, pin); break;
+        case Call::Kind::marker: marker_sync(call.marker_kind, call.label.c_str()); break;
+        }
+        if (call.pin && call.kind == Call::Kind::execute) {
+            // The pipeline states stay alive until what was just submitted has completed (a held batch keeps its own).
+            std::lock_guard state(state_mutex_);
+            std::vector<std::shared_ptr<void>> pins{std::move(call.pin)};
+            retire_pins(pins, submitted_);
+        }
+    }
+
+    // Every 10 s, per queue: what the worker did. Called with inbox_mutex_ held.
+    void report_async_locked() {
+        const auto now = std::chrono::steady_clock::now();
+        const double s = std::chrono::duration<double>(now - async_stats_.since).count();
+        if (s < 10.0) return;
+        static constexpr const char* kinds[] = {"direct", "compute", "copy"};
+        const AsyncStats& a = async_stats_;
+        std::fprintf(stderr,
+                     "[rt] submit-async: %s queue %p: %.1f calls/s (%.1f batches/s), queued now %zu (max %zu), "
+                     "worker busy %.0f%%, call waited for the worker avg %.2f ms max %.2f ms, caller waited for "
+                     "room %llu times %.1f ms\n",
+                     kinds[int(kind_) < 3 ? int(kind_) : 0], static_cast<const void*>(this), double(a.calls) / s,
+                     double(a.batches) / s, inbox_.size(), a.depth_max, 100.0 * double(a.run_ns) / (s * 1e9),
+                     a.calls ? double(a.lag_ns) / double(a.calls) / 1e6 : 0.0, double(a.lag_max_ns) / 1e6,
+                     static_cast<unsigned long long>(a.room_waits), double(a.room_wait_ns) / 1e6);
+        async_stats_ = AsyncStats{};
+    }
+
+    // What was queued before this call has run (held work may stay held, as without the worker). A worker that does
+    // not come back (a GPU hang inside wait_for_room, say) is reported every 10 s, and after 60 s the caller goes on
+    // without it: false.
+    bool flush_async() {
+        if (!async_started_.load(std::memory_order_acquire) || t_worker_of_ == this) return true;
+        std::unique_lock lock(inbox_mutex_);
+        const auto idle = [this] { return inbox_.empty() && !worker_busy_; };
+        for (int slice = 1; slice <= 6; ++slice) {
+            if (idle_cv_.wait_for(lock, std::chrono::seconds(10), idle)) return true;
+            std::fprintf(stderr, "[rt] d3d12: waited %d s for a queue's worker to finish what is queued (%zu calls, "
+                                 "running call %llu)%s\n",
+                         slice * 10, inbox_.size(), static_cast<unsigned long long>(running_seq_),
+                         slice == 6 ? "; going on without it" : "");
+        }
+        return false;
+    }
+
+    void stop_async() {
+        if (!async_started_.load(std::memory_order_acquire)) return;
+        const bool drained = flush_async();
+        {
+            std::lock_guard lock(inbox_mutex_);
+            async_stop_ = true;
+        }
+        inbox_cv_.notify_all();
+        room_cv_.notify_all();
+        if (!worker_.joinable()) return;
+        if (drained) {
+            worker_.join();
+            return;
+        }
+        // A worker stuck for a minute holds this queue's objects: it is left running rather than joined forever
+        // (only at teardown; the process is ending or the device is gone).
+        std::fprintf(stderr, "[rt] d3d12: a queue's worker did not finish; it is detached at the queue's destruction\n");
+        worker_.detach();
+    }
+
+    std::mutex inbox_mutex_;
+    std::condition_variable inbox_cv_, room_cv_, idle_cv_;
+    std::deque<Call> inbox_;
+    std::size_t inbox_batches_ = 0;
+    std::uint64_t running_seq_ = 0;  // the call the worker runs now
+    bool worker_busy_ = false, release_requested_ = false, async_stop_ = false;
+    AsyncStats async_stats_;
+    std::atomic<bool> async_started_{false};
+    bool synchronous_ = false;  // make_synchronous()
+    std::thread worker_;
+    static inline thread_local VulkanQueue* t_worker_of_ = nullptr;  // the queue whose worker this thread is
+    static inline thread_local std::uint64_t async_seq_ = 0;  // the sequence number of the call being run
+    std::atomic<std::uint64_t> held_front_seq_{0};  // held_.front().seq, 0 when empty; see release_held()
+
+    // Wait-before-Signal. state_mutex_ is outermost (before pipeline_mutex_ -> resource_mutex_ -> tracker_mutex_ ->
+    // submit_mutex_) and guards the members above that execute, signal, wait and marker touch.
     std::mutex state_mutex_;
     std::deque<Deferred> held_;
     std::vector<std::shared_ptr<void>> wait_pins_;     // keep the fences of waits_ alive

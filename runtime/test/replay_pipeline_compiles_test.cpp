@@ -2,13 +2,16 @@
 // prepared twice, once with every pipeline built where prepare() meets it and once with them left to PipelineCompiles
 // and built on PipelineWorkers. Both have to give the same result, the same pipeline to every draw and dispatch, the same
 // commands dropped, and the same pipelines built, each once. Fixed cases, then random ones. Run a second time with
-// LEONIDA_STRICT_REPLAY=1, where a dispatch without a pipeline fails its list. No GPU: pipelines and resources are fakes.
+// LEONIDA_STRICT_REPLAY=1, where a dispatch without a pipeline fails its list. Also which large pipelines compile at once
+// within a budget (PipelineCompiles::build). No GPU: pipelines and resources are fakes.
+#include "../src/large_module_gate.h"
 #include "../src/pipeline_workers.h"
 #include "../src/vulkan_replay.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -39,9 +42,10 @@ T handle(std::uintptr_t n) {
 constexpr ResourceId color_id = 1, depth_id = 2, arguments_id = 3;
 constexpr std::uint64_t bad_va = 0xbad0000;
 
-// The large pipelines being built now, and how often there were two.
+// The large pipelines being built now, and how often there were two, where they are to compile one after another.
 std::atomic<int> large_now = 0;
 std::atomic<int> large_together = 0;
+std::atomic<bool> large_one_at_a_time = true;
 
 // What a pipeline state owns: its variants, built on demand under its own lock, and what was asked of it.
 struct Owner {
@@ -60,7 +64,7 @@ struct Owner {
         if (failed && compute) return VK_NULL_HANDLE;  // a refused compute pipeline is not tried again
         attempts.push_back(flags);
         if (large) {
-            if (++large_now > 1) ++large_together;
+            if (++large_now > 1 && large_one_at_a_time) ++large_together;
             const auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(20);
             while (std::chrono::steady_clock::now() < end) std::this_thread::yield();
             --large_now;
@@ -84,6 +88,7 @@ struct PipelineSpec {
     bool fails = false;
     bool with_built = true;
     bool large = false;
+    std::uint64_t estimate = 0;
     bool skipped = false;   // compute: never built, its dispatches are dropped
     bool bindless = false;  // compute: needs a set 0, which these functions cannot bind
     bool async = false;     // its null handle may be waiting for another worker: never left to PipelineCompiles
@@ -114,6 +119,7 @@ struct Registry {
                 ComputePipeline p{};
                 p.layout = handle<VkPipelineLayout>(7);
                 p.large = spec.large;
+                p.estimate = spec.estimate;
                 p.async_build = spec.async;
                 p.skipped = spec.skipped;
                 if (spec.bindless) p.bindless_set = handle<VkDescriptorSet>(6);
@@ -138,6 +144,7 @@ struct Registry {
             }
             p.mesh = spec.mesh;
             p.large = spec.large;
+            p.estimate = spec.estimate;
             p.vertex_slots = spec.vertices ? 1 : 0;
             if (spec.rectangle) p.rectangle_variant_topology = 17;
             p.variant = [&owner](std::uint32_t flags) { return owner.build(flags); };
@@ -273,12 +280,12 @@ struct Outcome {
     std::multiset<std::pair<std::uintptr_t, std::uint32_t>> built;
     std::size_t jobs = 0;
     std::size_t runs = 0;
-    std::size_t units = 0;  // what run() was given: the large pipelines together are one
+    std::size_t units = 0;  // what run() was given: the large pipelines together are one (no budget)
 };
 
 // `workers` null: prepare() builds each pipeline itself, as without workers.
 Outcome prepare_all(const std::vector<CommandList>& lists, const std::vector<PipelineSpec>& specs,
-                    PipelineWorkers* workers) {
+                    PipelineWorkers* workers, const std::function<std::uint64_t()>& budget = {}) {
     Registry registry(specs);
     ReplayFunctions vk = functions(registry);
     PipelineCompiles compiles;
@@ -294,7 +301,8 @@ Outcome prepare_all(const std::vector<CommandList>& lists, const std::vector<Pip
                                          ++out.runs;
                                          out.units = count;
                                          workers->run(count, job);
-                                     });
+                                     },
+                                     budget);
     if (out.result == ReplayResult::success)
         for (std::size_t i = 0; i < lists.size(); ++i) {
             for (std::size_t c = 0; c < prepared[i].commands.size(); ++c) {
@@ -312,10 +320,13 @@ Outcome prepare_all(const std::vector<CommandList>& lists, const std::vector<Pip
 }
 
 Outcome compare(const std::string& name, const std::vector<PipelineSpec>& specs,
-                const std::vector<std::vector<CommandSpec>>& commands, PipelineWorkers& workers) {
+                const std::vector<std::vector<CommandSpec>>& commands, PipelineWorkers& workers,
+                const std::function<std::uint64_t()>& budget = {}) {
     const auto lists = record(commands);
     const Outcome serial = prepare_all(lists, specs, nullptr);
-    const Outcome together = prepare_all(lists, specs, &workers);
+    large_one_at_a_time = !budget;
+    const Outcome together = prepare_all(lists, specs, &workers, budget);
+    large_one_at_a_time = true;
     check(serial.result == together.result, name + ": another result");
     check(serial.pipelines == together.pipelines, name + ": another pipeline for a draw or dispatch");
     if (serial.result == ReplayResult::success)
@@ -516,6 +527,7 @@ void random_submissions(PipelineWorkers& workers) {
             s.with_built = chance(90);
             s.async = chance(8);
             s.large = chance(15);
+            s.estimate = rng() % 12;
             s.bindless = chance(2);
             s.skipped = s.compute && chance(4);
             if (s.skipped) s.fails = s.pending = true;
@@ -540,11 +552,350 @@ void random_submissions(PipelineWorkers& workers) {
                 c.mesh = c.pipeline <= specs.size() && specs[c.pipeline - 1].mesh;
                 list.push_back(c);
             }
-        succeeded += compare("random submission " + std::to_string(round), specs, commands, workers).result ==
-                     ReplayResult::success;
+        const std::uint64_t memory = rng() % 24;  // 0: no budget
+        const auto budget = [memory] { return memory; };
+        const bool limited = chance(50);
+        succeeded += compare("random submission " + std::to_string(round), specs, commands, workers,
+                             limited ? std::function<std::uint64_t()>(budget) : std::function<std::uint64_t()>{})
+                         .result == ReplayResult::success;
     }
     check(succeeded > 1000 && succeeded < 2900, "the random submissions both succeed and fail: " +
                                                     std::to_string(succeeded));
+}
+
+// Re-preparing after a prior compile pass reuses prior outcomes (both built handles and non-strict failed compute
+// dispatches) without re-invoking build() or failing the submission.
+void prior_compiles_reuse(PipelineWorkers& workers) {
+    Registry registry({
+        {.compute = true, .pending = true, .fails = false, .with_built = true},
+        {.compute = true, .pending = true, .fails = true, .with_built = true},
+    });
+    const std::vector<CommandList> lists = record({{
+        CommandSpec{.kind = CommandSpec::dispatch, .pipeline = 1},
+        CommandSpec{.kind = CommandSpec::dispatch, .pipeline = 2},
+    }});
+    std::vector<PreparedList> prepared(1);
+    ReplayFunctions vk = functions(registry);
+    PipelineCompiles first;
+    vk.compiles = &first;
+    const ReplayResult r0 = prepare(lists[0], resolve, vk, prepared[0]);
+    check(r0 == ReplayResult::success && first.size() == 2, "prior_compiles_reuse: pass 0 collected both");
+    first.build([&](std::size_t count, const std::function<void(std::size_t)>& job) { workers.run(count, job); });
+    const ReplayResult c0 = check_compiled_pipelines(first, r0);
+    if (strict_replay()) {
+        check(c0 == ReplayResult::unresolved_resource, "prior_compiles_reuse: strict fails on failed dispatch");
+        return;
+    }
+    check(c0 == ReplayResult::success, "prior_compiles_reuse: non-strict tolerates failed dispatch");
+    check(registry.owners[0]->attempts.size() == 1 && registry.owners[1]->attempts.size() == 1,
+          "prior_compiles_reuse: each pipeline built once on pass 0");
+    // Reset the failed flag on owner 2 so any redundant build() call on pass 1 would be caught in attempts.
+    registry.owners[1]->failed = false;
+
+    PipelineCompiles second;
+    vk.compiles = &second;
+    const ReplayResult r1 = prepare(lists[0], resolve, vk, prepared[0]);
+    const ReplayResult b1 = build_pipelines(
+        second, std::span(prepared), r1,
+        [&](std::size_t count, const std::function<void(std::size_t)>& job) { workers.run(count, job); },
+        {}, &first);
+    check(b1 == ReplayResult::success, "prior_compiles_reuse: pass 1 succeeded");
+    check(registry.owners[0]->attempts.size() == 1 && registry.owners[1]->attempts.size() == 1,
+          "prior_compiles_reuse: pass 1 did not re-invoke build() on prior failure");
+    check(prepared[0].commands[0].pipeline.pipeline == handle<VkPipeline>(0x1001),
+          "prior_compiles_reuse: built compute handle attached");
+    check(prepared[0].commands[1].pipeline.pipeline == VK_NULL_HANDLE,
+          "prior_compiles_reuse: failed compute dispatch stays dropped");
+}
+
+// Serial compilation stops at the first refused graphics draw (matching pre-unlock serial semantics and
+// d3d12_pipeline_workers::refused_graphics) instead of compiling later pipelines in the same submission.
+void serial_stops_at_refused_draw() {
+    Registry registry({
+        {.compute = false, .pending = true, .fails = false},
+        {.compute = false, .pending = true, .fails = true},
+        {.compute = false, .pending = true, .fails = false},
+        {.compute = false, .pending = true, .fails = false},
+    });
+    const std::vector<CommandList> lists = record({{
+        CommandSpec{.kind = CommandSpec::draw, .pipeline = 1},
+        CommandSpec{.kind = CommandSpec::draw, .pipeline = 2},
+        CommandSpec{.kind = CommandSpec::draw, .pipeline = 3},
+        CommandSpec{.kind = CommandSpec::draw, .pipeline = 4},
+    }});
+    std::vector<PreparedList> prepared(1);
+    ReplayFunctions vk = functions(registry);
+    PipelineCompiles compiles;
+    vk.compiles = &compiles;
+    const ReplayResult r = prepare(lists[0], resolve, vk, prepared[0]);
+    check(r == ReplayResult::success && compiles.size() == 4, "serial_stops: collected all 4 draws");
+    const ReplayResult out = build_pipelines_serial(compiles, std::span(prepared), r);
+    check(out == ReplayResult::unsupported, "serial_stops: refused draw returns unsupported");
+    check(registry.owners[0]->attempts.size() == 1 && registry.owners[1]->attempts.size() == 1,
+          "serial_stops: built first draw and attempted refused second draw");
+    check(registry.owners[2]->attempts.empty() && registry.owners[3]->attempts.empty(),
+          "serial_stops: did not compile draws past the first refused draw");
+}
+
+// ---- Large pipelines within a budget. ----
+
+// Pipelines that note the order they start in. One with `hold` does not end before `release` is called.
+struct Shop {
+    struct Item {
+        Shop* shop = nullptr;
+        ComputePipeline pipeline{};
+        std::string name;
+        bool hold = false;
+    };
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::vector<std::string> started;
+    std::vector<std::unique_ptr<Item>> items;
+    bool released = false;
+    int large_in = 0, most_large_in = 0;
+    LargeModuleGate* gate = nullptr;  // set: a large one takes its place there, as in the layer
+
+    ComputePipeline& add(const std::string& name, std::uint64_t estimate, bool large, bool hold = false) {
+        auto& item = *items.emplace_back(std::make_unique<Item>());
+        item.shop = this;
+        item.name = name;
+        item.hold = hold;
+        item.pipeline.large = large;
+        item.pipeline.estimate = estimate;
+        item.pipeline.build_context = &item;
+        item.pipeline.build = [](void* context) {
+            auto& i = *static_cast<Item*>(context);
+            Shop& shop = *i.shop;
+            LargeModuleGate::Ticket place;
+            if (shop.gate && i.pipeline.large) place = LargeModuleGate::Ticket(*shop.gate, i.pipeline.estimate);
+            std::unique_lock lock(shop.mutex);
+            shop.started.push_back(i.name);
+            if (i.pipeline.large) shop.most_large_in = std::max(shop.most_large_in, ++shop.large_in);
+            shop.changed.notify_all();
+            if (i.hold) shop.changed.wait_for(lock, std::chrono::seconds(10), [&] { return shop.released; });
+            if (i.pipeline.large) --shop.large_in;
+            return handle<VkPipeline>(std::uintptr_t(&i) | 1);
+        };
+        return item.pipeline;
+    }
+    void fill(PipelineCompiles& compiles) {
+        for (auto& item : items) compiles.add(item->pipeline, PipelineCompiles::User::dispatch);
+    }
+    // Whether `count` have started, within 10 s.
+    bool wait_started(std::size_t count) {
+        std::unique_lock lock(mutex);
+        return changed.wait_for(lock, std::chrono::seconds(10), [&] { return started.size() >= count; });
+    }
+    void release() {
+        std::lock_guard lock(mutex);
+        released = true;
+        changed.notify_all();
+    }
+};
+
+// On `threads` threads, which take the jobs in order.
+void on_threads(unsigned threads, std::size_t count, const std::function<void(std::size_t)>& job) {
+    std::atomic<std::size_t> next = 0;
+    std::vector<std::thread> workers;
+    for (unsigned t = 0; t < threads; ++t)
+        workers.emplace_back([&] {
+            for (std::size_t i; (i = next++) < count;) job(i);
+        });
+    for (auto& w : workers) w.join();
+}
+
+using Names = std::vector<std::string>;
+
+// The order and the jobs of the run, on one thread: the largest first, then the others, and the budget read once.
+void budget_order() {
+    struct Case {
+        std::vector<std::uint64_t> large;
+        std::uint64_t budget;
+        std::size_t lanes;
+        Names order;  // of the large ones
+    };
+    for (const Case& c : {Case{{5, 2, 3, 2, 1}, 5, 3, {"5", "3", "2", "2", "1"}},
+                          Case{{5, 2, 3, 2, 1}, 4, 2, {"5", "3", "2", "2", "1"}},
+                          Case{{5, 2, 3, 2, 1}, 0, 1, {"5", "2", "3", "2", "1"}},  // no budget: in the order they came
+                          Case{{5, 2, 3, 2, 1}, 100, 5, {"5", "3", "2", "2", "1"}},
+                          Case{{9}, 5, 1, {"9"}},        // more than the budget: one, alone
+                          Case{{9, 9}, 5, 1, {"9", "9"}},
+                          Case{{9, 1}, 5, 1, {"9", "1"}},
+                          Case{{4, 4}, 8, 2, {"4", "4"}}}) {
+        Shop shop;
+        for (const auto size : c.large) shop.add(std::to_string(size), size, true);
+        for (int i = 0; i < 3; ++i) shop.add("s" + std::to_string(i), 0, false);
+        PipelineCompiles compiles;
+        shop.fill(compiles);
+        std::size_t units = 0;
+        unsigned reads = 0;
+        compiles.build([&](std::size_t count, const std::function<void(std::size_t)>& job) {
+            units = count;
+            for (std::size_t i = 0; i < count; ++i) job(i);
+        }, [&] { ++reads; return c.budget; });
+        Names want = c.order;
+        for (int i = 0; i < 3; ++i) want.push_back("s" + std::to_string(i));
+        const std::string name = "budget " + std::to_string(c.budget) + " of " + std::to_string(c.large.size());
+        check(shop.started == want, name + ": another order");
+        check(units == c.lanes + 3, name + ": " + std::to_string(units) + " jobs, not " + std::to_string(c.lanes + 3));
+        check(reads == 1, name + ": the budget read " + std::to_string(reads) + " times");
+        for (std::size_t i = 0; i < shop.items.size(); ++i)
+            check(compiles.built(PipelineCompiles::Ticket(i + 1)) != VK_NULL_HANDLE, name + ": not built");
+    }
+    // Without a large pipeline the budget is not read, and the jobs are the pipelines.
+    Shop shop;
+    for (int i = 0; i < 3; ++i) shop.add("s" + std::to_string(i), 0, false);
+    PipelineCompiles compiles;
+    shop.fill(compiles);
+    std::size_t units = 0;
+    unsigned reads = 0;
+    compiles.build([&](std::size_t count, const std::function<void(std::size_t)>& job) {
+        units = count;
+        for (std::size_t i = 0; i < count; ++i) job(i);
+    }, [&] { ++reads; return 100u; });
+    check(units == 3 && reads == 0, "the budget read for pipelines that are not large");
+}
+
+// A large one that does not fit beside the one in is not waited for while others are left: they come first.
+void budget_others_first() {
+    Shop shop;
+    shop.add("8", 8, true, true);
+    shop.add("4a", 4, true);
+    shop.add("4b", 4, true);
+    for (int i = 0; i < 3; ++i) shop.add("s" + std::to_string(i), 0, false);
+    PipelineCompiles compiles;
+    shop.fill(compiles);
+    std::thread building([&] {
+        compiles.build([&](std::size_t count, const std::function<void(std::size_t)>& job) {
+            check(count == 2 + 3, "two lanes: the two of 4 fit 8 together");
+            on_threads(2, count, job);
+        }, [] { return 8; });
+    });
+    const bool all = shop.wait_started(6);  // "8" is held: the other lane does the rest
+    Names seen;
+    {
+        std::lock_guard lock(shop.mutex);
+        seen = shop.started;
+    }
+    shop.release();
+    building.join();
+    check(all && seen.size() == 6 && seen[0] == "8", "the large one first");
+    check(all && std::set<std::string>(seen.begin() + 1, seen.begin() + 4) == std::set<std::string>{"s0", "s1", "s2"},
+          "the others before the large ones that do not fit");
+    check(all && seen[4] == "4a" && seen[5] == "4b", "then the next large ones");
+}
+
+// Those that fit together start together, before the others.
+void budget_fits_together() {
+    Shop shop;
+    shop.add("3", 3, true, true);
+    shop.add("5", 5, true, true);
+    for (int i = 0; i < 2; ++i) shop.add("s" + std::to_string(i), 0, false);
+    PipelineCompiles compiles;
+    shop.fill(compiles);
+    std::thread building([&] {
+        compiles.build([&](std::size_t count, const std::function<void(std::size_t)>& job) { on_threads(2, count, job); },
+                       [] { return 8; });
+    });
+    const bool both = shop.wait_started(2);
+    Names seen;
+    {
+        std::lock_guard lock(shop.mutex);
+        seen = shop.started;
+    }
+    shop.release();
+    building.join();
+    check(both && std::set<std::string>(seen.begin(), seen.begin() + 2) == std::set<std::string>{"3", "5"},
+          "two that fit the budget are in together");
+    check(shop.most_large_in == 2, "two that fit the budget at once");
+}
+
+// The room that a large one leaves is the next large one's, before the others.
+void budget_room_is_given_back() {
+    Shop shop;
+    shop.add("5", 5, true, true);
+    for (const char* name : {"3a", "3b", "3c"}) shop.add(name, 3, true);
+    for (int i = 0; i < 3; ++i) shop.add("s" + std::to_string(i), 0, false);
+    PipelineCompiles compiles;
+    shop.fill(compiles);
+    std::thread building([&] {
+        compiles.build([&](std::size_t count, const std::function<void(std::size_t)>& job) {
+            check(count == 2 + 3, "two lanes: two of 3 fit 8, three do not");
+            on_threads(2, count, job);
+        }, [] { return 8; });
+    });
+    const bool all = shop.wait_started(7);  // "5" is held: the other lane has room for one of 3 at a time
+    Names seen;
+    {
+        std::lock_guard lock(shop.mutex);
+        seen = shop.started;
+    }
+    shop.release();
+    building.join();
+    check(all && Names(seen.begin(), seen.begin() + 4) == Names{"5", "3a", "3b", "3c"},
+          "a large one does not leave its room");
+}
+
+// Graphics and compute pipelines share the budget: what each is expected to take counts alike.
+void budget_graphics_and_compute() {
+    Shop shop;
+    shop.add("3", 3, true);
+    shop.add("4", 4, true);
+    GraphicsPipeline graphics{};
+    graphics.large = true;
+    graphics.estimate = 5;
+    graphics.variant = [&](std::uint32_t) {
+        std::lock_guard lock(shop.mutex);
+        shop.started.push_back("5");
+        return handle<VkPipeline>(5);
+    };
+    PipelineCompiles compiles;
+    shop.fill(compiles);
+    compiles.add(graphics, 0);
+    std::size_t units = 0;
+    compiles.build([&](std::size_t count, const std::function<void(std::size_t)>& job) {
+        units = count;
+        for (std::size_t i = 0; i < count; ++i) job(i);
+    }, [] { return 8; });
+    check(shop.started == Names{"5", "4", "3"}, "the largest first, graphics or compute");
+    check(units == 2, "3 and 4 fit 8, and 5 does not beside them");
+}
+
+// The lanes are no more than could be in: a thread is not kept waiting for room there is none of.
+void budget_lanes_are_bounded() {
+    Shop shop;
+    for (int i = 0; i < 3; ++i) shop.add("5" + std::to_string(i), 5, true);
+    for (int i = 0; i < 6; ++i) shop.add("s" + std::to_string(i), 0, false);
+    PipelineCompiles compiles;
+    shop.fill(compiles);
+    compiles.build([&](std::size_t count, const std::function<void(std::size_t)>& job) {
+        check(count == 2 + 6, "10 bytes hold two of 5");
+        on_threads(4, count, job);
+    }, [] { return 10; });
+    check(shop.started.size() == 9 && shop.most_large_in <= 2, "no more than two large ones at once");
+}
+
+// Every one of them is built once, with the gate of the runtime holding what does not fit, whatever sizes and budget.
+void budget_random(PipelineWorkers& workers) {
+    std::mt19937 rng(20251127);
+    for (int round = 0; round < 300; ++round) {
+        Shop shop;
+        const std::uint64_t budget = rng() % 20;
+        LargeModuleGate gate([budget] { return budget; });
+        shop.gate = &gate;
+        const unsigned large = rng() % 10, others = rng() % 10;
+        for (unsigned i = 0; i < large; ++i) shop.add("l" + std::to_string(i), rng() % 12, true);
+        for (unsigned i = 0; i < others; ++i) shop.add("s" + std::to_string(i), 0, false);
+        PipelineCompiles compiles;
+        shop.fill(compiles);
+        compiles.build([&](std::size_t count, const std::function<void(std::size_t)>& job) { workers.run(count, job); },
+                       [budget] { return budget; });
+        Names names = shop.started;
+        std::sort(names.begin(), names.end());
+        check(std::adjacent_find(names.begin(), names.end()) == names.end() && names.size() == large + others,
+              "random budget " + std::to_string(round) + ": a pipeline built twice or not at all");
+        check(gate.inflight() == 0, "random budget " + std::to_string(round) + ": a place not given back");
+    }
 }
 
 }  // namespace
@@ -555,8 +906,17 @@ int main() {
         cases(workers);
         if (threads) many(workers);
         reused_lists(workers);
+        prior_compiles_reuse(workers);
         random_submissions(workers);
+        budget_random(workers);
     }
+    serial_stops_at_refused_draw();
+    budget_order();
+    budget_others_first();
+    budget_fits_together();
+    budget_room_is_given_back();
+    budget_graphics_and_compute();
+    budget_lanes_are_bounded();
     check(large_together == 0, "two large pipelines were built at once");
     if (failures) return 1;
     std::printf("replay_pipeline_compiles_test: passed\n");

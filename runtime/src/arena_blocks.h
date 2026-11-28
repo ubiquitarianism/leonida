@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <utility>
 #include <vector>
@@ -66,11 +67,18 @@ public:
                 const std::uint64_t block = next->first;
                 const std::uint64_t block_size = next->second;
                 const std::uint64_t end = block + block_size;
-                std::uint64_t start = align_up(block, alignment);
-                while (start < end && bytes <= end - start) {
-                    const std::uint64_t keep_out_end = keep_out(start, start + bytes);
-                    if (!keep_out_end) break;
-                    start = align_up(keep_out_end, alignment);
+                std::uint64_t start = 0;
+                if (align_up(block, alignment, start)) {
+                    while (start < end && bytes <= end - start) {
+                        const std::uint64_t keep_out_end = keep_out(start, start + bytes);
+                        if (!keep_out_end) break;
+                        if (keep_out_end <= start || !align_up(keep_out_end, alignment, start)) {
+                            start = end;
+                            break;
+                        }
+                    }
+                } else {
+                    start = end;
                 }
                 if (cuts_ != cuts) break;  // the map moved under the walk: search the new one
                 if (start < end && bytes <= end - start) {
@@ -189,7 +197,10 @@ public:
 
     // Whether the map's free bytes and the device's live bytes add up to the arena: a byte released twice, or a
     // released range that was never allocated, breaks this. O(1), so the device checks it on every call.
-    bool consistent(std::uint64_t live_bytes) const { return free_bytes_ + live_bytes == size_ - reserved_; }
+    bool consistent(std::uint64_t live_bytes) const {
+        const std::uint64_t total = size_ > reserved_ ? size_ - reserved_ : 0;
+        return live_bytes <= total && free_bytes_ == total - live_bytes;
+    }
 
     // Faults reported so far, and the last one this call reported.
     std::uint64_t faults() const { return faults_; }
@@ -202,8 +213,16 @@ public:
     static constexpr int kAttempts = 8;
 
 private:
-    static std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
-        return (value + alignment - 1) / alignment * alignment;
+    static bool align_up(std::uint64_t value, std::uint64_t alignment, std::uint64_t& out) {
+        const std::uint64_t rem = value % alignment;
+        if (!rem) {
+            out = value;
+            return true;
+        }
+        const std::uint64_t add = alignment - rem;
+        if (value > std::numeric_limits<std::uint64_t>::max() - add) return false;
+        out = value + add;
+        return true;
     }
 
     Fault note_fault(Fault fault) {
