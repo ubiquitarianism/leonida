@@ -419,6 +419,7 @@ test('Shift speeds the camera up and Ctrl slows it down, on either side of the k
         AbortController,
         setTimeout: () => 1, clearTimeout() {},
         fetch: manifestResponse({ spawn: [0, 0, 0], chunks: [] }), GLTFLoader: class {},
+        AbortController, setTimeout, clearTimeout,
     });
     // One frame is 0.1 s at the default 40 m/s, so E alone climbs 4 m.
     const climb = (...modifiers) => {
