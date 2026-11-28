@@ -12051,6 +12051,9 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // Leonida: for the A/B phase lines, when each frame is handed over to be shown.
+            #[cfg(feature = "diagnostics")]
+            crate::ab::shown();
             // Leonida: with bars, frame generation is told where in the buffer the picture is.
             crate::fg::picture_box((!whole).then_some([placed.left, placed.top, width, height]));
             crate::fg::present_start();

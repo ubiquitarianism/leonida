@@ -53,7 +53,13 @@ struct Phase {
     drawn: u64,
     frames: Vec<f32>,
     draws: u64,
+    /// When the host last handed a frame over to be shown ([`shown`]), and the intervals between
+    /// those of the phase, in order (ms).
+    shown_last: Option<std::time::Instant>,
+    shown: Vec<f32>,
 }
+
+static PHASE: Mutex<Option<Phase>> = Mutex::new(None);
 
 /// The frames' mean, median and nine tenths.
 fn summary(frames: &mut [f32]) -> (f32, f32, f32) {
@@ -65,6 +71,36 @@ fn summary(frames: &mut [f32]) -> (f32, f32, f32) {
     (mean, frames[frames.len() / 2], frames[frames.len() * 9 / 10])
 }
 
+/// Intervals in order: the mean change from one to the next (jitter) and their spread (standard
+/// deviation), ms.
+fn jitter(intervals: &[f32]) -> (f32, f32) {
+    if intervals.len() < 2 {
+        return (0.0, 0.0);
+    }
+    let n = intervals.len() as f32;
+    let jitter = intervals.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>() / (n - 1.0);
+    let mean = intervals.iter().sum::<f32>() / n;
+    let spread = (intervals.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n).sqrt();
+    (jitter, spread)
+}
+
+/// The host hands a frame over to be shown (right before its present, on the presenting
+/// thread): the intervals between these are what the phase's line says of how evenly frames come.
+pub(crate) fn shown() {
+    if asked().is_none() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut phase = PHASE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(p) = phase.as_mut() else { return };
+    if let Some(last) = p.shown_last
+        && (now - p.began).as_secs_f64() > 1.0
+    {
+        p.shown.push((now - last).as_secs_f32() * 1000.0);
+    }
+    p.shown_last = Some(now);
+}
+
 /// The title's present ends on this thread. `change`: called when another
 /// phase begins, before any switch changes, with what `switch` is and what it
 /// will be.
@@ -72,7 +108,6 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
     let Some(asked) = asked() else {
         return;
     };
-    static PHASE: Mutex<Option<Phase>> = Mutex::new(None);
     let now = std::time::Instant::now();
     let drawn = crate::draw::drawn();
     let mut phase = PHASE.lock().unwrap_or_else(|e| e.into_inner());
@@ -84,6 +119,8 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
         drawn,
         frames: Vec::new(),
         draws: 0,
+        shown_last: None,
+        shown: Vec::new(),
     });
     if (now - p.began).as_secs_f64() > 1.0 {
         p.frames.push((now - p.last).as_secs_f32() * 1000.0);
@@ -96,14 +133,19 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
     }
     let bits = |number: u64| (number % (1 << asked.switches.len())) as u32;
     let (was, will) = (bits(p.number), bits(number));
+    let (title_jitter, title_spread) = jitter(&p.frames);
+    let (shown_jitter, shown_spread) = jitter(&p.shown);
+    let shown_mean = p.shown.iter().sum::<f32>() / p.shown.len().max(1) as f32;
     let (mean, median, most) = summary(&mut p.frames);
     let on: Vec<&str> = asked.switches.iter().enumerate().filter(|(n, _)| was >> n & 1 != 0).map(|(_, s)| s.as_str()).collect();
     tracing::info!(
-        "A/B phase {} bits {was} on [{}]: {} frames, mean {mean:.1} ms, median {median:.1}, p90 {most:.1}, {:.0} draws a frame",
+        "A/B phase {} bits {was} on [{}]: {} frames, mean {mean:.1} ms, median {median:.1}, p90 {most:.1}, {:.0} draws a frame; \
+         title presents jitter {title_jitter:.1} ms spread {title_spread:.1}; host presents {} mean {shown_mean:.1} ms jitter {shown_jitter:.1} spread {shown_spread:.1}",
         p.number,
         on.join(" "),
         p.frames.len(),
-        p.draws as f64 / p.frames.len().max(1) as f64
+        p.draws as f64 / p.frames.len().max(1) as f64,
+        p.shown.len()
     );
     for (n, switch) in asked.switches.iter().enumerate() {
         change(switch, was >> n & 1 != 0, will >> n & 1 != 0);
@@ -111,6 +153,7 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
     BITS.store(will, Relaxed);
     (p.number, p.began, p.draws) = (number, now, 0);
     p.frames.clear();
+    p.shown.clear();
 }
 
 #[cfg(test)]
@@ -126,6 +169,8 @@ mod tests {
         assert!(parse("0,LEONIDA_A").is_none());
         assert_eq!(summary(&mut [30.0, 10.0, 20.0]), (20.0, 20.0, 30.0));
         assert_eq!(summary(&mut []), (0.0, 0.0, 0.0));
+        assert_eq!(jitter(&[70.0]), (0.0, 0.0));
+        assert_eq!(jitter(&[60.0, 80.0, 60.0, 80.0]), (20.0, 10.0));
         assert_eq!(pick("LEONIDA_NONE_SUCH"), None);
     }
 }
