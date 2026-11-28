@@ -665,6 +665,16 @@ struct RtTriangleGeometry {
     std::uint32_t flags = 0;          // D3D12_RAYTRACING_GEOMETRY_FLAGS (bit 0 opaque, bit 1 no duplicate any-hit)
 };
 
+// The triangles of a BLAS geometry: an indexed one has index_count / 3 of them (none with fewer than 3 indices; its
+// index type stays declared, so counting its vertices instead would read indices from a buffer it may not have),
+// another vertex_count / 3. Every build and size query counts them this way.
+constexpr std::uint32_t rt_triangle_count(bool indexed, std::uint32_t index_count, std::uint32_t vertex_count) {
+    return (indexed ? index_count : vertex_count) / 3u;
+}
+constexpr std::uint32_t rt_triangle_count(const RtTriangleGeometry& t) {
+    return rt_triangle_count(t.index_type != 0, t.index_count, t.vertex_count);
+}
+
 // BLAS or TLAS build command (VK_KHR_acceleration_structure).
 struct BuildAccelerationStructure {
     bool is_tlas = false;

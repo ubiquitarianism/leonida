@@ -2601,6 +2601,13 @@ if(TARGET Vulkan::Headers)
     endforeach()
     set_tests_properties(d3d12_com PROPERTIES SKIP_RETURN_CODE 77)
 
+    # The KHR prebuild's size query: triangle counts, vertex formats and flags as the build records them. No GPU.
+    add_executable(d3d12_rt_khr_inputs_test test/d3d12_rt_khr_inputs_test.cpp)
+    target_link_libraries(d3d12_rt_khr_inputs_test PRIVATE Vulkan::Headers)
+    target_compile_definitions(d3d12_rt_khr_inputs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_rt_khr_inputs_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_rt_khr_inputs COMMAND d3d12_rt_khr_inputs_test)
+
     # Where the device finds its translated shaders (shader_path.txt, a path that is not UTF-8). No GPU.
     add_executable(d3d12_shader_path_test test/d3d12_shader_path_test.cpp)
     target_link_libraries(d3d12_shader_path_test PRIVATE gta6rt_d3d12_com)
@@ -4691,6 +4698,16 @@ if(TARGET Vulkan::Headers)
       target_compile_options(replay_khr_as_copy_postbuild_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME replay_khr_as_copy_postbuild COMMAND replay_khr_as_copy_postbuild_test)
+    # KHR BLAS build emit: an indexed geometry with fewer than 3 indices has no triangles (no GPU).
+    add_executable(replay_khr_blas_build_test test/replay_khr_blas_build_test.cpp)
+    target_link_libraries(replay_khr_blas_build_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_khr_blas_build_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    if(MSVC)
+      target_compile_options(replay_khr_blas_build_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME replay_khr_blas_build COMMAND replay_khr_blas_build_test)
     # PreparedList::wrote_readback and readback_src_stages match the actual producer stage (depth24, rgb96, UAV clear; no GPU).
     add_executable(replay_readback_stages_test test/replay_readback_stages_test.cpp)
     target_link_libraries(replay_readback_stages_test PRIVATE Vulkan::Headers)

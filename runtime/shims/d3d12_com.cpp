@@ -6,6 +6,7 @@
 #include "d3d12_fence_waiter.h"
 #include "d3d12_feature_compat.h"
 #include "d3d12_indirect_draw_policy.h"
+#include "d3d12_rt_khr_inputs.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
@@ -1073,16 +1074,7 @@ public:
         leonida::BuildAccelerationStructure cmd{};
         cmd.is_tlas = (in.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
         cmd.update = (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE) != 0;
-        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE)
-            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
-        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION)
-            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
-        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE)
-            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD)
-            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
-        if (in.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)
-            cmd.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;   // XDXR: BOX16 nodes (BLAS)
+        cmd.build_flags = khr_build_flags(in.Flags);  // as the size query gets them (d3d12_rt_khr_inputs.h)
         cmd.dst_va = desc->DestAccelerationStructureData;
         cmd.src_va = desc->SourceAccelerationStructureData;
         cmd.scratch_va = desc->ScratchAccelerationStructureData;
@@ -1103,15 +1095,7 @@ public:
                 t.vertex_stride = static_cast<std::uint32_t>(gd->Triangles.VertexBuffer.StrideInBytes);
                 // The vertex formats D3D12 allows for BLAS builds; any other stays VK_FORMAT_UNDEFINED and the
                 // build is refused at replay instead of reading the wrong layout.
-                switch (gd->Triangles.VertexFormat) {
-                case DXGI_FORMAT_R32G32B32_FLOAT: t.vertex_format = VK_FORMAT_R32G32B32_SFLOAT; break;
-                case DXGI_FORMAT_R32G32_FLOAT: t.vertex_format = VK_FORMAT_R32G32_SFLOAT; break;
-                case DXGI_FORMAT_R16G16B16A16_FLOAT: t.vertex_format = VK_FORMAT_R16G16B16A16_SFLOAT; break;
-                case DXGI_FORMAT_R16G16_FLOAT: t.vertex_format = VK_FORMAT_R16G16_SFLOAT; break;
-                case DXGI_FORMAT_R16G16B16A16_SNORM: t.vertex_format = VK_FORMAT_R16G16B16A16_SNORM; break;
-                case DXGI_FORMAT_R16G16_SNORM: t.vertex_format = VK_FORMAT_R16G16_SNORM; break;
-                default: t.vertex_format = VK_FORMAT_UNDEFINED; break;
-                }
+                t.vertex_format = khr_vertex_format(gd->Triangles.VertexFormat);
                 t.index_va = gd->Triangles.IndexBuffer;
                 t.index_count = gd->Triangles.IndexCount;
                 if (gd->Triangles.IndexFormat == DXGI_FORMAT_R16_UINT)

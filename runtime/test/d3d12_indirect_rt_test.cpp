@@ -1071,9 +1071,8 @@ int main() {
         if (blas_compact_info.ResultDataMaxSizeInBytes == 0 || blas_compact_info.ScratchDataSizeInBytes == 0)
             return fail("GetRaytracingAccelerationStructurePrebuildInfo(BLAS compact)");
 
-        // origin/main's GetRaytracingAccelerationStructurePrebuildInfo does not yet forward ALLOW_COMPACTION
-        // (tracked by #8695), while BuildRaytracingAccelerationStructure does. Query the driver's build sizes
-        // with ALLOW_COMPACTION_BIT_KHR and take the max so this test is valid both before and after #8695.
+        // GetRaytracingAccelerationStructurePrebuildInfo forwards ALLOW_COMPACTION as the build does
+        // (d3d12_rt_khr_inputs.h); the driver's own sizes with ALLOW_COMPACTION_BIT_KHR are taken as a floor.
         VkAccelerationStructureBuildSizesInfoKHR compact_vk_sizes{
             VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
         if (vkGetAccelerationStructureBuildSizesKHR) {

@@ -5467,9 +5467,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                     tr.indexData.deviceAddress = addr(t.index_va);
                     tr.transformData.deviceAddress = addr(t.transform_va);
                     geoms.push_back(g);
-                    const std::uint32_t prim_count =
-                        (t.index_type != 0 && t.index_count >= 3) ? (t.index_count / 3u) : (t.vertex_count / 3u);
-                    ranges.push_back({prim_count, 0, 0, 0});
+                    ranges.push_back({rt_triangle_count(t), 0, 0, 0});
                 }
             }
             VkAccelerationStructureBuildGeometryInfoKHR info{

@@ -26,6 +26,7 @@
 #include "d3d12_title_image_upload.h"
 #include "d3d12_title_buffer_windows.h"
 #include "d3d12_geometry_views.h"
+#include "d3d12_rt_khr_inputs.h"
 #include "placed_image_map_note.h"
 #include "d3d12_title_image_census.h"
 #include "d3d12_xs_native_pso.h"
@@ -18240,64 +18241,20 @@ public:
         }
         if (!state_.info.ray_tracing || !vk.vkGetAccelerationStructureBuildSizesKHR) return;
 
-        std::vector<VkAccelerationStructureGeometryKHR> geoms;
-        std::vector<std::uint32_t> max_prims;
-        if (is_tlas) {
-            VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
-            g.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
-            g.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-            g.geometry.instances.arrayOfPointers =
-                desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS ? VK_TRUE : VK_FALSE;
-            geoms.push_back(g);
-            max_prims.push_back(desc->NumDescs);
-        } else {
-            for (UINT i = 0; i < desc->NumDescs; ++i) {
-                const D3D12_RAYTRACING_GEOMETRY_DESC* gd =
-                    (desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
-                        ? (desc->ppGeometryDescs ? desc->ppGeometryDescs[i] : nullptr)
-                        : (desc->pGeometryDescs ? &desc->pGeometryDescs[i] : nullptr);
-                if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) continue;
-                VkAccelerationStructureGeometryKHR g{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
-                g.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-                g.flags = (gd->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0u;
-                auto& tr = g.geometry.triangles;
-                tr.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-                tr.vertexFormat = (gd->Triangles.VertexFormat == DXGI_FORMAT_R32G32_FLOAT) ? VK_FORMAT_R32G32_SFLOAT
-                                                                                           : VK_FORMAT_R32G32B32_SFLOAT;
-                tr.vertexStride = gd->Triangles.VertexBuffer.StrideInBytes;
-                tr.maxVertex = gd->Triangles.VertexCount ? (gd->Triangles.VertexCount - 1u) : 0u;
-                tr.indexType = (gd->Triangles.IndexFormat == DXGI_FORMAT_R16_UINT)
-                                   ? VK_INDEX_TYPE_UINT16
-                                   : ((gd->Triangles.IndexFormat == DXGI_FORMAT_R32_UINT) ? VK_INDEX_TYPE_UINT32
-                                                                                          : VK_INDEX_TYPE_NONE_KHR);
-                geoms.push_back(g);
-                const std::uint32_t prims =
-                    (gd->Triangles.IndexFormat != DXGI_FORMAT_UNKNOWN && gd->Triangles.IndexCount >= 3)
-                        ? (gd->Triangles.IndexCount / 3u)
-                        : (gd->Triangles.VertexCount / 3u);
-                max_prims.push_back(prims);
-            }
-        }
-        if (geoms.empty()) return;
+        // The geometries, triangle counts, vertex formats and flags the recorded build gets (d3d12_rt_khr_inputs.h).
+        const KhrBuildSizeQuery query = khr_build_size_query(*desc);
+        if (query.geometries.empty()) return;
 
         VkAccelerationStructureBuildGeometryInfoKHR bgi{
             VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
-        bgi.type = is_tlas ? VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
-                           : VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE)
-            bgi.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
-        if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE)
-            bgi.flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-        if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD)
-            bgi.flags |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
-        if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)   // as the build gets it
-            bgi.flags |= VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;
-        bgi.geometryCount = static_cast<std::uint32_t>(geoms.size());
-        bgi.pGeometries = geoms.data();
+        bgi.type = query.type;
+        bgi.flags = query.flags;
+        bgi.geometryCount = static_cast<std::uint32_t>(query.geometries.size());
+        bgi.pGeometries = query.geometries.data();
 
         VkAccelerationStructureBuildSizesInfoKHR sizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
         vk.vkGetAccelerationStructureBuildSizesKHR(state_.info.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                                                   &bgi, max_prims.data(), &sizes);
+                                                   &bgi, query.max_primitives.data(), &sizes);
         out->ResultDataMaxSizeInBytes = sizes.accelerationStructureSize;
         out->ScratchDataSizeInBytes = sizes.buildScratchSize;
         out->UpdateScratchDataSizeInBytes = sizes.updateScratchSize;
