@@ -341,7 +341,10 @@ int main() {
     // that read the flags from the wrong header word would pick the other binding model without failing anywhere
     // else. There are no parameters because the DENY_* bits are invalid next to a parameter any of those stages
     // can see.
-    const uint32_t every_pc_flag =
+    const uint32_t heap_direct_flags =
+        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+        D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+    uint32_t every_pc_flag =
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
         D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS |
         D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
@@ -349,8 +352,20 @@ int main() {
         D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
         D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS |
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT |
-        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
-        D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+        heap_direct_flags;
+    // The heap-direct bits came with Shader Model 6.6. Windows 10's built-in d3d12.dll predates them and refuses them
+    // ("Unsupported bit-flag set"), so there the other bits are checked without them.
+    {
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC heap_direct{};
+        heap_direct.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+        heap_direct.Desc_1_1 = {0, nullptr, 0, nullptr, static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(heap_direct_flags)};
+        Blobs probe;
+        if (FAILED(D3D12SerializeVersionedRootSignature(&heap_direct, &probe.blob, &probe.error))) {
+            std::printf("SKIP 1.1 with every root-signature flag: the heap-direct bits (the host d3d12.dll can't "
+                        "serialize them, e.g. Windows 10); the other flags are still checked\n");
+            every_pc_flag &= ~heap_direct_flags;
+        }
+    }
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC flagged11{};
     flagged11.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
     flagged11.Desc_1_1 = {0, nullptr, 0, nullptr, static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(every_pc_flag)};
@@ -360,7 +375,7 @@ int main() {
         if (serialize_desc(flagged11, out, "1.1 with every root-signature flag") &&
             parse_checked(out.blob, "1.1 with every root-signature flag", got)) {
             check_named(got.flags == every_pc_flag, "1.1 with every root-signature flag",
-                        "the whole PC flag word round-trips (heap-direct bits included)");
+                        "the whole PC flag word round-trips (heap-direct bits included where the host has them)");
             const std::vector<uint8_t> bytes = encode_canonical(got);
             const DecodeResult again = decode_canonical(bytes.data(), bytes.size());
             check_named(again.ok && again.sig.flags == every_pc_flag, "1.1 with every root-signature flag",
