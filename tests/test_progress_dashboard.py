@@ -687,5 +687,96 @@ class Outputs(unittest.TestCase):
             self.assertIn("is not a directory", err.getvalue())
 
 
+class Hardening(unittest.TestCase):
+    @staticmethod
+    def _minimal_snap():
+        return {
+            "schema": pd.SCHEMA, "generated_at": "2026-11-24T10:00:00Z", "git": {},
+            "panels": [], "counts": {}, "components": [], "metrics": [],
+            "sources": [], "notes": [], "github": {}, "content_hash": "0" * 64,
+        }
+
+    def test_github_login_skips_null_author_and_null_body(self):
+        def fake_gh(args, timeout=60):
+            if args[:2] == ["issue", "list"] and "Coordinating" in args[args.index("--search") + 1]:
+                return [{"number": 14, "title": "Coordinating who works on what", "updatedAt": "2026-11-24T00:00:00Z"}]
+            if args[:2] == ["issue", "view"] and args[2] == "14":
+                fields = args[args.index("--json") + 1]
+                if fields == "body":
+                    return {"body": "### Up for grabs\n| X-1 |\n"}
+                if fields == "comments":
+                    return {"comments": [
+                        {"author": None, "body": "claiming: X", "createdAt": "2026-11-24T01:00:00Z"},
+                        {"author": {"login": "alice"}, "body": None, "createdAt": "2026-11-24T01:01:00Z"},
+                        {"author": {"login": "alice"}, "body": "claiming: Y", "createdAt": "2026-11-24T01:02:00Z"},
+                    ]}
+            return []
+
+        col = pd.Collector()
+        with mock.patch.object(pd, "gh_json", fake_gh), mock.patch.object(pd.shutil, "which", lambda _: "/usr/bin/gh"):
+            summary = pd.collect_github(col, "o/r", "alice")
+        self.assertEqual(summary["mine"]["claims"],
+                         [{"at": "2026-11-24T01:02:00Z", "issue": 14, "text": "claiming: Y"}])
+
+    def test_tests_flag_requires_run_tests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as stop:
+                pd.main(["--out", os.path.join(tmp, "out"), "--tests", "foo"])
+            self.assertEqual(stop.exception.code, 2)
+            self.assertIn("--tests requires --run-tests", err.getvalue())
+
+    def test_ci_test_files_oserror_exits_2_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with mock.patch.object(pd, "ci_test_files", side_effect=PermissionError(13, "denied", "tests/blocked")), \
+                    contextlib.redirect_stderr(err):
+                rc = pd.main(["--out", os.path.join(tmp, "out"), "--run-tests"])
+            self.assertEqual(rc, 2)
+            self.assertIn("denied", err.getvalue())
+
+    def test_corrupt_non_list_and_bom_history_json(self):
+        snap = self._minimal_snap()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            os.makedirs(out)
+            hist = Path(out, "history.json")
+            for bad in (
+                b"{bad",
+                b"{}",
+                b'[{"content_hash":"old"}]',
+                b'[{"content_hash":"old","metrics":null}]',
+                b'[{"content_hash":"old","metrics":[]}]',
+                b'[{"content_hash":null,"metrics":{}}]',
+            ):
+                hist.write_bytes(bad)
+                err = io.StringIO()
+                with mock.patch.object(pd, "build", return_value=snap), contextlib.redirect_stderr(err):
+                    rc = pd.main(["--out", out])
+                self.assertEqual(rc, 2)
+                self.assertIn("error:", err.getvalue())
+                self.assertEqual(hist.read_bytes(), bad)
+                self.assertFalse(Path(out, "progress.html").exists())
+
+            valid = [{"generated_at": "2026-11-24T09:00:00Z", "head": "abc", "content_hash": "0" * 16, "metrics": {}}]
+            hist.write_bytes(b"\xef\xbb\xbf" + json.dumps(valid).encode("utf-8"))
+            out_s, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(pd, "build", return_value=snap), \
+                    contextlib.redirect_stdout(out_s), contextlib.redirect_stderr(err):
+                rc = pd.main(["--out", out])
+            self.assertEqual(rc, 0, err.getvalue())
+
+    def test_write_outputs_oserror_exits_2_cleanly(self):
+        snap = self._minimal_snap()
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with mock.patch.object(pd, "build", return_value=snap), \
+                    mock.patch.object(pd, "write_outputs", side_effect=PermissionError(13, "read-only", "progress.html")), \
+                    contextlib.redirect_stderr(err):
+                rc = pd.main(["--out", os.path.join(tmp, "out")])
+            self.assertEqual(rc, 2)
+            self.assertIn("read-only", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

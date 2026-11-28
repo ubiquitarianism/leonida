@@ -957,9 +957,11 @@ def collect_github(col, repo, login, d3d_issue=None):
             claims = []
             for n in [num] + ([int(prev.group(1))] if prev else []):
                 comments = gh_json(["issue", "view", str(n), "-R", repo, "--json", "comments"]) or {}
-                claims += [{"at": c.get("createdAt"), "issue": n, "text": plain(c["body"].splitlines()[0])[:160]}
-                           for c in comments.get("comments", [])
-                           if c.get("author", {}).get("login") == login and "claiming" in c["body"].lower()]
+                for c in comments.get("comments", []):
+                    body_text = c.get("body") or ""
+                    if (c.get("author") or {}).get("login") == login and "claiming" in body_text.lower():
+                        first_line = (body_text.splitlines() or [""])[0]
+                        claims.append({"at": c.get("createdAt"), "issue": n, "text": plain(first_line)[:160]})
             prs = gh_json(["pr", "list", "-R", repo, "--author", login, "--state", "all", "--limit", "50",
                            "--json", "number,title,state,isDraft,updatedAt"]) or []
             summary["mine"] = {"login": login, "claims": claims,
@@ -1024,10 +1026,27 @@ def render_page(snap, history):
     return template.replace("/*__PROGRESS_LOGO__*/", logo_src()).replace("/*__PROGRESS_DATA__*/null", payload)
 
 
+def _load_history(hist_path):
+    if not os.path.isfile(hist_path):
+        return []
+    try:
+        history = json.loads(read_utf8(hist_path).lstrip("\ufeff"))
+    except ValueError as exc:
+        raise ValueError(f"{hist_path}: invalid JSON: {exc}") from None
+    if not isinstance(history, list) or any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("content_hash"), str)
+        or not isinstance(item.get("metrics"), dict)
+        for item in history
+    ):
+        raise ValueError(f"{hist_path}: expected a JSON list of snapshot summaries")
+    return history
+
+
 def write_outputs(snap, out_dir):
     os.makedirs(os.path.join(out_dir, "snapshots"), exist_ok=True)
     hist_path = os.path.join(out_dir, "history.json")
-    history = json.loads(read_utf8(hist_path)) if os.path.isfile(hist_path) else []
+    history = _load_history(hist_path)
     new = not history or history[-1]["content_hash"] != snap["content_hash"][:16]
     if new:
         stamp = snap["generated_at"].replace("-", "").replace(":", "")
@@ -1065,6 +1084,8 @@ def main(argv=None):
         ap.error("--d3d-issue requires --github")
     if args.d3d_issue is not None and args.d3d_issue < 1:
         ap.error("--d3d-issue must be a positive integer")
+    if args.tests is not None and not args.run_tests:
+        ap.error("--tests requires --run-tests")
     if args.jobs < 1:
         ap.error("--jobs must be a positive integer")
     if args.test_timeout < 1:
@@ -1082,7 +1103,12 @@ def main(argv=None):
         print(f"--work {args.work} is not a folder", file=sys.stderr)
         return 2
     if args.run_tests:
-        args.test_files = [f for f in ci_test_files() if not args.tests or re.search(args.tests, f)]
+        try:
+            all_tests = ci_test_files()
+        except OSError as exc:
+            print(f"error: {exc.filename or ''}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
+        args.test_files = [f for f in all_tests if not args.tests or re.search(args.tests, f)]
         if args.tests and not args.test_files:
             ap.error("--tests did not match any test files")
     if os.path.exists(out_dir) and not os.path.isdir(out_dir):
@@ -1095,10 +1121,13 @@ def main(argv=None):
         return 2
     try:
         snap = build(args, out_dir)
+        new = write_outputs(snap, out_dir)
     except OSError as exc:
         print(f"error: {exc.filename or ''}: {exc.strerror or exc}", file=sys.stderr)
         return 2
-    new = write_outputs(snap, out_dir)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     n = len(snap["components"])
     print(f"{n} units, {len(snap['metrics'])} metrics -> {os.path.join(out_dir, 'progress.html')}"
           + ("" if new else " (no change since the last snapshot)"))
