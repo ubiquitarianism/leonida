@@ -694,12 +694,15 @@ private:
                 last_tore_ = true;
                 ++tear_presents_;
             }
-            if (copy_frame && capture_ptr_) {  // a temporary splash-only allocation may have just been released
-                captured_ = true;
-                captured_extent_ = extent_;
-                captured_format_ = format_;
-                if (disk_sample) pending_capture_ = frame.done;
-            }
+            if (copy_frame && capture_ptr_ && disk_sample) pending_capture_ = frame.done;
+        }
+        if (copy_frame && capture_ptr_ &&
+            (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR || result == VK_ERROR_OUT_OF_DATE_KHR)) {
+            // Even when vkQueuePresentKHR reports OUT_OF_DATE after a resize, the frame was rendered and copied
+            // into capture_buffer_, so continuous read_back() stays valid (pending_capture_ stays shown-only above).
+            captured_ = true;
+            captured_extent_ = extent_;
+            captured_format_ = format_;
         }
         if (result == VK_ERROR_SURFACE_LOST_KHR) {
             // The surface was lost during the present (display disconnected, a driver reset of the window's
