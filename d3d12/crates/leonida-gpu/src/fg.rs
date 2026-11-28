@@ -14,15 +14,19 @@
 //!   (leonida-loader's `hooks.rs`). The title's own temporal upscaler hands nothing over: with it
 //!   no frame is tagged and none is generated.
 //! - [`present_start`] / [`present_end`] around the proxy's `Present`.
+//! - With `LEONIDA_FG_MARKERS=1`, Reflex's frames at the title's own events ([`frame_begins`],
+//!   [`title_submits`], [`title_presents`]): its sleep where the title begins a frame, not after
+//!   our present on the submitting thread (see "Reflex frames" below).
 //!
 //! The title gives no camera matrices: they are made from a 60 degree field of view, the
 //! upscale's near/far and the render size, the camera standing still (its motion is in the
-//! motion vectors). Frame indices are the presents so far: the upscale of a frame is recorded
-//! before its present.
+//! motion vectors). Frame indices are the presents so far (with `LEONIDA_FG_MARKERS=1`: the
+//! Reflex frame the title's present took): the upscale of a frame is recorded before its present.
 
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Instant;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::IDXGIFactory2;
@@ -99,8 +103,14 @@ fn reflex_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("LEONIDA_FG_REFLEX").is_none_or(|v| v != "0"))
 }
 
-struct State {
+/// Streamline, and what only the presenter reads and changes (behind its own lock): the title's
+/// threads call Streamline (`Sl` is `Sync`) for their markers without waiting for the presenter.
+struct Fg {
     sl: sl::Sl,
+    state: Mutex<State>,
+}
+
+struct State {
     /// Frames to generate as last given to DLSS-G (0: turned off); none before the first present.
     set: Option<u32>,
     /// The most frames this card generates per rendered one, as DLSS-G says; 0: not asked yet.
@@ -108,19 +118,447 @@ struct State {
     told: u32,
 }
 
-static STATE: OnceLock<Option<Mutex<State>>> = OnceLock::new();
-/// Presents so far: the index of the frame being made.
+static STATE: OnceLock<Option<Fg>> = OnceLock::new();
+/// Presents so far (the host's): the index of the frame being made without `LEONIDA_FG_MARKERS`.
 static FRAME: AtomicU32 = AtomicU32::new(1);
 /// A frame was tagged since the last present.
 static TAGGED: AtomicBool = AtomicBool::new(false);
 
 const VIEWPORT: sl::ViewportHandle = sl::ViewportHandle::new(0);
 
-fn state() -> Option<&'static Mutex<State>> {
+fn state() -> Option<&'static Fg> {
     STATE.get().and_then(|s| s.as_ref())
 }
 
-fn init(device: &ID3D12Device) -> anyhow::Result<State> {
+/// `LEONIDA_FG_MARKERS=1`: Reflex's sleep and markers at the title's events ("Reflex frames"
+/// below); unset or `0`: all markers at the host's present and the sleep after it, as before.
+/// Off by default: with it Reflex's simulation starts come exactly 71.4 ms apart (median and p90,
+/// its limit at 28 shown a second), but the frames handed over to be shown came no more evenly
+/// than without (Series X, 1080 lines, RTX 4060 Ti, 2026-11-28, the change from one host present
+/// interval to the next: 11.5 ms against 13.5 with that limit, 10.1 against 11.1 without one, and
+/// with `crate::smooth` holding presents 7.8 against 7.6 and 7.2 against 7.7; a phase's figure
+/// varies by about 1-3 ms): our submitting thread's uneven work still reaches the screen.
+fn markers_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_FG_MARKERS").is_some_and(|v| v == "1"))
+}
+
+// ---- Reflex frames ------------------------------------------------------------------------------
+//
+// Reflex paces the thread that sleeps in `slReflexSleep`, and measures a frame from its
+// SimulationStart to its PresentEnd. Before `LEONIDA_FG_MARKERS` every marker was sent at the
+// host's present and the sleep taken after it, on our submitting thread: Reflex paced that thread,
+// not the title, and its frame limit (`LEONIDA_FG_LIMIT_FPS`) held our presents back while the
+// title went on at its own uneven pace. With it, a Reflex frame follows the title:
+// - [`frame_begins`], the title's frame-start wait (`crate::frame::wait`, after our tick): a new
+//   Reflex frame, its sleep (on the title's thread, under no lock of ours), then SimulationStart.
+//   The title polls that wait and begins two or three frames per shown one in cutscenes, so a
+//   wait opens a frame only once the open one has had its first submission; others do nothing.
+// - [`title_submits`], the title's first submission to a direct queue after that: SimulationEnd
+//   and RenderSubmitStart (found atomically: the title submits from several threads).
+// - [`title_presents`], the title's present: the newest frame that has submitted is the one it
+//   shows; the present's number is kept with that frame's index for the presenter.
+// - [`present_start`] / [`present_end`] on the presenting thread, later: RenderSubmitEnd, the
+//   constants and tags, PresentStart, and PresentEnd, all with that index, so that everything
+//   of one frame shares one token.
+// Tokens are made and read one at a time ([`MARK`]): the guide (2.10) calls
+// `slGetNewFrameToken` not thread safe and a token made on one thread could be made over by
+// another's before it is read. The sleep's token is made under the lock and the lock let go
+// before the sleep. After Leandroazc/Azc-Low-End (`streamline/reflex.rs` `Frames`,
+// `streamline.rs` `frame_begins` / `title_submits` / `title_presents` / `reflex_sleep`, GPL-3.0),
+// without its readings of the pad: here the frame-start wait alone opens frames.
+
+/// The token lock: token creation and the calls that read a token (markers, constants, tags).
+/// Never held across Reflex's sleep or the proxy's `Present`.
+static MARK: Mutex<()> = Mutex::new(());
+/// The newest Reflex frame opened (0: none yet).
+static OPEN: AtomicU32 = AtomicU32::new(0);
+/// The newest Reflex frame whose sleep has returned (its simulation started).
+static STARTED: AtomicU32 = AtomicU32::new(0);
+/// The newest Reflex frame that had its first submission.
+static SUBMITTED: AtomicU32 = AtomicU32::new(0);
+/// The Reflex frame the title's last present took.
+static PRESENTED: AtomicU32 = AtomicU32::new(0);
+/// Per title present (its number modulo the length): the number's low 32 bits above the Reflex
+/// frame's index, for the presenter, which presents a few frames behind the title.
+static BY_PRESENT: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+/// A sleep took longer than [`SLEEP_TOO_LONG_US`]: none is asked for again this run.
+static SLEEP_OFF: AtomicBool = AtomicBool::new(false);
+/// The thread of the last frame-start wait that opened a Reflex frame, the last first submission,
+/// the last title present and the last host present (for the counters' line).
+static THREADS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+const T_OPENER: usize = 0;
+const T_SUBMIT: usize = 1;
+const T_PRESENT: usize = 2;
+const T_HOST: usize = 3;
+
+/// A sleep longer than this is warned of (microseconds).
+const SLEEP_LONG_US: u64 = 250_000;
+/// After a sleep longer than this no further sleep is asked for (the markers go on).
+const SLEEP_TOO_LONG_US: u64 = 2_000_000;
+
+/// What the title's present shows, from the newest frames opened, started, submitted and
+/// presented (see [`title_presents`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Takes {
+    /// The newest frame that has submitted (and was not presented).
+    Submitted(u32),
+    /// A frame begun with no submission yet: its simulation ends and its submissions begin here.
+    Unsubmitted(u32),
+    /// Nothing begun since the last present: a frame of its own, all of its markers here.
+    Made(u32),
+    /// A frame still in its sleep and none other: the last present's frame again.
+    Repeated(u32),
+}
+
+/// The next frame index after `index` (indices count from 1).
+fn after(index: u32) -> u32 {
+    index.wrapping_add(1).max(1)
+}
+
+/// Whether a frame-start wait opens a new Reflex frame: none is open yet, or the open one has
+/// had its first submission.
+fn opens(open: u32, submitted: u32) -> bool {
+    open == 0 || submitted == open
+}
+
+fn takes(open: u32, started: u32, submitted: u32, last: u32) -> Takes {
+    if submitted != 0 && submitted != last {
+        Takes::Submitted(submitted)
+    } else if open != 0 && open != last && started == open {
+        Takes::Unsubmitted(open)
+    } else if open == started {
+        Takes::Made(after(open))
+    } else {
+        Takes::Repeated(last)
+    }
+}
+
+#[cfg(test)]
+mod reflex_frame_tests {
+    use super::{Takes, opens, takes};
+
+    #[test]
+    fn reflex_frames_follow_the_titles_events() {
+        // The first wait opens a frame; polls before its first submission open none.
+        assert!(opens(0, 0));
+        assert!(!opens(1, 0));
+        assert!(opens(1, 1));
+        // Frame 3 submitted, 2 was presented: the present shows 3, though 4 is begun (in its sleep).
+        assert_eq!(takes(4, 3, 3, 2), Takes::Submitted(3));
+        // Frame 4 begun and started, not submitted, 3 presented: the present takes 4.
+        assert_eq!(takes(4, 4, 3, 3), Takes::Unsubmitted(4));
+        // Everything presented: a frame of its own.
+        assert_eq!(takes(4, 4, 4, 4), Takes::Made(5));
+        assert_eq!(takes(0, 0, 0, 0), Takes::Made(1));
+        // Only a frame in its sleep: the last one again.
+        assert_eq!(takes(5, 4, 4, 4), Takes::Repeated(4));
+    }
+}
+
+/// The counters of the Reflex frames' line ([`log_counts`]), taken at each line.
+#[derive(Clone, Copy)]
+enum N {
+    Waits,
+    Opened,
+    Polls,
+    Sleeps,
+    SleptUs,
+    SleptMaxUs,
+    Direct,
+    First,
+    InSleep,
+    Presents,
+    BySubmission,
+    Unsubmitted,
+    Made,
+    Repeated,
+    Unmapped,
+    FirstOnOpener,
+    PresentOnOpener,
+    OpenerChanged,
+    TokenSame,
+    TokenBehind,
+    TokenOther,
+    XSame,
+    XBehind,
+    XOther,
+    MarkWaitMaxUs,
+}
+const COUNTERS: usize = N::MarkWaitMaxUs as usize + 1;
+static COUNTS: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+
+fn add(n: N, v: u64) {
+    COUNTS[n as usize].fetch_add(v, Ordering::Relaxed);
+}
+
+fn most(n: N, v: u64) {
+    COUNTS[n as usize].fetch_max(v, Ordering::Relaxed);
+}
+
+/// [`MARK`], with the longest wait for it counted.
+fn mark() -> MutexGuard<'static, ()> {
+    let asked = Instant::now();
+    let held = MARK.lock().unwrap_or_else(|e| e.into_inner());
+    most(N::MarkWaitMaxUs, asked.elapsed().as_micros() as u64);
+    held
+}
+
+fn markers(fg: &Fg, index: u32, which: &[sl::PCLMarker]) {
+    if let Ok(token) = fg.sl.new_frame_token(Some(index)) {
+        for &marker in which {
+            let _ = fg.sl.pcl_set_marker(marker, token);
+        }
+    }
+}
+
+/// The title's frame-start wait made a token (`crate::frame::wait`, after our own tick's sleep,
+/// on the title's thread): a new Reflex frame if the open one has had its first submission, with
+/// Reflex's sleep (`LEONIDA_FG_MARKERS=1`) and its SimulationStart.
+pub(crate) fn frame_begins() {
+    let Some(fg) = state() else { return };
+    let marking = markers_on();
+    let thread = crate::host::thread_id();
+    add(N::Waits, 1);
+    let (index, sleep) = {
+        let _held = mark();
+        let open = OPEN.load(Ordering::Relaxed);
+        if !opens(open, SUBMITTED.load(Ordering::Relaxed)) {
+            add(N::Polls, 1);
+            return;
+        }
+        let index = after(open);
+        OPEN.store(index, Ordering::Relaxed);
+        add(N::Opened, 1);
+        if THREADS[T_OPENER].swap(thread, Ordering::Relaxed) != thread && open != 0 {
+            add(N::OpenerChanged, 1);
+        }
+        // (The sleep's token is made here, under the lock, and read by the sleep after it.)
+        let sleep = (marking && reflex_on() && !SLEEP_OFF.load(Ordering::Relaxed))
+            .then(|| fg.sl.new_frame_token(Some(index)).ok())
+            .flatten();
+        (index, sleep)
+    };
+    if let Some(token) = sleep {
+        let began = Instant::now();
+        let _ = fg.sl.reflex_sleep(token);
+        let took = began.elapsed().as_micros() as u64;
+        add(N::Sleeps, 1);
+        add(N::SleptUs, took);
+        most(N::SleptMaxUs, took);
+        if took > SLEEP_TOO_LONG_US {
+            SLEEP_OFF.store(true, Ordering::Relaxed);
+            tracing::warn!(ms = took / 1000, index, "frame generation: Reflex slept the title's frame start for over 2 s; no further sleep this run (its markers go on)");
+        } else if took > SLEEP_LONG_US {
+            static TOLD: AtomicU32 = AtomicU32::new(0);
+            if TOLD.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(ms = took / 1000, index, "frame generation: Reflex slept the title's frame start for over 250 ms");
+            }
+        }
+    }
+    let _held = mark();
+    STARTED.store(index, Ordering::Relaxed);
+    if marking {
+        markers(fg, index, &[sl::PCLMarker::eSimulationStart]);
+    }
+}
+
+/// The title submits to a direct queue (`crate::queue` `execute`, before the lists go anywhere):
+/// the open frame's first submission ends its simulation and begins its submissions. A
+/// submission while the open frame is in its sleep is the frame before's and does nothing.
+pub(crate) fn title_submits() {
+    let Some(fg) = state() else { return };
+    add(N::Direct, 1);
+    let open = OPEN.load(Ordering::Relaxed);
+    if open == 0 || SUBMITTED.load(Ordering::Relaxed) == open {
+        return;
+    }
+    if STARTED.load(Ordering::Relaxed) != open {
+        add(N::InSleep, 1);
+        return;
+    }
+    let _held = mark();
+    let open = OPEN.load(Ordering::Relaxed);
+    if SUBMITTED.load(Ordering::Relaxed) == open || STARTED.load(Ordering::Relaxed) != open {
+        return;
+    }
+    SUBMITTED.store(open, Ordering::Relaxed);
+    add(N::First, 1);
+    let thread = crate::host::thread_id();
+    THREADS[T_SUBMIT].store(thread, Ordering::Relaxed);
+    if thread == THREADS[T_OPENER].load(Ordering::Relaxed) {
+        add(N::FirstOnOpener, 1);
+    }
+    if markers_on() {
+        markers(fg, open, &[sl::PCLMarker::eSimulationEnd, sl::PCLMarker::eRenderSubmitStart]);
+    }
+}
+
+/// For the counters: the frame token a console submission (`ExecuteCommandListsX`) carries,
+/// against the last one our frame-start wait handed out.
+pub(crate) fn title_submits_token(token: u64) {
+    if state().is_none() {
+        return;
+    }
+    let ours = crate::frame::current();
+    add(if token == ours { N::XSame } else if token.wrapping_add(1) == ours { N::XBehind } else { N::XOther }, 1);
+}
+
+/// The title's present number `present` (`crate::queue` `present`, on the title's thread),
+/// whose first plane carries the title's frame token `token`: the Reflex frame it shows
+/// ([`takes`]), kept for the presenter ([`reflex_index`]).
+pub(crate) fn title_presents(present: u64, token: u64) {
+    let Some(fg) = state() else { return };
+    let ours = crate::frame::current();
+    add(if token == ours { N::TokenSame } else if token.wrapping_add(1) == ours { N::TokenBehind } else { N::TokenOther }, 1);
+    let marking = markers_on();
+    let thread = crate::host::thread_id();
+    let index = {
+        let _held = mark();
+        THREADS[T_PRESENT].store(thread, Ordering::Relaxed);
+        if thread == THREADS[T_OPENER].load(Ordering::Relaxed) {
+            add(N::PresentOnOpener, 1);
+        }
+        let open = OPEN.load(Ordering::Relaxed);
+        let started = STARTED.load(Ordering::Relaxed);
+        let submitted = SUBMITTED.load(Ordering::Relaxed);
+        let last = PRESENTED.load(Ordering::Relaxed);
+        let index = match takes(open, started, submitted, last) {
+            Takes::Submitted(index) => {
+                add(N::BySubmission, 1);
+                index
+            }
+            Takes::Unsubmitted(index) => {
+                add(N::Unsubmitted, 1);
+                SUBMITTED.store(index, Ordering::Relaxed);
+                if marking {
+                    markers(fg, index, &[sl::PCLMarker::eSimulationEnd, sl::PCLMarker::eRenderSubmitStart]);
+                }
+                index
+            }
+            Takes::Made(index) => {
+                add(N::Made, 1);
+                OPEN.store(index, Ordering::Relaxed);
+                STARTED.store(index, Ordering::Relaxed);
+                SUBMITTED.store(index, Ordering::Relaxed);
+                if marking {
+                    markers(
+                        fg,
+                        index,
+                        &[sl::PCLMarker::eSimulationStart, sl::PCLMarker::eSimulationEnd, sl::PCLMarker::eRenderSubmitStart],
+                    );
+                }
+                index
+            }
+            Takes::Repeated(index) => {
+                add(N::Repeated, 1);
+                index
+            }
+        };
+        PRESENTED.store(index, Ordering::Relaxed);
+        index
+    };
+    BY_PRESENT[(present % BY_PRESENT.len() as u64) as usize].store((present & 0xffff_ffff) << 32 | u64::from(index), Ordering::Release);
+    add(N::Presents, 1);
+    if present % 300 == 0 {
+        log_counts(present);
+    }
+}
+
+/// The Reflex frame the title's present number `frame` took ([`title_presents`]); none if it is
+/// not known (a present before Streamline started, or long gone).
+fn reflex_index(frame: u64) -> Option<u32> {
+    let kept = BY_PRESENT[(frame % BY_PRESENT.len() as u64) as usize].load(Ordering::Acquire);
+    let index = kept as u32;
+    (kept >> 32 == frame & 0xffff_ffff && index != 0).then_some(index)
+}
+
+/// Every 300 title presents: what the Reflex frames' counters saw since the last line.
+fn log_counts(present: u64) {
+    let take = |n: N| COUNTS[n as usize].swap(0, Ordering::Relaxed);
+    let presents = take(N::Presents).max(1);
+    let waits = take(N::Waits);
+    let opened = take(N::Opened);
+    let sleeps = take(N::Sleeps);
+    let slept = take(N::SleptUs);
+    let thread = |t: usize| THREADS[t].load(Ordering::Relaxed);
+    tracing::info!(
+        present,
+        markers = markers_on(),
+        waits_per_present = format_args!("{:.2}", waits as f64 / presents as f64),
+        opened_per_present = format_args!("{:.2}", opened as f64 / presents as f64),
+        polls = take(N::Polls),
+        sleeps,
+        slept_mean_ms = format_args!("{:.1}", slept as f64 / sleeps.max(1) as f64 / 1000.0),
+        slept_max_ms = format_args!("{:.1}", take(N::SleptMaxUs) as f64 / 1000.0),
+        direct = take(N::Direct),
+        first = take(N::First),
+        in_sleep = take(N::InSleep),
+        by_submission = take(N::BySubmission),
+        unsubmitted = take(N::Unsubmitted),
+        made = take(N::Made),
+        repeated = take(N::Repeated),
+        unmapped = take(N::Unmapped),
+        first_on_opener = take(N::FirstOnOpener),
+        present_on_opener = take(N::PresentOnOpener),
+        opener_changed = take(N::OpenerChanged),
+        token_same = take(N::TokenSame),
+        token_behind = take(N::TokenBehind),
+        token_other = take(N::TokenOther),
+        x_same = take(N::XSame),
+        x_behind = take(N::XBehind),
+        x_other = take(N::XOther),
+        mark_wait_max_us = take(N::MarkWaitMaxUs),
+        opener = thread(T_OPENER),
+        submitter = thread(T_SUBMIT),
+        title_presenter = thread(T_PRESENT),
+        host_presenter = thread(T_HOST),
+        "frame generation: Reflex frames since the last line (per title present; first: first direct submissions of a frame; in_sleep: direct submissions while a frame slept; the title's present took by_submission/unsubmitted/made/repeated; token_*: its present's frame token against our last, x_*: its ExecuteCommandListsX tokens; threads by id)"
+    );
+}
+
+/// Every 300 host presents: what Reflex's latency report says of its last frames (its times are
+/// microseconds): the gaps between simulation starts, and from a simulation's start to its
+/// present's end and to the end of its rendering.
+fn log_reflex_report(fg: &Fg) {
+    let Ok(st) = fg.sl.reflex_get_state() else { return };
+    if !st.latencyReportAvailable {
+        static TOLD: AtomicBool = AtomicBool::new(false);
+        if !TOLD.swap(true, Ordering::Relaxed) {
+            tracing::info!("frame generation: Reflex gives no latency report here");
+        }
+        return;
+    }
+    let mut reports: Vec<&sl::ReflexReport> = st.frameReport.iter().filter(|r| r.frameID != 0 && r.simStartTime != 0).collect();
+    reports.sort_by_key(|r| r.frameID);
+    let ms = |mut v: Vec<u64>, at: f64| {
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_unstable();
+        v[((v.len() - 1) as f64 * at).round() as usize] as f64 / 1000.0
+    };
+    let gaps: Vec<u64> = reports.windows(2).map(|w| w[1].simStartTime.saturating_sub(w[0].simStartTime)).collect();
+    let to_present: Vec<u64> =
+        reports.iter().filter(|r| r.presentEndTime > r.simStartTime).map(|r| r.presentEndTime - r.simStartTime).collect();
+    let to_gpu: Vec<u64> =
+        reports.iter().filter(|r| r.gpuRenderEndTime > r.simStartTime).map(|r| r.gpuRenderEndTime - r.simStartTime).collect();
+    let gpu: Vec<u64> = reports.iter().filter(|r| r.gpuFrameTimeUs != 0).map(|r| u64::from(r.gpuFrameTimeUs)).collect();
+    tracing::info!(
+        frames = reports.len(),
+        first = reports.first().map_or(0, |r| r.frameID),
+        last = reports.last().map_or(0, |r| r.frameID),
+        start_gap_median_ms = format_args!("{:.1}", ms(gaps.clone(), 0.5)),
+        start_gap_p90_ms = format_args!("{:.1}", ms(gaps, 0.9)),
+        sim_to_present_median_ms = format_args!("{:.1}", ms(to_present.clone(), 0.5)),
+        sim_to_present_p90_ms = format_args!("{:.1}", ms(to_present, 0.9)),
+        sim_to_gpu_end_median_ms = format_args!("{:.1}", ms(to_gpu, 0.5)),
+        gpu_frame_median_ms = format_args!("{:.1}", ms(gpu, 0.5)),
+        "frame generation: Reflex's latency report over its last frames"
+    );
+}
+
+fn init(device: &ID3D12Device) -> anyhow::Result<Fg> {
     let dir = std::env::var_os("LEONIDA_STREAMLINE_DIR")
         .ok_or_else(|| anyhow::anyhow!("LEONIDA_STREAMLINE_DIR is not set"))?;
     // SAFETY: NVIDIA's signed interposer from the SDK folder the launcher names.
@@ -187,7 +625,10 @@ fn init(device: &ID3D12Device) -> anyhow::Result<State> {
             "frame generation: Reflex paces the rendered frames to this rate (LEONIDA_FG_LIMIT_FPS)"
         );
     }
-    Ok(State { sl: s, set: None, most: 0, told: 0 })
+    if markers_on() {
+        tracing::info!("frame generation: Reflex sleeps where the title begins a frame and marks its own events (LEONIDA_FG_MARKERS=0: at our present)");
+    }
+    Ok(Fg { sl: s, state: Mutex::new(State { set: None, most: 0, told: 0 }) })
 }
 
 trait WideZ {
@@ -224,19 +665,18 @@ pub(crate) fn start(device: &ID3D12Device, factory: IDXGIFactory2) -> IDXGIFacto
     let state = STATE.get_or_init(|| match init(device) {
         Ok(s) => {
             tracing::info!(frames = wanted() + 1, "frame generation: Streamline started");
-            Some(Mutex::new(s))
+            Some(s)
         }
         Err(e) => {
             tracing::warn!(error = %e, "frame generation: Streamline did not start; presenting without it");
             None
         }
     });
-    let Some(state) = state else { return factory };
-    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(fg) = state else { return factory };
     let mut raw = factory.as_raw();
     // SAFETY: a live factory; the call puts a new proxy (with its own reference) in `raw` and
     // leaves ours to the native one.
-    let r = unsafe { s.sl.upgrade_interface(&mut raw) };
+    let r = unsafe { fg.sl.upgrade_interface(&mut raw) };
     if !r.is_ok() || raw.is_null() {
         tracing::warn!(result = %r, "frame generation: the factory was not upgraded");
         return factory;
@@ -403,21 +843,21 @@ fn constants(l: &Latest) -> sl::Constants {
     }
 }
 
-/// Right before the proxy's `Present`: generation on (once), and for a frame the upscale ran in,
-/// its constants and its depth and motion vectors (valid until this present: the next frame's
-/// lists come after it on the queue).
-pub(crate) fn present_start() {
-    let Some(state) = state() else { return };
-    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-    let index = FRAME.load(Ordering::Relaxed);
+/// Right before the proxy's `Present` of the title's present number `frame`: generation on
+/// (once), and for a frame the upscale ran in, its constants and its depth and motion vectors
+/// (valid until this present: the next frame's lists come after it on the queue).
+pub(crate) fn present_start(frame: u64) {
+    let Some(fg) = state() else { return };
+    let mut s = fg.state.lock().unwrap_or_else(|e| e.into_inner());
+    let count = FRAME.load(Ordering::Relaxed);
     // The amount, at the first present and whenever the menu changed it (looked at twice a second
     // or so): no restart, the proxy swap chain stays.
-    if s.set.is_none() || index % 8 == 0 {
+    if s.set.is_none() || count % 8 == 0 {
         let asked = wanted_now();
         // No more than the card and driver generate (DLSS 4.5 gives up to 5 here: 6x).
         // Asked once here (each question restarts Streamline's count of presented frames).
         if s.most == 0 {
-            s.most = match s.sl.dlssg_get_state(&VIEWPORT, None) {
+            s.most = match fg.sl.dlssg_get_state(&VIEWPORT, None) {
                 Ok(st) if st.numFramesToGenerateMax > 0 => st.numFramesToGenerateMax,
                 _ => 1,
             };
@@ -433,7 +873,7 @@ pub(crate) fn present_start() {
                 flags: sl::DLSSGFlags::eRetainResourcesWhenOff,
                 ..Default::default()
             };
-            let r = s.sl.dlssg_set_options(&VIEWPORT, &options);
+            let r = fg.sl.dlssg_set_options(&VIEWPORT, &options);
             tracing::info!(result = %r, frames = want + 1, "frame generation: amount set (1 = off)");
             s.set = Some(want);
             if want == 0 {
@@ -441,14 +881,36 @@ pub(crate) fn present_start() {
             }
         }
     }
-    let Ok(token) = s.sl.new_frame_token(Some(index)) else { return };
-    for marker in [
-        sl::PCLMarker::eSimulationStart,
-        sl::PCLMarker::eSimulationEnd,
-        sl::PCLMarker::eRenderSubmitStart,
-        sl::PCLMarker::eRenderSubmitEnd,
-    ] {
-        let _ = s.sl.pcl_set_marker(marker, token);
+    // With `LEONIDA_FG_MARKERS=1`: the Reflex frame the title's present took, whose simulation
+    // and submission markers were sent on the title's threads; its token is made and read under
+    // the token lock from here to its PresentStart. Before: the present count, and every marker here.
+    let marking = markers_on();
+    THREADS[T_HOST].store(crate::host::thread_id(), Ordering::Relaxed);
+    let index = if marking {
+        match reflex_index(frame) {
+            Some(index) => index,
+            None => {
+                add(N::Unmapped, 1);
+                return;
+            }
+        }
+    } else {
+        count
+    };
+    let _held = marking.then(mark);
+    let Ok(token) = fg.sl.new_frame_token(Some(index)) else { return };
+    let owed: &[sl::PCLMarker] = if marking {
+        &[sl::PCLMarker::eRenderSubmitEnd]
+    } else {
+        &[
+            sl::PCLMarker::eSimulationStart,
+            sl::PCLMarker::eSimulationEnd,
+            sl::PCLMarker::eRenderSubmitStart,
+            sl::PCLMarker::eRenderSubmitEnd,
+        ]
+    };
+    for &marker in owed {
+        let _ = fg.sl.pcl_set_marker(marker, token);
     }
     // Every present carries the last upscale's numbers and buffers, a present with no new
     // upscale since the last one too (DLSS-G drops a frame that has none).
@@ -456,7 +918,7 @@ pub(crate) fn present_start() {
     {
         let latest = LATEST.lock().unwrap_or_else(|e| e.into_inner());
         // Said once: generation is on and nothing has come from an upscale yet.
-        if latest.is_none() && index == 600 {
+        if latest.is_none() && count == 600 {
             tracing::warn!(
                 "frame generation: neither an upscale nor a G-buffer pass has handed over depth and motion vectors in 600 presents, and no frame is generated until one does (menus and loading screens have neither)"
             );
@@ -478,7 +940,7 @@ pub(crate) fn present_start() {
             Some((l, look(l.depth)?, look(l.motion)?))
         });
         if let Some((l, (depth, depth_state), (motion, motion_state))) = found {
-            let r = s.sl.set_constants(&constants(l), token, &VIEWPORT);
+            let r = fg.sl.set_constants(&constants(l), token, &VIEWPORT);
             let mut depth_res = sl::Resource::d3d12_tex2d(depth.texture.as_raw(), depth_state);
             let mut motion_res = sl::Resource::d3d12_tex2d(motion.texture.as_raw(), motion_state);
             let extent = Some(sl::Extent { top: 0, left: 0, width: l.render[0], height: l.render[1] });
@@ -494,7 +956,7 @@ pub(crate) fn present_start() {
             }
             // SAFETY: live resources (their host copies are held through the call), in the
             // states they will be in at the present; no list needed for eValidUntilPresent.
-            let t = unsafe { s.sl.set_tag_for_frame(token, &VIEWPORT, &tags, std::ptr::null_mut()) };
+            let t = unsafe { fg.sl.set_tag_for_frame(token, &VIEWPORT, &tags, std::ptr::null_mut()) };
             if (!r.is_ok() || !t.is_ok()) && s.told < 5 {
                 s.told += 1;
                 tracing::warn!(constants = %r, tags = %t, index, "frame generation: constants or tags refused");
@@ -502,20 +964,31 @@ pub(crate) fn present_start() {
             PRESENT_TAGGED.store(fresh, Ordering::Relaxed);
         }
     }
-    let _ = s.sl.pcl_set_marker(sl::PCLMarker::ePresentStart, token);
+    let _ = fg.sl.pcl_set_marker(sl::PCLMarker::ePresentStart, token);
 }
 
 /// The present now ending had constants and tags.
 static PRESENT_TAGGED: AtomicBool = AtomicBool::new(false);
 
-/// Right after the proxy's `Present`: the next frame's index, Reflex's sleep, and now and then
-/// what the generator says of itself.
-pub(crate) fn present_end() {
-    let Some(state) = state() else { return };
-    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+/// Right after the proxy's `Present` of the title's present number `frame`: its PresentEnd, the
+/// next frame's index, Reflex's sleep (without `LEONIDA_FG_MARKERS=1`: with it the sleep is at
+/// the title's frame start, [`frame_begins`]), and now and then what the generator says of itself.
+pub(crate) fn present_end(frame: u64) {
+    let Some(fg) = state() else { return };
+    // (Only the presenter takes it: held as before, the sleep without the switch included.)
+    let _state = fg.state.lock().unwrap_or_else(|e| e.into_inner());
     let index = FRAME.load(Ordering::Relaxed);
-    if let Ok(token) = s.sl.new_frame_token(Some(index)) {
-        let _ = s.sl.pcl_set_marker(sl::PCLMarker::ePresentEnd, token);
+    let marking = markers_on();
+    if marking {
+        if let Some(reflex) = reflex_index(frame) {
+            let _held = mark();
+            markers(fg, reflex, &[sl::PCLMarker::ePresentEnd]);
+        }
+    } else if let Ok(token) = fg.sl.new_frame_token(Some(index)) {
+        let _ = fg.sl.pcl_set_marker(sl::PCLMarker::ePresentEnd, token);
+    }
+    if index % 300 == 0 && reflex_on() {
+        log_reflex_report(fg);
     }
     let tagged = PRESENT_TAGGED.swap(false, Ordering::Relaxed);
     // For the frame-rate texts: frames shown per rendered one, as Streamline says of the last
@@ -523,7 +996,7 @@ pub(crate) fn present_end() {
     // DLSS-G generates nothing while the window is not focused).
     const POLL: u32 = 10;
     if index % POLL == 0 {
-        match s.sl.dlssg_get_state(&VIEWPORT, None) {
+        match fg.sl.dlssg_get_state(&VIEWPORT, None) {
             Ok(st) => {
                 let per = if st.status.0 == 0 { st.numFramesActuallyPresented.clamp(1, 6) } else { 1 };
                 SHOWN.store(per, Ordering::Relaxed);
@@ -549,11 +1022,12 @@ pub(crate) fn present_end() {
     }
     let next = index + 1;
     FRAME.store(next, Ordering::Relaxed);
-    // Reflex paces the next frame here.
-    if reflex_on()
-        && let Ok(token) = s.sl.new_frame_token(Some(next))
+    // Reflex paces the next frame here (with `LEONIDA_FG_MARKERS=1`: at the title's frame start).
+    if !marking
+        && reflex_on()
+        && let Ok(token) = fg.sl.new_frame_token(Some(next))
     {
-        let _ = s.sl.reflex_sleep(token);
+        let _ = fg.sl.reflex_sleep(token);
     }
 }
 /// Frames shown per frame rendered (1 without generation working), as Streamline last said.

@@ -739,6 +739,12 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     let _called = crate::timeline::span("the title's ExecuteCommandLists");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
+    // Leonida: with frame generation, a frame's first submission to a direct queue ends its
+    // simulation for Reflex (`LEONIDA_FG_MARKERS`).
+    #[cfg(windows)]
+    if !this.is_null() && queue(this).kind == DIRECT {
+        crate::fg::title_submits();
+    }
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
@@ -856,9 +862,20 @@ fn overlay_resource(parameters: *const Plane) -> Option<This> {
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
-extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
+extern "system" fn execute_x(this: This, count: u32, lists: *const This, token: u64, _flags: u32) {
+    // (Leonida: the counters of frame generation's Reflex frames compare its token with ours.)
+    #[cfg(windows)]
+    if !this.is_null() && queue(this).kind == DIRECT {
+        crate::fg::title_submits_token(token);
+    }
+    #[cfg(not(windows))]
+    let _ = token;
     execute(this, count, lists);
 }
+
+/// `D3D12_COMMAND_LIST_TYPE_DIRECT`: the queue kind that draws.
+#[cfg(windows)]
+const DIRECT: u32 = 0;
 /// Signal with sync settings for the top and bottom of the pipe; our
 /// submissions are complete when they return, so it signals at once.
 extern "system" fn signal2_x(
@@ -1093,6 +1110,14 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // Leonida: with frame generation, the Reflex frame this present shows (`LEONIDA_FG_MARKERS`),
+    // kept by its number for the presenter.
+    #[cfg(windows)]
+    crate::fg::title_presents(
+        frame,
+        // SAFETY: the title passes `planes` plane descriptions.
+        if planes > 0 { unsafe { plane_parameters.as_ref() }.map_or(0, |p| p.token) } else { 0 },
+    );
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

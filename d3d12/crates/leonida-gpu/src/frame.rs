@@ -209,6 +209,10 @@ pub(crate) extern "system" fn wait(
     }
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
+        // Leonida: with frame generation, where the title begins a frame Reflex's frame may begin
+        // (its sleep and simulation start with `LEONIDA_FG_MARKERS=1`).
+        #[cfg(windows)]
+        crate::fg::frame_begins();
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
         if !token.is_null() {
