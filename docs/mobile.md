@@ -50,6 +50,18 @@ of the x86-64 → arm64 groundwork.
 
 ## Status and honest limits
 
+- The `0F` SIMD opcode list is generated from opcode ranges, and the ranges skipped eight ModRM
+  forms: `7C`/`7D` (HADDPD/HSUBPD and their `F2` forms), `D0` (ADDSUBPD/PS), `D7` (PMOVMSKB), `E6`
+  (CVTDQ2PD/CVTTPD2DQ/CVTPD2DQ), `E7` (MOVNTDQ), `F0` (LDDQU), `F7` (MASKMOVDQU). Each decoded as
+  the unknown `op0f_XX` of its opcode bytes, so the byte after them was read as the next
+  instruction. Two measurements on the retail image. Walking every `.pdata` function (299,257) with
+  the unfixed decoder, 6 of them stop on one of these opcodes; with the fix they decode 852
+  instructions further and 3 reach the end of the function with no unknown left. A per-instruction
+  differential against objdump over `.text` (objdump's walk and the decoder's walk, lengths
+  compared, 26,674,180 instructions) drops 6 mismatches, 4 `F3 0F E6` and 2 `66 REX.W 0F D7`, and
+  adds none. Confirmed with the REA `gnu.objdump` section-header evidence
+  `ev_e29cbdffd0dc7c46889b2a1f955011ce9f2795017233c97107ded73f9186dd90`, which gives the `.text`
+  and `.pdata` extents both walks read.
 - Hand-written fixtures run end-to-end under qemu: arithmetic, loops, taken/not-taken signed and
   unsigned branches, `setcc`/`cmov`, `adc`/`sbb` carry chains, shifts with CF, `movsx`, high-byte
   regs, `call`/`ret`/`leave`/`pushf`/`popf`, `rep movsb`, `repne scasb`, moffs/LEA memory

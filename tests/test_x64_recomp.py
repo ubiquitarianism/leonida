@@ -169,6 +169,27 @@ class DecodeTests(unittest.TestCase):
         ins = self.one(asm("f3 0f 1e fa"))      # endbr64 (decoded, no crash)
         self.assertEqual(ins.size, 4)
 
+    def test_simd_opcodes_outside_the_ranges_carry_modrm(self):
+        # The generated 0F SIMD opcode ranges skip 7C/7D, D0, D7, E6, E7, F0 and F7, all of which
+        # are SSE opcodes with a ModRM byte. They decoded as the unknown op0f_XX of the two opcode
+        # bytes, so the walk stopped one byte early; the SSE forms all take the V W shape.
+        for code, size in (("f3 0f e6 c9", 4),      # cvtdq2pd xmm1,xmm1
+                           ("66 0f e6 c0", 4),      # cvttpd2dq xmm0,xmm0
+                           ("f2 0f e6 c0", 4),      # cvtpd2dq xmm0,xmm0
+                           ("66 48 0f d7 d0", 5),   # pmovmskb rdx,xmm0
+                           ("0f d7 c1", 3),         # pmovmskb eax,mm1
+                           ("66 0f d0 c1", 4),      # addsubpd xmm0,xmm1
+                           ("f2 0f d0 c1", 4),      # addsubps xmm0,xmm1
+                           ("66 0f e7 04 24", 5),   # movntdq [rsp],xmm0
+                           ("f2 0f f0 01", 4),      # lddqu xmm0,[rcx]
+                           ("66 0f f7 c1", 4),      # maskmovdqu xmm0,xmm1
+                           ("66 0f 7c c1", 4),      # haddpd xmm0,xmm1
+                           ("f2 0f 7d c1", 4)):     # hsubps xmm0,xmm1
+            ins = self.one(asm(code))
+            self.assertFalse(ins.unknown, code)
+            self.assertEqual(ins.size, size, code)
+            self.assertEqual(ins.kind, "simd", code)
+
     def test_group7_0f01_carries_modrm(self):
         # 0F 01 /r is the system-instruction group. Every form has a ModRM byte, so
         # reading only the two opcode bytes stops the walk one byte early.
