@@ -476,6 +476,10 @@ struct Pipeline {
     /// from the first time it is asked ([`kept_answer`]).
     #[cfg(all(windows, feature = "diagnostics"))]
     skip: std::sync::atomic::AtomicU8,
+    /// Which of the sets tried in turns name one of its shaders ([`skip_tried`]): a bit each,
+    /// and bit 7 once asked.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    skip_try: std::sync::atomic::AtomicU8,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -613,6 +617,47 @@ fn kept_answer(cell: &std::sync::atomic::AtomicU8, ask: impl FnOnce() -> bool) -
     }
 }
 
+/// Timing experiment: the pipelines with a shader that `LEONIDA_SKIP_TRY_A`, `_B` or `_C` names
+/// (hashes, as for `LEONIDA_SKIP_PIPELINES`) are left out while that switch is on. Each is a
+/// switch of `LEONIDA_AB` (`LEONIDA_AB=15,LEONIDA_SKIP_TRY_A,LEONIDA_SKIP_TRY_B`) and does nothing
+/// when it is not named there: a phase's frame time against the next one's says what those
+/// programs cost the card in the frame. Their lines of a timing run do not say it: a command's
+/// time there runs from the end of the command before it, so the first program behind the
+/// geometry is charged with the card finishing the geometry. For timing only: the picture is
+/// wrong while one is on, and what the programs left out make is stale for those after them.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skip_tried(p: &Pipeline) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    const NAMES: [&str; 3] = ["LEONIDA_SKIP_TRY_A", "LEONIDA_SKIP_TRY_B", "LEONIDA_SKIP_TRY_C"];
+    // The sets that are switches of this run, each with its number among the switches.
+    static SETS: OnceLock<Vec<(u32, std::collections::HashSet<String>)>> = OnceLock::new();
+    let sets = SETS.get_or_init(|| {
+        NAMES
+            .iter()
+            .filter_map(|name| {
+                let bit = crate::ab::bit(name)?;
+                let hashes: std::collections::HashSet<String> =
+                    parse_skip_hashes(&std::env::var(name).unwrap_or_default()).into_iter().collect();
+                (!hashes.is_empty()).then_some((bit, hashes))
+            })
+            .collect()
+    });
+    if sets.is_empty() {
+        return false;
+    }
+    let mut mask = p.skip_try.load(Relaxed);
+    if mask == 0 {
+        mask = 0x80;
+        for (n, (_, hashes)) in sets.iter().enumerate() {
+            if p.shaders.iter().any(|shader| hashes.contains(&shader.hash)) {
+                mask |= 1 << n;
+            }
+        }
+        p.skip_try.store(mask, Relaxed);
+    }
+    mask & 0x7f != 0 && sets.iter().enumerate().any(|(n, (bit, _))| mask >> n & 1 != 0 && crate::ab::on(*bit))
+}
+
 /// Whether the skip list (`LEONIDA_SKIP_PIPELINES`) leaves the pipeline out.
 /// Every draw, dispatch and indirect execution asks, on the threads that
 /// record lists; each ask looked every shader of the pipeline up in the
@@ -629,6 +674,9 @@ pub(crate) fn is_skipped(this: This) -> bool {
         return false;
     }
     let p = pipeline(this);
+    if skip_tried(p) {
+        return true;
+    }
     static KEPT: OnceLock<bool> = OnceLock::new();
     if !*KEPT.get_or_init(|| std::env::var_os("LEONIDA_SKIP_KEPT").is_none_or(|v| v != "0")) {
         return skipped_shader(p).is_some();
@@ -716,6 +764,8 @@ fn hand_out(
         bound: std::sync::atomic::AtomicBool::new(false),
         #[cfg(all(windows, feature = "diagnostics"))]
         skip: std::sync::atomic::AtomicU8::new(0),
+        #[cfg(all(windows, feature = "diagnostics"))]
+        skip_try: std::sync::atomic::AtomicU8::new(0),
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }

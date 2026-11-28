@@ -1393,8 +1393,8 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
             "translating again")
         drop(translated)
     # The translation also depends on the fallback flags (--no-float-controls, --bary-fallback,
-    # --texel-offset-fallback, --mesh-compute), so they are kept beside it like the wave64 mode. A folder from
-    # before the file existed was translated without them.
+    # --texel-offset-fallback, --mesh-compute, --mesh-serial-waves, ...), so they are kept beside it like the wave64
+    # mode. A folder from before the file existed was translated without them.
     flags_file = os.path.join(spirv, "translator_flags.txt")
     want_flags = translator_flags_setting(fallbacks)
     had_flags = read_shader_setting(flags_file)
@@ -1866,7 +1866,7 @@ WAVE64_MODES = ("auto", "on", "off")
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
                   ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
-                  ("--compact-spirv", "compact_spirv"))
+                  ("--compact-spirv", "compact_spirv"), ("--mesh-serial-waves", "mesh_serial_waves"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -3330,6 +3330,12 @@ def main() -> int:
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
                          "without VK_EXT_mesh_shader; on by itself on Intel's Windows Vulkan driver, whose mesh "
                          "draws crash on the corpus' mesh shaders (BUILD-2202)")
+    ap.add_argument("--mesh-serial-waves", action="store_true",
+                    help="with wave64 emulation, run the waves of a mesh shader one after the other in 64 "
+                         "invocations instead of side by side (the translator's --mesh-serial-waves, #2435). "
+                         "Only wave64 mesh shaders of more than 64 threads, a multiple of 64, with no LDS "
+                         "instruction, store or atomic take that form; the others, and every shader translated "
+                         "natively or with --mesh-compute, come out as before. Off by default")
     ap.add_argument("--native-mesh", action="store_true",
                     help="keep native mesh shaders on Intel's Windows Vulkan driver instead of turning on "
                          "--mesh-compute (for a driver that fixes BUILD-2202's crash)")

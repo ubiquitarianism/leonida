@@ -19,6 +19,7 @@ from contextlib import suppress
 import errno
 import io
 import json
+import math
 import os
 import struct
 import sys
@@ -378,11 +379,14 @@ def _bbox(accessor: dict | None) -> dict | None:
         return None
     lower = accessor.get("min")
     upper = accessor.get("max")
-    if not (isinstance(lower, list) and isinstance(upper, list) and len(lower) >= 3 and len(upper) >= 3):
+    if not (isinstance(lower, list) and isinstance(upper, list) and len(lower) == len(upper) == 3):
         return None
-    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in lower[:3] + upper[:3]):
+    for value in lower + upper:
+        if not (_is_int(value) or (isinstance(value, float) and math.isfinite(value))):
+            return None
+    if any(lo > hi for lo, hi in zip(lower, upper)):
         return None
-    return {"min": lower[:3], "max": upper[:3]}
+    return {"min": lower, "max": upper}
 
 
 def _merge_bbox(boxes: list[dict]) -> dict | None:
@@ -400,7 +404,7 @@ def _material_name(gltf: dict, index: object) -> str | None:
 
 
 def _texture_name(gltf: dict, texture_index: object) -> str | None:
-    """The baseColor texture's image name, falling back to its URI then the texture name."""
+    """The texture's image name, falling back to its URI then the texture name."""
     texture = _entry(gltf, "textures", texture_index)
     if texture is None:
         return None
@@ -426,7 +430,13 @@ def _material_report(gltf: dict, index: int, material: dict) -> dict:
     pbr = _object(material.get("pbrMetallicRoughness"))
     base_color_texture = _object(pbr.get("baseColorTexture"))
     texture_index = _index(base_color_texture.get("index"))
-    return {
+    additional = {}
+    for owner, role in ((pbr, "metallicRoughnessTexture"), (material, "normalTexture"),
+                        (material, "occlusionTexture"), (material, "emissiveTexture")):
+        if role in owner:
+            ref = _index(_object(owner[role]).get("index"))
+            additional[role] = {"index": ref, "name": _texture_name(gltf, ref)}
+    report = {
         "index": index,
         "name": _text(material.get("name")),
         "base_color_factor": pbr.get("baseColorFactor"),
@@ -435,6 +445,9 @@ def _material_report(gltf: dict, index: int, material: dict) -> dict:
         "alpha_mode": material.get("alphaMode"),
         "double_sided": material.get("doubleSided"),
     }
+    if additional:
+        report["additional_textures"] = additional
+    return report
 
 
 def _primitive_mode(primitive: dict) -> tuple[int | None, str | None, bool]:
@@ -634,7 +647,7 @@ def format_report(report: dict) -> str:
         f"{chunk['type']} {chunk['byte_length']} bytes (padding {_padding_text(chunk.get('padding'))})"
         for chunk in report["chunks"]))
     bbox = report["position_bbox"]
-    suffix = (" (partial: some POSITION accessors have no min/max)"
+    suffix = (" (partial: some POSITION accessors have missing or invalid bounds)"
               if bbox is not None and not report["position_bbox_complete"] else "")
     lines.append(f"POSITION bbox: {_bbox_text(bbox)}{suffix}")
 
@@ -667,6 +680,8 @@ def format_report(report: dict) -> str:
             f"baseColorTexture={_show(material['base_color_texture'])} "
             f"(index {_show(material['base_color_texture_index'])}) "
             f"alphaMode={_show(material['alpha_mode'])} doubleSided={_show(material['double_sided'])}")
+        for role, texture in material.get("additional_textures", {}).items():
+            lines.append(f"    {role}={_show(texture['name'])} (index {_show(texture['index'])})")
 
     lines.append("skins:")
     if not report["skins"]:

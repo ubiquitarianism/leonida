@@ -475,6 +475,18 @@ class TestCli(unittest.TestCase):
                     self.assertIn("awc_names: error: cannot read", err.getvalue())
                     self.assertFalse(os.path.exists(out))
 
+    def test_word_dictionary_preambles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = [
+                ("hashdict", "\ufeff" + " " * 8192 + '\n{"123": "voice_a"}', ["voice_a"]),
+                ("words.json", '\ufeff ["voice_b"]', ["voice_b"]),
+                ("words.txt", "\ufeffvoice_c\nvoice_d\n", ["voice_c", "voice_d"]),
+            ]
+            for filename, contents, expected in cases:
+                with self.subTest(filename=filename):
+                    path = write(os.path.join(tmp, filename), contents.encode("utf-8"))
+                    self.assertEqual(A.read_words(path), expected)
+
     def test_json_word_list_still_reads(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = write(os.path.join(tmp, "words.json"), json.dumps(["a_word", 2]))

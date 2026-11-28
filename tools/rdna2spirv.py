@@ -8763,9 +8763,12 @@ class Gen:
                 self.emit(f"{rel} = OpCopyObject %uint {lane}")
             else:
                 self.emit(f"{rel} = OpISub %uint {lane} {self.cu(32)}")
-            # bits below `rel`, clamped to [0, 32]
+            # bits below `rel`, clamped to [0, 32] (mask shift count to < 32 so OpShiftLeftLogical
+            # never executes SPIR-V UB on the discarded side of OpSelect).
+            rel_s = self.tmp()
             self.emit(f"{inrange} = OpULessThan %bool {rel} {self.cu(32)}")
-            self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {rel}")
+            self.emit(f"{rel_s} = OpBitwiseAnd %uint {rel} {self.cu(31)}")
+            self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {rel_s}")
             self.emit(f"{m1} = OpISub %uint {one} {self.cu(1)}")
             big = self.tmp()
             # lo: lanes >= 32 count all 32 bits; hi: lanes < 32 count none (rel wraps above 32).

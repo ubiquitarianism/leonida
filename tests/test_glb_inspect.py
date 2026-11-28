@@ -722,6 +722,30 @@ class GlbInspectTests(unittest.TestCase):
                                                 "images": 0, "skins": 0, "animations": 0})
             self.assertIsNone(report["position_bbox"])
 
+    def test_invalid_bounds_do_not_distort_the_aggregate(self):
+        for lower, upper in (([0, 4, 0], [1, 3, 1]), ([0, 0, 0, 0], [9, 9, 9]),
+                             ([0, 0, 0], [9, 9, 9, 9]), ([0, False, 0], [9, 9, 9])):
+            with self.subTest(lower=lower, upper=upper):
+                doc = triangle_gltf()
+                doc["accessors"].append({"type": "VEC3", "count": 3, "min": lower, "max": upper})
+                doc["meshes"][0]["primitives"].append({"attributes": {"POSITION": 2}})
+                data = glb(doc)
+                report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+                self.assertIsNone(report["meshes"][0]["primitives"][1]["bbox"])
+                self.assertEqual(report["position_bbox"], {"min": [0, 0, 0], "max": [1, 1, 0]})
+                self.assertFalse(report["position_bbox_complete"])
+                self.assertIn("(partial:", glb_inspect.format_report(report))
+
+    def test_overflowed_json_exponent_still_allows_strict_json_report(self):
+        doc = bbox_gltf(with_bounds=True)
+        doc["accessors"][0]["max"][0] = "huge"
+        payload = json_bytes(doc).rstrip(b" ").replace(b'"huge"', b"1e999")
+        data = container(payload + b" " * (-len(payload) % 4))
+        report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+        self.assertIsNone(report["position_bbox"])
+        self.assertFalse(report["position_bbox_complete"])
+        json.dumps(report, allow_nan=False)
+
     def test_position_bbox_from_accessor_bounds(self):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "bounds.glb")
@@ -738,6 +762,26 @@ class GlbInspectTests(unittest.TestCase):
             self.assertEqual(report["position_bbox"], {"min": [-1.5, -2, -3], "max": [4, 5, 6]})
             self.assertTrue(report["position_bbox_complete"])
             self.assertEqual(report["meshes"][0]["primitives"][0]["bbox"], report["position_bbox"])
+
+    def test_additional_material_textures_resolve_each_declared_binding(self):
+        doc = triangle_gltf()
+        material = doc["materials"][0]
+        material["pbrMetallicRoughness"]["metallicRoughnessTexture"] = {"index": 1}
+        material.update(normalTexture={"index": 0}, occlusionTexture={"index": 1},
+                        emissiveTexture={"index": 99})
+        doc["textures"].append({"extensions": {"EXT_texture_webp": {"source": 1}}})
+        doc["images"].append({"uri": "packed.webp"})
+        doc["materials"].append({"normalTexture": {"index": True}})
+        data = glb(doc)
+        report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+        packed = {"index": 1, "name": "packed.webp"}
+        self.assertEqual(report["materials"][0]["additional_textures"], {
+            "metallicRoughnessTexture": packed, "normalTexture": {"index": 0, "name": "red.png"},
+            "occlusionTexture": packed, "emissiveTexture": {"index": 99, "name": None},
+        })
+        self.assertEqual(report["materials"][1]["additional_textures"],
+                         {"normalTexture": {"index": None, "name": None}})
+        self.assertIn('metallicRoughnessTexture="packed.webp" (index 1)', glb_inspect.format_report(report))
 
     def test_missing_bounds_and_material_fields_are_reported_not_guessed(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -187,6 +187,18 @@ class BootTraceTests(unittest.TestCase):
         self.assertIn("debug strings: 1", text)
         self.assertNotIn("secret game text", text)
 
+    def test_last_startup_record_survives_a_torn_tail(self):
+        self.write(self.startup, [{"kind": "map", "module": "a"},
+                                  {"kind": "debug_string", "text": "private text", "seq": 8, "t": 1.25}])
+        with open(self.startup, "ab") as tail:
+            tail.write(b'{"kind":')
+        report = bt.summarize(bt.parse_startup(self.startup, limit=0), None)
+        self.assertEqual(report["startup"]["last_event"], {"kind": "debug_string", "seq": 8, "t": 1.25})
+        text = bt.format_text(report, 0)
+        self.assertIn("last startup event: debug_string #8 at 1.25 s", text)
+        self.assertNotIn("private text", text)
+        self.assertNotIn("last_event", bt.counts_only(report)["startup"])
+
     def test_truncated_line_is_counted_not_fatal(self):
         self.write(self.startup, STARTUP)
         with open(self.startup, "a", encoding="utf-8", newline="\n") as f:
@@ -585,6 +597,17 @@ class BootTraceTests(unittest.TestCase):
         ):
             self.assertIn(needle, text)
 
+    def test_file_open_error_histogram_counts_beyond_the_sample_limit(self):
+        self.write(self.startup, [{"kind": "file_open_failed", "error": code, "path": "private-path"}
+                                  for code in (5, 2, 2, 2, True, -1, 2**32, "private-error")])
+        for limit in (0, 1):
+            report = bt.summarize(bt.parse_startup(self.startup, limit), None)
+            counters = bt.counts_only(report)["startup"]
+            self.assertEqual(counters["file_open_errors"], {"5": 1, "2": 3, "unknown": 4})
+            self.assertEqual(sum(counters["file_open_errors"].values()), counters["file_open_failed_count"])
+            self.assertNotIn("private", json.dumps(counters))
+            self.assertEqual(len(report["startup"]["file_open_failed"]), limit)
+
     def test_failed_file_opens_and_skipped_int3_are_listed(self):
         self.write(
             self.startup,
@@ -646,6 +669,21 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(startup["kinds"]["xmem_physical_pages"], len(observations))
         self.assertIn(f"  XMem physical page observations: {len(observations)}", text.getvalue())
         return text.getvalue(), startup["xmem_physical_pages"]
+
+    def test_xmem_attribute_samples_and_private_counts(self):
+        self.write(self.startup, [
+            {"kind": "xmem_attributes", "attributes": "0x10", "size": 0, "api": "XMemAlloc", "caller": "private"},
+            {"kind": "xmem_attributes", "attributes": "0x20", "api": "XMemFree"},
+            {"kind": "xmem_attributes", "size": True},
+        ])
+        report = bt.summarize(bt.parse_startup(self.startup, 2), None)
+        samples = report["startup"]["xmem_attributes"]
+        self.assertEqual([r["size"] for r in samples], [0, None])
+        self.assertIn("XMemAlloc attributes 0x10 size 0", bt.format_text(report, 2))
+        counts = bt.counts_only(report)
+        self.assertEqual(counts["startup"]["xmem_attributes_count"], 3)
+        self.assertNotIn("private", json.dumps(counts))
+        self.assertEqual(bt.parse_startup(self.startup, 0)["xmem_attributes"], [])
 
     def test_single_xmem_physical_pages_observation(self):
         observation = {
