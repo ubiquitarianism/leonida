@@ -103,11 +103,19 @@ Useful switches:
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
 * `LEONIDA_STUB_PIPELINES=1` creates a pipeline whose translated shader is missing (no shader library, or no entry
-  for its program) as a no-op stub instead of failing `CreateGraphicsPipelineState` / `CreateComputePipelineState`.
-  The stub is never registered, so `SetPipelineState` binds no PSO and its draws and dispatches are no-ops (D3D-482).
-  Diagnostic only, like `LEONIDA_SKIP_INT3`: it follows a boot past every pipeline the title creates without
-  translating or running a game shader, so nothing the title draws reaches the screen. Each stub is logged with a
-  power-of-two count.
+  for its program) as a stub instead of failing `CreateGraphicsPipelineState` / `CreateComputePipelineState`.
+  A graphics pipeline with a vertex stage (MVP-GPU-04) is a real Vulkan pipeline built from the built-in stages in
+  `runtime/src/stub_pipeline.h` and registered like any other, so its draws run through replay (render targets,
+  layouts, push constants) and the validation layer. Its vertex stage puts every vertex outside the clip volume, so
+  the draw changes no pixel. `LEONIDA_STUB_PIPELINES=color` makes every three vertices a triangle over the viewport
+  and writes magenta (1 to an integer target) to each render target, so the passes that are stubbed show on screen.
+  The cover needs a triangle topology (a point or line draw marks only its points or lines) and stays inside the
+  scissor rectangle; the title's culling, wireframe fill, sample mask, depth and stencil tests, blending and logic op
+  are off for it, and its write mask is kept. A compute or mesh stub is never registered: `SetPipelineState` binds no
+  executable pipeline and its dispatches and mesh draws are not recorded (D3D-482). A mesh draw with another device's
+  stub, and a draw with another implementation's PSO, are still recording errors. Diagnostic only, like `LEONIDA_SKIP_INT3`: it follows a boot past every pipeline the title
+  creates without translating or running a game shader. Each stub is logged with a power-of-two count.
+  `d3d12_stub_pipelines_test` and `d3d12_stub_draw_test` cover it.
 * During `--run` on Vulkan, the runtime paints the package shell splash when the title shows its window. The first
   direct queue presents it on the window's swapchain. Startup clears keep the splash visible until the first
   non-black output replaces it. The runtime reads `ShellVisuals/SplashScreenImage` from
@@ -256,7 +264,7 @@ order. It maps each question to the event to look for; it does not answer them.
 | 11 | `CheckFeatureSupport` answers | the call's `ok`/`failed` and the `[rt]` feature-id line; the answer itself is not logged yet |
 | 12 | Async compute / copy queues | queue creation and cross-queue fences |
 | 13 | 144-byte push constants | device creation `[rt]` line; `push_constants_need_fallback` when the device reports fewer |
-| 14 | Two code-base stages in one PSO | PSO creation log; the index metadata (`uses_code_base`) |
+| 14 | Two code-base stages in one PSO | answered without a trace: the pipeline library pairs the stages, and `tools/pso_code_base_pairs.py` counts 0 of 25,471 (`uses_code_base` per stage comes from the index metadata) |
 | 15 | `ExecuteIndirect` signatures | `CreateCommandSignature` and `ExecuteIndirect` calls |
 | 16 | UAV counters and typed buffer formats | UAV descs and V# format logs; formats outside `Gen.FORMATS` read 0 |
 | 17 | Upload/readback resources reaching shaders | `CreateCommittedResource` heap types and the VB/IB/descriptor that points at one |
@@ -275,7 +283,54 @@ order. It maps each question to the event to look for; it does not answer them.
   does not affect these outcomes.
 * `exit` is the game's own code, not the loader's. A crash after the first frame is the next layer question.
 
-## 6. Limits
+## 6. Which pull requests a stop depends on
+
+A stop is only comparable with someone else's when both name the same base, the same pull requests in the same
+order, and a shader library made by the same translator. `tools/boot_matrix.py` makes that one row per named set:
+
+```powershell
+python -I tools\boot_matrix.py merge --base origin/main --fetch origin --out $matrix `
+    --set main= --set rt5=445 --set rt5-plus=445,565
+# check out or export boot-matrix/rt5 where you build, then, per set:
+python -I tools\boot_matrix.py run $matrix --set rt5 --tree $tree --exe $exe --game-dir $pkg `
+    --shaders $work\shaders\spirv --build
+python -I tools\boot_matrix.py report $matrix
+```
+
+* `merge` only runs git (`merge-tree --write-tree`, `commit-tree`): no checkout, nothing from a pull request runs.
+  A PR that `scripts/merge_check.py` finds already on the base is skipped (also one merged and then reverted there:
+  git merges an ancestor as a no-op, so revert the revert on a branch and give it as `N:REF`); one that conflicts
+  with an earlier PR in the set is skipped too (its files are listed in `matrix.json`, and whether it conflicts with
+  the base itself or only with the PRs before it). Each set becomes the branch `boot-matrix/<set>`; an empty set
+  (`main=`) is the base alone, the row to compare the others with. A set's branch that is checked out in the
+  repository stops the merge before anything is written.
+* `run` first checks that the tree holds the set's head: `merge` writes the blob id of every file of that head to
+  `<matrix>/<set>/files.json`, and a tree that lacks one of them or holds other content stops the run (exit 2) before
+  anything is built. CRLF line ends count as the same file; files the head does not have (a build folder) are not
+  looked at. It then builds `runtime/` in the tree, in a build folder of the head's own
+  (`runtime/build-boot-matrix-<head>`, so an earlier set's binary is never reused), or takes `--gta6rt`: such a run
+  is recorded as built `prebuilt (unverified)`, since nothing shows which source the binary came from. It runs
+  `--run --trace --trace-d3d12` with `LEONIDA_D3D12=vulkan` and stops the process tree at `--timeout` (600 s). Each
+  run gets a fresh `LEONIDA_SAVE_DIR`, and a fresh overlay unless `--overlay` names one, so what an earlier run wrote
+  cannot change it. The traces stay in `<matrix>/<set>/runN/`; `result.json` has the stop, the D3D12 call count, the
+  last call and the run's options (`--env` names, timeout, overlay, configuration).
+* The `Shaders` column compares the library's `translation_sources.sha256` (written by `make_game.py`) with the
+  same digest over the tree: `stale` means the library came from another translator, a common reason a stop does
+  not reproduce.
+* `report` prints the Markdown table (or `--json`), with the newest run of each set's current head. Both pass on
+  only a fixed list of fields, each checked for the form it should have: the base and the heads as commits, set
+  names, each PR's number, status and why it was skipped, the build and shader state, the stop's kind, exit or
+  exception code, module+RVA and access kind, the counts, the run's options (`LEONIDA_*` names, others counted) and
+  the last D3D12 call as number, label and outcome. A label of the shape the runtime writes
+  (`ID3D12Device::CreateFence`, `Xbox CreatePlacedResourceX (device slot 133)`) is shown whole, one with free text
+  after its name is cut to the name, anything else is `(other)`; an outcome, exception code or access kind of
+  another form is `other`, and a location outside every known module is `unmapped`. The refs given for the base and
+  the PRs, merge_check's verdicts, conflicted file names, the access address and the loader's error message (it can
+  name a path) stay in `matrix.json` and `result.json` on your machine. A `last exception` row is the last exception
+  the trace recorded before the process ended; exceptions are logged before handlers run, so it is where to look
+  first, not proof of the cause.
+
+## 7. Limits
 
 The retail executable is not in the package, so this page is untested against it; the tool and the trace formats
 are tested on synthetic fixtures and on `tiny_game` (which has no D3D12 calls). The present slots (Q6) and the

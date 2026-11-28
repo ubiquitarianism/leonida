@@ -6,6 +6,9 @@ survives a crash; `runtime/README.md`, "Startup trace"), and the D3D12 proxy wri
 triage needs: modules, unimplemented calls and their callers, DllMain/TLS results, exceptions and the exit, then
 the D3D12 calls by outcome and the first call per method.
 
+With LEONIDA_TRACE_PIPELINE_COMPILE=1, the D3D12 log also reports time spent building and waiting for Vulkan
+pipelines. Builds with a recorded start and no matching end are counted separately.
+
 The method field can contain spaces (`SetMarker/BeginEvent with unknown metadata`), so the parser takes the
 outcome as the last field instead of assuming a single-word method. PowerShell 5.1 wraps the first stderr line of
 a native program in an error record (`program.exe : [d3d12-trace] #1 ...`), so a `<name> : ` prefix before the
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 
@@ -38,6 +42,18 @@ PACING_LINE = re.compile(
     r"p50_us=(\d+) p95_us=(\d+) p99_us=(\d+) "
     r"latency_samples=(\d+) latency_p50_us=(\d+) latency_p95_us=(\d+) latency_p99_us=(\d+)\s*$"
 )
+PIPELINE_PREFIX = r"^(?:.+ : )?\[rt\] pipeline-"
+PIPELINE_BEGIN = re.compile(
+    PIPELINE_PREFIX + r"compile-begin trigger=(?P<trigger>\S+) tid=(?P<tid>\d+) bytes=\d+ "
+    r"variant=(?P<variant>\d+) begin_ms=\d+ key=(?P<key>\S+) shaders=.*$"
+)
+PIPELINE_END = re.compile(
+    PIPELINE_PREFIX + r"compile trigger=(?P<trigger>\S+) tid=(?P<tid>\d+) start_us=\d+ "
+    r"us=(?P<us>\d+) hit=(?P<hit>-1|0|1) bytes=\d+ variant=(?P<variant>\d+) "
+    r"result=(?P<result>-?\d+) end_ms=\d+ key=(?P<key>\S+) shaders=.*$"
+)
+PIPELINE_USE = re.compile(PIPELINE_PREFIX + r"use trigger=\S+ tid=\d+ us=(\d+) ready=([01]) end_ms=\d+\s*$")
+PIPELINE_ID = ("tid", "trigger", "variant", "key")
 D3D12_PROBLEMS = ("failed", "unsupported", "refused", "partial")
 D3D12_OUTCOMES = frozenset((*D3D12_PROBLEMS, "called", "ok", "ignored"))
 
@@ -75,10 +91,12 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "debug_strings": 0,
         "file_open_failed": [],
         "file_open_failed_count": 0,
+        "file_open_errors": {},
         "int3_skipped": [],
         "exceptions": [],
         "exception_count": 0,
         "xmem_physical_pages": [],
+        "xmem_attributes": [],
         "exit": None,
         "error": None,
     }
@@ -91,11 +109,8 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 event = json.loads(line)
                 if isinstance(event, dict) and event.get("kind") == "exit" and type(event.get("code")) is not int:
                     event = None
-            except json.JSONDecodeError:
-                trace["bad_lines"] += 1
-                if len(trace["bad_line_numbers"]) < limit:
-                    trace["bad_line_numbers"].append(number)
-                continue
+            except (ValueError, RecursionError):
+                event = None
             if not isinstance(event, dict) or "kind" not in event:
                 trace["bad_lines"] += 1
                 if len(trace["bad_line_numbers"]) < limit:
@@ -103,6 +118,13 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 continue
             trace["events"] += 1
             kind = str(event.get("kind"))
+            seq, elapsed = event.get("seq"), event.get("t")
+            trace["last_event"] = {
+                "kind": kind,
+                "seq": seq if type(seq) is int and seq >= 0 else None,
+                "t": elapsed if (type(elapsed) is int and elapsed >= 0 or
+                                 type(elapsed) is float and math.isfinite(elapsed) and elapsed >= 0) else None,
+            }
             trace["kinds"][kind] = trace["kinds"].get(kind, 0) + 1
             if kind == "trace_open":
                 trace["pid"] = event.get("pid")
@@ -145,6 +167,10 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 trace["debug_strings"] += 1
             elif kind == "file_open_failed":
                 trace["file_open_failed_count"] += 1
+                error = event.get("error")
+                code = str(error) if type(error) is int and 0 <= error < (1 << 32) else "unknown"
+                errors = trace["file_open_errors"]
+                errors[code] = errors.get(code, 0) + 1
                 if len(trace["file_open_failed"]) < limit:
                     trace["file_open_failed"].append(
                         {
@@ -172,18 +198,19 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                     trace["exceptions"].append(detail)
                 else:
                     trace["exceptions"][-1] = detail
-            elif kind == "xmem_physical_pages":
-                samples = trace["xmem_physical_pages"]
+            elif kind in ("xmem_physical_pages", "xmem_attributes"):
+                samples = trace[kind]
                 if len(samples) < limit:
                     attributes = event.get("attributes")
-                    pages = event.get("pages")
+                    quantity = "pages" if kind == "xmem_physical_pages" else "size"
+                    value = event.get(quantity)
                     record = {
                         "attributes": (
                             attributes
                             if isinstance(attributes, str) and re.fullmatch(r"0x[0-9a-fA-F]{1,16}", attributes)
                             else None
                         ),
-                        "pages": pages if type(pages) is int and 0 <= pages < (1 << 64) else None,
+                        quantity: value if type(value) is int and 0 <= value < (1 << 64) else None,
                     }
                     for key in ("api", "caller"):
                         value = event.get(key)
@@ -205,8 +232,36 @@ def parse_startup(path: str, limit: int = 10) -> dict:
     return trace
 
 
+def _record_pipeline_timing(line: str, timing: dict, active: dict) -> bool:
+    if match := PIPELINE_BEGIN.match(line):
+        key = match.group(*PIPELINE_ID)
+        active[key] = active.get(key, 0) + 1
+        timing["started"] += 1
+        return True
+    if match := PIPELINE_END.match(line):
+        key = match.group(*PIPELINE_ID)
+        count = active.get(key, 0)
+        if count > 1:
+            active[key] -= 1
+        elif count:
+            del active[key]
+        else:
+            timing["completions_without_start"] += 1
+        timing["completed"] += 1
+        timing["non_success_results"] += int(match["result"]) != 0
+        timing["cache_hits"] += match["hit"] == "1"
+        timing["max_compile_us"] = max(timing["max_compile_us"], int(match["us"]))
+        return True
+    if match := PIPELINE_USE.match(line):
+        timing["logged_waits"] += 1
+        timing["waits_not_ready"] += match[2] == "0"
+        timing["max_wait_us"] = max(timing["max_wait_us"], int(match[1]))
+        return True
+    return False
+
+
 def parse_d3d12(path: str, limit: int = 10) -> dict:
-    """Read the `--trace-d3d12` stderr lines, ignoring the runtime's ordinary diagnostics."""
+    """Read D3D12 calls and selected runtime diagnostics from stderr."""
     trace = {
         "path": path,
         "calls": 0,
@@ -224,9 +279,14 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
         "sequence_breaks": [],
         "frame_pacing": None,
     }
+    timing = dict.fromkeys(("started", "completed", "completions_without_start", "non_success_results",
+                            "cache_hits", "max_compile_us", "logged_waits", "waits_not_ready", "max_wait_us"), 0)
+    active = {}
     with _open_text(path) as fh:
         for line in fh:
             stripped = line.rstrip("\n")
+            if _record_pipeline_timing(stripped, timing, active):
+                continue
             pacing_match = PACING_LINE.match(stripped)
             if pacing_match:
                 trace["frame_pacing"] = {
@@ -275,6 +335,9 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
             "is it the stderr log of a --trace-d3d12 run, with the Vulkan device enabled?"
         )
     trace["last_call"] = {"seq": seq, "method": method, "outcome": outcome}
+    if timing["started"] or timing["completed"] or timing["logged_waits"]:
+        timing["starts_without_completion"] = sum(active.values())
+        trace["pipeline_timing"] = timing
     return trace
 
 
@@ -291,11 +354,13 @@ def counts_only(summary: dict) -> dict:
                                              "file_open_failed_count", "exception_count")
         }
         counters["startup"].update(
+            file_open_errors=dict(startup["file_open_errors"]),
             modules=len(startup["modules"]),
             dllmain_failed=startup["dllmain"]["failed"],
             unimplemented_imports=len(startup["unimplemented"]),
             int3_skipped=len(startup["int3_skipped"]),
             xmem_physical_pages_count=startup["kinds"].get("xmem_physical_pages", 0),
+            xmem_attributes_count=startup["kinds"].get("xmem_attributes", 0),
             exit_observed=startup["exit"] is not None,
         )
     if d3d12 := summary["d3d12"]:
@@ -311,6 +376,8 @@ def counts_only(summary: dict) -> dict:
         }
         if d3d12.get("frame_pacing") is not None:
             counters["d3d12"]["frame_pacing"] = dict(d3d12["frame_pacing"])
+        if "pipeline_timing" in d3d12:
+            counters["d3d12"]["pipeline_timing"] = dict(d3d12["pipeline_timing"])
     return counters
 
 
@@ -332,6 +399,11 @@ def format_text(summary: dict, limit: int) -> str:
             )
             kinds = ", ".join(f"{k} {v}" for k, v in sorted(startup["kinds"].items()))
             out.append(f"  kinds: {kinds}")
+            if startup["exit"] is None:
+                last = startup["last_event"]
+                seq = f" #{last['seq']}" if last["seq"] is not None else ""
+                elapsed = f" at {last['t']} s" if last["t"] is not None else ""
+                out.append(f"  last startup event: {last['kind']}{seq}{elapsed}")
         if startup["modules"]:
             # A relocated module is marked: triage step 1 asks whether the executable sits at its preferred base.
             names = [m["module"] + (" (relocated)" if m.get("relocated") else "") for m in startup["modules"]]
@@ -368,6 +440,9 @@ def format_text(summary: dict, limit: int) -> str:
             out.append(f"  debug strings: {startup['debug_strings']} (text not shown)")
         if startup["file_open_failed_count"]:
             out.append(f"  failed file opens: {startup['file_open_failed_count']}")
+            ranked = sorted(startup["file_open_errors"].items(), key=lambda item: (-item[1], item[0]))
+            if limit:
+                out.append("    Win32 errors: " + _tail([f"{code} ({n})" for code, n in ranked], limit))
             for item in startup["file_open_failed"][:limit]:
                 out.append(f"    {item['path']} error {item['error']} from {item['caller']}")
             if startup["file_open_failed_count"] > limit:
@@ -387,6 +462,15 @@ def format_text(summary: dict, limit: int) -> str:
                 out.append(f"    code {exc['code']} at {exc['at']}{detail}")
                 if exc.get("stack"):
                     out.append(f"      stack: {_tail(exc['stack'], limit)}")
+        if count := startup["kinds"].get("xmem_attributes"):
+            out.append(f"  XMem attribute observations: {count}")
+            shown = startup["xmem_attributes"][:limit]
+            for item in shown:
+                size = f" size {item['size']}" if item["size"] is not None else ""
+                out.append(f"    {item['api'] or '?'} attributes {item['attributes'] or '?'}{size}"
+                           f" from {item['caller'] or '?'}")
+            if len(shown) < count:
+                out.append(f"    ... {count - len(shown)} more")
         if count := startup["kinds"].get("xmem_physical_pages"):
             out.append(f"  XMem physical page observations: {count}")
             shown = startup.get("xmem_physical_pages", [])[:limit]
@@ -408,9 +492,21 @@ def format_text(summary: dict, limit: int) -> str:
         outcomes = ", ".join(f"{k} {v}" for k, v in sorted(d3d12["outcomes"].items()))
         out.append(
             f"  {d3d12['calls']} call(s), {d3d12['ignored_lines']} other line(s)"
-            " (the [rt] diagnostics are not summarized)"
+            " (other [rt] diagnostics are not summarized)"
             + (f": {outcomes}" if outcomes else "")
         )
+        if timing := d3d12.get("pipeline_timing"):
+            out.append(
+                f"  Vulkan pipelines: {timing['started']} started, {timing['completed']} completed, "
+                f"{timing['starts_without_completion']} without a recorded completion, "
+                f"{timing['completions_without_start']} without a recorded start, "
+                f"{timing['non_success_results']} non-success result(s), {timing['cache_hits']} cache hit(s), "
+                f"longest compile {timing['max_compile_us']} us"
+            )
+            out.append(
+                f"  Vulkan pipeline waits: {timing['logged_waits']} logged, "
+                f"{timing['waits_not_ready']} ended without a pipeline, longest {timing['max_wait_us']} us"
+            )
         if fp := d3d12.get("frame_pacing"):
             line = (
                 f"  frame pacing: {fp['frames']} frame(s), {fp['samples']} interval(s), "

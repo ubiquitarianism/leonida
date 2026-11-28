@@ -17,6 +17,17 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATH = re.compile(r"`((?:tools|runtime|tests|scripts|docs|viewer|game)/[A-Za-z0-9_./\-]+)`")
+FENCE_OPEN = re.compile(r"(`{3,})[^`]*$|(~{3,}).*$")
+# Inline Markdown links pointing at an external URL (e.g. another repository's tree).
+EXTERNAL_LINK = re.compile(
+    r"""\[[^\]]*\]\(
+    (?:<[^>\n]*://[^>\n]*>|[^)\s]*://[^)\s]*)
+    (?:\s+(?:
+        "(?:\\.|[^"\\])*" | '(?:\\.|[^'\\])*' | \((?:\\.|[^()\\])*\)
+    ))?
+    \)""",
+    re.VERBOSE,
+)
 # Pages that quote another project's tree (SCARAB, americas-recomp): their paths are not this repository's.
 OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md"}
 # Build output, not tracked.
@@ -48,6 +59,22 @@ PORT_BRANCH_PATHS = {
 }
 
 
+def _update_fence(fence, line):
+    """Return (new_fence, is_fence_line) for CommonMark backtick or tilde fences."""
+    stripped = line.lstrip(" \t").rstrip("\r")
+    if fence is not None:
+        char, length = fence
+        run = len(stripped) - len(stripped.lstrip(char))
+        if run >= length and not stripped[run:].strip(" \t"):
+            return None, True
+        return fence, False
+    match = FENCE_OPEN.match(stripped)
+    if match:
+        run = match.group(1) or match.group(2)
+        return (run[0], len(run)), True
+    return None, False
+
+
 def tracked_files():
     try:
         out = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
@@ -69,15 +96,14 @@ def missing_paths(pages, files, allowed_missing=None):
     allowed_missing = allowed_missing or {}
     out = []
     for page, text in sorted(pages.items()):
-        in_fence = False
         allowed = allowed_missing.get(page, ())
+        fence = None
         for n, line in enumerate(text.split("\n"), 1):
-            if line.lstrip().startswith("```"):
-                in_fence = not in_fence
+            fence, is_fence_line = _update_fence(fence, line)
+            if is_fence_line or fence is not None:
                 continue
-            if in_fence or "://" in line:          # a link into another repository names its paths
-                continue
-            for m in PATH.finditer(line):
+            scan = EXTERNAL_LINK.sub("", line)
+            for m in PATH.finditer(scan):
                 path = m.group(1).rstrip("/.")
                 if "*" in path or path.startswith(BUILD_OUTPUT) or path in known or path in allowed:
                     continue
@@ -90,6 +116,45 @@ class DocsRepoPaths(unittest.TestCase):
         pages = {"docs/a.md": "Run `tools/real.py`, then `tools/gone.py`.\n```\n`tools/in_fence.py`\n```\n"
                               "`runtime/build/x.exe` and `tests/` and [`tools/x.py`](https://example.org/tools/x.py)"}
         self.assertEqual(missing_paths(pages, ["tools/real.py", "tests/t.py"]), [("docs/a.md:1", "tools/gone.py")])
+
+    def test_url_on_line_does_not_hide_missing_repo_path(self):
+        pages = {
+            "docs/u.md": (
+                "See https://example.org/spec and `tools/gone.py`.\n"
+                "See [`tools/other.py`](https://example.org/tools/other.py) and `tools/also_gone.py`.\n"
+                "See [upstream](https://example.org/repo \"title\") and `tools/real.py`.\n"
+                "See [`tools/angled.py`](<https://example.org/tools/angled.py>) and `tools/real.py`.\n"
+            )
+        }
+        self.assertEqual(
+            missing_paths(pages, ["tools/real.py"]),
+            [("docs/u.md:1", "tools/gone.py"), ("docs/u.md:2", "tools/also_gone.py")],
+        )
+
+    def test_tilde_and_nested_fences_are_tracked(self):
+        pages = {
+            "docs/f.md": "\n".join([
+                "~~~",
+                "`tools/in_tilde.py`",
+                "```",
+                "~~~",
+                "`tools/after_tilde.py`",
+                "````md",
+                "```",
+                "`tools/in_four.py`",
+                "````",
+                "`tools/after_four.py`",
+                "```inline``` and `tools/after_inline.py`",
+            ])
+        }
+        self.assertEqual(
+            missing_paths(pages, ["tools/real.py"]),
+            [
+                ("docs/f.md:5", "tools/after_tilde.py"),
+                ("docs/f.md:10", "tools/after_four.py"),
+                ("docs/f.md:11", "tools/after_inline.py"),
+            ],
+        )
 
     def test_docs_viewer_and_game_paths_are_checked(self):
         # TEST-871: a missing page, viewer file or package manifest is reported like a missing tool.
