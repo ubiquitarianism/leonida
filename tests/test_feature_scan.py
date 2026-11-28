@@ -5,16 +5,20 @@
 Every input is built here: tiny DXBC containers with only the parts the scanner reads, three hand-written .s
 listings and a two-entry spirv/index.json. No game data.
 """
+import contextlib
+import io
 import json
 import os
 import struct
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 sys.path.insert(0, TOOLS)
 import feature_scan as F  # noqa: E402
+import report_paths  # noqa: E402
 
 failures = 0
 
@@ -508,6 +512,35 @@ def test_a_failed_check_fails_only_its_own_test():
     check([r.splitlines()[0] for r in reported] == ["FAIL fails_a_check: 1 check(s) failed"],
           f"with its own count in the message ({reported})")
     assert failures == 0, f"{failures} script-runner check(s) failed"
+
+
+def test_out_named_like_the_optional_spirv_index():
+    """`--out spirv/INDEX.json` names `spirv/index.json`, the optional SPIR-V index the scan reads, on a volume that
+    ignores case, so writing the report there leaves the next run unable to scan. On Linux only the volume probe
+    can tell the two names apart, and a real case-folding mount (vfat/exFAT/CIFS) is not available in CI or here, so
+    the probe is simulated: same folder, and a name that differs only by case, is one file."""
+    def folding(first, second):
+        first_dir, first_name = os.path.split(first)
+        second_dir, second_name = os.path.split(second)
+        return (first_name.casefold() == second_name.casefold()
+                and os.path.normcase(first_dir) == os.path.normcase(second_dir))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        sh, _ = build(tmp)
+        os.unlink(os.path.join(sh, "spirv", "index.json"))
+        out = os.path.join(sh, "spirv", "INDEX.json")
+        err = io.StringIO()
+        code = None
+        try:
+            with mock.patch.object(report_paths, "_same_resolved_name", side_effect=folding),                     mock.patch.object(sys, "argv", ["feature_scan.py", sh, "--out", out]),                     contextlib.redirect_stderr(err):
+                code = F.main()
+        except SystemExit as stop:
+            code = stop.code
+        check(code == 2, f"--out naming the optional SPIR-V index: exit 2, got {code}")
+        check("spirv" in err.getvalue().replace("\\", "/"),
+              f"the refusal names spirv/index.json ({err.getvalue().strip()!r})")
+        check(not os.path.exists(out), "nothing is written when --out is refused")
+    assert failures == 0, f"{failures} optional-index check(s) failed"
 
 
 def run_tests(tests, report=print):

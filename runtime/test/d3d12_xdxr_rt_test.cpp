@@ -10,9 +10,21 @@
 // d3d12_blas_box16, then updated in place with the same flags (d3d12_blas_box16_update); and once more without
 // ALLOW_UPDATE, so that its triangles are paired into TRI0/TRI1 leaves (d3d12_blas_paired; the ALLOW_UPDATE builds
 // must have no pairs, since a refit rewrites the leaves one triangle each).
+// Then the paired BLAS and a TLAS over it again, each into a title-placed buffer (Xbox device slot 133: a buffer on
+// the caller's own pages, its GPU VA their CPU address, past the GPU address arena; once on read-write pages, which
+// the layer imports, and once on write-combined ones, which get a shadow), with instance descs that name the BLAS by
+// that address, a COMPACTED_SIZE postbuild and a CLONE copy of it: the builder must write the buffer's GPU copy, the
+// same bytes as the arena builds, and the TLAS record must name the BLAS by the VA shaders reach that copy at; heap_base
+// + the title address is no allocation (in retail, an MMU write fault and a lost device). The same again on a list of
+// the device behind the Xbox-ABI device proxy, as the title makes its lists (the list's device is then the proxy).
+// Last, a destination on pages no buffer covers is left out (the pages keep their bytes), and a TLAS instance naming
+// such pages gets no BLAS.
 // `python -I tools/xdxr_bvh.py check-build <out dir>` validates them and traces rays against brute force (ctest:
 // d3d12_xdxr_rt + d3d12_xdxr_rt_check). Exit 77 without a Vulkan device, or with LEONIDA_RT_AS=khr. No game files.
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_xs_device.h"
+#include "../src/title_va_alias.h"
+#include "../src/xdxr_build.h"
 
 #include <cmath>
 #include <cstdint>
@@ -496,6 +508,286 @@ int main(int argc, char** argv) {
               "{\"kind\": \"blas\", \"pairs\": true, \"address\": " +
                   std::to_string(static_blas->GetGPUVirtualAddress()) + ", \"triangles\": " + tris + "}\n"))
         return fail("static BLAS readback");
+    // ---- title-placed destinations (slot 133) ----
+    std::vector<std::uint8_t> paired;
+    {
+        void* p = nullptr;
+        if (FAILED(static_rb->Map(0, nullptr, &p))) return fail("Map the paired BLAS");
+        std::uint32_t units = 0;
+        std::memcpy(&units, static_cast<char*>(p) + 4, 4);
+        paired.assign(static_cast<std::uint8_t*>(p), static_cast<std::uint8_t*>(p) + (UINT64(units) + 1) * 64);
+        static_rb->Unmap(0, nullptr);
+    }
+    leonida::XdxrLayout tlas_layout;
+    tlas_layout.compute(3, true);
+    auto instance_word = [&](const std::uint8_t* tl, int i, unsigned at) {
+        std::uint32_t w = 0;
+        std::memcpy(&w, tl + tlas_layout.elements_off + 128 * i + at, 4);
+        return w;
+    };
+    auto read_back = [&](ID3D12Resource* rb, UINT64 bytes, std::vector<std::uint8_t>& out) {
+        void* p = nullptr;
+        if (FAILED(rb->Map(0, nullptr, &p))) return false;
+        out.assign(static_cast<std::uint8_t*>(p), static_cast<std::uint8_t*>(p) + bytes);
+        rb->Unmap(0, nullptr);
+        return true;
+    };
+    auto round_up = [](UINT64 x) { return (x + 0xffff) & ~UINT64(0xffff); };
+    const UINT64 blas_room = round_up(static_info.ResultDataMaxSizeInBytes);
+    const UINT64 tlas_room = round_up(tlas_info.ResultDataMaxSizeInBytes);
+    Ref<ID3D12Resource> refs_up;   // instance descs: three naming the slot-133 BLAS, three naming the arena one
+    if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_UPLOAD, 6 * 64, D3D12_RESOURCE_STATE_GENERIC_READ,
+                           D3D12_RESOURCE_FLAG_NONE, refs_up.put())))
+        return fail("instance upload buffer", hr);
+    Ref<ID3D12Resource> clone, clone_rb, title_tlas_rb;
+    if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, static_info.ResultDataMaxSizeInBytes, as_state, uav,
+                           clone.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, static_info.ResultDataMaxSizeInBytes,
+                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, clone_rb.put())) ||
+        FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, tlas_info.ResultDataMaxSizeInBytes,
+                           D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, title_tlas_rb.put())))
+        return fail("clone buffers", hr);
+    UINT64 fence_value = 8;
+    for (const DWORD modifier : {DWORD(0), DWORD(PAGE_WRITECOMBINE)}) {
+        // Top-down: far above the arena's size, as the title's pages are, so no arena VA can be mistaken for them.
+        auto* pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, std::size_t(blas_room + tlas_room),
+                                                              MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN,
+                                                              PAGE_READWRITE | modifier));
+        if (!pages) return fail("title pages");
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = blas_room;
+        desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = uav;
+        Ref<ID3D12Resource> title_blas, title_tlas;
+        if (FAILED(hr = rt::d3d12::create_buffer_at_host_address(device.p, pages, desc, 0xFFFFFFFFu,
+                                                                 IID_PPV_ARGS(title_blas.put()))))
+            return fail("slot-133 BLAS buffer", hr);
+        desc.Width = tlas_room;
+        if (FAILED(hr = rt::d3d12::create_buffer_at_host_address(device.p, pages + blas_room, desc, 0xFFFFFFFFu,
+                                                                 IID_PPV_ARGS(title_tlas.put()))))
+            return fail("slot-133 TLAS buffer", hr);
+        const UINT64 title_blas_va = reinterpret_cast<UINT64>(pages);
+        if (title_blas->GetGPUVirtualAddress() != title_blas_va ||
+            title_tlas->GetGPUVirtualAddress() != title_blas_va + blas_room)
+            return fail("a slot-133 buffer's GPU VA is not its address");
+        const bool shadow = rt::d3d12::title_shadow_buffer(title_blas.p);
+        const UINT64 shader_va = leonida::title_va_aliases().shader_va(title_blas_va);
+        if (shader_va == title_blas_va) return fail("the slot-133 BLAS buffer has no GPU copy");
+        D3D12_RAYTRACING_INSTANCE_DESC refs[6]{};
+        for (int i = 0; i < 6; ++i) {
+            std::memcpy(refs[i].Transform, xforms[i % 3], sizeof xforms[i % 3]);
+            refs[i].InstanceID = 20 + i % 3;
+            refs[i].InstanceMask = masks[i % 3];
+            refs[i].AccelerationStructure = i < 3 ? title_blas_va : static_blas->GetGPUVirtualAddress();
+        }
+        void* up = nullptr;
+        if (FAILED(refs_up->Map(0, nullptr, &up))) return fail("Map instance descs");
+        std::memcpy(up, refs, sizeof refs);
+        refs_up->Unmap(0, nullptr);
+
+        if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset (slot 133)");
+        build = {};
+        build.Inputs = static_inputs;
+        build.DestAccelerationStructureData = title_blas_va;
+        build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+        list->BuildRaytracingAccelerationStructure(&build, 1, &compacted_desc);   // COMPACTED_SIZE at info + 0
+        list->ResourceBarrier(1, &barrier);
+        build = {};
+        build.Inputs = tlas_inputs;
+        build.Inputs.InstanceDescs = refs_up->GetGPUVirtualAddress();
+        build.DestAccelerationStructureData = title_tlas->GetGPUVirtualAddress();
+        build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+        list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+        list->ResourceBarrier(1, &barrier);
+        build.Inputs.InstanceDescs = refs_up->GetGPUVirtualAddress() + 3 * 64;    // the same over the arena BLAS
+        build.DestAccelerationStructureData = tlas->GetGPUVirtualAddress();
+        list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+        list->CopyRaytracingAccelerationStructure(clone->GetGPUVirtualAddress(), title_blas_va,
+                                                  D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE);
+        list->ResourceBarrier(1, &barrier);
+        list->CopyBufferRegion(blas_rb.p, 0, title_blas.p, 0, static_info.ResultDataMaxSizeInBytes);
+        list->CopyBufferRegion(title_tlas_rb.p, 0, title_tlas.p, 0, tlas_info.ResultDataMaxSizeInBytes);
+        list->CopyBufferRegion(tlas_rb.p, 0, tlas.p, 0, tlas_info.ResultDataMaxSizeInBytes);
+        list->CopyBufferRegion(clone_rb.p, 0, clone.p, 0, static_info.ResultDataMaxSizeInBytes);
+        list->CopyBufferRegion(info_rb.p, 0, info.p, 0, 8);
+        if (!submit(fence_value++)) return fail("slot-133 builds did not complete");
+        if (FAILED(device->GetDeviceRemovedReason()))
+            return fail("device removed by slot-133 builds", device->GetDeviceRemovedReason());
+        std::vector<std::uint8_t> got, title_tl, arena_tl, cloned;
+        UINT64 size = 0;
+        if (!read_back(blas_rb.p, paired.size(), got) || !read_back(title_tlas_rb.p, tlas_info.ResultDataMaxSizeInBytes, title_tl) ||
+            !read_back(tlas_rb.p, tlas_info.ResultDataMaxSizeInBytes, arena_tl) ||
+            !read_back(clone_rb.p, paired.size(), cloned))
+            return fail("Map slot-133 readbacks");
+        {
+            void* p = nullptr;
+            if (FAILED(info_rb->Map(0, nullptr, &p))) return fail("Map postbuild (slot 133)");
+            std::memcpy(&size, p, 8);
+            info_rb->Unmap(0, nullptr);
+        }
+        const char* kind = shadow ? "write-combined pages (shadow)" : "read-write pages (import)";
+        if (got != paired) {
+            std::fprintf(stderr, "slot-133 BLAS on %s differs from the arena build\n", kind);
+            return fail("slot-133 BLAS bytes");
+        }
+        // An import is the title's pages: the CPU reads what the GPU wrote there.
+        if (!shadow && std::memcmp(pages, paired.data(), paired.size()) != 0) return fail("the imported pages");
+        if (size != paired.size()) return fail("slot-133 BLAS COMPACTED_SIZE");
+        if (cloned != paired) return fail("CLONE of the slot-133 BLAS");
+        // The two TLASes agree but for the BLAS address of their records: the shader VA of the slot-133 BLAS's copy,
+        // and the arena BLAS's VA, in 256-byte units.
+        std::uint32_t units = 0;
+        std::memcpy(&units, arena_tl.data() + 4, 4);
+        const std::size_t used = std::size_t(units + 1) * 64;
+        if (used > title_tl.size()) return fail("TLAS size");
+        for (int i = 0; i < 3; ++i) {
+            const std::uint32_t want_title = std::uint32_t(shader_va >> 8);
+            const std::uint32_t want_arena = std::uint32_t(static_blas->GetGPUVirtualAddress() >> 8);
+            if (instance_word(title_tl.data(), i, 60) != want_title || instance_word(arena_tl.data(), i, 60) != want_arena) {
+                std::fprintf(stderr, "instance %d: BLAS 0x%08x (want 0x%08x), arena 0x%08x (want 0x%08x)\n", i,
+                             instance_word(title_tl.data(), i, 60), want_title, instance_word(arena_tl.data(), i, 60),
+                             want_arena);
+                return fail("the TLAS record's BLAS address");
+            }
+            std::memset(title_tl.data() + tlas_layout.elements_off + 128 * i + 60, 0, 4);
+            std::memset(arena_tl.data() + tlas_layout.elements_off + 128 * i + 60, 0, 4);
+        }
+        if (std::memcmp(title_tl.data(), arena_tl.data(), used) != 0) return fail("slot-133 TLAS bytes");
+        std::printf("d3d12_xdxr_rt: BLAS and TLAS built into slot-133 buffers on %s, at shader VA 0x%llx for title "
+                    "address 0x%llx\n",
+                    kind, static_cast<unsigned long long>(shader_va), static_cast<unsigned long long>(title_blas_va));
+        // The buffers go before their pages (a shadow watches them).
+        for (Ref<ID3D12Resource>* r : {&title_blas, &title_tlas}) {
+            r->p->Release();
+            r->p = nullptr;
+        }
+        VirtualFree(pages, 0, MEM_RELEASE);
+    }
+
+    // ---- the same on a list whose device is the Xbox-ABI proxy (Device::identity), as the title's lists are ----
+    {
+        void* proxy = nullptr;
+        if (FAILED(hr = rt::d3d12_xs::create_device_proxy(device.p, __uuidof(ID3D12Device), &proxy)) || !proxy)
+            return fail("device proxy", hr);
+        rt::d3d12::set_device_outer(device.p, static_cast<IUnknown*>(proxy));
+        // Made after the outer is set, so they belong to the proxied device (a queue checks its lists' and fences').
+        Ref<ID3D12CommandQueue> proxy_queue;
+        Ref<ID3D12Fence> proxy_fence;
+        Ref<ID3D12CommandAllocator> proxy_allocator;
+        Ref<ID3D12GraphicsCommandList4> proxy_list;
+        Ref<ID3D12Resource> proxy_rb;
+        if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(proxy_queue.put()))) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(proxy_fence.put()))) ||
+            FAILED(buffer(device.p, D3D12_HEAP_TYPE_READBACK, static_info.ResultDataMaxSizeInBytes,
+                          D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, proxy_rb.put())) ||
+            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(proxy_allocator.put()))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, proxy_allocator.p, nullptr,
+                                             IID_PPV_ARGS(proxy_list.put()))))
+            return fail("list of the proxied device");
+        auto* pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, std::size_t(blas_room),
+                                                              MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE));
+        if (!pages) return fail("title pages (proxy)");
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = blas_room;
+        desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = uav;
+        Ref<ID3D12Resource> title_blas;
+        if (FAILED(hr = rt::d3d12::create_buffer_at_host_address(device.p, pages, desc, 0xFFFFFFFFu,
+                                                                 IID_PPV_ARGS(title_blas.put()))))
+            return fail("slot-133 BLAS buffer (proxy)", hr);
+        build = {};
+        build.Inputs = static_inputs;
+        build.DestAccelerationStructureData = reinterpret_cast<UINT64>(pages);
+        build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+        proxy_list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+        proxy_list->ResourceBarrier(1, &barrier);
+        proxy_list->CopyBufferRegion(proxy_rb.p, 0, title_blas.p, 0, static_info.ResultDataMaxSizeInBytes);
+        if (FAILED(hr = proxy_list->Close())) return fail("Close (proxy)", hr);
+        ID3D12CommandList* proxy_lists[] = {proxy_list.p};
+        proxy_queue->ExecuteCommandLists(1, proxy_lists);
+        if (rt::d3d12::last_execute_result(proxy_queue.p) != leonida::ReplayResult::success)
+            return fail("the proxied list was refused");
+        if (FAILED(proxy_queue->Signal(proxy_fence.p, 1))) return fail("Signal (proxy)");
+        HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        const bool ran = e && SUCCEEDED(proxy_fence->SetEventOnCompletion(1, e)) &&
+                         WaitForSingleObject(e, 10000) == WAIT_OBJECT_0;
+        if (e) CloseHandle(e);
+        if (!ran) return fail("the proxied list did not complete");
+        if (FAILED(device->GetDeviceRemovedReason()))
+            return fail("device removed by a proxied list's build", device->GetDeviceRemovedReason());
+        std::vector<std::uint8_t> got;
+        if (!read_back(proxy_rb.p, paired.size(), got)) return fail("Map (proxy)");
+        if (got != paired) return fail("slot-133 BLAS built on a proxied list");
+        rt::d3d12::set_device_outer(device.p, nullptr);
+        title_blas.p->Release();
+        title_blas.p = nullptr;
+        proxy_list.p->Release();
+        proxy_list.p = nullptr;
+        proxy_allocator.p->Release();
+        proxy_allocator.p = nullptr;
+        proxy_queue.p->Release();
+        proxy_queue.p = nullptr;
+        proxy_fence.p->Release();
+        proxy_fence.p = nullptr;
+        // The proxy is kept: the queue releases the lists it pinned on its own thread after the fence, and they hold
+        // the proxy as their device.
+        VirtualFree(pages, 0, MEM_RELEASE);
+        std::printf("d3d12_xdxr_rt: a list of the proxied device builds into a slot-133 buffer\n");
+    }
+
+    // ---- no GPU copy: pages no buffer covers. The build is left out (the list still closes, the pages keep their
+    // bytes, the device stays), and a TLAS instance naming them gets no BLAS (record 0, root INVALID) ----
+    {
+        auto* raw = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, std::size_t(blas_room),
+                                                            MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE));
+        if (!raw) return fail("raw pages");
+        std::memset(raw, 0xCD, std::size_t(blas_room));
+        D3D12_RAYTRACING_INSTANCE_DESC refs[3]{};
+        for (int i = 0; i < 3; ++i) {
+            std::memcpy(refs[i].Transform, xforms[0], sizeof xforms[0]);
+            refs[i].InstanceMask = 0xff;
+            refs[i].AccelerationStructure = i == 0 ? reinterpret_cast<UINT64>(raw) : static_blas->GetGPUVirtualAddress();
+        }
+        void* up = nullptr;
+        if (FAILED(refs_up->Map(0, nullptr, &up))) return fail("Map instance descs (raw)");
+        std::memcpy(up, refs, sizeof refs);
+        refs_up->Unmap(0, nullptr);
+        if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset (raw)");
+        build = {};
+        build.Inputs = static_inputs;
+        build.DestAccelerationStructureData = reinterpret_cast<UINT64>(raw);
+        build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+        list->BuildRaytracingAccelerationStructure(&build, 1, &compacted_desc);
+        list->ResourceBarrier(1, &barrier);
+        build = {};
+        build.Inputs = tlas_inputs;
+        build.Inputs.InstanceDescs = refs_up->GetGPUVirtualAddress();
+        build.DestAccelerationStructureData = tlas->GetGPUVirtualAddress();
+        build.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+        list->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+        list->ResourceBarrier(1, &barrier);
+        list->CopyBufferRegion(tlas_rb.p, 0, tlas.p, 0, tlas_info.ResultDataMaxSizeInBytes);
+        if (!submit(fence_value++)) return fail("the list with an unresolved destination did not run");
+        if (FAILED(device->GetDeviceRemovedReason()))
+            return fail("device removed by an unresolved destination", device->GetDeviceRemovedReason());
+        for (UINT64 i = 0; i < blas_room; ++i)
+            if (raw[i] != 0xCD) return fail("a build wrote pages no buffer covers");
+        std::vector<std::uint8_t> tl;
+        if (!read_back(tlas_rb.p, tlas_info.ResultDataMaxSizeInBytes, tl)) return fail("Map TLAS (raw)");
+        if (instance_word(tl.data(), 0, 60) != 0 || (instance_word(tl.data(), 0, 56) & 0x3fffffffu) != 0x3fffffffu ||
+            instance_word(tl.data(), 1, 60) != std::uint32_t(static_blas->GetGPUVirtualAddress() >> 8))
+            return fail("a TLAS instance naming unbacked pages");
+        VirtualFree(raw, 0, MEM_RELEASE);
+        std::printf("d3d12_xdxr_rt: a build into pages no buffer covers was left out, and an instance naming them "
+                    "has no BLAS\n");
+    }
+
     std::printf("d3d12_xdxr_rt: BLAS %llu bytes (prebuild %llu), TLAS (prebuild %llu), written to %s\n",
                 static_cast<unsigned long long>(blas_info.ResultDataMaxSizeInBytes),
                 static_cast<unsigned long long>(blas_info.ResultDataMaxSizeInBytes),

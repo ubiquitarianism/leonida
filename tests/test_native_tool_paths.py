@@ -51,6 +51,25 @@ class AssembleSpirv(unittest.TestCase):
             self.assertEqual(f.read(4), b"\x03\x02\x23\x07")  # the SPIR-V magic, little-endian
         self.assertEqual([n for n in os.listdir(out_dir or ".") if n.endswith(".tmp")], [], "the staging file is removed")
 
+    @unittest.skipUnless(shutil.which("spirv-opt"), "needs spirv-opt")
+    def test_compact_binary_before_publish(self):
+        body = MINIMAL_CS.replace("%fn = OpTypeFunction", "%uint = OpTypeInt 32 0\n"
+                                 "%seven = OpConstant %uint 7\n%fn = OpTypeFunction")
+        body = body.replace("OpReturn", "%dead = OpIAdd %uint %seven %seven\nOpReturn")
+        with tempfile.TemporaryDirectory(prefix=MARK) as folder:
+            sa = os.path.join(folder, "input.spvasm")
+            sv = os.path.join(folder, "out.spv")
+            with open(sa, "w", encoding="utf-8", newline="\n") as f:
+                f.write(body)
+            for compact in (False, True):
+                result = rdna2spirv.assemble_spirv(sa, sv, compact=compact)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if compact:
+                    self.assertLess(os.path.getsize(sv), original_size)
+                else:
+                    original_size = os.path.getsize(sv)
+            self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(folder)))
+
     def test_a_folder_outside_the_code_page(self):
         # Before: spirv-as got '...\shaders-?\cs_min.spvasm' and failed with "file does not exist".
         with tempfile.TemporaryDirectory() as tmp:

@@ -4,7 +4,19 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include "../src/vulkan_replay.h"
+#include "../src/vulkan_index_view.h"
+#include <cstring>
 #include "../src/vulkan_memory.h"  // resizable_bar, memory_type_order
+
+// Argument-buffer bounds only, no Vulkan calls. A 64-byte compound record has padding to an
+// 80-byte stride between records, but needs none after the last. A terminal DRAW_INDEXED alone is only 20 bytes.
+static_assert(leonida::indirect_records_fit(2048, 1904, 2, 80, 64));
+static_assert(!leonida::indirect_records_fit(2048, 1908, 2, 80, 64));
+static_assert(leonida::indirect_records_fit(2048, 1908, 2, 80, 20));
+static_assert(leonida::indirect_records_fit(0, UINT64_MAX - 3, 0, 80, 64));
+static_assert(!leonida::indirect_records_fit(UINT64_MAX, UINT64_MAX - 3, 1, 80, 64));
+static_assert(leonida::indirect_records_fit(UINT64_MAX, 0, UINT32_MAX, UINT32_MAX - 3, UINT32_MAX - 3));
+static_assert(!leonida::indirect_records_fit(UINT32_MAX, 0, UINT32_MAX, UINT32_MAX - 3, UINT32_MAX - 3));
 
 #ifdef _WIN32
 #include <windows.h>
@@ -159,7 +171,7 @@ static_assert(leonida::query_result_size(leonida::d3d12_query::pipeline_statisti
     }                                                            \
 } while (0)
 
-int main() {
+static int state_map_tests() {
     using namespace leonida;
     namespace s = d3d12_state;
     const auto layout = [](std::uint32_t states, bool presentable = false) {
@@ -608,7 +620,8 @@ int main() {
         CHECK(list.execute_indirect({IndirectKind::dispatch, 20, 2, 1, 20, 0, 0}));
         CHECK(list.close());
         CHECK(replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success);
-        const std::vector<VkDeviceSize> expected{260, 264, 268, 516, 272, 520, 276, 296};
+        // Only the two dispatch records emit: legacy graphics IR carries no captured draw state.
+        const std::vector<VkDeviceSize> expected{276, 296};
         CHECK(offsets == expected);
 
         // Reject invalid spans before invoking Vulkan, including after adding the backing-buffer base.
@@ -628,6 +641,184 @@ int main() {
         CHECK(offsets == expected);
     }
 
+    return 0;
+}
+
+static int indirect_tests(bool bounded_only) {
+    using namespace leonida;
+    // Pure CPU recorder: both indirect actions use the current draw's scope, pipeline,
+    // pushed data and (when indexed) IA binding. The opaque argument buffer is never mapped.
+    {
+        static std::string events;
+        static VkDeviceSize argument_offset, count_offset;
+        static VkBuffer argument_handle, count_handle, index_handle;
+        static VkDeviceSize index_offset, index_size;
+        static VkIndexType index_type;
+        static std::uint32_t argument_count, argument_stride;
+        GraphicsPipeline pipeline{};
+        pipeline.pipeline = reinterpret_cast<VkPipeline>(std::uintptr_t{1});
+        ResourceBinding args{};
+        args.buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{2});
+        args.size = 36; args.buffer_offset = 256; args.indirect_arguments = true;
+        ResourceBinding counts{};
+        counts.buffer = args.buffer; counts.size = 8; counts.buffer_offset = 512; counts.indirect_arguments = true;
+        ReplayFunctions vk{};
+        vk.draw_indirect_first_instance = true;
+        vk.graphics_pipeline = [&](std::uintptr_t) { return &pipeline; };
+        vk.buffer_at = [](std::uint64_t, std::uint64_t&, VkBuffer& buffer, VkDeviceSize& offset) {
+            buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{3}); offset = 16; return true;
+        };
+        vk.image_view = [](const ResourceBinding&, const VkImageSubresourceRange&) { return VkImageView{}; };
+        const auto ignore = [](auto...) {};
+        vk.bind_vertex_buffers2 = ignore; vk.set_viewport = ignore; vk.set_scissor = ignore;
+        vk.set_primitive_topology = ignore; vk.set_primitive_restart_enable = ignore;
+        vk.set_stencil_reference = ignore; vk.set_blend_constants = ignore;
+        vk.begin_rendering = [](auto...) { events += '['; };
+        vk.end_rendering = [](auto...) { events += ']'; };
+        vk.bind_pipeline = [](auto...) { events += 'P'; };
+        vk.push_constants = [](auto...) { events += 'C'; };
+        vk.bind_index_buffer = [](auto...) { events += 'L'; };  // direct, legacy bind
+        const auto bounded = [](VkCommandBuffer, VkBuffer b, VkDeviceSize off, VkDeviceSize size, VkIndexType t) {
+            index_handle = b; index_offset = off; index_size = size; index_type = t; events += 'I';
+        };
+        vk.draw = [](auto...) { events += 'D'; };
+        vk.draw_indexed = [](auto...) { events += 'X'; };
+        vk.draw_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t count, std::uint32_t stride) {
+            argument_offset = offset; argument_count = count; argument_stride = stride; events += 'd';
+        };
+        vk.draw_indexed_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t count, std::uint32_t stride) {
+            argument_offset = offset; argument_count = count; argument_stride = stride; events += 'x';
+        };
+        vk.draw_indirect_count = [](VkCommandBuffer, VkBuffer arg, VkDeviceSize offset, VkBuffer cnt, VkDeviceSize coff,
+                                    std::uint32_t max_count, std::uint32_t stride) {
+            argument_handle = arg; count_handle = cnt; argument_offset = offset; count_offset = coff;
+            argument_count = max_count; argument_stride = stride; events += 'n';
+        };
+        vk.draw_indexed_indirect_count = [](VkCommandBuffer, VkBuffer arg, VkDeviceSize offset, VkBuffer cnt,
+                                            VkDeviceSize coff, std::uint32_t max_count, std::uint32_t stride) {
+            argument_handle = arg; count_handle = cnt; argument_offset = offset; count_offset = coff;
+            argument_count = max_count; argument_stride = stride; events += 'y';
+        };
+        Draw d{}; d.pipeline = 1; d.topology = 4; d.viewport = {0,0,8,8,0,1}; d.scissor = {0,0,8,8};
+        IndirectDrawArgs arg{9,16,24};  // one record, legal padding must not be read
+        {
+            // Copying the rare command shares a stable snapshot and reuses the original views block.
+            auto views = std::make_shared<const DrawViews>();
+            Draw source = d; source.views = views;
+            auto mutable_args = arg;
+            CommandList list;
+            CHECK(list.draw_indirect(std::move(source), mutable_args) && list.commands().size() == 1);
+            mutable_args.argument_buffer = 123;
+            const Command command_copy = list.commands().front();
+            const auto captured = draw_command(command_copy);
+            CHECK(captured.state && captured.arguments && captured.state == draw_command(list.commands().front()).state);
+            CHECK(captured.state->views == views && captured.arguments->argument_buffer == arg.argument_buffer);
+            CHECK(!draw_command(Command{Draw{}}).arguments && !draw_command(Command{UavBarrier{}}).state);
+        }
+        const auto run = [&] {
+            CommandList list;
+            events.clear();
+            if (!list.draw_indirect(Draw{d}, arg) || !list.close()) return ReplayResult::invalid_draw;
+            return replay(list, VK_NULL_HANDLE, [&](ResourceId id) {
+                return id == 9 ? &args : id == 10 ? &counts : nullptr;
+            }, vk);
+        };
+        CHECK(run() == ReplayResult::success && events == "[PCd]");
+        CHECK(argument_offset == 272 && argument_count == 1 && argument_stride == 24);
+        d.indexed = true; d.index = {0x1000, 8, 57};
+        CHECK(run() == ReplayResult::success && events.empty());  // supported draw, no safe index binding
+        vk.bind_robust_index_view = bounded;
+        // Resolver returns the rest of a larger allocation. Only complete elements inside the IBV are bindable.
+        vk.buffer_at = [](std::uint64_t, std::uint64_t& size, VkBuffer& b, VkDeviceSize& off) {
+            b = reinterpret_cast<VkBuffer>(std::uintptr_t{3}); off = 16; size = 64; return true;
+        };
+        const auto ib = reinterpret_cast<VkBuffer>(std::uintptr_t{3});
+        CHECK(run() == ReplayResult::success && events == "[PCIx]" && index_handle == ib &&
+              index_offset == 16 && index_size == 8 && index_type == VK_INDEX_TYPE_UINT16);
+        d.index = {0x1000, 15, 42};
+        CHECK(run() == ReplayResult::success && events == "[PCIx]" && index_size == 12 &&
+              index_type == VK_INDEX_TYPE_UINT32);
+        vk.draw_indirect_count_enabled = true; vk.max_draw_indirect_count = UINT32_MAX;
+        arg.count_buffer = 10; arg.count_offset = 4; d.index.size = 20;
+        CHECK(run() == ReplayResult::success && events == "[PCIy]" && index_size == 20 &&
+              index_offset == 16 && index_type == VK_INDEX_TYPE_UINT32);
+        // The ordinary direct draw still uses its original unsized binding.
+        CommandList direct;
+        Draw direct_state = d;
+        direct_state.count = 3; direct_state.instances = 1;
+        CHECK(direct.draw(direct_state) && direct.close()); events.clear();
+        CHECK(replay(direct, VK_NULL_HANDLE, [](ResourceId) -> const ResourceBinding* { return nullptr; }, vk)
+              == ReplayResult::success && events == "[PCLX]");
+        CHECK(!can_enable_robust_index_view({}, nullptr, false, true, false));
+        CHECK(!can_enable_robust_index_view({}, nullptr, true, false, false));
+        CHECK(!can_enable_robust_index_view({}, nullptr, true, true, true));
+        CHECK(can_enable_robust_index_view({}, nullptr, true, true, false));
+        const auto compatible = [](VkPhysicalDevice, VkPhysicalDeviceProperties2* p) {
+            static_cast<VkPhysicalDeviceVulkan12Properties*>(p->pNext)->robustBufferAccessUpdateAfterBind = VK_TRUE;
+        };
+        CHECK(can_enable_robust_index_view({}, compatible, true, true, true));
+        const auto incompatible = [](VkPhysicalDevice, VkPhysicalDeviceProperties2*) {};  // remains VK_FALSE
+        CHECK(!can_enable_robust_index_view({}, incompatible, true, true, true));
+        if (bounded_only) return 0;
+        d.index = {0x1000, 8, 57};
+        vk.draw_indirect_count_enabled = false; vk.max_draw_indirect_count = 1;
+        arg.count_buffer = 0; arg.count_offset = 0;
+        CHECK(run() == ReplayResult::success && events == "[PCIx]");
+        CHECK(argument_offset == 272 && argument_count == 1 && argument_stride == 24);
+        d.index.va = 0; CHECK(run() == ReplayResult::success && events.empty()); d.index.va = 0x1000;
+        // An unresolvable indexed argument buffer never turns into a direct indexed draw.
+        arg.argument_buffer = 999;
+        const auto missing = run();
+        CHECK((missing == ReplayResult::success || missing == ReplayResult::unresolved_resource) && events.empty());
+        arg.argument_buffer = 9;
+        arg.argument_offset = 20; CHECK(run() == ReplayResult::invalid_indirect_arguments && events.empty());
+        arg.argument_offset = 16; args.buffer_offset = UINT64_MAX - 3;
+        CHECK(run() == ReplayResult::invalid_indirect_arguments && events.empty()); args.buffer_offset = 256;
+        args.indirect_arguments = false; CHECK(run() == ReplayResult::success && events.empty()); args.indirect_arguments = true;
+        pipeline.nonunit_vertex_divisor = true; CHECK(run() == ReplayResult::success && events.empty());
+        pipeline.nonunit_vertex_divisor = false; vk.draw_indirect_first_instance = false;
+        CHECK(run() == ReplayResult::success && events.empty());
+        vk.draw_indirect_first_instance = true; d.topology = topology_quad_list;
+        CHECK(run() == ReplayResult::success && events.empty());
+
+        // Multi-record fixed count, then counted, both forms. Ranges end exactly
+        // at the final payload and uint32 count, after nonzero backing-buffer bases.
+        d.topology = 4; d.indexed = false; arg.max_count = 2;
+        vk.max_draw_indirect_count = 2; vk.multi_draw_indirect = true;
+        args.size = 56; CHECK(run() == ReplayResult::success && events == "[PCd]");
+        CHECK(argument_count == 2 && argument_stride == 24 && argument_offset == 272);
+        d.indexed = true; CHECK(run() == ReplayResult::invalid_indirect_arguments && events.empty());
+        args.size = 60; CHECK(run() == ReplayResult::success && events == "[PCIx]");
+        CHECK(argument_count == 2 && argument_stride == 24);
+        vk.max_draw_indirect_count = 1; CHECK(run() == ReplayResult::success && events.empty());
+        vk.max_draw_indirect_count = UINT32_MAX; vk.multi_draw_indirect = false;
+        CHECK(run() == ReplayResult::success && events.empty());
+        // Counted commands have their own drawIndirectCount feature; leave multiDrawIndirect disabled.
+        arg.count_offset = 4; CHECK(run() == ReplayResult::invalid_indirect_arguments && events.empty());
+        arg.count_buffer = 10; CHECK(run() == ReplayResult::success && events.empty());
+        vk.draw_indirect_count_enabled = true; d.indexed = false;
+        CHECK(run() == ReplayResult::success && events == "[PCn]");
+        CHECK(argument_offset == 272 && count_offset == 516 && argument_handle == args.buffer &&
+              count_handle == counts.buffer && argument_count == 2 && argument_stride == 24);
+        d.indexed = true; CHECK(run() == ReplayResult::success && events == "[PCIy]");
+        CHECK(argument_offset == 272 && count_offset == 516 && argument_count == 2 && argument_stride == 24);
+        vk.max_draw_indirect_count = 128; CHECK(run() == ReplayResult::success && events.empty()); // unknown raw count
+        vk.max_draw_indirect_count = UINT32_MAX; counts.indirect_arguments = false;
+        CHECK(run() == ReplayResult::success && events.empty()); counts.indirect_arguments = true;
+        counts.size = 7; CHECK(run() == ReplayResult::invalid_indirect_arguments && events.empty()); counts.size = 8;
+        counts.buffer_offset = UINT64_MAX - 3; CHECK(run() == ReplayResult::invalid_indirect_arguments && events.empty());
+        counts.buffer_offset = 512; arg.count_offset = 1;
+        CHECK(run() == ReplayResult::invalid_indirect_arguments && events.empty());
+        arg.count_offset = 4; vk.draw_indexed_indirect_count = nullptr;
+        CHECK(run() == ReplayResult::success && events.empty());
+        arg.max_count = 0; CHECK(run() == ReplayResult::success && events.empty());
+    }
+
+    return 0;
+}
+
+static int memory_tests() {
+    using namespace leonida;
     // Resizable BAR detection (D3D-96) on the heap layouts real cards report.
     {
         constexpr VkDeviceSize mib = VkDeviceSize(1) << 20;
@@ -786,4 +977,10 @@ int main() {
     std::printf("state map, enhanced barriers, subresource decoding, layout tracking, discard ranges, block formats, "
                 "BAR detection and memory types OK\n");
     return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && !std::strcmp(argv[1], "--bounded-index-view")) return indirect_tests(true);
+    if (argc != 1) return 1;
+    return state_map_tests() || indirect_tests(false) || memory_tests();
 }

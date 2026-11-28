@@ -6,9 +6,12 @@
 //   xgameruntime_user_test --expect-gamertag TAG    the same, run with LEONIDA_GAMERTAG=TAG
 #include <windows.h>
 
+#include <io.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -54,6 +57,59 @@ template <class F> F at(void* obj, int index) { return reinterpret_cast<F>(slot(
 // Waits for an XAsyncBlock on the process queue, as a title polling XAsyncGetStatus(wait = true) does.
 bool finished(XAsyncBlock* async) { return XAsyncGetStatus(async, true) != E_PENDING; }
 
+// Sends stderr, where the shim's "[rt] xgameruntime: XUser ... first call" lines go, to a temporary file until
+// finish(), which returns what was written.
+struct StderrCapture {
+    char path[MAX_PATH] = {};
+    int saved = -1;
+    StderrCapture() {
+        char dir[MAX_PATH] = {};
+        GetTempPathA(sizeof(dir), dir);
+        GetTempFileNameA(dir, "xur", 0, path);
+        std::fflush(stderr);
+        saved = _dup(2);
+        std::FILE* out = nullptr;
+        if (fopen_s(&out, path, "wb") == 0 && out) {
+            if (saved >= 0) _dup2(_fileno(out), 2);
+            std::fclose(out);
+        }
+    }
+    std::string finish() {
+        std::fflush(stderr);
+        if (saved >= 0) {
+            _dup2(saved, 2);
+            _close(saved);
+            saved = -1;
+        }
+        std::string text;
+        std::FILE* in = nullptr;
+        if (fopen_s(&in, path, "rb") == 0 && in) {
+            char chunk[4096];
+            for (size_t n; (n = std::fread(chunk, 1, sizeof(chunk), in)) > 0;) text.append(chunk, n);
+            std::fclose(in);
+        }
+        DeleteFileA(path);
+        return text;
+    }
+    ~StderrCapture() { finish(); }
+};
+
+int count_of(const std::string& text, const std::string& needle) {
+    int count = 0;
+    for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++count;
+    return count;
+}
+
+// The line of `text` that contains `needle`, or "" when none does.
+std::string line_with(const std::string& text, const std::string& needle) {
+    const size_t at = text.find(needle);
+    if (at == std::string::npos) return {};
+    const size_t newline_before = text.rfind('\n', at);
+    const size_t begin = newline_before == std::string::npos ? 0 : newline_before + 1;
+    const size_t end = text.find('\n', at);
+    return text.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -80,6 +136,10 @@ int main(int argc, char** argv) {
     void* none = reinterpret_cast<void*>(1);
     check(query(&kUserClass, kOther, &none) == E_NOINTERFACE && none == nullptr,
           "an interface the class doesn't have is E_NOINTERFACE with a cleared out pointer");
+
+    // Every call from here to the gamertag checks is the slot's first in this process: its first-call lines are read
+    // back below.
+    StderrCapture capture;
 
     // ---- XUserAddAsync / XUserAddResult (slots 7, 8) ----
     using AddAsync = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, XAsyncBlock*);
@@ -208,6 +268,25 @@ int main(int argc, char** argv) {
     check(tag(tag_face, h, 0, want - 1, buf, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
           "a buffer one byte short is E_INSUFFICIENT_BUFFER");
     check(tag(tag_face, h, 7, sizeof(buf), buf, &used) == E_INVALIDARG, "an unknown component is E_INVALIDARG");
+
+    // ---- first-call lines: one per slot (per gamertag component), whatever the number of calls ----
+    const std::string log = capture.finish();
+    std::fputs(log.c_str(), stdout);
+    check(count_of(log, "[rt] xgameruntime: XUser AddAsync first call: options 0x1,") == 1 &&
+              count_of(log, "XUser AddAsync first call") == 1,
+          "XUserAddAsync logs its first call (options 0x1) once, not for the two calls after it");
+    check(count_of(log, "[rt] xgameruntime: XUser AddResult first call:") == 1 &&
+              count_of(log, "[rt] xgameruntime: XUser CheckPrivilege first call:") == 1 &&
+              count_of(log, "[rt] xgameruntime: XUser GetState first call:") == 1 &&
+              count_of(log, "[rt] xgameruntime: XUser RegisterForChangeEvent first call:") == 1,
+          "AddResult, CheckPrivilege, GetState and RegisterForChangeEvent log their first call once");
+    const std::string classic = line_with(log, "[rt] xgameruntime: XUser GetGamertag first call: Classic (0)");
+    check(count_of(log, "XUser GetGamertag first call: Classic (0)") == 1 &&
+              classic.find(std::string("-> 0x00000000, \"") + expect_tag + "\"") != std::string::npos,
+          "XUserGetGamertag logs the first Classic call once, with S_OK and the gamertag (not the short-buffer call)");
+    check(count_of(log, "[rt] xgameruntime: XUser GetGamertag first call:") == 5 &&
+              line_with(log, "GetGamertag first call: unknown component (7)").find("0x80070057") != std::string::npos,
+          "one GetGamertag line per component asked for (four, and the unknown one with E_INVALIDARG)");
 
     // ---- handles: duplicate, close, all accounted for (3, 4) ----
     using Dup = HRESULT(STDMETHODCALLTYPE*)(void*, XUserHandle, XUserHandle*);

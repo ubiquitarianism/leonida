@@ -1,11 +1,18 @@
 ; M3 pixel shader, pass 2: samples the first render target of pass 1 (read through an SRV in a descriptor table) and
 ; swaps red and blue. Run: d3d12_m3_frame_test.
-; User data from the root signature ([0] a table of one SRV, [1] a table of one sampler, [2] one 32-bit constant):
-;   s[0:1] = console VA of the SRV table's first slot (the T#);   s[2:3] = console VA of the sampler table's slot (the S#)
-;   s4 = the output's alpha, a float (changes every frame)
+; User data from the root signature ([0] a table of one SRV, [1] a table of one sampler, [2] one 32-bit constant), in
+; the console's graphics layout (from s8, one dword per table: the heaps live below 4 GiB):
+;   s8 = console VA of the SRV table's first slot (the T#);   s9 = console VA of the sampler table's slot (the S#)
+;   s10 = the output's alpha, a float (changes every frame)
+; The first five instructions move them to s[0:1], s[2:3] (high dwords 0, as the game's shaders force s9 to 0) and s4.
 ; attr0.xy = (u, v), 0..1 over the target.   mrt0 = (texel.b, texel.g, texel.r, s4)
 ; fssm-at: 0x10
 ; fssm-data: 0x33505350 0x20535020
+s_mov_b32 s0, s8
+s_mov_b32 s1, 0
+s_mov_b32 s2, s9
+s_mov_b32 s3, 0
+s_mov_b32 s4, s10
 s_load_dwordx8 s[8:15], s[0:1], 0x0
 s_load_dwordx4 s[16:19], s[2:3], 0x0
 s_waitcnt lgkmcnt(0)

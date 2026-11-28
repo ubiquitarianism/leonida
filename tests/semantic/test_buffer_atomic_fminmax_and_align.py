@@ -238,6 +238,20 @@ class BufferAtomicFminmax(unittest.TestCase):
 
 
 class AtomicNaturalAlignment(unittest.TestCase):
+    def test_raw_atomic_soffset_only(self):
+        # No vaddr. The same backed word is in range at N=8 and out of range at N=7.
+        for num_bytes, old_value, stored_value in ((8, 19, 22), (7, 0, 19)):
+            with self.subTest(num_bytes=num_bytes):
+                body = buf_rsrc_lines(TARGET, 0, num_bytes, RAW_W3) + [
+                    "s_mov_b32 s12, 4",
+                    "v_mov_b32_e32 v2, 3",
+                    "buffer_atomic_add v2, off, s[8:11], s12 glc",
+                    "s_waitcnt vmcnt(0)",
+                ] + out_store_lines("v2")
+                mem = run(body, {TARGET: SENTINEL, TARGET + 4: 19})
+                self.assertEqual((mem[TARGET], mem[TARGET + 4], mem[OUT]),
+                                 (SENTINEL, stored_value, old_value))
+
     def test_buffer_atomic_32bit_alignment(self):
         # Measured natively on gfx1036 (wave32 & wave64): (addr & 3) != 0 drops the atomic;
         # active glc lane gets 0, inactive lane keeps vdata; base+2 + offset=2 -> aligned -> succeeds.

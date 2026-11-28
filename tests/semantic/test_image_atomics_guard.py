@@ -123,6 +123,11 @@ def find_guarded_texel_block(spv):
     # `if (%true)` there, which guards nothing because nothing can be inactive. Accept that constant, and
     # only that constant: a shader with an OpStore to %active still needs the lane mask to protect the access.
     exec_is_constant_true = not re.search(r"^\s*OpStore %active\b", spv, re.M)
+    # A tagged 3D view additionally requires a valid R32_UINT descriptor. In a shader
+    # with constant EXEC its predicate is (true && descriptor_ok). An EXEC-writing
+    # shader still has to derive its condition from the live lane mask.
+    folded_active_and = set(re.findall(
+        r"^\s*(%\w+) = OpLogicalAnd %bool (?:%true %\w+|%\w+ %true)$", spv, re.M))
     guarded_targets = set()
     for insns in blocks.values():
         for i, ln in enumerate(insns):
@@ -132,7 +137,7 @@ def find_guarded_texel_block(spv):
                 if not m:
                     continue
                 cond = m.group(1)
-                if (exec_is_constant_true and cond == "%true") or derived_from(spv, cond):
+                if (exec_is_constant_true and (cond == "%true" or cond in folded_active_and)) or derived_from(spv, cond):
                     guarded_targets.add(m.group(2))
     found = []
     for lbl, insns in blocks.items():
@@ -289,6 +294,23 @@ class ImageAtomicsGuardTests(unittest.TestCase):
         self.assertTrue(any("= OpAccessChain " in ln for ln in insns))
         self.assertTrue(any("= OpImageTexelPointer " in ln for ln in insns))
         self.assertTrue(any("= OpAtomicIAdd %uint " in ln for ln in insns))
+
+    def test_volume_descriptor_guard_keeps_dynamic_exec(self):
+        spv = translate([
+            "s_and_b32 exec_lo, exec_lo, s4",
+            "image_atomic_add v0, v[1:3], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_3D unorm",
+        ])
+        validate_spirv(spv)
+        self.assertEqual(len(find_guarded_texel_block(spv)), 1)
+        cond = texel_guard_condition(spv)
+        guard = re.search(rf"^[ \t]*{cond} = OpLogicalAnd %bool (%\w+) (%\w+)$", spv, re.M)
+        self.assertIsNotNone(guard)
+        active, descriptor_ok = guard.groups()
+        self.assertTrue(derived_from(spv, active))
+        self.assertFalse(derived_from(spv, descriptor_ok))
+        broken = spv.replace(guard[0], f"{cond} = OpLogicalAnd %bool %true {descriptor_ok}")
+        with self.assertRaisesRegex(AssertionError, "unguarded block"):
+            find_guarded_texel_block(broken)
 
     def test_image_atomic_inc_and_dec_cas_2d_3d_and_a16(self):
         cases = [

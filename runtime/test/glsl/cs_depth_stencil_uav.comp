@@ -1,0 +1,55 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+
+// The two T#s are passed as root constants in s4..s19, exactly as written by CreateUnorderedAccessView.
+layout(local_size_x = 1) in;
+layout(push_constant) uniform UserData { uint s[20]; } pc;
+layout(set = 0, binding = 2, std430) readonly buffer DescriptorMap { uint words[]; };
+#if defined(DEPTH16_ARRAY)
+layout(set = 0, binding = 12, r16ui) uniform uimage2DArray depths[];
+#elif defined(DEPTH16_2D)
+layout(set = 0, binding = 9, r16ui) uniform uimage2D depths[];
+#elif defined(DEPTH_STENCIL_ARRAY)
+layout(set = 0, binding = 11, r32f) uniform image2DArray depths[];
+layout(set = 0, binding = 12, r8ui) uniform uimage2DArray stencils[];
+#else
+layout(set = 0, binding = 8, r32f) uniform image2D depths[];
+layout(set = 0, binding = 9, r8ui) uniform uimage2D stencils[];
+#endif
+
+uint lookup(uint first) {
+    uint hash = 2166136261u;
+    for (uint i = 0; i < 8; ++i) hash = (hash ^ pc.s[first + i]) * 16777619u;
+    for (uint probe = 0; probe < 8; ++probe) {
+        uint slot = 1 + ((hash + probe) & words[0]) * 10;
+        bool equal = true;
+        for (uint i = 0; i < 8; ++i) equal = equal && words[slot + i] == pc.s[first + i];
+        if (equal) return words[slot + 8];
+    }
+    return 0;
+}
+
+void main() {
+    // Read before writing. A stale copy (or writing back the wrong plane) changes the expected bytes.
+    uint depth = lookup(4);
+#if defined(DEPTH16_2D) || defined(DEPTH16_ARRAY)
+#if defined(DEPTH16_2D)
+    ivec2 pixel = ivec2(2, 1);
+#else
+    ivec3 pixel = ivec3(2, 1, 1);
+#endif
+    uint before = imageLoad(depths[depth], pixel).r;
+    imageStore(depths[depth], pixel, uvec4(before ^ 0x1357u));
+#else
+    uint stencil = lookup(12);
+#if defined(DEPTH_STENCIL_ARRAY)
+    ivec3 depth_pixel = ivec3(2, 1, 0), stencil_pixel = ivec3(5, 3, 1);
+#else
+    ivec2 depth_pixel = ivec2(2, 1), stencil_pixel = ivec2(5, 3);
+#endif
+    float before = imageLoad(depths[depth], depth_pixel).r;
+    uint mask = imageLoad(stencils[stencil], stencil_pixel).r;
+    imageStore(depths[depth], depth_pixel, vec4(before * 0.25));
+    imageStore(stencils[stencil], stencil_pixel, uvec4(mask ^ 0xffu));
+#endif
+}

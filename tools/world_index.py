@@ -145,6 +145,12 @@ def _f32(b, o):
     return struct.unpack_from("<f", b, o)[0] if 0 <= o and o + 4 <= len(b) else 0.0
 
 
+def split_pointer(ref):
+    """(1-based block number, byte offset) of a pointer into the resource's own blocks: the low 20 bits are the
+    block number (0 = null), the bits above the byte offset in that block (docs/psin.md, docs/world.md)."""
+    return ref & 0xFFFFF, ref >> 20
+
+
 def _ptr(value, size):
     """Resolve a 0x5xxxxxxx pointer, the only segment a single carved system stream contains."""
     if value >> 28 != 5:
@@ -224,7 +230,7 @@ def _placement_tables(b, blocks, map_schema, entity_schema):
         if member is None:
             return ()
         ref, count, capacity = struct.unpack_from("<QHH", b, at + member[0])
-        number, offset = ref & 0xFFFFF, ref >> 20
+        number, offset = split_pointer(ref)
         if not count or count > capacity or not 1 <= number <= len(blocks):
             return ()
         kind, length, base = blocks[number - 1]

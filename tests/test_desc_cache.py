@@ -21,7 +21,13 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import rdna2spirv  # noqa: E402
 
-CALL = "OpFunctionCall %uint %desc_lookup_fn"
+LOOKUP_FN = "%desc_lookup_fn"   # the probe every image instruction calls
+
+
+def lookup_calls(text):
+    """How many descriptor lookups the module calls. The probe's result type depends on the table entry
+    layout (`--descriptor-table`: a plain module gets the index only, a tagged one index and kind)."""
+    return sum(1 for line in text.splitlines() if "OpFunctionCall" in line and LOOKUP_FN in line)
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 SAMPLE = "image_sample v[4:7], v[0:1], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D"
 LOAD = "image_load v[4:7], v[0:1], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm"
@@ -60,7 +66,7 @@ def translate(lines):
 
 
 def calls(*lines):
-    return translate(list(lines) + [EXP, "s_endpgm"]).count(CALL)
+    return lookup_calls(translate(list(lines) + [EXP, "s_endpgm"]))
 
 
 def test_one_lookup_per_descriptor():
@@ -128,13 +134,13 @@ def test_no_caching_inside_construct():
     # Back at top level of the block: a fresh lookup must be emitted, cached, and reused by a third lookup.
     assert g.desc_cache_ok()
     idx_outer = g.desc_lookup_sgpr(t_desc, 8)
-    assert idx_outer != idx_inner, "top-level lookup reused non-dominating id from inside construct"
+    assert idx_outer[0] != idx_inner[0], "top-level lookup reused non-dominating id from inside construct"
     assert g.desc_cache == {(8, 8): idx_outer}
     assert g.desc_lookup_sgpr(t_desc, 8) == idx_outer
-    g.store_reg("sgpr", 20, idx_outer)  # use the post-merge id so dominance is checked by spirv-val
+    g.store_reg("sgpr", 20, idx_outer[0])  # use the post-merge id so dominance is checked by spirv-val
 
     asm = rdna2spirv.assemble(g)
-    assert asm.count(CALL) == 2, asm.count(CALL)
+    assert lookup_calls(asm) == 2, lookup_calls(asm)
     if shutil.which("spirv-as") and shutil.which("spirv-val"):
         with tempfile.TemporaryDirectory() as tmp:
             sa = os.path.join(tmp, "dom.spvasm")
@@ -153,7 +159,9 @@ def test_desc_probe_defers_index_load_to_hit_block():
     # on non-matching probes and misses.
     asm = translate([SAMPLE, EXP, "s_endpgm"])
     lines = [l.strip() for l in asm.splitlines()]
-    fn_idx = lines.index("%desc_lookup_fn = OpFunction %uint None %fn_desc_lookup")
+    # The probe's result type follows the table entry layout (`--descriptor-table`): index only, or index
+    # and kind.
+    fn_idx = next(i for i, line in enumerate(lines) if line.startswith("%desc_lookup_fn = OpFunction"))
     end_idx = lines.index("OpFunctionEnd", fn_idx)
     fn_lines = lines[fn_idx:end_idx]
 
@@ -177,7 +185,9 @@ def test_desc_probe_breaks_directly_with_dont_unroll():
     # Breaking directly to %dl_end with DontUnroll keeps the loop compact while giving %dl_end a distinct exit phi.
     asm = translate([LOAD, EXP, "s_endpgm"])
     lines = [l.strip() for l in asm.splitlines()]
-    fn_idx = lines.index("%desc_lookup_fn = OpFunction %uint None %fn_desc_lookup")
+    # The probe's result type follows the table entry layout (`--descriptor-table`): index only, or index
+    # and kind.
+    fn_idx = next(i for i, line in enumerate(lines) if line.startswith("%desc_lookup_fn = OpFunction"))
     end_idx = lines.index("OpFunctionEnd", fn_idx)
     fn_lines = lines[fn_idx:end_idx]
 
@@ -186,7 +196,7 @@ def test_desc_probe_breaks_directly_with_dont_unroll():
     next_idx = fn_lines.index("%dl_next = OpLabel")
     hit_block = fn_lines[hit_idx:next_idx]
     assert hit_block[-1] == "OpBranch %dl_end", hit_block
-    assert not any("OpStore %dl_k" in l for l in hit_block), hit_block
+    assert not any(l.startswith("OpStore %dl_k ") for l in hit_block), hit_block   # the loop counter, not %dl_kind
 
     import spirv_asm
     spv_bytes = spirv_asm.assemble(asm)
@@ -214,7 +224,7 @@ def test_lookup_result_is_broadcast_before_use():
     # result goes through OpGroupNonUniformBroadcastFirst, and only the broadcast id indexes the descriptor arrays.
     asm = translate([SAMPLE, LOAD, EXP, "s_endpgm"])
     lines = [ln.strip() for ln in asm.splitlines()]
-    results = {ln.split()[0] for ln in lines if CALL in ln}
+    results = {ln.split()[0] for ln in lines if "OpFunctionCall" in ln and LOOKUP_FN in ln}
     bcast = {}
     for ln in lines:
         if "OpGroupNonUniformBroadcastFirst" in ln:
@@ -223,7 +233,13 @@ def test_lookup_result_is_broadcast_before_use():
             # a wave32 pixel shader in a 64-lane subgroup takes its own half's first lane with a shuffle (SHADER-731,
             # #4225; docs/design.md "Execution model")
             bcast[ln.split()[0]] = ln.split()[-2]
-    assert results and sorted(bcast.values()) == sorted(results), (results, bcast)
+    extracts = {ln.split()[0]: ln.split()[-2] for ln in lines
+                if "OpCompositeExtract %uint" in ln and ln.split()[-2] in results}
+    # A tagged entry returns (index, kind): each component is broadcast before use, so a broadcast reads the
+    # call or an extract of it.
+    assert results and bcast, (results, bcast)
+    assert all(src in results or extracts.get(src) in results for src in bcast.values()), \
+        (results, extracts, bcast)
     assert "OpCapability GroupNonUniform" in lines
     assert "OpCapability GroupNonUniformBallot" in lines or "OpCapability GroupNonUniformShuffle" in lines
     for ln in lines:

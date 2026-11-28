@@ -10,6 +10,7 @@
 #include <initializer_list>
 #include <vector>
 #include "predicated_copy_spv.h"
+#include "vulkan_aftermath.h"
 namespace leonida {
 struct PredicatedCopyDispatch {
     VkDescriptorSet set = VK_NULL_HANDLE;
@@ -128,6 +129,7 @@ private:
         ok = ok && fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(device_, &layout_info, nullptr, &layout) == VK_SUCCESS;
         VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         module.codeSize = sizeof(predicated_copy_spirv); module.pCode = predicated_copy_spirv;
+        const aftermath::ShaderName aftermath_name("(runtime) predicated_copy");
         ok = ok && fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(device_, &module, nullptr, &shader) == VK_SUCCESS;
         VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};

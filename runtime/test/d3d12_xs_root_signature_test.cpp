@@ -268,6 +268,62 @@ void test_version_1_2(SerializeFn serialize, DeserializeFn deserialize, ID3D12De
     std::puts("PASS root signature 1.2 serialization, versioned reflection, and legacy comparison");
 }
 
+void check_directly_indexed_flags(SerializeFn serialize, DeserializeFn deserialize, ID3D12Device& device,
+                                  D3D_ROOT_SIGNATURE_VERSION version) {
+    D3D12_ROOT_PARAMETER constants{};
+    constants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    constants.Constants = {0, 0, 2};
+    D3D12_ROOT_PARAMETER1 constants1{};
+    constants1.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    constants1.Constants = {0, 0, 2};
+    const auto flags = static_cast<UINT>(D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) |
+                       static_cast<UINT>(D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED);
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
+    desc.Version = version;
+    if (version == D3D_ROOT_SIGNATURE_VERSION_1_0)
+        desc.Desc_1_0 = {1, &constants, 0, nullptr, static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags)};
+    else
+        desc.Desc_1_1 = {1, &constants1, 0, nullptr, static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(flags)};
+
+    // The in-box serializer of Windows 10 refuses these bits; Windows 11 takes them. Either way the shim must hand
+    // back a blob that still carries them.
+    ComPtr<ID3DBlob> direct, direct_error, shim, shim_error;
+    const HRESULT direct_hr = D3D12SerializeVersionedRootSignature(&desc, &direct, &direct_error);
+    const HRESULT shim_hr = serialize(&desc, &shim, &shim_error);
+    require_success(shim_hr, "serialize directly indexed flags via shim");
+    require(shim != nullptr && shim_error == nullptr, "shim returns a blob and no error");
+    if (SUCCEEDED(direct_hr)) {
+        // A host that takes the flags itself gets its own blob back unchanged.
+        require(direct != nullptr && direct->GetBufferSize() == shim->GetBufferSize() &&
+                std::memcmp(direct->GetBufferPointer(), shim->GetBufferPointer(), shim->GetBufferSize()) == 0,
+                "a host that takes the flags gets its blob back");
+        std::printf("PASS host accepts directly indexed flags (version %d)\n", static_cast<int>(version));
+    } else {
+        require(direct_error != nullptr, "the refusing host reports why");
+        std::printf("PASS host refuses directly indexed flags (version %d, 0x%08lX); shim retried\n",
+                    static_cast<int>(version), static_cast<unsigned long>(direct_hr));
+    }
+
+    const void* data = shim->GetBufferPointer();
+    const SIZE_T size = shim->GetBufferSize();
+    ComPtr<ID3D12RootSignatureDeserializer> layout;
+    require_success(D3D12CreateRootSignatureDeserializer(data, size, IID_PPV_ARGS(&layout)),
+                    "deserialize directly indexed blob");
+    require((static_cast<UINT>(layout->GetRootSignatureDesc()->Flags) & flags) == flags,
+            "directly indexed flags survive in the blob");
+
+    ComPtr<ID3D12RootSignatureDeserializer> shim_layout;
+    require_success(deserialize(data, size, IID_PPV_ARGS(&shim_layout)), "deserialize directly indexed via shim");
+    require((static_cast<UINT>(shim_layout->GetRootSignatureDesc()->Flags) & flags) == flags,
+            "directly indexed flags survive the shim deserializer");
+
+    ComPtr<ID3D12RootSignature> signature;
+    require_success(device.CreateRootSignature(0, data, size, IID_PPV_ARGS(&signature)),
+                    "create WARP directly indexed root signature");
+    require(signature != nullptr, "WARP returned a directly indexed root signature");
+    std::puts("PASS directly indexed flags survive serialization and are accepted by the device");
+}
+
 }  // namespace
 
 int main() {
@@ -292,6 +348,8 @@ int main() {
         test_version_1_0(serialize, deserialize, *device.Get());
         test_version_1_1(serialize, deserialize, *device.Get());
         test_version_1_2(serialize, deserialize, *device.Get());
+        check_directly_indexed_flags(serialize, deserialize, *device.Get(), D3D_ROOT_SIGNATURE_VERSION_1_0);
+        check_directly_indexed_flags(serialize, deserialize, *device.Get(), D3D_ROOT_SIGNATURE_VERSION_1_1);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL %s\n", error.what());
         return 1;

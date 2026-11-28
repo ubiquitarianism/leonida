@@ -1,0 +1,20 @@
+GPU:        NVIDIA GeForce RTX 4070 SUPER (Ada / AD104, PCI 10de:2783), subgroup 32..32
+Driver:     NVIDIA 591.86 (proprietary, Windows), Vulkan SDK 1.4.363.0
+Subgroup:   32..32
+OS:         Windows 11 Pro 10.0.26200
+Commit:     b4b7756e8c64e7ae8b310288d543db0e428c0796 (main, 2026-11-25)
+Tools:      llvm-mc 21.1.8 (AMDGPU target), SPIRV-Tools v2026.4,
+            CMake 4.4.4 + Ninja 1.13.2, MSVC, Python 3.13.0
+run_gpu_tests.py: 265 shaders: 265 translated, 265 pass spirv-val
+            native:                 207/256 passed, 49 skipped, 0 failed
+            LEONIDA_W64_EMULATE=1:  239/256 passed, 17 skipped, 0 failed
+Failed:     None.
+Skipped:    Native: 32 wave64 compute/mesh cases, one 64-wide fragment case,
+            and 16 cases handled by separate test executables or scripts.
+            Emulated: the same fragment case and 16 separate cases.
+Notes:
+- Built with scripts\build_runtime.ps1 on Windows.
+- Both cs_imgload_tfe and cs_imgload_d16_tfe pass in both modes.
+- Wave64 graphics tier A: 1, tier C: 1 (tier C is not exact).
+- AI-assisted (ChatGPT): setup guidance and preparation of this report
+  from locally executed tests. No game files used.

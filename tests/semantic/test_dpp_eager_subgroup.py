@@ -17,6 +17,7 @@ too, by running the translated DPP in tests/semantic/spirv_wave_interp.py.
 Standard library only; no GPU, no LLVM, no SPIRV-Tools, no game files.
 """
 import os
+import re
 import sys
 import unittest
 
@@ -181,6 +182,19 @@ class DppSubgroupOpsRunInEveryLane(unittest.TestCase):
                     spv = dpp_vs(form, exec_off)
                     self.assertIn("OpGroupNonUniformShuffle", spv)
                     self.assertEqual(conditional_subgroup_ops(spv), [])
+
+    def test_fi0_shuffle_index_is_ballot_safe(self):
+        # Lane 6 reads lane 7; in a seven-invocation wave that source is absent, so FI=0 must redirect it before
+        # the shuffle. Masking an undefined shuffle result afterwards is not enough (SHADER-DPP-ABSENT-SOURCE).
+        spv = dpp_vs("quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:1")
+        ballot_bits = set(re.findall(r'(%\w+)\s*=\s*OpGroupNonUniformBallotBitExtract\b', spv))
+        safe_lanes = set()
+        for m in re.finditer(r'(%\w+)\s*=\s*OpSelect\s+%uint\s+(%\w+)\s+(%\w+)\s+(%\w+)', spv):
+            if m.group(2) in ballot_bits:
+                safe_lanes.add(m.group(1))
+        shuffles = re.findall(r'OpGroupNonUniformShuffle\s+%uint\s+%c3\s+%\w+\s+(%\w+)', spv)
+        self.assertEqual(len(shuffles), 1)
+        self.assertIn(shuffles[0], safe_lanes)
 
     def test_values(self):
         for form in DPP_FORMS:

@@ -269,6 +269,37 @@ void test_legacy_entry_point() {
     Blobs blobs;
     HRESULT hr = D3D12SerializeRootSignature(&cleared, D3D_ROOT_SIGNATURE_VERSION_1_0, &blobs.blob, &blobs.error);
     check(SUCCEEDED(hr), "legacy copy with cleared flags is accepted by the PC serializer");
+
+    // The directly indexed bits meet a host that refuses them even at flags 0: the shim retries without them and
+    // puts them back in the blob. Reached through the registry, since the name above is the host import.
+    using LegacyFn = HRESULT(WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**,
+                                      ID3DBlob**);
+    const auto legacy =
+        reinterpret_cast<LegacyFn>(rt::shims::find("d3d12_xs.dll", "D3D12SerializeRootSignature"));
+    check(legacy != nullptr, "the legacy shim is reachable");
+    D3D12_ROOT_SIGNATURE_DESC indexed = make_legacy_desc(rt::d3d12_xs::kDirectlyIndexedFlags);
+    Blobs retried;
+    hr = legacy ? legacy(&indexed, D3D_ROOT_SIGNATURE_VERSION_1_0, &retried.blob, &retried.error) : E_FAIL;
+    check(SUCCEEDED(hr) && retried.blob != nullptr, "legacy shim serializes with the directly indexed flags");
+    check(indexed.Flags == static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(rt::d3d12_xs::kDirectlyIndexedFlags),
+          "legacy original keeps the directly indexed flags");
+    if (retried.blob) {
+        const uint8_t* bytes = static_cast<const uint8_t*>(retried.blob->GetBufferPointer());
+        const SIZE_T size = retried.blob->GetBufferSize();
+        uint32_t chunk_count = 0;
+        std::memcpy(&chunk_count, bytes + 28, sizeof(chunk_count));
+        bool kept = false;
+        for (uint32_t i = 0; i < chunk_count; ++i) {
+            uint32_t off = 0;
+            std::memcpy(&off, bytes + 32 + i * 4, sizeof(off));
+            if (off > size || size - off < 8 + 24) continue;
+            if (std::memcmp(bytes + off, "RTS0", 4) != 0) continue;
+            uint32_t flags = 0;
+            std::memcpy(&flags, bytes + off + 8 + 20, sizeof(flags));
+            kept = flags == rt::d3d12_xs::kDirectlyIndexedFlags;
+        }
+        check(kept, "the directly indexed flags are back in the legacy RTS0 chunk");
+    }
 }
 
 void test_preserves_low_bits_and_unknown_versions() {

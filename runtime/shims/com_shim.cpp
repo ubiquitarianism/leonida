@@ -1,7 +1,8 @@
 // COM lifecycle and helper shims for api-ms-win-core-com-l1-1-0..3.dll.
 //
 // game_scarlett_master.exe imports CoInitializeEx, CoUninitialize, CoCreateInstance, CoCreateGuid, CoTaskMemFree,
-// PropVariantClear, and StringFromGUID2 through api-ms-win-core-com-l1-1-0.dll. When the host (or a host library) has
+// PropVariantClear, and StringFromGUID2 through api-ms-win-core-com-l1-1-0.dll. CoCreateInstance of the
+// MMDeviceEnumerator goes to silent_audio.cpp, which serves a silent output endpoint when the host has none. When the host (or a host library) has
 // already initialized a thread as STA, a guest call to CoInitializeEx(nullptr, COINIT_MULTITHREADED) fails with
 // RPC_E_CHANGED_MODE (0x80010106) and an unbalanced CoUninitialize can tear down host COM early.
 //
@@ -15,6 +16,7 @@
 #include <new>
 
 #include "shims.h"
+#include "silent_audio.h"
 
 namespace rt::com_shim {
 namespace {
@@ -88,7 +90,13 @@ HRESULT WINAPI co_initialize_ex(LPVOID reserved, DWORD coinit) {
         created->requested_coinit = coinit;
         created->host_coinit = owned_mode;
         created->mismatch_absorbed = absorbed;
-        TlsSetValue(slot, created);
+        if (!TlsSetValue(slot, created)) {
+            // Not tracked, so no CoUninitialize would ever give the host reference back: undo it and fail.
+            const DWORD error = GetLastError();
+            delete created;
+            ::CoUninitialize();
+            return HRESULT_FROM_WIN32(error ? error : ERROR_NOT_ENOUGH_MEMORY);
+        }
         return S_OK;
     }
 
@@ -116,18 +124,29 @@ void WINAPI co_uninitialize() {
     if (!state || state->guest_depth == 0) return;
 
     --state->guest_depth;
-    if (state->guest_depth == 0) {
-        for (uint32_t i = 0; i < state->host_inits_owned; ++i) {
+    if (state->guest_depth != 0) {
+        // A nested init took its own host reference: give it back now, not at the outermost CoUninitialize, so balanced
+        // inner pairs do not pile up host references. The first init's reference stays until the guest balances.
+        if (state->host_inits_owned > 1) {
             ::CoUninitialize();
+            --state->host_inits_owned;
         }
-        TlsSetValue(slot, nullptr);
-        delete state;
+        return;
     }
+    for (uint32_t i = 0; i < state->host_inits_owned; ++i) {
+        ::CoUninitialize();
+    }
+    TlsSetValue(slot, nullptr);
+    delete state;
 }
 
 HRESULT WINAPI co_create_instance(REFCLSID rclsid, LPUNKNOWN outer, DWORD cls_context, REFIID riid, LPVOID* ppv) {
     if (!ppv) return E_POINTER;
     *ppv = nullptr;
+    // The audio device enumerator: the host's when it has an output, else (or with LEONIDA_AUDIO=silent) one that
+    // also answers with the silent output endpoint (silent_audio.h).
+    if (!outer && IsEqualCLSID(rclsid, rt::silent_audio::kClsidMMDeviceEnumerator))
+        return rt::silent_audio::create_enumerator(cls_context, riid, ppv);
     return ::CoCreateInstance(rclsid, outer, cls_context, riid, ppv);
 }
 

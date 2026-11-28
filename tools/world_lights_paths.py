@@ -138,10 +138,11 @@ class Meta:
         return None if m is None else m[0]
 
     def ref(self, v):
-        """Resolve a pointer: a pool reference (1-based block number in bits 0..11, byte offset from bit 20),
-        or a 0x5xxxxxxx system pointer. Returns (block struct hash or None, offset) or None."""
-        bi, off = v & 0xFFF, v >> 20
-        if (v >> 12) & 0xFF == 0 and 1 <= bi <= len(self.blocks):
+        """Resolve a pointer: a pool reference (1-based block number in bits 0..19, byte offset from bit 20,
+        world_index.split_pointer), or a 0x5xxxxxxx system pointer. Returns (block struct hash or None, offset) or
+        None."""
+        bi, off = WI.split_pointer(v)
+        if 1 <= bi <= len(self.blocks):
             name, size, base = self.blocks[bi - 1]
             if base is not None and off < size:
                 # A pool offset of 0x500..0x5ff makes the value look like a 0x5xxxxxxx pointer as well.

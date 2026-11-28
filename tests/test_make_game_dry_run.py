@@ -39,7 +39,8 @@ class DryRunFlagsTest(unittest.TestCase):
         argv = ["make_game.py", "--game", self.game_dir, "--check"]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
-                mock.patch("make_game.check", return_value=dummy_version) as mock_check, \
+                mock.patch("make_game.load_version", return_value=dummy_version) as load_version, \
+                mock.patch("make_game.py") as run_tool, \
                 mock.patch("make_game.preflight") as mock_preflight, \
                 mock.patch("make_game.shaders") as mock_shaders, \
                 mock.patch("make_game.assets") as mock_assets, \
@@ -48,7 +49,8 @@ class DryRunFlagsTest(unittest.TestCase):
                 mock.patch("make_game.log"):
             ret = make_game.main()
             self.assertEqual(ret, 0)
-            mock_check.assert_called_once_with(os.path.abspath(self.game_dir), False)
+            load_version.assert_called_once_with(os.path.abspath(self.game_dir))
+            run_tool.assert_not_called()
             mock_preflight.assert_not_called()
             mock_shaders.assert_not_called()
             mock_assets.assert_not_called()
@@ -57,7 +59,7 @@ class DryRunFlagsTest(unittest.TestCase):
             self.assertFalse(os.path.exists(self.out_dir))
             self.assertFalse(os.path.exists(self.work_dir))
 
-    def test_dry_run_full_check_passes_full_flag_and_halts_before_build(self) -> None:
+    def test_full_check_forwards_hash_jobs_and_halts_before_build(self) -> None:
         dummy_version = {
             "title": "Grand Theft Auto VI",
             "version": "1.0.2.1",
@@ -65,23 +67,21 @@ class DryRunFlagsTest(unittest.TestCase):
             "expected_exe": "game_scarlett_master.exe",
         }
         argv = ["make_game.py", "--game", self.game_dir, "--check", "--full-check"]
-        with mock.patch.object(sys, "argv", argv), \
-                mock.patch("make_game.below_normal"), \
-                mock.patch("make_game.check", return_value=dummy_version) as mock_check, \
-                mock.patch("make_game.preflight") as mock_preflight, \
-                mock.patch("make_game.shaders") as mock_shaders, \
-                mock.patch("make_game.assets") as mock_assets, \
-                mock.patch("make_game.runtime") as mock_runtime, \
-                mock.patch("make_game.pipelines") as mock_pipelines, \
-                mock.patch("make_game.log"):
-            ret = make_game.main()
-            self.assertEqual(ret, 0)
-            mock_check.assert_called_once_with(os.path.abspath(self.game_dir), True)
-            mock_preflight.assert_not_called()
-            mock_shaders.assert_not_called()
-            mock_assets.assert_not_called()
-            mock_runtime.assert_not_called()
-            mock_pipelines.assert_not_called()
+        manifest = os.path.join(make_game.VERSIONS, "xbox-1.0.2.1.json")
+        for args, workers in ((["--jobs", "1"], 1), ([], 4), (["--jobs", "20"], 8)):
+            with self.subTest(args=args), \
+                    mock.patch.object(sys, "argv", argv + args), \
+                    mock.patch("make_game.os.cpu_count", return_value=8), \
+                    mock.patch("make_game.below_normal"), \
+                    mock.patch("make_game.load_version", return_value=dummy_version), \
+                    mock.patch("make_game.py") as run_tool, \
+                    mock.patch("make_game.preflight") as preflight, \
+                    mock.patch("make_game.run_build_stages") as build:
+                self.assertEqual(make_game.main(), 0)
+                run_tool.assert_called_once_with("manifest.py", "verify", self.game_dir,
+                                                 "--manifest", manifest, "--jobs", str(workers))
+                preflight.assert_not_called()
+                build.assert_not_called()
 
     def test_dry_run_check_failure_aborts_immediately_without_side_effects(self) -> None:
         argv = ["make_game.py", "--game", self.game_dir, "--check"]

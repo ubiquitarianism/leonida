@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import zlib
 
 # `python -I` implies `-P`, so the script's directory is not on sys.path; the sibling modules are next to it.
@@ -16,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 import bcpack
 import bcpack_tables
+import replace_retry
 import ttpf_mips as ttpf
 
 
@@ -420,6 +422,34 @@ def local_bc3(symbols, profile):
     return np.column_stack((low, high)).astype("<u8").tobytes()
 
 
+def _rename_no_clobber(src, dst, *, seconds=None):
+    """Atomically move src to dst on Windows without overwriting, retrying transient sharing locks."""
+    deadline = time.monotonic() + (replace_retry.RETRY_SECONDS if seconds is None else seconds)
+    delay = replace_retry.FIRST_DELAY
+    while True:
+        try:
+            return os.rename(src, dst)
+        except PermissionError as e:
+            if not replace_retry._transient(e) or time.monotonic() >= deadline:
+                raise
+        time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+        delay = min(delay * 2, replace_retry.MAX_DELAY)
+
+
+def _move_no_clobber(src, dst, *, is_nt=None):
+    """Move src to dst without overwriting dst, raising FileExistsError if dst exists.
+
+    On Windows, os.rename wraps MoveFileExW without MOVEFILE_REPLACE_EXISTING, which is an atomic
+    kernel operation that raises FileExistsError ([WinError 183]) if dst exists.
+    On POSIX, os.link atomically creates a hard link and raises FileExistsError (EEXIST) if dst exists.
+    If os.link fails for reasons other than destination existence, fail safely by re-raising the
+    original exception without non-atomic fallbacks, strictly preventing TOCTOU clobbering.
+    """
+    if os.name == "nt" if is_nt is None else is_nt:
+        return _rename_no_clobber(src, dst)
+    return os.link(src, dst)
+
+
 def export_file(pool, index, target, mips, force, profile):
     target = Path(target)
     with open(profile, encoding="utf-8") as source:
@@ -431,13 +461,12 @@ def export_file(pool, index, target, mips, force, profile):
     with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as f:
         tmp = Path(f.name)
         try:
-            f.write(data)
-            f.close()
+            with f:
+                f.write(data)
             if force:
-                os.replace(tmp, target)
+                replace_retry.replace(tmp, target)
             else:
-                os.link(tmp, target)
+                _move_no_clobber(tmp, target)
         finally:
-            f.close()
             tmp.unlink(missing_ok=True)
     return 0

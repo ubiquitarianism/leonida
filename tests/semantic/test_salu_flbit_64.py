@@ -123,9 +123,10 @@ class Flbit64Tests(unittest.TestCase):
         self.assertEqual(run_lines(["s_flbit_i32_b64 s0, 1"])[0], 63)
         self.assertEqual(run_lines(["s_flbit_i32_i64 s0, -1"])[0], M32)
 
-    def test_lane_mask_source_is_rejected(self):
+    # b64 of a lane mask in wave64 reads the whole wave's mask: tests/semantic/test_lane_mask_bitreplicate_flbit.py.
+    def test_signed_lane_mask_source_is_rejected(self):
         with self.assertRaises(rdna2spirv.Unsupported):
-            run_lines(["s_flbit_i32_b64 s0, exec"])
+            run_lines(["s_flbit_i32_i64 s0, exec"])
 
 
 if __name__ == "__main__":

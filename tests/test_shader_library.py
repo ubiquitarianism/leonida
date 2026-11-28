@@ -13,11 +13,13 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import shader_disasm  # noqa: E402
 import shader_library as sl  # noqa: E402
 import shader_meta  # noqa: E402
 
@@ -388,6 +390,129 @@ class Main(unittest.TestCase):
             self.assertIn("fspx_code_sha256", meta)
             self.assertNotIn("fspx_state_sha256", meta)
 
+    def two_state_library(self):
+        """Program 0 with three state blobs, two of them the same bytes, and once without a state; program 1 with one
+        of those blobs; program 2 in a graphics pipeline. Returns (library, the two distinct states, program 0)."""
+        first, second = kind0(), kind0(threads=(32, 1, 1))
+        code = prog(3)
+        compute = [(0, NONE, 0, NONE), (1, NONE, 0, NONE), (2, NONE, 0, NONE), (NONE, NONE, 0, NONE),
+                   (1, NONE, 1, NONE)]
+        lib = build([(NONE, NONE, {0: (2, 3)})], compute, [first, second, first, layout_blob(2, D_PS)],
+                    [code, prog(4), prog(5)])
+        return lib, (first, second), code
+
+    # The entries of that library's compute programs: program 0, its second state (blob 1) and program 1.
+    TWO_STATE_NAMES = [sl.program_name(0, {"cs"}), sl.program_name(0, {"cs"}) + "_state_1", sl.program_name(1, {"cs"})]
+
+    def test_program_with_two_states_gets_an_entry_for_each(self):
+        lib, (first, second), code = self.two_state_library()
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(lib)
+            out = os.path.join(tmp, "out")
+            # A further state is an output like any other: --save must not name it.
+            names = self.TWO_STATE_NAMES
+            self.assert_save_overlap(src, out, os.path.join(out, "fspx", names[1] + ".state"), "--stages", "cs")
+            self.assertFalse(os.path.exists(out))
+            rc, text = self.run_main(src, "--out", out, "--stages", "cs")
+            self.assertEqual(rc, 0)
+            self.assertIn("3 written", text)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                index = json.load(f)
+            self.assertEqual([(e["file"], e["program"], e["threads"]) for e in index],
+                             [(names[0] + ".dxbc", 0, [8, 8, 1]), (names[1] + ".dxbc", 0, [32, 1, 1]),
+                              (names[2] + ".dxbc", 1, [32, 1, 1])])
+            self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
+                             sorted(n + ext for n in names for ext in (".code", ".json", ".state")))
+            for name, state in zip(names, (first, second, second)):
+                with open(os.path.join(out, "fspx", name + ".state"), "rb") as f:
+                    self.assertEqual(f.read(), state)
+            for name in names[:2]:
+                with open(os.path.join(out, "fspx", name + ".code"), "rb") as f:
+                    self.assertEqual(f.read(), code)
+            # Both entries of program 0 have its code key, and each its own state key.
+            metas = [shader_meta.collect(os.path.join(out, "disasm", n + ".s"), n, [[]], [[]]) for n in names[:2]]
+            self.assertEqual({m["fspx_code_sha256"] for m in metas}, {hashlib.sha256(code).hexdigest()})
+            self.assertEqual([m["fspx_state_sha256"] for m in metas],
+                             [hashlib.sha256(first).hexdigest(), hashlib.sha256(second).hexdigest()])
+            # Every record names the entry with its state; the one without a state names the program.
+            with open(os.path.join(out, "library.json"), encoding="utf-8") as f:
+                self.assertEqual([c["program"] for c in json.load(f)["compute"]],
+                                 [names[0], names[1], names[0], names[0], names[2]])
+
+    def test_compute_hashes_select_programs_by_their_code(self):
+        lib, (first, second), code = self.two_state_library()
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(lib)
+            hashes = os.path.join(tmp, "hashes.txt")
+            with open(hashes, "w", encoding="utf-8", newline="\n") as f:
+                f.write("\n " + hashlib.sha256(code).hexdigest().upper() + "\n\n")
+            out = os.path.join(tmp, "out")
+            names = self.TWO_STATE_NAMES[:2]
+            self.assert_save_overlap(src, out, os.path.join(out, "fspx", names[1] + ".code"),
+                                     "--compute-hashes", hashes)
+            self.assertFalse(os.path.exists(out))
+            rc, text = self.run_main(src, "--out", out, "--compute-hashes", hashes)
+            self.assertEqual(rc, 0)
+            self.assertIn("2 written", text)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                self.assertEqual([e["file"] for e in json.load(f)], [n + ".dxbc" for n in names])
+            self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
+                             sorted(n + ext for n in names for ext in (".code", ".json", ".state")))
+            for name, state in zip(names, (first, second)):
+                with open(os.path.join(out, "fspx", name + ".state"), "rb") as f:
+                    self.assertEqual(f.read(), state)
+            # The tables are the library's, whatever was selected.
+            with open(os.path.join(out, "library.json"), encoding="utf-8") as f:
+                summary = json.load(f)
+            self.assertEqual([c["program"] for c in summary["compute"]],
+                             [names[0], names[1], names[0], names[0], self.TWO_STATE_NAMES[2]])
+            self.assertEqual(summary["graphics"][0]["stages"], {"ps": sl.program_name(2, {"ps"})})
+
+    def test_compute_hashes_are_checked_before_anything_is_written(self):
+        lib, _, code = self.two_state_library()
+        digest = hashlib.sha256(code).hexdigest()
+        pixel = hashlib.sha256(sl.program(lib, sl.parse(lib), 2)).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(lib)
+            out = os.path.join(tmp, "out")
+            listed = os.path.join(tmp, "hashes.txt")
+
+            def usage_error(text, *args):
+                with open(listed, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+                    self.run_main(src, *args)
+                self.assertEqual(caught.exception.code, 2)
+                return err.getvalue()
+
+            self.assertIn("not allowed with", usage_error(digest, "--out", out, "--stages", "cs",
+                                                          "--compute-hashes", listed))
+            self.assertIn("--compute-hashes needs --out", usage_error(digest, "--save", os.path.join(tmp, "l.bin"),
+                                                                      "--compute-hashes", listed))
+            for text in ("", "\n", digest[:-1], digest + " not-a-digest", "0x" + digest):
+                with self.subTest(text=text):
+                    self.assertIn("cannot read --compute-hashes", usage_error(text, "--out", out,
+                                                                              "--compute-hashes", listed))
+            self.assertIn("cannot read --compute-hashes",
+                          usage_error(digest, "--out", out, "--compute-hashes", os.path.join(tmp, "missing.txt")))
+            # A digest no compute program has, here an unknown one and a pixel program's.
+            for text in (digest + "\n" + "0" * 64, pixel):
+                with self.subTest(text=text):
+                    with open(listed, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(text)
+                    with self.assertRaises(sl.LibraryError) as caught:
+                        self.run_main(src, "--out", out, "--compute-hashes", listed)
+                    self.assertIn("match no compute program", str(caught.exception))
+            self.assertFalse(os.path.exists(out))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "l.bin")))
+
     def test_same_code_with_distinct_states_gets_distinct_state_keys(self):
         code = prog(0x44556677)
         s_a, s_b = kind0(threads=(32, 1, 1)), kind0(threads=(64, 1, 1))
@@ -405,6 +530,29 @@ class Main(unittest.TestCase):
             self.assertEqual({m["fspx_code_sha256"] for m in metas}, {hashlib.sha256(code).hexdigest()})
             self.assertEqual([m["fspx_state_sha256"] for m in metas],
                              [hashlib.sha256(s_a).hexdigest(), hashlib.sha256(s_b).hexdigest()])
+
+    def test_compute_hash_filter_keeps_distinct_states(self):
+        first, second = kind0(), kind0(threads=(32, 1, 1))
+        code = prog(3)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(build([], [(i, NONE, 0, NONE) for i in range(3)] + [(0, NONE, 1, NONE)],
+                              [first, second, first], [code, prog(4)]))
+            hashes = os.path.join(tmp, "hashes.txt")
+            with open(hashes, "w", encoding="utf-8", newline="\n") as f:
+                f.write(hashlib.sha256(code).hexdigest() + "\n")
+            out = os.path.join(tmp, "out")
+            rc, _ = self.run_main(src, "--out", out, "--compute-hashes", hashes)
+            self.assertEqual(rc, 0)
+            names = ["lib_cs_00000", "lib_cs_00000_state_1"]
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                self.assertEqual([e["file"] for e in json.load(f)], [n + ".dxbc" for n in names])
+            for name, state in zip(names, (first, second)):
+                with open(os.path.join(out, "fspx", name + ".state"), "rb") as f:
+                    self.assertEqual(f.read(), state)
+            with open(os.path.join(out, "library.json"), encoding="utf-8") as f:
+                self.assertEqual([e["program"] for e in json.load(f)["compute"][:3]], [*names, names[0]])
 
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -566,6 +714,45 @@ class Main(unittest.TestCase):
             self.assertIn("1 of 4 named by a carved shader's HASH digest, 3 not in the carve, "
                           "1 unreadable/corrupt container\n", stdout.getvalue())
             self.assertEqual(stderr.getvalue().splitlines(), ["carve: ZERO.dxbc: not a DXBC container"])
+
+    def test_disasm_auto_falls_back_per_program_without_regressing_clean_programs(self):
+        ps_prog = prog(0x11112222)
+        vs_body = bytes.fromhex("02 1a 28 f4 00 00 00 fa") + ENDPGM
+        vs_code = prologue(0x33334444) + vs_body
+        vs_prog = vs_code + CODE_END * ((-len(vs_code)) % 256 // 4)
+        blobs = [layout_blob(2, D_PS), layout_blob(2, D_VS)]
+        graphics = [(NONE, NONE, {0: (0, 0), 1: (1, 1)})]
+        lib_bytes = build(graphics, [], blobs, [ps_prog, vs_prog])
+
+        def fake_run_mc(code, mcpu, wave32=True):
+            if code == V_MOV * 2 + ENDPGM:
+                return "\t; mocked llvm-mc ps\n\ts_endpgm\n", 0, ""
+            return "\ts_endpgm\n", 2, "<stdin>:1:1: warning: invalid instruction encoding\n"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(lib_bytes)
+            out = os.path.join(tmp, "out")
+            with mock.patch.object(shader_disasm, "probe") as probe_mock, \
+                 mock.patch.object(shader_disasm, "run_mc", side_effect=fake_run_mc):
+                rc, _ = self.run_main(src, "--out", out, "--disasm", "--jobs", "1")
+            self.assertEqual(rc, 0)
+            probe_mock.assert_called_once_with("gfx1013")
+            with open(os.path.join(out, "disasm", "lib_ps_00000.s"), encoding="utf-8") as f:
+                ps_text = f.read()
+            self.assertIn("; mocked llvm-mc ps", ps_text)
+            self.assertIn("0 invalid words", ps_text)
+            self.assertNotIn("; --- llvm-mc messages ---", ps_text)
+            with open(os.path.join(out, "disasm", "lib_vs_00001.s"), encoding="utf-8") as f:
+                vs_text = f.read()
+            self.assertIn("0 invalid words", vs_text)
+            self.assertIn("[s104,s105,vcc_lo,vcc_hi]", vs_text)
+            self.assertNotIn("; --- llvm-mc messages ---", vs_text)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                by = {e["file"]: e for e in json.load(f)}
+            self.assertEqual(by["lib_ps_00000.dxbc"]["invalid_words"], 0)
+            self.assertEqual(by["lib_vs_00001.dxbc"]["invalid_words"], 0)
 
 
 if __name__ == "__main__":

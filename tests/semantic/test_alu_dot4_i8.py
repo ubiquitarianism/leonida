@@ -15,8 +15,9 @@ op_sel. The plain instruction has op_sel 0 and op_sel_hi 7. 89 words in 8 of tho
 op_sel 2 and op_sel_hi 5, which llvm-mc does not decode (docs/fspx.md). Run on the same hardware as two raw words
 (0xCC165008 0x0C0E0501: v8 = v1 . v2 + v3 with those fields), that form gave the words of MEASURED_OP_SEL: the dot
 product with the two 16-bit halves of the second source exchanged, as op_sel selects halves for the packed 16-bit
-ops. `ref_op_sel` reproduces them; the translator refuses any op_sel on these two instructions until a listing can
-carry it.
+ops. `ref_op_sel` reproduces them. A listing carries the form since tools/shader_disasm.py prints it
+(tests/semantic/test_fspx_dot4_op_sel_disasm.py), and the translator also recovers it from the binary when a
+listing lacks it (rdna2spirv.skipped_form).
 
 neg_lo and neg_hi. llvm-mc accepts them on v_dot4_i32_i8 for gfx1036 (not on v_dot4c_i32_i8), and the hardware does
 not ignore them: on the same GPU, 5 operand sets with 8 forms each gave the words of `ref_neg`, 9 of which are in
@@ -163,6 +164,45 @@ class Dot4I8(unittest.TestCase):
                 ]
                 spv = support.translate_lines("ps_dot4_op_sel", lines)
                 self.assertEqual(support.mrt0_words(spv), [measured] * 4)
+
+    def test_llvm_gap_restores_the_measured_dot_and_its_following_store(self):
+        from test_vcc_tuple_fallback import PROGRAM_VARIANTS, OUT, run, translate
+        # Synthetic v8 = dot(v1, swap_halves(v2)) + v3. The store observes the real destination.
+        program = [
+            ("v_mov_b32_e32 v1, 0x04030201", "ff 02 02 7e 01 02 03 04"),
+            ("v_mov_b32_e32 v2, 0x08070605", "ff 02 04 7e 05 06 07 08"),
+            ("v_mov_b32_e32 v3, 0", "80 02 06 7e"),
+            (None, "08 50 16 cc 01 05 0e 0c"),
+            ("v_mov_b32_e32 v6, 0x3000", "ff 02 0c 7e 00 30 00 00"),
+            ("global_store_dword v6, v8, s[0:1]", "00 80 70 dc 06 08 00 00"),
+            ("s_endpgm", "00 00 81 bf"),
+        ]
+        for variant in PROGRAM_VARIANTS:
+            with self.subTest(variant=variant):
+                self.assertEqual(run(translate(program, variant), {})[OUT], 62)
+        for word in ("08 d0 16 cc", "08 50 96 cc", "08 48 16 cc"):
+            with self.subTest(word=word), self.assertRaisesRegex(support.rdna2spirv.Unsupported, "undecodable"):
+                translate(program[:3] + [(None, word + " 01 05 0e 0c")] + program[4:])
+
+    def test_llvm_inline_dot_uses_the_stored_source_half(self):
+        import struct
+        from test_vcc_tuple_fallback import listing_and_blob, OUT, run, NAME
+        w0 = 0xcc164008
+        w1 = 257 | (138 << 9) | (259 << 18) | (1 << 27)
+        raw = struct.pack("<II", w0, w1)
+        printed = struct.pack("<II", w0, w1 | (1 << 28))
+        program = [("v_mov_b32_e32 v1, 0x00010001", "ff 02 02 7e 01 00 01 00"),
+                   ("v_mov_b32_e32 v3, 0", "80 02 06 7e"),
+                   ("v_dot4_i32_i8 v8, v1, 10, v3", printed.hex()),
+                   ("v_mov_b32_e32 v6, 0x3000", "ff 02 0c 7e 00 30 00 00"),
+                   ("global_store_dword v6, v8, s[0:1]", "00 80 70 dc 06 08 00 00"),
+                   ("s_endpgm", "00 00 81 bf")]
+        listing, blob = listing_and_blob(program)
+        for count in (b"0 invalid words", b"2 invalid words"):
+            with self.subTest(count=count):
+                source = listing.replace(b"2 invalid words", count)
+                spv = support.translate_listing(NAME, source, fssm=blob.replace(printed, raw))
+                self.assertEqual(run(spv, {})[OUT], 20)
 
     def test_the_neg_reference_reproduces_the_hardware_words(self):
         for neg_lo, neg_hi, a, b, addend, measured in MEASURED_NEG:

@@ -1,0 +1,25 @@
+GPU:        NVIDIA GeForce RTX 3090 (Ampere / GA102, PCI 10de:2204), subgroup 32..32
+Driver:     NVIDIA 620.73.04 (proprietary), Vulkan 1.4.357
+OS:         Bazzite 45.20261123.1 (Kinoite), kernel 7.3.5-ogc2.1.fc45.x86_64
+Commit:     3aa975421d470b76da1aa986a91282c59e20d642 (main, 2026-11-24)
+Tools:      llvm-mc 23.1.5, SPIRV-Tools v2026.2, CMake 4.3.0 + Ninja 1.13.2,
+            GCC 16.2.1, Python 3.15.2. CMake build ran in the Fedora 45 tool container;
+            the matching binaries ran on the Bazzite host and its NVIDIA driver.
+run_gpu_tests.py: 261 shaders translated and 261 pass spirv-val
+            native:                 203/252 passed, 49 skipped, 0 failed
+            LEONIDA_W64_EMULATE=1:  235/252 passed, 17 skipped, 0 failed
+Failed:     none
+Skipped:
+- Native: 31 compute fixtures and one mesh fixture require a native 64-wide subgroup; this RTX 3090 exposes subgroup 32..32. `ps_w64x_readlane` also requires a 64-wide fragment subgroup, which is unavailable. Sixteen other fixtures are intentionally run by the named D3D12 or `w64_graphics.py` harnesses.
+- Emulated: the same sixteen fixtures are delegated to those harnesses. `ps_w64x_readlane` remains skipped because wave64 emulation does not provide a 64-wide fragment subgroup.
+
+Setup: built the Vulkan test programs from this exact commit in a temporary Fedora 45 container using CMake/Ninja, then ran `scripts/run_gpu_tests.py` on the host with the NVIDIA ICD explicitly selected and implicit Vulkan layers disabled. The native test run was repeated once to retain the complete output; both native runs had the same 203/252, 49-skip, 0-failure result. `build.py`, `check.py` as separate commands, and `ctest` were not run; the integrated GPU runner translated and validated all 261 shaders in each mode.
+
+The fixtures are synthetic and use no game files or game-derived data. AI-assisted (OpenAI Codex): build and both GPU test runs were performed on this machine.
+
+Rerun on upstream main `6293c1c4f88c7ea2088ec595fea51362f1759996` (2026-11-24): rebuilt `vk_compute_test`, `vk_store_test`, `vk_harness`, `vk_texture_test`, `vk_sampler_test` and `vk_bindless_test` from that exact source in the Fedora 45 tool container, then ran the full integrated GPU suite on the same Bazzite host.
+- Native: 261/261 shaders translated and passed `spirv-val`; 203/252 passed, 49 skipped, 0 failed.
+- `LEONIDA_W64_EMULATE=1`: 261/261 shaders translated and passed `spirv-val`; 235/252 passed, 17 skipped, 0 failed.
+- Skips were reported by the runner for unavailable native 64-wide subgroup/fragment support or fixtures assigned to other harnesses. This refreshed run did not run standalone `build.py`, `check.py`, or `ctest`.
+
+An initial attempt before building all six required/auxiliary test binaries was incomplete (missing texture/sampler/bindless harness executables and `spirv-val` absent from `PATH`); it is not included in the results above. After building the missing harnesses and putting the validator on `PATH`, both complete runs finished with zero failures.

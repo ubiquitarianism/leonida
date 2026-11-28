@@ -10,10 +10,10 @@ layout(local_size_x = 16) in;
 layout(push_constant) uniform Params {
     uint tsharp[8];
     uint ssharp[4];
-    uint mode;    // 0: write via binding 9 (first half) + binding 4 (second half); 1: sample via binding 0
+    uint mode;    // 0/1: 2D store/sample; 2/3: 3D store/sample
     uint width;
     uint height;
-    uint pad;
+    uint slice;   // sample's absolute Z, or whether to probe relative Z=1 past a one-slice UAV
 } pc;
 
 layout(set = 0, binding = 0) uniform texture2D sampled_images[];
@@ -23,6 +23,9 @@ layout(set = 0, binding = 2, std430) readonly buffer DescriptorMap {
 };
 layout(set = 0, binding = 4, r32ui) uniform writeonly uimage2D storage_r32ui_images[];
 layout(set = 0, binding = 9, r32ui) uniform writeonly uimage2D storage_uint_images[];
+layout(set = 0, binding = 6) uniform texture3D sampled_volumes[];
+layout(set = 0, binding = 7, r32ui) uniform writeonly uimage3D storage_r32ui_volumes[];
+layout(set = 0, binding = 15, r32ui) uniform writeonly uimage3D storage_uint_volumes[];
 
 layout(set = 1, binding = 0, std430) readonly buffer InputWords {
     uint packed_words[];
@@ -59,11 +62,23 @@ void main() {
         } else {
             imageStore(storage_r32ui_images[image], xy, uvec4(packed_words[i], 0u, 0u, 0u));
         }
+    } else if (pc.mode == 2u) {
+        const uvec4 word = uvec4(packed_words[i], 0u, 0u, 0u);
+        if (i < total / 2u) {
+            imageStore(storage_uint_volumes[image], ivec3(xy, 0), word);
+            if (pc.slice != 0u) imageStore(storage_uint_volumes[image], ivec3(xy, 1), word);
+        } else {
+            imageStore(storage_r32ui_volumes[image], ivec3(xy, 0), word);
+            if (pc.slice != 0u) imageStore(storage_r32ui_volumes[image], ivec3(xy, 1), word);
+        }
     } else {
         uint sampler_key[8];
         for (int k = 0; k < 8; ++k) sampler_key[k] = k < 4 ? pc.ssharp[k] : 0xffffffffu;
         const uint smp = lookup(sampler_key);
         const vec2 uv = (vec2(xy) + 0.5) / vec2(float(pc.width), float(pc.height));
-        out_values[i] = textureLod(sampler2D(sampled_images[image], samplers[smp]), uv, 0.0);
+        if (pc.mode == 1u)
+            out_values[i] = textureLod(sampler2D(sampled_images[image], samplers[smp]), uv, 0.0);
+        else
+            out_values[i] = texelFetch(sampler3D(sampled_volumes[image], samplers[smp]), ivec3(xy, int(pc.slice)), 0);
     }
 }

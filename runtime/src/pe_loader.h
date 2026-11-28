@@ -54,11 +54,15 @@ struct Module {
     // the image's _tls_index. tls_index names TEB->ThreadLocalStoragePointer[tls_index], the array
     // __declspec(thread) reads; it is not a TlsAlloc slot. The loader reserves distinct indices by loading
     // gta6rt_tls_host.dll (and cloning it on demand for additional simultaneous TLS modules, up to 16 at a time).
+    // An executable gets index 0, as Windows gives the process EXE, because code built with /GA reads slot 0 without
+    // _tls_index. That needs reserve_tls_index0() at process start; without it, and for a second executable mapped
+    // while one holds index 0, the executable gets a helper index and a note on stderr, and its /GA code would use
+    // another module's TLS, so its code must not run (gta6rt refuses).
     // Every thread started after load() gets its own copy through the helper's DLL_THREAD_ATTACH, and gives it back
     // at DLL_THREAD_DETACH. A thread that was already running gets its copy from load() itself, as it would from
     // Windows for a DLL Windows loads: a block, no DLL_THREAD_ATTACH, and DLL_THREAD_DETACH when it ends.
     uint32_t tls_index = kNoTlsIndex;
-    uint32_t tls_slot = kNoTlsIndex;   // index into the loader's reserved TLS-host slot pool
+    uint32_t tls_slot = kNoTlsIndex;   // index into the loader's reserved TLS-host slot pool ; 16 is index 0, an executable's
     uint64_t tls_generation = 0;       // unique token per TLS initialisation, distinguishing reused slots/addresses
     void* tls_block = nullptr;         // calling thread's copy of the image's template
     void* tls_saved_block = nullptr;   // helper DLL block replaced in that thread, restored by ~Loader
@@ -133,6 +137,14 @@ public:
     void* load_runtime_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
+    // LEONIDA_COMPAT_DIR for a run-time LoadLibrary / GetModuleHandle (shims::BundledModuleOps::compat_module): the
+    // same DLL, and the same handle, a static import of `basename` binds to. `name` is the caller's: one with a
+    // directory is handled only when it names the compat file. DONT_RESOLVE_DLL_REFERENCES in `flags` is refused, as
+    // for bundled DLLs. owns_compat_handle: whether `module` is a DLL from the folder, including one Windows loaded
+    // there as another's dependency (it is then kept, as the others are).
+    void* runtime_compat_module(const std::wstring& basename, const std::wstring& name, bool load, uint32_t flags,
+                                bool& handled);
+    bool owns_compat_handle(void* module);
 
 private:
     void initialise(Module& m);
@@ -149,6 +161,12 @@ private:
     // owns every import of that DLL; `out` is the export, or null when the DLL lacks it. Caller holds mutex_.
     bool resolve_compat(const std::string& key, const std::string& dll, const std::string& name, uint16_t ordinal,
                         bool by_ordinal, void*& out);
+    // The file in compat_dir_ named `basename` (case-insensitively, as Windows matches module names), or null.
+    const std::filesystem::path* compat_file(const std::wstring& basename) const;
+    // The handle of `file` (a compat_file() entry): the one already in use (looked up before, or loaded by Windows on
+    // its own, as another compat DLL's dependency), else loaded by Windows when `load`. Null with `error` (a Windows
+    // error code) when Windows refused the file, or when it is not loaded and `load` is false. Caller holds mutex_.
+    void* compat_handle(const std::filesystem::path& file, bool load, uint32_t& error);
     void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);
     void parse_exports(Module& m);
     void protect_sections(Module& m);
@@ -158,8 +176,10 @@ private:
     std::filesystem::path game_dir_;
     // LEONIDA_COMPAT_DIR, read when the Loader is made; empty = no compat step. Drop-in DLLs named like console
     // modules (runtime/README.md, "Compat modules"), loaded by Windows from there and kept for the process lifetime.
+    // The folder's file names are listed once, then, so a lookup by name never touches the disk.
     std::filesystem::path compat_dir_;
-    std::map<std::string, void*> compat_modules_;  // lower-case DLL name -> HMODULE
+    std::vector<std::filesystem::path> compat_files_;  // file names in compat_dir_
+    std::map<std::string, void*> compat_modules_;  // file name (UTF-8, ASCII lower case) -> HMODULE
     std::map<std::filesystem::path::string_type, Module*> by_name_;  // native basename, ASCII case folded
     std::vector<Module*> order_;       // mapping order; owns the modules
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
@@ -181,6 +201,14 @@ private:
 // registers this with atexit; a caller that ends with ExitProcess must invoke it directly, because ExitProcess
 // skips the atexit table. Call it when no mapped code can run again: it unmaps the helper images.
 void cleanup_tls_clones();
+
+// Moves the runtime's own EXE off module TLS index 0, which Windows gave it, so that a mapped executable can have it
+// (Module::tls_index): its TLS moves to the index of one more helper clone, whose template is a copy of the EXE's.
+// Call it once at process start, before any other thread has run this EXE's code (gta6rt does it from a CRT
+// initializer): MSVC code keeps the address of its TLS slot across calls, so a thread that is already running cannot
+// be moved, and its TLS would stay at index 0. Returns false, with the reason in *why, when it cannot; later calls
+// return the first result.
+bool reserve_tls_index0(std::string* why = nullptr);
 
 std::string lower(std::string s);
 

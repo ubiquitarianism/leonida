@@ -1,0 +1,34 @@
+GPU:        Apple M6 (Apple GPU, 12 cores, Metal 4), subgroup 4..32
+Driver:     MoltenVK 1.4.2 (Homebrew bottle), Vulkan 1.4.357 (loader 1.4.363.0)
+Subgroup:   4..32 (no native 64-wide, no mesh, no shaderFloat64, no geometry stage, no PerVertexKHR)
+OS:         macOS 27.0 (26A425), arm64, 16 GiB unified memory
+Commit:     9e7720c (main, 2026-11-25)
+Tools:      llvm-mc 23.1.6 (Homebrew llvm, AMDGPU target), SPIRV-Tools v2026.4, glslang 16.6.0,
+            Apple clang 21.0.0, CMake 4.5.1, Ninja 1.13.2, Python 3.13.18
+CPU:        Apple M6
+RAM:        16 GiB reported
+
+run_gpu_tests.py: 274 shaders: 273 translated, 273 pass spirv-val (both modes; the one left is the computed
+            I/J pair that needs PerVertexKHR inputs, which --f16-interp-fallback cannot cover)
+            native:                 192/264 passed, 69 skipped, 3 failed
+            LEONIDA_W64_EMULATE=1:  225/264 passed, 36 skipped, 3 failed
+ctest:      96/96 passed, 2 skipped (shader_library_corpus, vk_sync_validation)
+Failed:     cs_fma_fused (both modes): word 7 (f16) reads 0x00000000, want 0x00007351. The known MoltenVK
+            1.4.2 row of docs/testing.md; #1724 moves the f16 operands to run time.
+            ps_imgatomic (both modes): 1 (native) and 2 (emulated) of 256 image-atomic texels wrong, render
+            target exact. The MoltenVK flake of #543 that the M5 Pro record reports.
+            cs_imgatomic_ext (both modes): 6 of 64 sint words differ, first word 32: got 0x0badf00d,
+            expected 0x00000101, the six 3D-volume glc returns. Not MoltenVK: the fixture's volume T# lacks
+            the synthetic-UAV tag the translator gates 3D atomics on, and it fails the same on NVIDIA,
+            RADV and llvmpipe; #1518 fixes the fixture.
+Skipped:    native: 33 "no 64-wide compute subgroup on this device" (the wave64 compute tests, which the
+            emulated run covers), 6 Float64 fixtures (no shaderFloat64), 5 "no VK_EXT_mesh_shader" and 1
+            "mesh shading unavailable", 1 "no geometryShader", 1 "cannot require a 64-wide fragment
+            subgroup", 1 "fragment subgroup may run narrower than 32", 1 "computed I/J pairs need
+            PerVertexKHR inputs", 19 documented "run by d3d12_*_test / w64_graphics.py" cases and 1 "needs
+            the Windows D3D12 runtime". Emulated: the same less the 33 wave64 compute tests.
+Notes:
+- Built with cmake -S runtime -B runtime/build/linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+  -DVulkan_INCLUDE_DIR=/opt/homebrew/include and cmake --build runtime/build/linux.
+- Run with LLVM_MC="$(brew --prefix llvm)/bin/llvm-mc".
+- No game files were used; only the synthetic fixtures in runtime/test/shaders.

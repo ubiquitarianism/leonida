@@ -20,6 +20,8 @@ each container as `<module>.dxbc` plus an `index.json` whose entries the transla
 `PSV0`, defaulting to `"cs"` when absent), so the next step can be `fssm_unpack.py <DIR>`: nothing is extracted unless asked for, and extracted shaders are game
 data that must stay in the user's work folder, never in the repository. Nothing here prints shader bytes.
 
+For a native program packed in an SGD5 envelope, `offset` locates the envelope, `stored_size` includes its header,
+and `size` and `sha256` describe the inflated DXBC. Plain containers keep their original ordering and offsets.
 Standard library only; reads files, never runs them.
 """
 
@@ -32,12 +34,14 @@ import os
 import re
 import struct
 import sys
+import zlib
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from report_paths import same_report_path  # noqa: E402
 
 DXBC = b"DXBC"
+SGD5_PROGRAM = struct.pack("<I", 0xDDCE7)
 XDAT = b"XDAT"
 XBCH = b"XBCH"
 FSPX = b"FSPX"
@@ -154,7 +158,7 @@ def xdat_tags(dxil: bytes) -> list[dict]:
     return out
 
 
-def inspect(data: bytes, image: str) -> tuple[list[dict], list[int]]:
+def inspect_raw(data: bytes, image: str) -> tuple[list[dict], list[int]]:
     """Every valid container in `data`, and the offsets of `DXBC` hits that failed validation."""
     found, rejected = [], []
     i = 0
@@ -203,6 +207,45 @@ def inspect(data: bytes, image: str) -> tuple[list[dict], list[int]]:
     return found, rejected
 
 
+def packed_dxbc(data: bytes, offset: int) -> bytes:
+    # SGD5 program envelope described by five-star-recomp (docs/shader-containers.md).
+    # Validate both stored sizes and the complete raw-deflate stream before inspecting its DXBC.
+    if offset < 4 or offset + 12 > len(data):
+        return b""
+    stored, size = struct.unpack_from("<II", data, offset + 4)
+    # Both stored sizes include the 12-byte envelope itself.
+    if (stored != u32(data, offset - 4) or not 12 < stored <= len(data) - offset
+            or stored > 64 << 20 or not 32 < size <= 64 << 20):
+        return b""
+    inflater = zlib.decompressobj(-15)
+    try:
+        dxbc = inflater.decompress(data[offset + 12:offset + stored], size + 1)
+    except zlib.error:
+        return b""
+    if (not inflater.eof or inflater.unused_data or len(dxbc) != size
+            or not dxbc.startswith(DXBC) or u32(dxbc, 24) != size):
+        return b""
+    return dxbc
+
+
+def inspect(data: bytes, image: str) -> tuple[list[dict], list[int]]:
+    found, rejected = inspect_raw(data, image)
+    # Keep the plain containers' existing indices. Extract packed console programs only:
+    # desktop containers can use the same envelope but have no RDNA2 program to translate.
+    pos = 0
+    while (offset := data.find(SGD5_PROGRAM, pos)) >= 0:
+        pos = offset + len(SGD5_PROGRAM)
+        dxbc = packed_dxbc(data, offset)
+        if not dxbc:
+            continue
+        records, _ = inspect_raw(dxbc, image)
+        if records and records[0]["offset"] == 0 and records[0]["has_xbch"]:
+            record = records[0]
+            record.update(offset=offset, stored_size=u32(data, offset + 4))
+            found.append(record)
+    return found, rejected
+
+
 def safe_stem(name: str | None, index: int) -> str:
     stem = SAFE_NAME.sub("_", name or "").strip("._")
     return stem or f"container_{index:02d}"
@@ -216,11 +259,14 @@ def extract(data: bytes, records: list[dict], directory: str) -> list[dict]:
         stem = safe_stem(record["name"], k)
         file = f"{stem}.dxbc"
         target = os.path.join(directory, file)
+        offset = record["offset"]
+        content = (packed_dxbc(data, offset) if "stored_size" in record
+                   else data[offset : offset + record["size"]])
         n = k
         while True:
             try:
                 with open(target, "xb") as f:
-                    f.write(data[record["offset"] : record["offset"] + record["size"]])
+                    f.write(content)
                 break
             except FileExistsError:
                 file = f"{stem}_{n:02d}.dxbc"

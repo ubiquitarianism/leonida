@@ -112,6 +112,18 @@ int main(int argc, char** argv) {
     check(XSystemGetDeviceType() == 7, "XSystemGetDeviceType is answered by the gta6rt shim (Series X)");
     XGameRuntimeUninitialize();
 
+    if (has_arg(argc, argv, "first-run-ui")) {
+        char value[32]{};
+        const auto configured = [&](const char* name, const char* expected) {
+            const DWORD n = GetEnvironmentVariableA(name, value, sizeof(value));
+            return n && n < sizeof(value) && std::strcmp(value, expected) == 0;
+        };
+        check(configured("LEONIDA_D3D12", "vulkan"), "first-run UI Vulkan backend");
+        check(configured("LEONIDA_PIPELINE_COMPILE", "on-demand"), "first-run UI pipeline profile");
+        check(configured("LEONIDA_KEYBOARD_PAD", "1"), "first-run UI keyboard pad reads keys only with focus");
+        check(configured("LEONIDA_ARENA_MB", "768"), "first-run UI caller override");
+    }
+
     if (has_arg(argc, argv, "tls")) {
         int seen = -1;
         std::thread t([&] { seen = t_counter; t_counter = 9; });

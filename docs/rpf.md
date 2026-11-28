@@ -129,6 +129,17 @@ scanners on a 48 MiB gap and checks that each one's Python heap peak stays under
 The carve is read-only and works on any `.rpf`, `.ttpf` or archive-like file. It does not decrypt the TOC, use
 keys, or write anything outside the output directory.
 
+Once one or more archives have been carved under `<work>\carve`, `tools/classify_carve.py` groups every entry by
+signature using only the per-archive `index.json` files (no carved payload reads):
+
+```powershell
+python -I tools/classify_carve.py <work>\carve
+```
+
+It classifies each entry as `bink2` (`KB2x`), `rbf0` (`52424630`), `respage` (`42400000`), `gpu-zerohdr` (16+ leading
+zero bytes), or `other:<hex>` (first 4 bytes), prints a summary table, and writes `<work>\carve\types.json` with
+overall and per-archive file counts, total bytes, and `min`/`max`/`median` (`median_low`) byte sizes.
+
 ## Recovery tools
 
 `tools/rpf9dump` is a bulk exporter built on the Core library from

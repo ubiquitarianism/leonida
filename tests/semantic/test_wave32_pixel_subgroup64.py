@@ -120,7 +120,7 @@ class Wave32PixelSubgroupTests(unittest.TestCase):
         memory = {base + 32 * half + 4 * w: word for half, words in tsharp.items() for w, word in enumerate(words)}
         # The runtime's descriptor hash table: word 0 the slot mask, then 10-word slots (T# words at 1-8, the
         # bindless index at 9). Two slots and mask 1: every T# is found within two probes whatever its hash.
-        desc_map = [1, *tsharp[0], 1, 0, *tsharp[1], 2]
+        desc_map = [1, *tsharp[0], 1, 1, *tsharp[1], 2, 1]
         texels = {1: (0.25, 0.5, 0.75, 1.0), 2: (1.0, 0.75, 0.5, 0.25)}
         images = [None] + [(lambda coord, lod, t=texels[k]: t) for k in (1, 2)]
         for first_quad in ("absent", "helpers"):

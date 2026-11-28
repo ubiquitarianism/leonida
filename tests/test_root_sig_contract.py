@@ -79,7 +79,7 @@ def test_cli_refuses_boolean_root_constant_count(tmp_path):
         [sys.executable, "-I", TOOL, str(index_path), "--rootsig", str(sig_path)],
         capture_output=True, text=True)
     assert result.returncode == 1
-    assert "root signature refused: param 0: constants need an integer count >= 1" in result.stdout
+    assert "root signature refused: param 0: constants need an integer count >= 0" in result.stdout
 
 
 def test_reconcile_compatible():
@@ -343,6 +343,20 @@ def test_console_layout_stage_bases():
         assert error == "" and len(dwords) == base + 4 + 2 + 1, stage   # constants 4, cbv 2, table 1
     dwords, error = rsc.pack_layout(ROOT_SIG, "hs")
     assert dwords == [] and "no console base" in error
+
+
+def test_zero_value_constants_take_no_dwords():
+    # As runtime/src/root_signature.cpp: a constant parameter of 0 values is accepted and packs to nothing.
+    sig = {"params": [{"type": "constants", "count": 0}, {"type": "cbv"},
+                      {"type": "constants", "count": 0}, {"type": "table"}]}
+    dwords, error = rsc.pack_layout(sig)
+    assert error == "" and [(d["param"], d["sub"]) for d in dwords] == [(1, 0), (1, 1), (3, 0), (3, 1)]
+    dwords, error = rsc.pack_layout(sig, "cs")
+    assert error == "" and [(d["param"], d["sub"]) for d in dwords[4:]] == [(1, 0), (1, 1), (3, 0)]
+    dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": 0}]}, "cs")
+    assert error == "" and len(dwords) == 4
+    dwords, error = rsc.pack_layout({"params": [{"type": "constants", "count": -1}]})
+    assert dwords == [] and "count >= 0" in error
 
 
 def test_console_layout_spill_refused():

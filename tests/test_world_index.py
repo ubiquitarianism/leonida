@@ -123,6 +123,14 @@ def make_rpf_streams(parts, start=0x40):
     return bytes(out)
 
 
+class PointerTest(unittest.TestCase):
+    def test_split_pointer(self):
+        # docs/psin.md: the low 20 bits are the 1-based block number (0 = null), the bits above the byte offset.
+        self.assertEqual(WI.split_pointer(0), (0, 0))
+        self.assertEqual(WI.split_pointer(4097 | (0x10 << 20)), (4097, 0x10))
+        self.assertEqual(WI.split_pointer(0xFFFFF | (0x1040 << 20)), (0xFFFFF, 0x1040))
+
+
 class WorldIndexTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
