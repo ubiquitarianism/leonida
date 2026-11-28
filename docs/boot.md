@@ -251,7 +251,7 @@ order. It maps each question to the event to look for; it does not answer them.
 
 | # | Question | Signal in the first trace |
 |---|---|---|
-| 1 | `D3D12XboxCreateDevice` 24-word params and flags | first `D3D12XboxCreateDevice` in the D3D12 trace; the shim prints the 24 words as an `[rt]` line in the same log, with or without `--trace-d3d12` (grep `^\[rt\]`); accept unknown flags |
+| 1 | `D3D12XboxCreateDevice` 0x50-byte params and flags | first `D3D12XboxCreateDevice` in the D3D12 trace; the shim prints the twenty dwords as an `[rt]` line in the same log, with or without `--trace-d3d12` (grep `^\[rt\]`); accept unknown flags. The struct is 0x50 bytes (20 dwords), not 24 words: at the single retail call site it is a stack local of a `0x228` frame whose saved `xmm6` begins at `+0x200`, and three 32-byte stores zero it up to `+0x4F`. Only `+0x00 = 0x00020004`, `+0x08 = 0x00100000`, `+0x28 = 1` and `+0x3C = 0x20` are fixed; `+0x20` and `+0x24` carry two bytes of launch state and `+0x30`-`+0x4F` stay zero. Adapter is null, the IID is `{5405C344-D457-444E-B4DD-2366E45AEE39}` |
 | 2 | Xbox device/heap/queue/command-list slots | queue, fence and allocator method names in the D3D12 trace; device slots past the PC vtable print an `[rt] d3d12_xs: device slot …` line instead and record nothing; compare with the SDK vtable |
 | 3 | Root signature → `s0..s31` | `CreateRootSignature`, `SetGraphicsRootSignature`, then the shader's user-SGPR reads; mask `0x03000000` on a copy |
 | 4 | Descriptor bytes and heap increments | first `CreateShaderResourceView`/`CreateSampler` and the first draw; dump the heap bytes and compare with the T#/S# parser |
