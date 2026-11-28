@@ -225,8 +225,24 @@ public:
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset), and
     // the objects a shim handed it with hold_until_reset.
     const std::vector<IUnknown*>& pinned() const { return held_; }
+    // The objects a shim handed it with hold_until_reset (also in pinned()), which ExecuteCommandLists keeps until
+    // the submission has completed: the application may Reset or release the list as soon as the call returns.
+    const std::vector<IUnknown*>& kept() const { return kept_; }
     // rt::d3d12::hold_until_reset: an object the recording uses that its caller does not keep (a shim's own scratch).
-    void hold_for_recording(IUnknown* object) { hold(object); }
+    void hold_for_recording(IUnknown* object) {
+        if (std::find(kept_.begin(), kept_.end(), object) == kept_.end()) kept_.push_back(object);
+        hold(object);
+    }
+    // rt::d3d12::drop_recording: what Reset lets go of, now, without a new recording; the list stays closed.
+    bool drop_recording() {
+        if (!list_.drop_recording()) return false;
+        calls_.clear();
+        tables_.clear();
+        directly_indexed_ = false;
+        release_held();
+        reset_state(nullptr);
+        return true;
+    }
     bool needs_all_sampled_views() const {
         if (directly_indexed_) return true;
         for (const auto& command : list_.commands()) {
@@ -497,12 +513,17 @@ public:
                                               const D3D12_CPU_DESCRIPTOR_HANDLE* depth) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return check(false);
-        render_targets_.fill({});
-        render_target_count_ = count;
-        draw_views_stale_ = true;
+        std::array<leonida::TargetView, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> bound{};
         for (UINT i = 0; i < count && targets; ++i) {
             const SIZE_T handle = single_range ? targets[0].ptr + SIZE_T(i) * descriptor_size : targets[i].ptr;
-            if (handle) render_targets_[i] = *reinterpret_cast<const leonida::TargetView*>(handle);
+            if (handle) bound[i] = *reinterpret_cast<const leonida::TargetView*>(handle);
+        }
+        // The same targets bound again keep the current views block (draw_views), so the draws after them do not
+        // each allocate a new one.
+        if (count != render_target_count_ || bound != render_targets_) {
+            render_targets_ = bound;
+            render_target_count_ = count;
+            draw_views_stale_ = true;
         }
         depth_ = depth && depth->ptr ? *reinterpret_cast<const leonida::TargetView*>(depth->ptr) : leonida::TargetView{};
     }
@@ -1623,6 +1644,9 @@ private:
     // layout it reads and the pipeline ExecuteCommandLists looks up still exist. (Keeping them alive while the GPU
     // runs the submission stays the application's job, as in D3D12.)
     std::vector<IUnknown*> held_;
+    // The part of held_ a shim handed the list (hold_until_reset). Nothing else keeps those alive while the GPU runs
+    // the submission (CommandQueue::keep_lists). No references of its own: held_ has them.
+    std::vector<IUnknown*> kept_;
 
     // A bundle keeps its state calls and draws instead of applying them: it has no render targets, viewport or root
     // signature of its own to resolve them against, and what it sets belongs to the list that executes it.
@@ -1658,6 +1682,7 @@ private:
     void release_held() {
         for (IUnknown* object : held_) object->Release();
         held_.clear();
+        kept_.clear();
     }
 
     void set_pipeline(ID3D12PipelineState* state) {
@@ -1857,8 +1882,10 @@ private:
         }
     }
 
+    // Only a slot whose view changes marks the views block stale (draw_views). Titles bind the same vertex buffer
+    // again before many of their draws, and a new block for each would be one allocation of about 700 bytes per
+    // draw, kept until the list's Reset.
     void set_vertex_buffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) {
-        if (count) draw_views_stale_ = true;
         for (UINT i = 0; i < count; ++i) {
             // A stream pool's GPU-only alias becomes the CPU view of the same pages (rule B, gfxgeom section 6): the
             // buffer made for it, and every other view naming that range, then use one host-readable address.
@@ -1868,9 +1895,12 @@ private:
                                          : 0;
             if (views) leonida::title_va_aliases().note(va, leonida::TitleVaAliases::vertex_view);
             if (views) leonida::title_va_aliases().want_buffer(va, views[i].SizeInBytes);
-            vertex_buffers_[start + i] = views ? leonida::VertexBufferView{va, views[i].SizeInBytes,
-                                                                          views[i].StrideInBytes}
-                                               : leonida::VertexBufferView{};
+            const leonida::VertexBufferView view =
+                views ? leonida::VertexBufferView{va, views[i].SizeInBytes, views[i].StrideInBytes}
+                      : leonida::VertexBufferView{};
+            if (view == vertex_buffers_[start + i]) continue;
+            vertex_buffers_[start + i] = view;
+            draw_views_stale_ = true;
         }
     }
 
@@ -2358,16 +2388,34 @@ public:
     // are not held (a D3D12 application keeps them until the fence it signals; the docs, section 4.4, list this),
     // except a shim's own the recording uses (hold_until_reset), which are pinned with them.
     static std::shared_ptr<void> pin_lists(const std::vector<const GraphicsCommandList*>& lists) {
-        auto objects = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* held) {
+        return reference_lists(lists, &GraphicsCommandList::pinned);
+    }
+
+    // What a batch submitted at once keeps alive until its submission has completed on the GPU: the shim's own
+    // objects its lists use (hold_until_reset). The lists release them at their Reset or release, which D3D12 allows
+    // as soon as ExecuteCommandLists returns, and a default-heap buffer's arena range is free again the moment the
+    // buffer is destroyed. Null when no list has any, which is every list without a shim's scratch.
+    static std::shared_ptr<void> keep_lists(const std::vector<const GraphicsCommandList*>& lists) {
+        for (const GraphicsCommandList* list : lists)
+            if (!list->kept().empty()) return reference_lists(lists, &GraphicsCommandList::kept);
+        return nullptr;
+    }
+
+    // Takes a reference to each object that `objects` returns for each list. They are released when the last copy of
+    // the result goes.
+    static std::shared_ptr<void> reference_lists(
+        const std::vector<const GraphicsCommandList*>& lists,
+        const std::vector<IUnknown*>& (GraphicsCommandList::*objects)() const) {
+        auto references = std::shared_ptr<std::vector<IUnknown*>>(new std::vector<IUnknown*>, [](auto* held) {
             for (IUnknown* object : *held) object->Release();
             delete held;
         });
         for (const GraphicsCommandList* list : lists)
-            for (IUnknown* object : list->pinned()) {
+            for (IUnknown* object : (list->*objects)()) {
                 object->AddRef();
-                objects->push_back(object);
+                references->push_back(object);
             }
-        return objects;
+        return references;
     }
 
     // A D3D12 queue holds the fences it waits on and signals until the work has been submitted.
@@ -2548,7 +2596,8 @@ public:
                 return;
             }
         }
-        last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
+        last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); },
+                                      [&graphics] { return keep_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)
             std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
@@ -3042,6 +3091,11 @@ bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object) {
     if (!l || !object) return false;
     l->hold_for_recording(object);
     return true;
+}
+
+bool drop_recording(ID3D12GraphicsCommandList* list) {
+    GraphicsCommandList* l = GraphicsCommandList::from(list);
+    return l && l->drop_recording();
 }
 
 bool recorded_commands(ID3D12GraphicsCommandList* list, std::vector<leonida::Command>& commands) {

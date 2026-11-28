@@ -16,6 +16,10 @@
 // so a range [lo, hi) is answered by visiting, per class in use, the granules from lo - 2^class to hi: the cost is the
 // halves near the range, never the heap. An entry is checked against the record when visited (a half that moved
 // leaves a stale entry behind; a bucket drops its stale entries whenever it has doubled since it was last cleaned).
+// A bucket counts the halves it holds and goes when the last one leaves it, so the buckets held are those of the live
+// halves: without that, every granule a session ever wrote a V# into kept its bucket until the heap was destroyed, and
+// the main heap lives as long as the session (many of its V#s are data the title keeps in a slot, with a new base
+// whenever the data changes).
 // Portable, standard library only: console_heap_slot_records_test exercises it without a GPU.
 #include <algorithm>
 #include <array>
@@ -58,6 +62,14 @@ public:
     std::size_t recorded() const { return recorded_; }  // halves in state resolved or waiting
     std::size_t waiting_count() const { return waiting_; }  // halves in state waiting
     std::uint64_t looked_at() const { return looked_at_; }  // index entries visited by touched(), all calls
+    // The buckets both indexes hold, counted over their maps: a diagnostic (the heap log line and
+    // console_heap_slot_records_test, which bounds it by the live halves).
+    std::size_t buckets() const {
+        std::size_t n = 0;
+        for (const auto& index : indexes_)
+            for (const auto& buckets : index.classes) n += buckets.size();
+        return n;
+    }
 
     // Half `half` (0: the buffer V#, 1: the UAV counter V#) of `slot` now names [base, base + span) and resolved as
     // `state` says, its copy at `target` (see above). span 0 counts as 1.
@@ -75,18 +87,15 @@ public:
         h.target = target;
         h.span_state = span | (std::uint64_t(state) << 56);
         count(state, +1);
-        if (state == none) return;  // entries left behind are stale now
-        const auto add = [&](int which, std::uint64_t start, std::uint64_t old_start) {
-            const unsigned c = span_class(span);
-            const std::uint64_t granule = start >> granule_shift(c);
+        for (const int which : {kSource, kTarget}) {
+            unsigned was_c = 0, is_c = 0;
+            std::uint64_t was_granule = 0, is_granule = 0;
+            const bool was = held(which, old, was_c, was_granule), is = held(which, h, is_c, is_granule);
             // Unchanged key: the entry already there stands for it.
-            if (old.state() != none && (which == kSource || old.target) && span_class(old.span()) == c &&
-                (old_start >> granule_shift(c)) == granule)
-                return;
-            push(which, c, granule, std::uint32_t(key));
-        };
-        add(kSource, base, old.base);
-        if (target) add(kTarget, target, old.target);
+            if (was && is && was_c == is_c && was_granule == is_granule) continue;
+            if (was) leave(which, was_c, was_granule);  // the entry left behind is stale now
+            if (is) push(which, is_c, is_granule, std::uint32_t(key));
+        }
     }
 
     void clear(std::size_t slot) {
@@ -141,6 +150,7 @@ private:
     struct Bucket {
         std::vector<std::uint32_t> keys;
         std::size_t clean = 0;  // its size when it was last cleaned
+        std::size_t live = 0;   // the halves held here now: each has a current entry in keys
     };
     struct Index {
         std::array<std::unordered_map<std::uint64_t, Bucket>, kClasses> classes;
@@ -158,18 +168,34 @@ private:
         if (state == waiting) waiting_ += std::size_t(std::ptrdiff_t(delta));
     }
 
+    // Whether index `which` holds a half recorded as `h`, and if so under which class and granule.
+    static bool held(int which, const Half& h, unsigned& c, std::uint64_t& granule) {
+        if (h.state() == none || (which == kTarget && !h.target)) return false;
+        c = span_class(h.span());
+        granule = (which == kSource ? h.base : h.target) >> granule_shift(c);
+        return true;
+    }
+
     // Whether index `which` still holds `key` under (c, granule).
     bool current(int which, std::uint32_t key, unsigned c, std::uint64_t granule) const {
-        const Half& h = halves_[key];
-        if (h.state() == none || span_class(h.span()) != c) return false;
-        if (which == kTarget && !h.target) return false;
-        return ((which == kSource ? h.base : h.target) >> granule_shift(c)) == granule;
+        unsigned hc = 0;
+        std::uint64_t hg = 0;
+        return held(which, halves_[key], hc, hg) && hc == c && hg == granule;
+    }
+
+    // A half no longer held under (c, granule): its entry there is stale, and with the last live half the bucket
+    // goes, its stale entries with it (a lookup skips them, so it answers the same without them).
+    void leave(int which, unsigned c, std::uint64_t granule) {
+        auto& buckets = indexes_[which].classes[c];
+        const auto it = buckets.find(granule);
+        if (it != buckets.end() && !--it->second.live) buckets.erase(it);
     }
 
     void push(int which, unsigned c, std::uint64_t granule, std::uint32_t key) {
         Index& index = indexes_[which];
         index.used |= std::uint64_t(1) << c;
         Bucket& bucket = index.classes[c][granule];
+        ++bucket.live;
         bucket.keys.push_back(key);
         if (bucket.keys.size() < 32 || bucket.keys.size() < 2 * bucket.clean) return;
         auto& keys = bucket.keys;

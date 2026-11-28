@@ -502,7 +502,7 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
-/// host copies of textures the title fills).
+/// host copies of textures the title fills, idle host lists nobody took).
 /// `LEONIDA_SWEEP=0` keeps everything, as before.
 fn sweep() {
     // The in-place probe and census, if asked for (`LEONIDA_INPLACE_PROBE`).
@@ -529,6 +529,7 @@ fn sweep() {
         trim_spare_backs();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
+    crate::list::trim_idle();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -1460,6 +1461,17 @@ mod tests {
 /// The batches of clamped records in one scratch buffer
 /// ([`HostList::batch_place`]).
 const BATCHES: u32 = 8;
+
+/// The largest indirect scratch buffer a host list keeps while it is idle
+/// ([`HostList::idle_trim`]): what most frames' executions fit in.
+const IDLE_INDIRECT_MOST: u64 = 1 << 20;
+
+/// Since the last frame-rate line: indirect scratch buffers past
+/// [`IDLE_INDIRECT_MOST`] idle lists let go, and their bytes. Each is made
+/// again by the next list that needs that much, so a count near one a frame
+/// says a title runs such an execution every frame and pays a buffer for it
+/// each time.
+static IDLE_INDIRECT_TRIMS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
@@ -2603,6 +2615,21 @@ fn batch_scratch_line(frames: f64) {
         b[3] as f64 / frames,
         (kept as u64 * BATCH_SCRATCH) as f64 / (1 << 20) as f64,
         if batch_pool() { "on" } else { "off" }
+    );
+}
+
+/// For the frame-rate line: what [`HostList::idle_trim`] let go per frame,
+/// if anything.
+fn idle_indirect_line(frames: f64) {
+    let t: Vec<u64> = IDLE_INDIRECT_TRIMS.iter().map(|t| t.swap(0, Ordering::Relaxed)).collect();
+    if t[0] == 0 {
+        return;
+    }
+    tracing::info!(
+        "indirect scratch buffers past 1 MiB let go by idle host lists per frame: {:.2}, {:.2} MB of the card's memory \
+         (each made again by the next list that needs it)",
+        t[0] as f64 / frames,
+        t[1] as f64 / frames / (1 << 20) as f64
     );
 }
 
@@ -4986,6 +5013,7 @@ fn late_line(frames: f64) {
     card_steps::log(frames);
     read_backs_line(frames);
     batch_scratch_line(frames);
+    idle_indirect_line(frames);
     allocator_trim_line();
     dynamic_wait_line(frames);
     crate::draw::waits_line(frames);
@@ -8859,6 +8887,26 @@ impl HostList {
             self.keep(&old_buf);
         }
         Some(buffer)
+    }
+
+    /// The list goes idle (`crate::list::recycle`, after its reset): an
+    /// indirect scratch buffer past [`IDLE_INDIRECT_MOST`] is let go, behind
+    /// the submissions still running ([`retire_resource`]). The buffer only
+    /// grows, doubling, and the idle pool hands its lists to any title list,
+    /// so one large indirect execution kept its buffer of the card's memory
+    /// in that list for the rest of the run, in as many idle lists as ever
+    /// served one. The next recording that needs that much makes one anew
+    /// ([`HostList::indirect_scratch`] starts from none).
+    pub(crate) fn idle_trim(&self) {
+        let large = {
+            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_some_and(|&(_, cap)| cap > IDLE_INDIRECT_MOST) { slot.take() } else { None }
+        };
+        if let Some((buffer, cap)) = large {
+            IDLE_INDIRECT_TRIMS[0].fetch_add(1, Ordering::Relaxed);
+            IDLE_INDIRECT_TRIMS[1].fetch_add(cap, Ordering::Relaxed);
+            retire_resource(buffer);
+        }
     }
 
     /// Where the next batch of clamped records goes: a device-local buffer

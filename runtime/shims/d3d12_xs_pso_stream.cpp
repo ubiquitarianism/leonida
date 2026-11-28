@@ -3,9 +3,12 @@
 
 #include "../src/shader_library.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 namespace rt::d3d12_xs {
 namespace {
@@ -110,6 +113,68 @@ const unsigned char* own_blob(std::vector<std::vector<unsigned char>>& blobs, co
     const auto* src = static_cast<const unsigned char*>(bytes);
     blobs.emplace_back(src, src + count);
     return blobs.back().data();
+}
+
+// Shader bytecode kept once per content for every record in the process. The title makes some 50 000 slot 86 calls
+// in its first boot from about 26 500 shaders (docs/embedded_shaders.md; the carved containers average 9.6 KB), so a
+// copy of each stage per record kept most containers many times over. A record holds a reference to the shared
+// bytes and the table holds weak references only, so a container is freed with the last record that uses it. The
+// bytes are never written after they are copied, so every stream that points at them reads what its own source held.
+class ShaderTable {
+public:
+    using ShaderData = PsoStreamRecord::ShaderData;
+
+    ShaderData acquire(const void* source, std::size_t size) {
+        const auto* bytes = static_cast<const std::uint8_t*>(source);
+        const std::uint64_t key = content_key(bytes, size);
+        {
+            std::lock_guard lock(mutex_);
+            if (auto found = find_locked(key, bytes, size)) return found;
+        }
+        // Copied outside the lock: another thread may have added the same bytes meanwhile, and then its copy is used.
+        auto made = std::make_shared<const std::vector<std::uint8_t>>(bytes, bytes + size);
+        std::lock_guard lock(mutex_);
+        if (auto found = find_locked(key, bytes, size)) return found;
+        if (++added_ % 1024 == 0) std::erase_if(shaders_, [](const auto& entry) { return entry.second.expired(); });
+        shaders_.emplace(key, made);
+        return made;
+    }
+
+private:
+    // A DXBC container carries a checksum of its contents in bytes 4..19, so that and the size pick the candidates
+    // without reading the whole program (as key_shader does in d3d12_vulkan_device.cpp). A container without one (all
+    // zero, as hand-built test containers have) or other bytecode is hashed with FNV-1a. A candidate is only taken
+    // when all its bytes are equal: hand-built containers can share a checksum.
+    static std::uint64_t content_key(const std::uint8_t* bytes, std::size_t size) {
+        std::uint64_t h = 0xcbf29ce484222325ull;
+        const auto mix = [&h](const std::uint8_t* data, std::size_t count) {
+            for (std::size_t i = 0; i < count; ++i) h = (h ^ data[i]) * 0x100000001b3ull;
+        };
+        mix(reinterpret_cast<const std::uint8_t*>(&size), sizeof(size));
+        if (size >= 20 && std::memcmp(bytes, "DXBC", 4) == 0 &&
+            std::any_of(bytes + 4, bytes + 20, [](std::uint8_t b) { return b != 0; }))
+            mix(bytes + 4, 16);
+        else
+            mix(bytes, size);
+        return h;
+    }
+    ShaderData find_locked(std::uint64_t key, const std::uint8_t* bytes, std::size_t size) {
+        const auto [first, last] = shaders_.equal_range(key);
+        for (auto it = first; it != last; ++it)
+            if (auto live = it->second.lock();
+                live && live->size() == size && std::memcmp(live->data(), bytes, size) == 0)
+                return live;
+        return {};
+    }
+
+    std::mutex mutex_;
+    std::unordered_multimap<std::uint64_t, std::weak_ptr<const std::vector<std::uint8_t>>> shaders_;
+    std::uint64_t added_ = 0;
+};
+
+ShaderTable& shader_table() {
+    static auto* table = new ShaderTable;  // never destroyed: a PSO may still be created during teardown
+    return *table;
 }
 
 // Holds a PsoStreamRecord as an IUnknown: the object keeps one reference, the creation code drops its own.
@@ -394,7 +459,10 @@ bool PsoStreamRecord::copy_pointed_data(std::size_t type, std::size_t payload_of
             if (code.pShaderBytecode && code.BytecodeLength) {
                 for (const auto& shader : payloads_->shaders)
                     if (shader->data() == code.pShaderBytecode && shader->size() == code.BytecodeLength) return true;
-                code.pShaderBytecode = own_blob(payloads_->blobs, code.pShaderBytecode, code.BytecodeLength);
+                // Equal bytecode from any stream is kept once (ShaderTable); this record holds a reference to it.
+                ShaderData shared = shader_table().acquire(code.pShaderBytecode, code.BytecodeLength);
+                code.pShaderBytecode = shared->data();
+                payloads_->shaders.push_back(std::move(shared));
                 std::memcpy(payload, &code, sizeof(code));
             }
             return true;

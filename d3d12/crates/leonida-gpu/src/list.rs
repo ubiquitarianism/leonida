@@ -218,25 +218,84 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, the bytes of
-/// upload memory it keeps, and when it was put by (`crate::host::now_ms`).
+/// A host list that has run and waits to be used again, and when it was put
+/// by (`crate::host::now_ms`). The bytes of upload memory it keeps are the
+/// pool's ([`Pool`]).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64, u64);
+struct Idle(crate::host::HostList, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
 #[cfg(windows)]
 unsafe impl Send for Idle {}
 
+/// Things kept to be used again, the oldest first, each with the bytes of
+/// upload memory it keeps.
+#[cfg(windows)]
+struct Pool<T> {
+    kept: Vec<(T, u64)>,
+    bytes: u64,
+    /// The fewest kept at any time since the last [`Pool::trim`]: the
+    /// oldest that many were not taken since then.
+    low: usize,
+}
+
+#[cfg(windows)]
+impl<T> Pool<T> {
+    const fn new() -> Self {
+        Pool { kept: Vec::new(), bytes: 0, low: 0 }
+    }
+
+    /// The thing given last.
+    fn take(&mut self) -> Option<T> {
+        let (thing, bytes) = self.kept.pop()?;
+        self.bytes -= bytes;
+        self.low = self.low.min(self.kept.len());
+        Some(thing)
+    }
+
+    /// Keeps `thing`, which keeps `bytes`, unless that takes the pool past
+    /// `most` things or bytes: then it comes back.
+    fn give(&mut self, thing: T, bytes: u64, most: (usize, u64)) -> Option<T> {
+        if self.kept.len() >= most.0 || self.bytes + bytes > most.1 {
+            return Some(thing);
+        }
+        self.bytes += bytes;
+        self.kept.push((thing, bytes));
+        None
+    }
+
+    /// Takes out the oldest `n` things.
+    fn take_oldest(&mut self, n: usize) -> Vec<(T, u64)> {
+        let gone: Vec<(T, u64)> = self.kept.drain(..n.min(self.kept.len())).collect();
+        self.bytes -= gone.iter().map(|(_, bytes)| bytes).sum::<u64>();
+        // The ones taken out were the oldest of those nobody took.
+        self.low = self.low.saturating_sub(gone.len());
+        gone
+    }
+
+    /// Takes out the oldest half (rounded up) of the things nobody took
+    /// since the last trim, so that what is kept follows what was needed
+    /// lately. Halving rather than taking out all of them keeps a need that
+    /// comes and goes from making things anew every time.
+    fn trim(&mut self) -> Vec<(T, u64)> {
+        let gone: Vec<(T, u64)> = self.kept.drain(..self.low.div_ceil(2)).collect();
+        self.bytes -= gone.iter().map(|(_, bytes)| bytes).sum::<u64>();
+        self.low = self.kept.len();
+        gone
+    }
+}
+
 /// Host lists that have run, reset and ready to record: the host side of
 /// a list a queue held, or of a part of a list cut at a wait, is taken
-/// from the title's list at its submission, and the title's list needs
-/// another. Each was made new and thrown away after its run: a hundred a
-/// frame in gameplay, each two command allocators and two lists, and for
-/// four in ten a budget and an argument buffer (run 61: "104 host lists
-/// made 21.2 ms" a frame, and the graphics kernel's time to free them).
+/// from the title's list at its submission, and the title's list takes
+/// another at its next reset. Each was made new and thrown away after its
+/// run: a hundred a frame in gameplay, each two command allocators and two
+/// lists, and for four in ten a budget and an argument buffer (run 61:
+/// "104 host lists made 21.2 ms" a frame, and the graphics kernel's time to
+/// free them).
 #[cfg(windows)]
-static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
+static IDLE: std::sync::Mutex<Pool<Idle>> = std::sync::Mutex::new(Pool::new());
 
 /// The most host lists kept idle (128 were too few: flights land several at
 /// a time, so lists were thrown away and others made in the same frame, with
@@ -266,17 +325,27 @@ fn pools() -> bool {
 /// after its reset, or a new one.
 #[cfg(windows)]
 fn fresh_list() -> Option<crate::host::HostList> {
-    let idle = {
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.0.pop();
-        if let Some(Idle(_, bytes, _)) = &taken {
-            idle.1 -= bytes;
-        }
-        taken
-    };
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     match idle {
-        Some(Idle(list, _, _)) => Some(list),
+        Some(Idle(list, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
+    }
+}
+
+/// Lets go of idle host lists nobody took lately ([`Pool::trim`]), once a
+/// second (`crate::host::sweep`). A command allocator keeps the memory of
+/// the most a list ever recorded into it over its resets, and the pool
+/// hands its lists to any title list, so every idle list grows to the size
+/// of the largest recording; the pool may keep [`IDLE_MOST`] of them,
+/// which a burst of landed flights fills and nothing emptied before.
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    let gone = IDLE.lock().unwrap_or_else(|e| e.into_inner()).trim();
+    if !gone.is_empty() {
+        // Freeing allocators is the driver's work: done where retired
+        // objects are dropped (the reaper thread), not on the submitting
+        // thread that sweeps.
+        crate::host::retire(gone);
     }
 }
 
@@ -293,34 +362,34 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).kept.len() >= IDLE_MOST.0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
+        host.idle_trim();
         let bytes = host.scratch_kept();
+        let now = crate::host::now_ms();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            let now = crate::host::now_ms();
-            idle.0.push(Idle(host, bytes, now));
-            idle.1 += bytes;
-            // (`LEONIDA_ALLOCATOR_TRIM=1`) Lists the frames did not need for
-            // that long are let go, with their allocators: the pool is last
-            // in, first out, so its oldest are the surplus of a spike, and
-            // nothing resets them again. Their submissions have run, as
-            // every idle list's (one the full pool turns away goes the same
-            // way).
-            if let Some(secs) = crate::host::allocator_trim() {
-                let n = stale(idle.0.iter().map(|i| i.2), now, secs * 1000);
-                let gone: Vec<Idle> = idle.0.drain(..n).collect();
-                idle.1 -= gone.iter().map(|i| i.1).sum::<u64>();
+        let refused = idle.give(Idle(host, now), bytes, IDLE_MOST);
+        // (`LEONIDA_ALLOCATOR_TRIM=1`) Lists the frames did not need for
+        // that long are let go, with their allocators: the pool is last in,
+        // first out, so its oldest are the surplus of a spike, and nothing
+        // resets them again. Their submissions have run, as every idle
+        // list's (one the full pool turns away goes the same way).
+        let gone = match crate::host::allocator_trim() {
+            Some(secs) if refused.is_none() => {
+                let n = stale(idle.kept.iter().map(|(i, _)| i.1), now, secs * 1000);
                 crate::host::ALLOCATOR_TRIMS[2].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-                // Released outside the lock.
-                drop(idle);
-                drop(gone);
+                idle.take_oldest(n)
             }
-        }
+            _ => Vec::new(),
+        };
+        // (Dropped outside the lock.)
+        drop(idle);
+        drop(refused);
+        drop(gone);
     }
 }
 
@@ -402,8 +471,8 @@ pub(crate) fn cut_list(this: This) -> bool {
 pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 
 /// Takes the host sides of the submitted `lists`, part by part ([`cut`]),
-/// and leaves each list a new, closed host list for its next reset, as
-/// [`detach`] does. What comes back is in the order the queue runs it: a
+/// and leaves each list without one until its next reset, as [`detach`]
+/// does. What comes back is in the order the queue runs it: a
 /// new entry starts at every part that has waits; host lists without
 /// waits join the entry before them. The list's upload memory and draw
 /// state (its dynamic descriptor slots) go with its last part, which runs
@@ -433,16 +502,11 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        // The list takes another host list at its reset ([`reset`]).
+        let Some(host) = list.host.take() else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -511,8 +575,8 @@ pub(crate) fn ahead_of_frame() -> Option<Detached> {
 }
 
 /// Takes the host sides of submitted lists (each once, however often the
-/// submission names it) and leaves each list a new, closed host list for
-/// its next reset: what was taken, and which of them run in what order.
+/// submission names it) and leaves each list without one until its next
+/// reset ([`reset`]): what was taken, and which of them run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
     let mut taken: Vec<(This, Detached)> = Vec::new();
@@ -525,17 +589,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = (*list).host.take() else {
                 continue;
             };
             let uploads =
@@ -734,6 +792,18 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        // A submission took the list's host list ([`detach`]): it takes one
+        // now. A submitted list used to get a new one at once and keep it
+        // until this reset, which for a list the title leaves alone for a
+        // while is a command allocator grown to the size of some other
+        // list's recording, kept for nothing. Closed, so that its reset
+        // below is the same as the one the list had before.
+        if list.host.is_none()
+            && let Some(fresh) = fresh_list()
+        {
+            fresh.close();
+            list.host = Some(fresh);
+        }
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
@@ -2831,6 +2901,65 @@ mod tests {
         assert_eq!(stale(std::iter::empty(), 40_000, 30_000), 0);
     }
 
+    /// A host list put by in the idle pool lets go of an indirect scratch
+    /// buffer past 1 MiB, which it kept for whichever title list took it
+    /// next; a smaller one it keeps.
+    #[cfg(windows)]
+    #[test]
+    fn an_idle_list_lets_go_of_a_large_indirect_scratch() {
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            eprintln!("no D3D12 device; idle host lists not tested");
+            return;
+        };
+        // SAFETY: a live buffer.
+        let width = |buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource| unsafe { buffer.GetDesc() }.Width;
+        // Through the pool and back. Other tests give lists to it and take
+        // them too: ours is among the last given, unless one took it. The
+        // lists taken out above ours go back in their order, so a test that
+        // expects its own list back still finds it. Only the pool's
+        // functions are used: its layout is not the same on every branch.
+        let detached = |host| Detached { host, _uploads: Vec::new(), _state: Default::default() };
+        let round_trip = |list: crate::host::HostList| {
+            let raw = list.list.as_raw();
+            list.close();
+            recycle(vec![detached(list)], &[0]);
+            let mut others = Vec::new();
+            let mut ours = None;
+            for _ in 0..16 {
+                let Some(l) = fresh_list() else { break };
+                if l.list.as_raw() == raw {
+                    ours = Some(l);
+                    break;
+                }
+                l.close();
+                others.push(detached(l));
+            }
+            others.reverse();
+            let all: Vec<usize> = (0..others.len()).collect();
+            recycle(others, &all);
+            ours
+        };
+        let list = host.new_list().unwrap();
+        assert_eq!(width(&list.indirect_scratch(1).unwrap()), 64 << 10);
+        let large = list.indirect_scratch(2 << 20).unwrap();
+        assert_eq!(width(&large), 2 << 20);
+        drop(large);
+        let Some(list) = round_trip(list) else {
+            eprintln!("another test took the list from the pool");
+            return;
+        };
+        assert_eq!(width(&list.indirect_scratch(1).unwrap()), 64 << 10, "the large buffer was let go");
+        // One within the bound stays with the list.
+        let kept = list.indirect_scratch(1 << 20).unwrap().as_raw();
+        let Some(list) = round_trip(list) else {
+            eprintln!("another test took the list from the pool");
+            return;
+        };
+        assert_eq!(list.indirect_scratch(1).unwrap().as_raw(), kept, "1 MiB is kept");
+        list.close();
+    }
+
     /// After edsuuu/VI-BR-PORT 7377418.
     #[test]
     fn a_compression_scratch_is_cut_to_the_level_it_is_copied_into() {
@@ -2934,6 +3063,112 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// A title list that was submitted holds no host list, and so no command
+    /// allocator grown by what it recorded, until the title resets it. Each
+    /// used to get a new host list at its submission and keep it while it
+    /// was idle, so every title list kept one alive besides those in flight
+    /// and in the pool.
+    #[cfg(windows)]
+    #[test]
+    fn a_submitted_list_keeps_no_host_list_until_its_reset() {
+        if crate::host::host().is_none() {
+            eprintln!("no D3D12 device; the host lists of submitted lists are not tested");
+            return;
+        }
+        const LISTS: usize = 64;
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let lists: Vec<This> = (0..LISTS)
+            .map(|_| {
+                let mut list = null;
+                assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+                list
+            })
+            .collect();
+        let held = |lists: &[This]| lists.iter().filter(|&&l| host_list(l).is_some()).count();
+        assert_eq!(held(&lists), LISTS, "a new list records at once");
+        for round in 0..4 {
+            for &list in &lists {
+                // (A new list starts open.)
+                if round > 0 {
+                    assert_eq!(reset(list, allocator, null), S_OK);
+                    assert!(host_list(list).is_some(), "round {round}: a reset list records");
+                }
+                assert_eq!(close(list), S_OK);
+            }
+            // Submitted, run and landed, as a queue that holds its lists
+            // does it: their host sides are taken and given back once run.
+            let (taken, order) = detach(&lists);
+            assert_eq!(taken.len(), LISTS);
+            recycle(taken, &order);
+            assert_eq!(held(&lists), 0, "round {round}: submitted lists keep host lists alive");
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for list in lists {
+            assert_eq!(release(list), 0);
+        }
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// The idle pool follows what was needed lately: after a burst fills it
+    /// to the most, a steady need of a few lists a second leaves it with
+    /// about those few. Each trim lets go of the oldest half of those
+    /// nobody took since the one before, and never of those that were taken.
+    #[cfg(windows)]
+    #[test]
+    fn idle_lists_nobody_takes_are_let_go() {
+        let mut pool: Pool<u32> = Pool::new();
+        for i in 0..IDLE_MOST.0 as u32 {
+            assert_eq!(pool.give(i, 1, IDLE_MOST), None);
+        }
+        assert_eq!(pool.give(9999, 1, IDLE_MOST), Some(9999), "no more than the most");
+        assert_eq!(pool.give(9999, IDLE_MOST.1, (usize::MAX, IDLE_MOST.1)), Some(9999), "no more bytes than the most");
+        // Given since the last trim: nobody had the time to take them.
+        assert!(pool.trim().is_empty());
+        let mut kept = Vec::new();
+        for second in 0..12 {
+            // Eight lists recorded, run and given back.
+            let taken: Vec<u32> = (0..8).map(|_| pool.take().expect("kept")).collect();
+            for &t in &taken {
+                assert_eq!(pool.give(t, 1, IDLE_MOST), None);
+            }
+            let gone = pool.trim();
+            assert!(gone.iter().all(|(t, _)| !taken.contains(t)), "second {second}: a list in use was let go");
+            if second == 0 {
+                assert_eq!(gone.len(), (IDLE_MOST.0 - 8).div_ceil(2));
+                assert_eq!(gone[0].0, 0, "the oldest go first");
+            }
+            kept = taken;
+        }
+        assert_eq!(pool.kept.len(), 8, "what is kept is what was needed lately");
+        assert_eq!(pool.bytes, 8);
+        assert!(pool.kept.iter().all(|(t, _)| kept.contains(t)));
+        // Nothing needed at all: the pool empties.
+        for _ in 0..8 {
+            pool.trim();
+        }
+        assert!(pool.kept.is_empty() && pool.bytes == 0);
+    }
+
+    /// `LEONIDA_ALLOCATOR_TRIM`'s cut of the oldest idle lists keeps the
+    /// pool's bytes, and its count of those nobody took, true.
+    #[cfg(windows)]
+    #[test]
+    fn taking_out_the_oldest_keeps_the_pools_counts() {
+        let mut pool: Pool<u32> = Pool::new();
+        for i in 0..6 {
+            assert_eq!(pool.give(i, 10 + u64::from(i), IDLE_MOST), None);
+        }
+        assert!(pool.trim().is_empty());
+        // Nobody takes any for a while: the six are all untouched.
+        let gone = pool.take_oldest(2);
+        assert_eq!(gone.iter().map(|(t, _)| *t).collect::<Vec<_>>(), [0, 1], "the oldest go first");
+        assert_eq!(pool.bytes, 12 + 13 + 14 + 15);
+        assert_eq!(pool.low, 4, "four untouched ones are left");
+        assert!(pool.take_oldest(99).len() == 4 && pool.kept.is_empty() && pool.bytes == 0 && pool.low == 0);
     }
 
     /// An offset near `u64::MAX` must not overflow and write outside the

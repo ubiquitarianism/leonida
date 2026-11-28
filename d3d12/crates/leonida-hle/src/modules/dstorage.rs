@@ -12,16 +12,16 @@
 //! console's hardware runs them: in parallel, started in queue order,
 //! queues served by weighted round robin over their priorities (about 10x
 //! per level, counted in bytes), with at most the staging buffer's worth of
-//! compressed source in flight. Each request reads its source (a file or
-//! memory), inflates zlib data and/or unpacks BCPack data, and writes the
-//! destination (an address, or physical pages). Completion is what stays
-//! in order: a status entry is written once every request enqueued before
-//! it on its queue has finished, with the first failure (in queue order)
-//! since the previous status entry, or success.
+//! buffered bytes in flight ([`staging_bytes`]). Each request reads its
+//! source (a file or memory), inflates zlib data and/or unpacks BCPack data,
+//! and writes the destination (an address, or physical pages), through
+//! buffers its worker keeps from one request to the next ([`Scratch`]).
+//! Completion is what stays in order: a status entry is written once every
+//! request enqueued before it on its queue has finished, with the first
+//! failure (in queue order) since the previous status entry, or success.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -229,7 +229,9 @@ extern "system" fn create_queue(
 
 /// The title asks for 32 MiB and stops if this fails. Give PC worker threads
 /// enough staging headroom (default 256 MiB) so multi-MB RPF chunks don't
-/// starve the remaining cores.
+/// starve the remaining cores. This is the largest bound on this module's
+/// RAM: it caps the buffers of the requests running ([`staging_bytes`]); what
+/// the workers keep between requests is apart from it ([`SCRATCH_KEPT`] each).
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     static FLOOR_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let floor = *FLOOR_MB.get_or_init(|| {
@@ -776,6 +778,8 @@ pub(crate) mod stream_log {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    // This worker's buffers, in its own frame for as long as it runs.
+    let mut scratch = Scratch::default();
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -786,7 +790,8 @@ fn work(scheduler: &'static Scheduler) {
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
         let reading = leonida_gpu::timeline::span("streaming: a request");
-        let result = execute(&job.request);
+        let result = execute(&job.request, &mut scratch);
+        scratch.trim();
         reading.end();
         walls_request(&job.request, &result, started);
         stream_log::request(&job, started, &result);
@@ -801,6 +806,58 @@ fn work(scheduler: &'static Scheduler) {
         }
         scheduler.finished.notify_all();
     }
+}
+
+/// A worker's buffers between a request's source and its destination: a
+/// compressed source read from its file, the zlib output that BCPack then
+/// unpacks, and the bytes of a destination in pages that are not one
+/// allocation's in order. They are kept from one request to the next: new
+/// ones for every request cost an allocation each, and blocks of 1 MiB and
+/// more come from the host's virtual memory, fresh and zero-filled each time
+/// and given back at the end.
+#[derive(Default)]
+struct Scratch {
+    source: Vec<u8>,
+    packed: Vec<u8>,
+    pages: Vec<u8>,
+}
+
+/// What a worker keeps of its buffers between requests. A request that needs
+/// more has them for its own time, so at most this times the workers stays
+/// allocated while nothing runs.
+const SCRATCH_KEPT: usize = 16 << 20;
+
+impl Scratch {
+    /// Gives up buffers, largest first, until those kept hold at most
+    /// [`SCRATCH_KEPT`].
+    fn trim(&mut self) {
+        let mut buffers = [&mut self.source, &mut self.packed, &mut self.pages];
+        buffers.sort_unstable_by_key(|b| std::cmp::Reverse(b.capacity()));
+        let mut kept: usize = buffers.iter().map(|b| b.capacity()).sum();
+        for buffer in buffers {
+            if kept <= SCRATCH_KEPT {
+                break;
+            }
+            kept -= buffer.capacity();
+            *buffer = Vec::new();
+        }
+    }
+}
+
+/// `len` bytes of `buffer` for a request to overwrite. The buffer grows only
+/// past what earlier requests left in it, so a reused one is neither
+/// allocated nor cleared again; what those requests wrote stays in it, and
+/// callers use only the bytes they write. One that is too small is replaced
+/// rather than grown, since nothing in it needs copying.
+fn room(buffer: &mut Vec<u8>, len: usize) -> &mut [u8] {
+    if buffer.capacity() < len {
+        // The old one goes first, so that both are never held at once.
+        *buffer = Vec::new();
+        *buffer = vec![0; len];
+    } else if buffer.len() < len {
+        buffer.resize(len, 0);
+    }
+    &mut buffer[..len]
 }
 
 impl Lanes {
@@ -967,15 +1024,32 @@ impl Lane {
 }
 
 /// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// the source and the destination. That is a compressed source read from a
+/// file, the zlib output that BCPack then unpacks, and for physical pages
+/// the destination's bytes, which go through a buffer when the pages are
+/// not one allocation's in order (rarely, but nothing tells beforehand).
+/// Raw reads go straight to their destination, and memory sources are read
+/// where they are (as on the console).
 fn staging_bytes(request: &Request) -> u64 {
-    let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
-        u64::from(request.source_size)
+    let options = request.options;
+    let compressed = options & (ZLIB | BCPACK) != 0;
+    let source = if compressed && options & MEMORY_SOURCE == 0 {
+        request.source_size
     } else {
         0
-    }
+    };
+    let packed = if options & ZLIB != 0 && options & BCPACK != 0 {
+        request.intermediate_size
+    } else {
+        0
+    };
+    // What `execute` writes: the decompressed bytes, or a raw copy's source.
+    let pages = match (options & PAGE_DESTINATION != 0, compressed) {
+        (false, _) => 0,
+        (true, true) => request.destination_size,
+        (true, false) => request.source_size,
+    };
+    u64::from(source) + u64::from(packed) + u64::from(pages)
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the
@@ -1018,7 +1092,8 @@ struct Request {
     source: *const c_void,
     offset: u64,
     source_size: u32,
-    /// Compressed size between two decompression stages; unused here.
+    /// Compressed size between two decompression stages: room for the zlib
+    /// output that BCPack then unpacks.
     intermediate_size: u32,
     /// Matched by cancellation; the title leaves it 0.
     tag: u64,
@@ -1375,8 +1450,10 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
-/// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+/// Reads, inflates and/or unpacks, and writes one request, through the
+/// worker's buffers.
+fn execute(request: &Request, scratch: &mut Scratch) -> Result<(), HRESULT> {
+    let Scratch { source: read, packed, pages } = scratch;
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -1404,7 +1481,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     if options & (ZLIB | BCPACK | MEMORY_SOURCE) == ZLIB
         && let Some(movie) = glyph_movie(request)
     {
-        return into_destination(request, size, |out| {
+        return into_destination(request, size, pages, |out| {
             let n = movie.len().min(out.len());
             out[..n].copy_from_slice(&movie[..n]);
             out[n..].fill(0);
@@ -1416,25 +1493,24 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+        return into_destination(request, size, pages, |out| read_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let source = read_source(request, read).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        let out = room(packed, request.intermediate_size as usize);
+        let n = inflate(source, out).map_err(|hr| fail(hr, "zlib"))?;
+        &packed[..n]
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
+    into_destination(request, size, pages, |out| match tables {
+        Some(tables) => bcpack::decode(bc, source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1539,18 +1615,19 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// A compressed request's source: in memory where it is, or read from the
+/// file into `buffer`.
+fn read_source<'a>(request: &Request, buffer: &'a mut Vec<u8>) -> Result<&'a [u8], HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    // `read_into` writes all of it or fails, so nothing an earlier request
+    // left in the buffer shows.
+    let bytes = room(buffer, size);
+    read_into(request, bytes)?;
+    Ok(bytes)
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -1611,10 +1688,11 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
 /// physical pages are too when they are consecutive pages of one
-/// allocation, and otherwise go through a buffer.
+/// allocation, and otherwise go through `buffer`.
 fn into_destination(
     request: &Request,
     len: usize,
+    buffer: &mut Vec<u8>,
     mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
@@ -1644,7 +1722,7 @@ fn into_destination(
     // (Said aloud: by the title's protocol a submitted request's list stays
     // as it is.)
     for _ in 0..3 {
-        into_pages(&pages, offset, len, &mut fill)?;
+        into_pages(&pages, offset, len, buffer, &mut fill)?;
         let now = read_list(list, offset, len);
         if now == pages || !super::xmem::pages_known(&now, offset, len) {
             break;
@@ -1662,11 +1740,13 @@ fn into_destination(
     Ok(())
 }
 
-/// Runs `fill` on `len` bytes of `pages`, from `offset` into the first.
+/// Runs `fill` on `len` bytes of `pages`, from `offset` into the first;
+/// through `buffer` when they are not one allocation's in order.
 fn into_pages(
     pages: &[usize],
     offset: usize,
     len: usize,
+    buffer: &mut Vec<u8>,
     mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     // Consecutive pages of one allocation (the usual case): written in
@@ -1676,8 +1756,11 @@ fn into_pages(
         super::xmem::pages_written(pages, offset, len);
         return filled;
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
+    let data = room(buffer, len);
+    // Zero as a new buffer would be, so that bytes a decoder leaves alone
+    // are not an earlier request's.
+    data.fill(0);
+    let n = fill(data)?;
     // A page the title has just made, or a view the host refuses for a moment (commit
     // or address space short while a load maps many at once), can come right a little
     // later: tried again before the request fails (`LEONIDA_DSTORAGE_RETRIES`, default 12,
@@ -1783,7 +1866,7 @@ pub(crate) fn module() -> HleModule {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
@@ -2097,7 +2180,7 @@ mod tests {
             let len = PAGE + 100;
             let r = request(PAGE_DESTINATION, at.cast(), len, std::ptr::null(), 0, len);
             let mut runs = 0;
-            let written = into_destination(&r, len, |out| {
+            let written = into_destination(&r, len, &mut Vec::new(), |out| {
                 runs += 1;
                 out.fill(0xa5);
                 // SAFETY: our own list.
@@ -2137,7 +2220,7 @@ mod tests {
             protect(PAGE_READWRITE)
         });
         let r = request(0, at as *mut c_void, plain.len(), file, 0, plain.len());
-        assert_eq!(execute(&r), Ok(()));
+        assert_eq!(execute(&r, &mut Scratch::default()), Ok(()));
         assert_ne!(opener.join().unwrap(), 0);
         // SAFETY: as above, all of it readable.
         assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, plain.len()) }, plain);
@@ -2296,6 +2379,55 @@ mod tests {
         assert!(l.start().is_some());
     }
 
+    /// What a request holds of the staging buffer is every buffer it fills
+    /// between the source and the destination.
+    #[test]
+    fn staging_counts_every_buffer_a_request_holds() {
+        let (to, from) = (std::ptr::null_mut(), std::ptr::null());
+        // zlib then BCPack from a file: the source and the zlib output.
+        let mut both = request(ZLIB | 4 << 1, to, 4096, from, 0, 1000);
+        both.intermediate_size = 3000;
+        assert_eq!(staging_bytes(&both), 1000 + 3000);
+        // From memory the source is read where it is; the zlib output is not.
+        both.options |= MEMORY_SOURCE;
+        assert_eq!(staging_bytes(&both), 3000);
+        // Pages of several allocations take the destination's bytes through a
+        // buffer, so a request to pages holds that much too.
+        let to_pages = request(ZLIB | PAGE_DESTINATION, to, 4096, from, 0, 1000);
+        assert_eq!(staging_bytes(&to_pages), 1000 + 4096);
+        let raw_to_pages = request(PAGE_DESTINATION | MEMORY_SOURCE, to, 1000, from, 0, 1000);
+        assert_eq!(staging_bytes(&raw_to_pages), 1000);
+        // zlib alone and raw reads to an address hold what they did.
+        assert_eq!(staging_bytes(&request(ZLIB, to, 4096, from, 0, 1000)), 1000);
+        assert_eq!(staging_bytes(&request(0, to, 1000, from, 0, 1000)), 0);
+    }
+
+    /// A worker's buffers are used again by smaller requests, and it keeps
+    /// at most `SCRATCH_KEPT` of them between requests, giving up the
+    /// largest first.
+    #[test]
+    fn a_worker_keeps_its_buffers_up_to_a_bound() {
+        let mut scratch = Scratch::default();
+        room(&mut scratch.source, 1 << 20).fill(1);
+        room(&mut scratch.packed, 2 << 20);
+        scratch.trim();
+        let (source, packed) = (scratch.source.as_ptr(), scratch.packed.as_ptr());
+        // Smaller requests: the same buffers, and what they do not write
+        // stays as it was (nobody reads it).
+        assert_eq!(room(&mut scratch.source, 100).as_ptr(), source);
+        assert_eq!(room(&mut scratch.packed, 1 << 20).as_ptr(), packed);
+        assert_eq!(scratch.source.len(), 1 << 20);
+        room(&mut scratch.pages, SCRATCH_KEPT);
+        scratch.trim();
+        assert_eq!(scratch.pages.capacity(), 0, "the largest goes");
+        assert_eq!((scratch.source.as_ptr(), scratch.packed.as_ptr()), (source, packed));
+        // A request larger than the bound has its buffer for its own time.
+        room(&mut scratch.source, SCRATCH_KEPT + 1);
+        scratch.trim();
+        assert_eq!(scratch.source.capacity(), 0);
+        assert!(scratch.packed.capacity() >= 2 << 20);
+    }
+
     #[test]
     fn a_status_waits_for_every_earlier_read() {
         let mut l = lanes(STAGING);
@@ -2340,6 +2472,132 @@ mod tests {
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, bc4_blocks());
+    }
+
+    /// Counts the blocks of the sizes a test watches
+    /// (`compressed_requests_reuse_the_workers_buffers`). The test binary's
+    /// allocator (`test_alloc`) tells it of each block. Not with the features
+    /// under which leonida-gpu installs an allocator of its own.
+    #[cfg(not(any(feature = "diagnostics", feature = "mimalloc")))]
+    pub(crate) mod watched_blocks {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+
+        /// The sizes watched (0: none), and how many blocks of each were
+        /// allocated since.
+        pub(super) static SIZES: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+        pub(super) static BLOCKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+        pub(crate) fn note(size: usize) {
+            for (watched, blocks) in SIZES.iter().zip(&BLOCKS) {
+                if size != 0 && watched.load(Relaxed) == size {
+                    blocks.fetch_add(1, Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Compressed requests run on buffers their worker keeps: the source
+    /// read from the file, the zlib output that BCPack unpacks, and the
+    /// bytes of a destination in pages that are not one allocation's in
+    /// order are each allocated at most once per worker, not once per
+    /// request (blocks of 1 MiB and more come from the host's virtual
+    /// memory, new and zero-filled each time).
+    #[cfg(not(any(feature = "diagnostics", feature = "mimalloc")))]
+    #[test]
+    fn compressed_requests_reuse_the_workers_buffers() {
+        use crate::modules::xmem;
+        use watched_blocks::{BLOCKS, SIZES};
+        with_test_tables();
+        const BATCH: usize = 8;
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        // More requests of each kind than there are workers, several times.
+        let batches = 4 * workers.div_ceil(BATCH) + 1;
+
+        // zlib from the file, with about 1 MiB of source: bytes that do not
+        // compress (xorshift), so that the stream is about as long.
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        let plain: Vec<u8> = (0..(1 << 20) + 1234)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 32) as u8
+            })
+            .collect();
+        let packed = compress_zlib(&plain);
+        // zlib then BCPack from the file, with room for a BCPack stream far
+        // longer than this one (a stream may end short of it).
+        let bc4 = compress_zlib(&BC4_STREAM);
+        let intermediate = (1 << 20) + 4099;
+        let mut contents = packed.clone();
+        contents.extend_from_slice(&bc4);
+        let (_dir, file) = file_with(&contents);
+        // zlib from memory into three pages listed backwards: through a buffer.
+        let paged = pattern(2 * PAGE + 4093);
+        let paged_packed = compress_zlib(&paged);
+        let mut pages = vec![0usize; 3 * BATCH];
+        let mut n = pages.len();
+        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let mut lists: Vec<[usize; 3]> =
+            pages.chunks_exact(3).map(|p| [p[2], p[1], p[0]]).collect();
+        let mut inflated = vec![vec![0u8; plain.len()]; BATCH];
+        let mut unpacked = [[0u8; 16]; BATCH];
+
+        let (queue, array) = (new_queue(0), status_array(1));
+        // Sizes of their own: nothing else here allocates blocks of them.
+        let watch = [packed.len(), intermediate, paged.len()];
+        assert!(watch.iter().all(|&size| size >= 2 * PAGE && size != plain.len()));
+        for ((watched, blocks), size) in SIZES.iter().zip(&BLOCKS).zip(watch) {
+            blocks.store(0, Ordering::Relaxed);
+            watched.store(size, Ordering::Relaxed);
+        }
+        // A page's bytes, from the start, and what of the destination it holds.
+        let pieces = |list: [usize; 3]| {
+            [(list[0], 0..PAGE), (list[1], PAGE..2 * PAGE), (list[2], 2 * PAGE..paged.len())]
+        };
+        for _ in 0..batches {
+            for i in 0..BATCH {
+                inflated[i].fill(0);
+                unpacked[i] = [0; 16];
+                for (page, _) in pieces(lists[i]) {
+                    xmem::page_window(&[page], 0, PAGE).unwrap().bytes().fill(0);
+                }
+                let at = inflated[i].as_mut_ptr().cast();
+                enqueue(queue, &request(ZLIB, at, plain.len(), file, 0, packed.len()));
+                let at = unpacked[i].as_mut_ptr().cast();
+                let mut r = request(ZLIB | 4 << 1, at, 16, file, packed.len() as u64, bc4.len());
+                r.intermediate_size = intermediate as u32;
+                enqueue(queue, &r);
+                let at = lists[i].as_mut_ptr().cast();
+                let options = ZLIB | PAGE_DESTINATION | MEMORY_SOURCE;
+                let source = paged_packed.as_ptr().cast();
+                enqueue(queue, &request(options, at, paged.len(), source, 0, paged_packed.len()));
+            }
+            enqueue_status(queue, array, 0);
+            void(queue, 0x30);
+            assert_eq!(wait(array, 0), S_OK);
+            for i in 0..BATCH {
+                assert!(inflated[i] == plain, "zlib request {i}");
+                assert_eq!(unpacked[i], bc4_blocks(), "zlib then BCPack request {i}");
+                for (page, bytes) in pieces(lists[i]) {
+                    let mut window = xmem::page_window(&[page], 0, bytes.len()).unwrap();
+                    assert!(*window.bytes() == paged[bytes], "request {i} to pages");
+                }
+            }
+        }
+        for watched in &SIZES {
+            watched.store(0, Ordering::Relaxed);
+        }
+        void(queue, 0x40);
+        assert_eq!(xmem::XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+        let blocks = BLOCKS.each_ref().map(|b| b.load(Ordering::Relaxed));
+        assert!(
+            blocks.iter().all(|&b| b <= workers as u64),
+            "buffers allocated for the source read from the file, the zlib output for BCPack \
+             and the destination in pages: {blocks:?}, in {} requests of each kind on {workers} \
+             workers",
+            batches * BATCH
+        );
     }
 
     /// BCPack tables we made (uniform models; BC4 index pairs: low 3 bits,

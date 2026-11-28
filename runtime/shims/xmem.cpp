@@ -2260,6 +2260,13 @@ BOOL title_free_impl(LPVOID address, SIZE_T size, DWORD free_type) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
     uintptr_t release_end = 0;
     if (releases && address) allocation_extent(address, release_end);
+    // Whether [start, release_end) is all the release frees: allocation_extent stops after 4096 regions.
+    bool release_known = false;
+    if (release_end > start) {
+        MEMORY_BASIC_INFORMATION next{};
+        release_known = !VirtualQuery(reinterpret_cast<const void*>(release_end), &next, sizeof(next)) ||
+                        next.State == MEM_FREE || next.AllocationBase != address;
+    }
     uintptr_t decommit_end = 0;
     if ((free_type & MEM_DECOMMIT) && address) {
         decommit_end = size ? start + size : leonida::title_write_watch::end_of(start);
@@ -2276,8 +2283,11 @@ BOOL title_free_impl(LPVOID address, SIZE_T size, DWORD free_type) {
     } else {
         result = VirtualFree(address, size, free_type);
     }
-    // A release of size 0 frees the whole reservation, whose extent is not known here: a change anywhere.
+    // A release of size 0 frees the whole reservation: the range allocation_extent found before the free, so a reader
+    // whose pages are elsewhere (the D3D12 layer's textures and shadows) does not take every page for changed. Where
+    // that range is not known, a change anywhere.
     if (result && size) leonida::title_memory_map::changed(address, size);
+    else if (result && release_known) leonida::title_memory_map::changed(start, release_end);
     else if (result) leonida::title_memory_map::changed();
     if (result && (free_type & MEM_DECOMMIT)) note_unwatched_change(address, size, 0, true);
     if (result && (free_type & MEM_RELEASE) && !(free_type & MEM_PRESERVE_PLACEHOLDER))

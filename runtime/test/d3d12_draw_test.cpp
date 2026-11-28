@@ -80,6 +80,9 @@ static_assert(offsetof(Vertex, wrong_color) == 16);
 // Positive-only offscreen variant, sharing the translated-shader fixture, root signature and PSO description.
 int check_stateful_indirect_pixels(ID3D12Device* device, ID3D12RootSignature* root, D3D12_GRAPHICS_PIPELINE_STATE_DESC desc,
                                   bool multi, bool counted, bool nonindexed_only);
+// Recording only, on the same root signature and PSO description: which draws share a views block (DrawViews).
+int check_draw_views_sharing(ID3D12Device* device, ID3D12RootSignature* root,
+                             const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc);
 
 int main(int argc, char** argv) {
     const bool nonindexed_only = argc == 3 && std::strcmp(argv[2], "--nonindexed-only") == 0;
@@ -92,6 +95,7 @@ int main(int argc, char** argv) {
     const bool title_index = argc == 2 && std::strcmp(argv[1], "--title-index-window") == 0;
     const bool title_vertex = argc == 2 && std::strcmp(argv[1], "--title-vertex-window") == 0;
     const bool title_window = title_index || title_vertex;
+    const bool views_sharing = argc == 2 && std::strcmp(argv[1], "--draw-views-sharing") == 0;
     vktest::Device d;
     d.request_draw_indirect_first_instance = indirect_pixels;
     d.request_robust_index_view = indirect_pixels && !nonindexed_only;
@@ -243,6 +247,11 @@ int main(int argc, char** argv) {
         pso_desc.NumRenderTargets = 1;
         pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         pso_desc.SampleDesc.Count = 1;
+        if (views_sharing) {
+            const int result = check_draw_views_sharing(device.p, root.p, pso_desc);
+            EXPECT(d.validation_errors() == 0);
+            return result;
+        }
         if (indirect_pixels) {
             const int result = check_stateful_indirect_pixels(device.p, root.p, pso_desc, multi_pixels || count_pixels,
                                                               count_pixels, nonindexed_only);

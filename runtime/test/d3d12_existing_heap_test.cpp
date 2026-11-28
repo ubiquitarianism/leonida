@@ -4,7 +4,8 @@
 // on the host devices too. With VK_EXT_external_memory_host, OpenExistingHeapFromAddress on real host memory is
 // compared case by case with the host devices (open_cases: RTX 4090 and WARP agree), and a heap is opened on a
 // committed range; without it, the device reports EXISTING_HEAPS unsupported and answers an accepted range E_NOTIMPL.
-// No shaders or game data.
+// Each Vulkan-backed device goes with the test's last reference to it (release_device), and under
+// LEONIDA_VK_VALIDATION=1 vkDestroyDevice must find nothing left over. No shaders or game data.
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device3-openexistingheapfromaddress
 #include "../shims/title_gpu_placements.h"
 #include "../shims/xg_xs_layout.h"
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -1663,6 +1665,324 @@ int check_placed_view_map_changes(ID3D12Device* device) {
     return 0;
 }
 
+// What the slot-70 image checks below share: textures of 64 KiB the title writes into its memory and names through
+// slot-70 views, submissions (the registry's refresh pass runs before each) and what the registry holds.
+struct TitleImageBench {
+    static constexpr UINT width = 256, height = 256;
+    static constexpr SIZE_T texture_bytes = width * height;
+    const char* who = nullptr;
+    ID3D12Device* device = nullptr;
+    GpuReader gpu;
+    D3D12_RESOURCE_DESC desc{};
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    rt::d3d12::OwnedTitleImages start{};
+
+    int init(ID3D12Device* d, const char* name) {
+        device = d;
+        who = name;
+        EXPECT(!gpu.init(device, 4096));
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = width;
+        desc.Height = height;
+        desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Format = DXGI_FORMAT_R8_UNORM;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        srv.Format = desc.Format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = 1;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        start = images();
+        return 0;
+    }
+    // The title writes the bytes of the texture at `at` (unless `write` is false: it wrote them already, or the pages
+    // are not there), then names it.
+    bool name(std::uint8_t* at, unsigned seed, leonida::gfx10::ImageWords& slot, bool write = true) {
+        if (write)
+            for (SIZE_T i = 0; i < texture_bytes; ++i) at[i] = pattern_byte(i, seed);
+        std::array<UINT, 14> resource{};
+        std::array<UINT, 16> words{};
+        std::memcpy(resource.data(), &desc, sizeof(desc));
+        std::memcpy(words.data(), &srv, sizeof(srv));
+        return rt::d3d12::write_placed_texture_view(device, false, resource.data(), words.data(),
+                                                    reinterpret_cast<UINT64>(at),
+                                                    {reinterpret_cast<SIZE_T>(slot.data())});
+    }
+    bool index(const leonida::gfx10::ImageWords& descriptor) const {
+        std::uint32_t key[8];
+        std::memcpy(key, descriptor.data(), sizeof(key));
+        return rt::d3d12::bindless_hash_lookup(device, key);
+    }
+    int submit() {
+        ID3D12CommandList* lists[]{gpu.list.p};
+        gpu.queue->ExecuteCommandLists(1, lists);
+        EXPECT_HR(gpu.queue->Signal(gpu.fence.p, ++gpu.fence_value), S_OK);
+        EXPECT_HR(gpu.fence->SetEventOnCompletion(gpu.fence_value, gpu.done), S_OK);
+        EXPECT(WaitForSingleObject(gpu.done, 30000) == WAIT_OBJECT_0);
+        return 0;
+    }
+    // The image at `at` holds the texels of `seed`.
+    int texels(std::uint8_t* at, unsigned seed) const {
+        Ref<ID3D12Resource> image;
+        image.p = rt::d3d12::owned_title_image(device, reinterpret_cast<UINT64>(at));
+        EXPECT(image.p);
+        std::vector<std::uint8_t> got(texture_bytes);
+        EXPECT_HR(image->ReadFromSubresource(got.data(), width, UINT(texture_bytes), 0, nullptr), S_OK);
+        for (SIZE_T i = 0; i < texture_bytes; ++i)
+            if (got[i] != pattern_byte(i, seed)) {
+                std::fprintf(stderr, "%s: texel %zu of the image at %p is %u, expected %u\n", who, i,
+                             static_cast<void*>(at), unsigned(got[i]), unsigned(pattern_byte(i, seed)));
+                return 1;
+            }
+        return 0;
+    }
+    rt::d3d12::OwnedTitleImages images() const { return rt::d3d12::owned_title_images(device); }
+    std::uint64_t owned() const { return images().owned - start.owned; }
+    std::uint64_t looks() const { return images().looks - start.looks; }
+    std::uint64_t gone() const { return images().gone - start.gone; }
+};
+
+// The images the layer makes for slot-70 texture views of the title's memory have a lifetime (the
+// d3d12_title_image_retire test, with LEONIDA_TITLE_IMAGE_IDLE_MS=0 and LEONIDA_TITLE_IMAGE_CHECKS=4). A streaming
+// title places its textures at ever new addresses of the same memory: here 16 textures of 64 KiB, each 4 KiB after
+// the one before, in one committed range. An image a newer texture covers, or whose pages have all gone, and that no
+// view named since, is retired at the next submission; before, each address named kept its image, and its bindless
+// index, for the device's life. An image a view names again after a newer texture covered it is kept (two views of
+// the same bytes in use). A texture named again after its image was retired gets a new one with its texels, and the
+// T# its first view wrote finds it again. A slot-133 texture the title places over an image's bytes retires it once
+// a slot-70 view gives it its layout, not with the guess from its description. An image never filled stays when its
+// pages go. A change anywhere in the address space (title_memory_map::changed() with no range, which DirectStorage
+// transfers record) does not make the pass look at every image's pages, and a change over many images has them
+// looked at a few a pass.
+int check_title_image_retirement(ID3D12Device* device) {
+    TitleImageBench b;
+    const char* who = "slot-70 image retirement";
+    EXPECT(!b.init(device, who));
+    constexpr SIZE_T texture_bytes = TitleImageBench::texture_bytes, step = 4096, bytes = 1 << 20;
+    constexpr unsigned count = 16, checks = 4;  // LEONIDA_TITLE_IMAGE_CHECKS, set by main
+    auto* pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(pages);
+    const auto room = rt::d3d12::bindless_room(device).images_2d;
+
+    // 1. Sixteen textures over the same memory, one after the other: one image is left, the last one.
+    leonida::gfx10::ImageWords first{}, slot{};
+    for (unsigned i = 0; i < count; ++i) {
+        EXPECT(b.name(pages + i * step, i, i ? slot : first));
+        if (!i) EXPECT(b.index(first));  // published at its fill...
+        EXPECT(!b.submit());
+    }
+    EXPECT(!b.submit() && !b.submit());
+    const auto streamed = b.images();
+    std::printf("%s: %u textures named over the same memory: %llu images (%llu KiB), %llu retired, %llu of them under "
+                "a newer texture; %u bindless 2D indices taken\n",
+                who, count, static_cast<unsigned long long>(streamed.owned - b.start.owned),
+                static_cast<unsigned long long>((streamed.owned_bytes - b.start.owned_bytes) >> 10),
+                static_cast<unsigned long long>(streamed.retired - b.start.retired),
+                static_cast<unsigned long long>(streamed.superseded - b.start.superseded),
+                room - rt::d3d12::bindless_room(device).images_2d);
+    EXPECT(streamed.owned - b.start.owned == 1);
+    EXPECT(streamed.owned_bytes - b.start.owned_bytes <= 2 * texture_bytes);
+    EXPECT(streamed.superseded - b.start.superseded == count - 1);
+    EXPECT(room - rt::d3d12::bindless_room(device).images_2d <= 1);
+    EXPECT(!b.index(first));  // ...so its T# finds nothing
+    EXPECT(!b.texels(pages + (count - 1) * step, count - 1));
+
+    // 2. The first texture named again: a new image with its texels, which the T# of its first view finds again.
+    EXPECT(b.name(pages, 0, slot));
+    EXPECT(!b.submit());
+    EXPECT(b.owned() == 1 && !b.texels(pages, 0));
+    EXPECT(slot == first && b.index(first));
+
+    // 3. A view names it again after a newer texture covered half of it: both stay, at every submission.
+    leonida::gfx10::ImageWords newer{};
+    const auto named_again = b.images().named_again;
+    EXPECT(b.name(pages + 8 * step, 8, newer));
+    EXPECT(b.name(pages, 0, slot));
+    EXPECT(!b.submit() && !b.submit());
+    EXPECT(b.owned() == 2 && b.index(first) && b.index(newer));
+    EXPECT(b.images().named_again - named_again == 1);
+
+    // 4. A third texture over both, named alone: it is the one image left.
+    EXPECT(b.name(pages + 12 * step, 12, slot));
+    EXPECT(!b.submit());
+    EXPECT(b.owned() == 1 && !b.index(first) && !b.index(newer) && b.index(slot) && !b.texels(pages + 12 * step, 12));
+
+    // 5. Its pages decommitted: no image is left.
+    EXPECT(VirtualFree(pages, bytes, MEM_DECOMMIT) != FALSE);
+    leonida::title_memory_map::changed(pages, bytes);
+    EXPECT(!b.submit());
+    EXPECT(b.owned() == 0 && b.gone() == 1);
+
+    // 6. The pages back, and a texture named there again: it has an image and its texels.
+    EXPECT(VirtualAlloc(pages, bytes, MEM_COMMIT, PAGE_READWRITE) == pages);
+    leonida::title_memory_map::changed(pages, bytes);
+    EXPECT(b.name(pages, 0, slot));
+    EXPECT(!b.submit());
+    EXPECT(b.owned() == 1 && !b.texels(pages, 0) && b.index(first));
+
+    // 7. A slot-133 texture the title places over its bytes: the Layout 0 of its description is a guess, which may be
+    // larger than what the title placed, and covers nothing. A slot-70 view of it gives it its layout, and the image
+    // under it is retired.
+    {
+        Ref<ID3D12Resource> placed;
+        D3D12_RESOURCE_DESC placed_desc = b.desc;
+        placed_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        std::uint8_t* const at = pages + 65536 - 2 * step;
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, at, placed_desc, 0, IID_PPV_ARGS(&placed.p)), S_OK);
+        EXPECT(!b.submit());
+        EXPECT(b.owned() == 1 && b.index(first));
+        leonida::gfx10::ImageWords placed_view{};
+        EXPECT(b.name(at, 7, placed_view));
+        EXPECT(!b.submit());
+        EXPECT(b.owned() == 0 && !b.index(first));
+    }
+
+    // 8. A texture named before its pages came has an image never filled: it stays when a change over its pages
+    // finds none, and is filled once they come and a view names it again.
+    auto* hold = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, texture_bytes, MEM_RESERVE, PAGE_READWRITE));
+    EXPECT(hold);
+    leonida::gfx10::ImageWords pending{};
+    EXPECT(b.name(hold, 0, pending, false));
+    EXPECT(!b.submit());
+    EXPECT(b.owned() == 1);
+    leonida::title_memory_map::changed(hold, texture_bytes);
+    EXPECT(!b.submit() && !b.submit());
+    EXPECT(b.owned() == 1 && b.gone() == 1);
+    EXPECT(VirtualAlloc(hold, texture_bytes, MEM_COMMIT, PAGE_READWRITE) == hold);
+    for (SIZE_T i = 0; i < texture_bytes; ++i) hold[i] = pattern_byte(i, 3);
+    leonida::title_memory_map::changed(hold, texture_bytes);
+    EXPECT(!b.submit());
+    EXPECT(b.name(hold, 3, pending, false));
+    EXPECT(!b.submit());
+    EXPECT(b.owned() == 1 && !b.texels(hold, 3));
+
+    // 9. Twelve textures side by side, none over another, filled.
+    constexpr unsigned side = 12;
+    constexpr SIZE_T apart = 80 << 10;
+    auto* spread = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(spread);
+    std::vector<leonida::gfx10::ImageWords> views(side);
+    for (unsigned i = 0; i < side; ++i) EXPECT(b.name(spread + i * apart, 20 + i, views[i]));
+    EXPECT(!b.submit());
+    EXPECT(b.owned() == 1 + side && b.images().candidates == 0);
+    // A change anywhere: no image is looked at, as no page of theirs is known to have changed.
+    const auto looks = b.looks();
+    leonida::title_memory_map::changed();
+    EXPECT(!b.submit());
+    std::printf("%s: a change anywhere with %u images in the registry: %llu looks at their pages, %llu left to look "
+                "at\n",
+                who, 1 + side, static_cast<unsigned long long>(b.looks() - looks),
+                static_cast<unsigned long long>(b.images().candidates));
+    EXPECT(b.looks() == looks && b.images().candidates == 0 && b.owned() == 1 + side);
+    // A change over all twelve: their pages are looked at, at most `checks` a pass, and all are still there.
+    leonida::title_memory_map::changed(spread, bytes);
+    for (unsigned pass = 0; pass * checks < side; ++pass) {
+        EXPECT(!b.submit());
+        const auto seen = b.looks() - looks;
+        std::printf("%s: a change over %u images, pass %u: %llu looks at their pages\n", who, side, pass + 1,
+                    static_cast<unsigned long long>(seen));
+        EXPECT(seen == std::min<std::uint64_t>(side, (pass + 1) * checks));
+    }
+    EXPECT(b.owned() == 1 + side && b.images().candidates == 0 && b.gone() == 1);
+    // Their pages decommitted: they go, a few a pass.
+    EXPECT(VirtualFree(spread, bytes, MEM_DECOMMIT) != FALSE);
+    leonida::title_memory_map::changed(spread, bytes);
+    EXPECT(!b.submit());
+    EXPECT(b.gone() == 1 + checks);
+    EXPECT(!b.submit() && !b.submit());
+    EXPECT(b.owned() == 1 && b.gone() == 1 + side);
+    EXPECT(VirtualFree(hold, texture_bytes, MEM_DECOMMIT) != FALSE);
+    leonida::title_memory_map::changed(hold, texture_bytes);
+    EXPECT(!b.submit());
+    EXPECT(b.owned() == 0);
+
+    // The retired images' memory is freed once no submission can still read them (3 s after their retirement).
+    Sleep(3100);
+    EXPECT(!b.submit());
+    const auto end = b.images();
+    std::printf("%s: %llu images retired in all (%llu under a newer texture, %llu with their pages gone), %llu still "
+                "waiting for the GPU\n",
+                who, static_cast<unsigned long long>(end.retired - b.start.retired),
+                static_cast<unsigned long long>(end.superseded - b.start.superseded),
+                static_cast<unsigned long long>(end.gone - b.start.gone),
+                static_cast<unsigned long long>(end.waiting));
+    EXPECT(end.waiting == 0 && end.owned == b.start.owned);
+    VirtualFree(spread, 0, MEM_RELEASE);
+    VirtualFree(hold, 0, MEM_RELEASE);
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
+// The idle time of the slot-70 images (the d3d12_title_image_idle test, LEONIDA_TITLE_IMAGE_IDLE_MS=500). An image a
+// newer texture covers stays while a view named it less than that long ago, and goes after; one a view names again in
+// that time is no longer covered. An image whose pages went stays that long after the look that found them gone. A
+// view that names it meanwhile keeps it, until a later change over its pages finds them still gone.
+int check_title_image_idle(ID3D12Device* device) {
+    TitleImageBench b;
+    const char* who = "slot-70 image idle time";
+    EXPECT(!b.init(device, who));
+    using clock = std::chrono::steady_clock;
+    constexpr auto idle = std::chrono::milliseconds(500);  // LEONIDA_TITLE_IMAGE_IDLE_MS, set by main
+    constexpr SIZE_T half = 32 << 10, bytes = 1 << 20, upper = bytes / 2;
+    auto* pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(pages);
+    const auto superseded = [&] { return b.images().superseded - b.start.superseded; };
+
+    // x and y, then a newer texture over the second half of each.
+    leonida::gfx10::ImageWords x{}, x2{}, y{}, y2{};
+    const auto named = clock::now();
+    EXPECT(b.name(pages, 1, x) && b.name(pages + half, 2, x2));
+    EXPECT(b.name(pages + upper, 3, y) && b.name(pages + upper + half, 4, y2));
+    EXPECT(!b.submit());
+    if (clock::now() - named < idle)
+        EXPECT(b.owned() == 4 && superseded() == 0);
+    else
+        std::printf("%s: the first submission came after the idle time; its check is skipped\n", who);
+    // x named again: no longer covered. y, not named for longer than the idle time, goes.
+    Sleep(250);
+    EXPECT(b.name(pages, 1, x, false));
+    Sleep(400);
+    EXPECT(!b.submit());
+    EXPECT(b.owned() == 3 && superseded() == 1 && b.index(x) && !b.index(y));
+    Sleep(600);
+    EXPECT(!b.submit());
+    EXPECT(b.owned() == 3 && b.index(x) && b.index(x2) && b.index(y2));
+
+    // The pages of x and x2 decommitted: they stay for the idle time, then go.
+    EXPECT(VirtualFree(pages, upper, MEM_DECOMMIT) != FALSE);
+    leonida::title_memory_map::changed(pages, upper);
+    const auto gone = clock::now();
+    EXPECT(!b.submit());
+    if (clock::now() - gone < idle) EXPECT(b.owned() == 3 && b.gone() == 0);
+    Sleep(700);
+    EXPECT(!b.submit());
+    EXPECT(b.owned() == 1 && b.gone() == 2 && b.index(y2));
+
+    // Those of y2 decommitted, and y2 named again before the idle time: it stays, while no change over its pages
+    // comes. A later one finds them still gone, and it goes the idle time after.
+    EXPECT(VirtualFree(pages + upper, upper, MEM_DECOMMIT) != FALSE);
+    leonida::title_memory_map::changed(pages + upper, upper);
+    EXPECT(!b.submit());
+    EXPECT(b.name(pages + upper + half, 4, y2, false));
+    Sleep(700);
+    EXPECT(!b.submit());
+    EXPECT(b.owned() == 1 && b.gone() == 2);
+    leonida::title_memory_map::changed(pages + upper, upper);
+    EXPECT(!b.submit());
+    Sleep(700);
+    EXPECT(!b.submit());
+    EXPECT(b.owned() == 0 && b.gone() == 3);
+    std::printf("%s: %llu images retired under a newer texture and %llu with their pages gone, each after the idle "
+                "time\n",
+                who, static_cast<unsigned long long>(superseded()), static_cast<unsigned long long>(b.gone()));
+    // Their memory is freed 3 s after their retirement; an image still waiting at the end would keep the device.
+    Sleep(3100);
+    EXPECT(!b.submit());
+    EXPECT(b.images().waiting == 0);
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
 // A persistent Map can become readable without notifying xmem or calling Map a second time.
 int check_mapped_plane(ID3D12Device* device) {
     const char* who = "persistent slot-133 plane";
@@ -1754,6 +2074,73 @@ int check_mapped_plane_first_use(ID3D12Device* device) {
     texture->Unmap(0, nullptr);
     texture.p->Release();
     texture.p = nullptr;
+    VirtualFree(pages, 0, MEM_RELEASE);
+    return 0;
+}
+
+// The refresh worker's pass after the texel writes noted so far (LEONIDA_TEXTURE_REFRESH_ASYNC=1): submissions wake the
+// worker (a busy one can miss a request) until a pass has taken the writes, and title_texture_registry, read under the
+// registry's lock, returns once that pass is over.
+int wait_async_refresh(ID3D12Device* device, GpuReader& gpu) {
+    const char* who = "async texture refresh";
+    auto& writes = leonida::title_texel_writes::state();
+    ID3D12CommandList* lists[]{gpu.list.p};
+    for (int i = 0; i < 2000 && writes.pending.load(std::memory_order_acquire); ++i) {
+        gpu.queue->ExecuteCommandLists(1, lists);
+        EXPECT_HR(gpu.queue->Signal(gpu.fence.p, ++gpu.fence_value), S_OK);
+        EXPECT_HR(gpu.fence->SetEventOnCompletion(gpu.fence_value, gpu.done), S_OK);
+        EXPECT(WaitForSingleObject(gpu.done, 30000) == WAIT_OBJECT_0);
+        Sleep(1);
+    }
+    EXPECT(!writes.pending.load(std::memory_order_acquire));
+    rt::d3d12::title_texture_registry(device);
+    return 0;
+}
+
+// LEONIDA_TEXTURE_REFRESH_ASYNC=1 (the d3d12_mapped_plane_async test): a mapped slot-133 texture destroyed while its
+// thread held the registry's lock (a slot-70 view overwrote the descriptor that held its last reference) leaves
+// nothing in the async refresh's range index or mapped list once drain_titles_gone removes its entry. A key left in
+// the index made the next pass that saw a write over the texture's memory look the gone entry up with
+// title_textures.at(), and the std::out_of_range ended the process on the refresh worker
+// (RT-TITLE-TEXTURE-GONE-RANGES).
+int check_mapped_plane_gone_in_registry(ID3D12Device* device) {
+    const char* who = "mapped slot-133 plane destroyed inside the registry";
+    constexpr UINT width = 256, height = 8, size = width * height;
+    void* pages = VirtualAlloc(nullptr, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    EXPECT(pages);
+    std::memset(pages, 29, size);
+    GpuReader gpu;
+    EXPECT(!gpu.init(device, size));
+    const auto before = rt::d3d12::title_texture_registry(device);
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.SampleDesc.Count = desc.DepthOrArraySize = desc.MipLevels = 1;
+    leonida::title_xg_layouts::note({UINT(desc.Dimension), UINT(desc.Format), height, 1, 1, width}, 1);
+    ID3D12Resource* texture = nullptr;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 6, IID_PPV_ARGS(&texture)), S_OK);
+    void* mapped = nullptr;
+    EXPECT_HR(texture->Map(0, nullptr, &mapped), S_OK);
+    EXPECT(mapped == pages);
+    const auto registered = rt::d3d12::title_texture_registry(device);
+    EXPECT(registered.textures == before.textures + 1 && registered.ranges == before.ranges + 1 &&
+           registered.mapped == before.mapped + 1);
+    // One pass first: the worker's first pass looks at every texture, a later one only at those a write overlaps.
+    leonida::title_texel_writes::note(pages, size);
+    EXPECT(!wait_async_refresh(device, gpu));
+    EXPECT(rt::d3d12::release_in_title_registry(device, texture));
+    // The title writes those pages again, and submits.
+    std::memset(pages, 41, size);
+    leonida::title_texel_writes::note(pages, size);
+    EXPECT(!wait_async_refresh(device, gpu));
+    const auto after = rt::d3d12::title_texture_registry(device);
+    std::printf("%s: %llu textures, %llu range keys, %llu mapped after it went (%llu, %llu, %llu before it)\n", who,
+                static_cast<unsigned long long>(after.textures), static_cast<unsigned long long>(after.ranges),
+                static_cast<unsigned long long>(after.mapped), static_cast<unsigned long long>(before.textures),
+                static_cast<unsigned long long>(before.ranges), static_cast<unsigned long long>(before.mapped));
+    EXPECT(after.textures == before.textures && after.ranges == before.ranges && after.mapped == before.mapped);
     VirtualFree(pages, 0, MEM_RELEASE);
     return 0;
 }
@@ -2392,13 +2779,32 @@ void print_cases(const std::vector<Case>& cases, const char* who) {
                     int(c.desc.Properties.CPUPageProperty), int(c.desc.Properties.MemoryPoolPreference),
                     unsigned(c.desc.Flags));
 }
-}  // namespace
 
-int main(int argc, char** argv) {
+// The test's last reference to a device destroys it: nothing the layer made for it keeps it alive, such as the images
+// made for slot-70 views, live or retired (a retired one is released at the first refresh pass 3 s later, which a
+// device released before then never reaches). Otherwise the device and all its Vulkan objects outlive the test and
+// vkDestroyDevice reports them (VUID-vkDestroyDevice-device-05137).
+int release_device(Ref<ID3D12Device>& device, const char* who) {
+    const ULONG left = device.p->Release();
+    device.p = nullptr;
+    EXPECT(left == 0);
+    return 0;
+}
+
+int run(int argc, char** argv) {
     const bool prefix_only = argc == 2 && std::strcmp(argv[1], "--host-prefix-only") == 0;
     const bool async_plane = argc == 2 && std::strcmp(argv[1], "--mapped-plane-async") == 0;
-    if (argc != 1 && !prefix_only && !async_plane) return 2;
+    const bool image_retire = argc == 2 && std::strcmp(argv[1], "--title-image-retire") == 0;
+    const bool image_idle = argc == 2 && std::strcmp(argv[1], "--title-image-idle") == 0;
+    if (argc != 1 && !prefix_only && !async_plane && !image_retire && !image_idle) return 2;
     if (async_plane) _putenv_s("LEONIDA_TEXTURE_REFRESH_ASYNC", "1");  // read once, at the device's first refresh
+    // An image no view named since a newer texture covered it, or since its pages went, goes at the next pass; a pass
+    // visits at most 4 of those that may go.
+    if (image_retire) {
+        _putenv_s("LEONIDA_TITLE_IMAGE_IDLE_MS", "0");
+        _putenv_s("LEONIDA_TITLE_IMAGE_CHECKS", "4");
+    }
+    if (image_idle) _putenv_s("LEONIDA_TITLE_IMAGE_IDLE_MS", "500");
     _putenv_s("LEONIDA_TITLE_TEXTURE_PERIOD_MS", "0");
     _putenv_s("LEONIDA_TITLE_TEXTURE_CHECK_KB", "0");
     vktest::Device vk;
@@ -2423,16 +2829,34 @@ int main(int argc, char** argv) {
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         if (prefix_only) {
             if (!vk.host_pointer_alignment) return 77;
-            const int result = check_host_prefix_buffers(ours.p);
+            int result = check_host_prefix_buffers(ours.p);
+            result += release_device(ours, "vulkan device");
             return result || vk.validation_errors() ? 1 : 0;
         }
         if (async_plane) {
             int result = vk.host_image_copy ? check_mapped_plane_first_use(ours.p) : 0;
+            result += check_mapped_plane_gone_in_registry(ours.p);
             auto no_host_copy = info;  // the staged upload too
             no_host_copy.host_image_copy = false;
             Ref<ID3D12Device> staged;
             if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
             result += check_mapped_plane_first_use(staged.p);
+            result += release_device(staged, "staged device");
+            result += release_device(ours, "vulkan device");
+            return result || vk.validation_errors() ? 1 : 0;
+        }
+        if ((image_retire || image_idle) && !rt::d3d12::bindless_set_layout(ours.p)) return 77;
+        if (image_idle) {
+            const int result = check_title_image_idle(ours.p);
+            return result || vk.validation_errors() ? 1 : 0;
+        }
+        if (image_retire) {
+            int result = check_title_image_retirement(ours.p);
+            auto no_host_copy = info;  // the staged upload too
+            no_host_copy.host_image_copy = false;
+            Ref<ID3D12Device> staged;
+            if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
+            result += check_title_image_retirement(staged.p);
             return result || vk.validation_errors() ? 1 : 0;
         }
         failures += check(ours.p, "vulkan");
@@ -2460,6 +2884,7 @@ int main(int argc, char** argv) {
             failures += check_shared_bc_placements(staged.p, true);
             failures += check_mapped_plane(staged.p);
             failures += check_mapped_bc_array(staged.p);
+            failures += release_device(staged, "staged device");
         }
         failures += check_written_pages_all(ours.p);
         {
@@ -2473,6 +2898,7 @@ int main(int argc, char** argv) {
                     failures += check_write_watched(ours.p, second.p, modifier);
                 failures += check_rereserved(ours.p);
             }
+            if (second.p) failures += release_device(second, "second device");
         }
         failures += check_heap_lock_faults(ours.p);
         Ref<IDXGIFactory4> factory;
@@ -2490,10 +2916,24 @@ int main(int argc, char** argv) {
                 if (vk.host_pointer_alignment) failures += compare_cases(vulkan_cases, host_cases, who.c_str());
             }
         }
+        failures += release_device(ours, "vulkan device");
     }
     if (vk.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", vk.validation_errors());
         return 1;
     }
     return failures ? 1 : 0;
+}
+}  // namespace
+
+int main(int argc, char** argv) {
+    // run's vktest::Device destroys the Vulkan device on return, so what vkDestroyDevice finds left over
+    // (VUID-vkDestroyDevice-device-05137 under LEONIDA_VK_VALIDATION=1) is counted here.
+    const int result = run(argc, argv);
+    if (result) return result;
+    if (const unsigned errors = vktest::validation_error_count()) {
+        std::fprintf(stderr, "%u validation errors at teardown\n", errors);
+        return 1;
+    }
+    return 0;
 }

@@ -13,11 +13,20 @@
 //                         bound and in-use bytes, geometry copies, title windows and shadows, upload heaps, staging,
 //                         texture blocks, sampled textures, render targets and depth, and other, which add up to the
 //                         allocated bytes of the t= line.
+//   [rt] mem-probe vmmap: in place of the smaps line where there is no /proc (native Windows): the commit charge and
+//                         working set (GetProcessMemoryInfo), and the committed bytes of a VirtualQuery walk over the
+//                         user address space by the smaps line's kinds (title memory, other PE private memory, PE
+//                         images, PE sections, memory the Vulkan driver mapped for us), with the reserved bytes and
+//                         the largest private allocations.
 // The Vulkan counts come from wrapping the runtime's own function table (install()); helpers that load their own
 // pointers (depth24, predicate, xdxr, swapchain) are not counted: they create a handful of objects.
 
 #include <windows.h>
+#include <psapi.h>
 #include <vulkan/vulkan.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "psapi.lib")
+#endif
 
 #include "memory_breakdown.h"
 
@@ -30,6 +39,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <string>
@@ -501,6 +511,211 @@ inline std::string read_rollup() {
     return out;
 }
 
+// ---- native Windows: the address space by VirtualQuery, classified ----
+// One committed region as VirtualQuery reports it.
+struct VmRegion {
+    std::uint64_t base = 0, size = 0;
+    std::uint64_t allocation = 0;  // AllocationBase: the VirtualAlloc or the view the region belongs to
+    std::uint32_t type = 0;        // MEM_IMAGE, MEM_MAPPED or MEM_PRIVATE
+};
+
+// Sorted, with overlapping and touching ranges joined, so that a region can be cut at the ranges' edges.
+inline Ranges joined(Ranges ranges) {
+    std::sort(ranges.begin(), ranges.end());
+    Ranges out;
+    for (const auto& range : ranges) {
+        if (range.second <= range.first) continue;
+        if (!out.empty() && range.first <= out.back().second)
+            out.back().second = (std::max)(out.back().second, range.second);
+        else
+            out.push_back(range);
+    }
+    return out;
+}
+
+// The committed bytes by the smaps line's kinds, with the same title and vk_mapped ranges: the part of a region inside
+// a title range is title memory, the part inside a vk_mapped range is memory the Vulkan driver mapped for us, and the
+// rest is named by the region's type. The smaps line names a mapping by its first address; here a region is cut at
+// the ranges' edges instead, so a reservation the title commits only part of counts once in each kind it reaches.
+class VmTally {
+public:
+    VmTally(Ranges title, Ranges vk_mapped) : title_(joined(std::move(title))), vk_mapped_(joined(std::move(vk_mapped))) {}
+
+    void add(const VmRegion& region) {
+        bool counted[b_count] = {};
+        const std::uint64_t end = region.size > UINT64_MAX - region.base ? UINT64_MAX : region.base + region.size;
+        for (std::uint64_t at = region.base; at < end;) {
+            bool inside = false;
+            std::uint64_t next = piece(title_, at, end, inside);
+            int bucket = b_title;
+            if (!inside) {
+                next = piece(vk_mapped_, at, next, inside);
+                bucket = inside ? b_vk_mapped : type_bucket(region.type);
+            }
+            committed[bucket] += next - at;
+            if (!counted[bucket]) {
+                counted[bucket] = true;
+                ++regions[bucket];
+            }
+            if (bucket == b_pe_private) private_by_allocation_[region.allocation] += next - at;
+            at = next;
+        }
+    }
+
+    std::uint64_t total() const {
+        std::uint64_t sum = 0;
+        for (const std::uint64_t bytes : committed) sum += bytes;
+        return sum;
+    }
+
+    // The n allocations with the most committed private bytes outside the title and vk_mapped ranges, largest first:
+    // (bytes, allocation base).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> largest_private(std::size_t n) const {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranked;
+        ranked.reserve(private_by_allocation_.size());
+        for (const auto& [allocation, bytes] : private_by_allocation_) ranked.push_back({bytes, allocation});
+        const std::size_t keep = (std::min)(n, ranked.size());
+        std::partial_sort(ranked.begin(), ranked.begin() + std::ptrdiff_t(keep), ranked.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        ranked.resize(keep);
+        return ranked;
+    }
+
+    std::uint64_t committed[b_count] = {};
+    std::uint64_t regions[b_count] = {};  // the regions that put bytes into each kind
+
+private:
+    static int type_bucket(std::uint32_t type) {
+        if (type == MEM_IMAGE) return b_pe_image;
+        if (type == MEM_MAPPED) return b_pe_mapped;
+        return b_pe_private;
+    }
+    // From `at`, the end (at most `end`) of the piece that lies wholly inside one of `ranges` or wholly outside them.
+    static std::uint64_t piece(const Ranges& ranges, std::uint64_t at, std::uint64_t end, bool& inside) {
+        const auto it = std::upper_bound(ranges.begin(), ranges.end(), std::make_pair(at, UINT64_MAX));
+        if (it != ranges.begin() && at < std::prev(it)->second) {
+            inside = true;
+            return (std::min)(end, std::prev(it)->second);
+        }
+        inside = false;
+        return it == ranges.end() ? end : (std::min)(end, it->first);
+    }
+
+    Ranges title_, vk_mapped_;
+    std::map<std::uint64_t, std::uint64_t> private_by_allocation_;
+};
+
+// The process's commit charge and working set. PrivateUsage and PagefileUsage are the same figure on Windows 8 and
+// later; Wine fills only PagefileUsage (src/memory_figures.h), so the larger of the two is the charge.
+struct ProcessCounters {
+    bool read = false;                          // GetProcessMemoryInfo answered
+    bool private_working_set_reported = false;  // it took the PROCESS_MEMORY_COUNTERS_EX2 size
+    std::uint64_t private_commit = 0, peak_commit = 0, working_set = 0, peak_working_set = 0;
+    std::uint64_t private_working_set = 0;  // 0 where the system does not report it
+};
+
+// PROCESS_MEMORY_COUNTERS_EX2's layout. The SDK declares it only for NTDDI_WIN10_CU and later, and MinGW's headers may
+// not at all; Windows 10 21H2 and later fill it, an older system refuses its size.
+struct MemoryCountersEx2 {
+    PROCESS_MEMORY_COUNTERS_EX ex;
+    SIZE_T private_working_set;
+    ULONG64 shared_commit;
+};
+static_assert(sizeof(MemoryCountersEx2) == sizeof(PROCESS_MEMORY_COUNTERS_EX) + 2 * sizeof(ULONG64),
+              "PROCESS_MEMORY_COUNTERS_EX2 is PROCESS_MEMORY_COUNTERS_EX and two more 64-bit fields");
+
+inline ProcessCounters process_counters() {
+    MemoryCountersEx2 counters{};
+    counters.ex.cb = sizeof counters;
+    ProcessCounters out;
+    out.private_working_set_reported = GetProcessMemoryInfo(
+        GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof counters) != FALSE;
+    if (!out.private_working_set_reported) {
+        counters = {};
+        counters.ex.cb = sizeof counters.ex;
+        if (!GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters.ex),
+                                  sizeof counters.ex))
+            return out;
+    }
+    out.read = true;
+    out.private_commit = (std::max)(std::uint64_t(counters.ex.PrivateUsage), std::uint64_t(counters.ex.PagefileUsage));
+    out.peak_commit = counters.ex.PeakPagefileUsage;
+    out.working_set = counters.ex.WorkingSetSize;
+    out.peak_working_set = counters.ex.PeakWorkingSetSize;
+    out.private_working_set = counters.private_working_set;
+    return out;
+}
+
+// Walks the user address space (GetSystemInfo's bounds) with VirtualQuery: every committed region goes to the tally,
+// and the reserved bytes are summed. Returns how many regions it walked, free ones included.
+inline std::uint64_t walk_address_space(VmTally& tally, std::uint64_t& reserved) {
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    const auto last = reinterpret_cast<std::uintptr_t>(system.lpMaximumApplicationAddress);
+    std::uint64_t walked = 0;
+    for (auto at = reinterpret_cast<std::uintptr_t>(system.lpMinimumApplicationAddress); at <= last;) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof region)) break;
+        const auto base = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
+        ++walked;
+        if (region.State == MEM_COMMIT)
+            tally.add({base, region.RegionSize, reinterpret_cast<std::uintptr_t>(region.AllocationBase), region.Type});
+        else if (region.State == MEM_RESERVE)
+            reserved += region.RegionSize;
+        if (base + region.RegionSize <= at) break;  // no progress: stop rather than loop
+        at = base + region.RegionSize;
+    }
+    return walked;
+}
+
+inline std::string vmmap_text(double t, double ms, std::uint64_t walked, const ProcessCounters& counters,
+                              const VmTally& tally, std::uint64_t reserved) {
+    char item[256];
+    std::snprintf(item, sizeof item, "[rt] mem-probe vmmap t=%.0fs (%.0f ms, %llu regions): ", t, ms,
+                  (unsigned long long)walked);
+    std::string text = item;
+    if (counters.read) {
+        char private_ws[32] = "n/a";
+        if (counters.private_working_set)
+            std::snprintf(private_ws, sizeof private_ws, "%.0f", mib(counters.private_working_set));
+        std::snprintf(item, sizeof item,
+                      "private commit %.0f MiB (peak %.0f), working set %.0f MiB (private %s, peak %.0f); ",
+                      mib(counters.private_commit), mib(counters.peak_commit), mib(counters.working_set), private_ws,
+                      mib(counters.peak_working_set));
+        text += item;
+    } else {
+        text += "process counters n/a; ";
+    }
+    std::snprintf(item, sizeof item, "committed %.0f MiB by kind:", mib(tally.total()));
+    text += item;
+    const int kinds[] = {b_title, b_pe_private, b_pe_image, b_pe_mapped, b_vk_mapped};
+    for (const int b : kinds) {
+        std::snprintf(item, sizeof item, "%s %s %.0f (%llu regions)", b == kinds[0] ? "" : ",", bucket_name(b),
+                      mib(tally.committed[b]), (unsigned long long)tally.regions[b]);
+        text += item;
+    }
+    std::snprintf(item, sizeof item, "; reserved %.0f MiB; largest private allocations MiB:", mib(reserved));
+    text += item;
+    const auto largest = tally.largest_private(4);
+    for (std::size_t i = 0; i < largest.size(); ++i) {
+        std::snprintf(item, sizeof item, "%s 0x%llx %.0f", i ? "," : "", (unsigned long long)largest[i].second,
+                      mib(largest[i].first));
+        text += item;
+    }
+    if (largest.empty()) text += " none";
+    return text;
+}
+
+// The vmmap line of this process now. It takes the title and vk_mapped ranges the smaps line would use.
+inline std::string sample_vmmap(double t, const Ranges& title, const Ranges& vk_mapped) {
+    const std::uint64_t t0 = now_ns();
+    const ProcessCounters counters = process_counters();
+    VmTally tally(title, vk_mapped);
+    std::uint64_t reserved = 0;
+    const std::uint64_t walked = walk_address_space(tally, reserved);
+    return vmmap_text(t, double(now_ns() - t0) / 1e6, walked, counters, tally, reserved);
+}
+
 // What the device adds to the line: pipeline cache bytes, arena use, title memory ranges.
 struct DeviceFacts {
     std::function<std::string()> describe;  // one text fragment
@@ -590,6 +805,11 @@ inline void sample(const DeviceFacts& facts) {
                      .c_str());
     Ranges title = facts.title_ranges ? facts.title_ranges() : Ranges{};
     std::sort(title.begin(), title.end());
+    // Native Windows has no /proc to read: the vmmap line takes the same kinds from the Win32 API there.
+    if (proc_dir().empty()) {
+        std::fprintf(stderr, "%s\n", sample_vmmap(t, title, vk_mapped).c_str());
+        return;
+    }
     Usage usage[b_count];
     std::string top_files, error;
     const std::uint64_t t0 = now_ns();

@@ -402,9 +402,16 @@ impl Memory {
         let Some(at) = crate::upload::reserve(ARENA as usize) else {
             return false;
         };
-        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+        // Its copy's CPU side is the arena itself where the host opens it:
+        // what changes in it goes up as `bring` and `take` find it.
+        let Some(n) = crate::shadow::by_address_opened(at as u64, ARENA).and_then(|s| self.number(s)) else {
             return false;
         };
+        if self.copies[n].side_is_memory() {
+            // All of it goes up once, as a new copy's first refresh sends it.
+            // (Once it is numbered: a copy refused here is dropped.)
+            self.copies[n].resend(0, ARENA as usize);
+        }
         self.arenas.push((n, at));
         // The lowest first.
         self.free.extend((0..(ARENA / PAGE) as usize).rev().map(|i| (n, at + i * PAGE as usize)));
@@ -538,6 +545,9 @@ impl Memory {
             let never = std::mem::replace(&mut held.taken, now.max(1)) == 0;
             let shadow = &self.copies[held.copy];
             let base = held.at - shadow.span().0 as usize;
+            // Of an arena that is its copy's CPU side the dwords that
+            // changed go up as they are found here: nothing compares it.
+            let mut changed = Vec::new();
             let mut title = [0u8; PIECE];
             for piece in (0..PAGE as usize).step_by(PIECE) {
                 let from = (page * PAGE) as usize + piece;
@@ -545,10 +555,16 @@ impl Memory {
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
                 // SAFETY: a page of an arena of ours, under the mutex.
                 let ours = unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
-                self.stats.changed += merge(&title, ours, never) as u64 * 4;
+                let runs = merge(&title, ours, never);
+                self.stats.changed += runs.iter().map(|r| r.1 as u64).sum::<u64>();
+                if shadow.side_is_memory() && !never {
+                    changed.extend(runs.into_iter().map(|(at, n)| (base + piece + at, base + piece + at + n)));
+                }
             }
             if never {
                 shadow.resend(base, base + PAGE as usize);
+            } else if !changed.is_empty() {
+                shadow.resend_runs(changed.into_iter());
             }
         }
         self.stats.micros += started.elapsed().as_micros() as u64;
@@ -663,6 +679,9 @@ impl Memory {
         let Some(held) = self.pages.get(&page) else { return };
         let shadow = &self.copies[held.copy];
         let base = held.at - shadow.span().0 as usize;
+        // (As in `bring`: of an arena that is its copy's CPU side the dwords
+        // that changed go up from here.)
+        let mut changed = Vec::new();
         let mut title = [0u8; PIECE];
         let mut at = from;
         while at < to {
@@ -670,14 +689,28 @@ impl Memory {
             crate::host::copy_mapped(title.as_mut_ptr(), (page as usize * PAGE as usize + at) as *const u8, n, false);
             // SAFETY: a page of an arena of ours, under the mutex.
             let ours = unsafe { std::slice::from_raw_parts_mut((held.at + at) as *mut u8, n) };
-            if *ours != title[..n] {
+            if shadow.side_is_memory() && !whole {
+                // Only here do the dwords that changed matter: they are what
+                // goes up. Found 32 bytes at a time, as a refresh finds them
+                // (this runs at a submission).
+                let runs = crate::shadow::word_runs_put(held.at + at, &title[..n], ours);
+                changed.extend(runs.into_iter().map(|(a, len)| (base + at + a, base + at + a + len)));
+            } else if *ours != title[..n] {
+                // Sent whole, or compared at the next refresh: what differs
+                // is not needed here.
                 ours.copy_from_slice(&title[..n]);
-                crate::watch::wrote(held.at + at, n);
+                // (Nothing asks the write watch about an arena that is its
+                // copy's CPU side.)
+                if !shadow.side_is_memory() {
+                    crate::watch::wrote(held.at + at, n);
+                }
             }
             at += n;
         }
         if whole {
             shadow.resend(base + from, base + to);
+        } else if !changed.is_empty() {
+            shadow.resend_runs(changed.into_iter());
         }
     }
 
@@ -894,24 +927,28 @@ fn packed_len(header: u64) -> Option<u64> {
     (version & 0xFFFF == 6 && marks & 0x8100 == 0x8100 && nodes > 0 && len <= PACKED).then_some(len)
 }
 
-/// Puts what `title` holds into `ours` (what was last taken): the dwords that
-/// differ. How many.
-fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
+/// Puts what `title` holds into `ours` (what was last taken; as long as
+/// `title`): the dwords that differ, all of it if `never`. The runs that
+/// changed, as (offset, bytes) in order.
+fn merge(title: &[u8], ours: &mut [u8], never: bool) -> Vec<(usize, usize)> {
     if never {
         ours.copy_from_slice(title);
-        return PIECE / 4;
+        return if title.is_empty() { Vec::new() } else { vec![(0, title.len())] };
     }
     if ours == title {
-        return 0;
+        return Vec::new();
     }
-    let mut changed = 0;
-    for (t, o) in title.chunks_exact(4).zip(ours.chunks_exact_mut(4)) {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (i, (t, o)) in title.chunks(4).zip(ours.chunks_mut(4)).enumerate() {
         if t != o {
             o.copy_from_slice(t);
-            changed += 1;
+            match runs.last_mut() {
+                Some((at, n)) if *at + *n == i * 4 => *n += t.len(),
+                _ => runs.push((i * 4, t.len())),
+            }
         }
     }
-    changed
+    runs
 }
 
 /// Before a draw whose shader reads title memory by address: what its
@@ -1307,13 +1344,173 @@ mod tests {
     fn a_piece_takes_what_changed() {
         let mut title = [7u8; PIECE];
         let mut ours = vec![0u8; PIECE];
-        assert_eq!(merge(&title, &mut ours, true), PIECE / 4);
+        assert_eq!(merge(&title, &mut ours, true), [(0, PIECE)]);
         assert_eq!(ours, title);
-        assert_eq!(merge(&title, &mut ours, false), 0);
+        assert_eq!(merge(&title, &mut ours, false), []);
         // A dword of it.
         title[41] = 8;
-        assert_eq!(merge(&title, &mut ours, false), 1);
+        assert_eq!(merge(&title, &mut ours, false), [(40, 4)]);
         assert_eq!(ours, title);
+        // Dwords side by side are one run, and the runs are in order.
+        title[4..12].fill(9);
+        title[100] = 9;
+        assert_eq!(merge(&title, &mut ours, false), [(4, 8), (100, 4)]);
+        assert_eq!(ours, title);
+    }
+
+    /// The process's commit charge (its private bytes).
+    fn commit() -> u64 {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+        // SAFETY: our own process and a sized structure.
+        let read = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+        // (Failed, every reading would be 0 and nothing measured.)
+        assert_ne!(read, 0, "the process's memory counters");
+        c.PagefileUsage as u64
+    }
+
+    /// The tests here that make arenas, one at a time: what one makes is
+    /// not counted in another's commit.
+    fn arenas_turn() -> std::sync::MutexGuard<'static, ()> {
+        static TURN: Mutex<()> = Mutex::new(());
+        TURN.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// An arena is in the PC's memory once: the CPU's side of its copy on
+    /// the card is the arena itself, not a second buffer of its size with
+    /// the same bytes (64 MiB more commit per arena, and the structure
+    /// builder keeps up to 48). On the host's card, as the other tests that
+    /// need one.
+    #[test]
+    fn an_arena_is_in_the_pcs_memory_once() {
+        let Some(host) = host() else { return };
+        if !crate::shadow::cards() || !host.card_ready() {
+            return;
+        }
+        // A host that does not open memory as a heap of its own (no
+        // ID3D12Device13, or a driver that refuses) keeps the CPU's side a
+        // buffer of its own, as designed. (The block is never let go: the
+        // heap lets go of its pages a moment after its last reference.)
+        let block = crate::upload::reserve(1 << 16).expect("a block");
+        if let Err(e) = crate::inplace::place_part(&host.device, block as u64, 1 << 16) {
+            eprintln!("memory is not opened as a heap here ({e:?}): an arena's copy keeps a CPU side of its own");
+            return;
+        }
+        let _turn = arenas_turn();
+        // Three times each, as other tests make and free memory meanwhile.
+        // First what the copy's side on the card costs by itself (some
+        // drivers charge the process for the card's memory too: 64 MiB on an
+        // AMD RX 7900 XT): the most of three, all kept until the end, as the
+        // driver hands memory let go of out again without a charge.
+        let mut cards = Vec::new();
+        let mut card = 0;
+        for _ in 0..3 {
+            let before = commit();
+            cards.push(host.uav_buffer(ARENA).expect("a buffer on the card"));
+            card = card.max(commit().saturating_sub(before));
+        }
+        // Then an arena, the least of three.
+        let mut m = Memory::new().expect("title memory by address");
+        let mut sides = Vec::new();
+        let mut grew = u64::MAX;
+        for _ in 0..3 {
+            let before = commit();
+            assert!(m.another(), "an arena");
+            grew = grew.min(commit().saturating_sub(before));
+            let &(n, at) = m.arenas.last().expect("an arena");
+            sides.push((at, m.copies[n].card_data() as usize));
+        }
+        eprintln!(
+            "an arena of {} MiB: {} MiB more commit, its side on the card {} MiB; (arena, CPU side): {sides:x?}",
+            ARENA >> 20,
+            grew >> 20,
+            card >> 20
+        );
+        for (at, side) in sides {
+            assert_eq!(side, at, "the CPU's side of the arena's copy is the arena itself");
+        }
+        assert!(
+            grew < card + ARENA + ARENA / 2,
+            "an arena of {} MiB took {} MiB of commit beside its side on the card",
+            ARENA >> 20,
+            grew.saturating_sub(card) >> 20
+        );
+    }
+
+    /// What the title changed in a page of an arena goes up by the dword,
+    /// and what the card's side holds beside it stays (the structure
+    /// builder's work is only there): with the arena as its copy's CPU side
+    /// nothing compares the two, so `bring` says what it changed. On the
+    /// host's card.
+    #[test]
+    fn an_arena_sends_up_only_the_dwords_the_title_changed() {
+        let Some(host) = host() else { return };
+        if !crate::shadow::cards() || !host.card_ready() {
+            return;
+        }
+        let _turn = arenas_turn();
+        let mut m = Memory::new().expect("title memory by address");
+        assert!(m.another(), "an arena");
+        // A page of title memory of the test's own, where the directory
+        // reaches.
+        let title = crate::upload::reserve(PAGE as usize).expect("a page");
+        // SAFETY: the test's own page, never let go.
+        let words = unsafe { std::slice::from_raw_parts_mut(title as *mut u32, PAGE as usize / 4) };
+        for (i, word) in words.iter_mut().enumerate() {
+            *word = i as u32;
+        }
+        let page = title as u64 / PAGE;
+        let (copy, at) = m.free.pop().expect("a free page");
+        m.hold(page, at, copy);
+        let shadow = m.copies[copy].clone();
+        let offset = at as u64 - shadow.span().0;
+        // Taken whole the first time.
+        m.frame = 1;
+        m.bring(page, page + 1);
+        let (aside, data) = host.shared_buffer(PAGE).expect("a buffer");
+        // A list that brings every copy up to date when it is submitted, as
+        // a list that reads memory by address does.
+        let run = |m: &Memory, record: &dyn Fn(&ID3D12GraphicsCommandList)| {
+            let list = host.new_list().expect("a host list");
+            m.bring_up(&list);
+            record(&list.list);
+            list.close();
+            host.execute(&[&list]);
+        };
+        // A store on the card's side alone, as the builder's: dword 10.
+        // SAFETY: the mapping of the buffer just made.
+        unsafe { data.cast::<u32>().write(0xb11d) };
+        // SAFETY: an open list; live buffers, the ranges inside them.
+        run(&m, &|list| unsafe { list.CopyBufferRegion(&shadow.buffer, offset + 40, &aside, 0, 4) });
+        // The title changes dword 20, and the page is taken again.
+        words[20] = 0x7171;
+        m.frame = 2;
+        m.bring(page, page + 1);
+        // SAFETY: as above.
+        run(&m, &|list| unsafe { list.CopyBufferRegion(&aside, 0, &shadow.buffer, offset, PAGE) });
+        // SAFETY: the mapping; `execute` waited for the copy.
+        let got = unsafe { std::slice::from_raw_parts(data.cast::<u32>().cast_const(), PAGE as usize / 4) };
+        assert_eq!(got[20], 0x7171, "the dword the title changed went up");
+        assert_eq!(got[10], 0xb11d, "the card's own dword stayed");
+        assert_eq!(&got[..10], &words[..10], "the page went up whole the first time");
+        assert_eq!(&got[21..], &words[21..]);
+        // The same of a page taken at a submission (`land`, of a page not
+        // in a packed structure): dword 11 on the card's side alone, dword
+        // 30 changed by the title.
+        // SAFETY: the mapping, which no copy uses now.
+        unsafe { data.cast::<u32>().write(0xb11e) };
+        // SAFETY: as above.
+        run(&m, &|list| unsafe { list.CopyBufferRegion(&shadow.buffer, offset + 44, &aside, 0, 4) });
+        words[30] = 0x7172;
+        m.take(page, 0, PAGE as usize, false);
+        // SAFETY: as above.
+        run(&m, &|list| unsafe { list.CopyBufferRegion(&aside, 0, &shadow.buffer, offset, PAGE) });
+        // SAFETY: as above.
+        let got = unsafe { std::slice::from_raw_parts(data.cast::<u32>().cast_const(), PAGE as usize / 4) };
+        assert_eq!(got[30], 0x7172, "the dword the title changed went up from `take`");
+        assert_eq!((got[10], got[11]), (0xb11d, 0xb11e), "the card's own dwords stayed");
+        assert_eq!(got[20], 0x7171);
     }
 
     #[test]

@@ -2157,16 +2157,16 @@ fn sweep_batch(all: &std::collections::BTreeSet<usize>, from: usize, limit: usiz
 /// makes the list or the slot hold it) is protected by that idle time alone.
 /// Every caller uses it at once, within the title's call.
 /// Called before a submission starts, by the thread that submits.
-/// `LEONIDA_TEXTURE_SWEEP=0` lets nothing go.
+/// `LEONIDA_TEXTURE_SWEEP=0` lets nothing idle go; copies replaced by ones
+/// with more levels go all the same.
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("LEONIDA_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
-        return;
-    }
-    // Copies replaced by ones with more levels, as any let go.
+    // Copies replaced by ones with more levels, as any let go. Before the
+    // switch below, which must not keep them: nothing uses them any more and
+    // nothing else lets them go, so with the sweep off they would be held
+    // for good.
     {
         let mut replaced = REPLACED.lock().unwrap_or_else(|e| e.into_inner());
         let (gone, keep): (Vec<_>, Vec<_>) =
@@ -2176,6 +2176,10 @@ pub(crate) fn let_go_idle() {
         for (_, made) in gone {
             crate::host::retire(made);
         }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("LEONIDA_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
+        return;
     }
     let memory = crate::host::host().and_then(|h| h.video_memory());
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5214,5 +5218,56 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// With the sweep off (`LEONIDA_TEXTURE_SWEEP=0`), a host copy replaced
+    /// by one with more levels still goes once nothing may be about to
+    /// record its use: nothing else lets it go. In a process of its own,
+    /// since the switch is read once.
+    #[cfg(windows)]
+    #[test]
+    fn replaced_copies_go_with_the_sweep_off() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const CHILD: &str = "LEONIDA_REPLACED_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "resource::tests::replaced_copies_go_with_the_sweep_off", "--nocapture"])
+                .env(CHILD, "1")
+                .env("LEONIDA_TEXTURE_SWEEP", "0")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "the run with the sweep off failed:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        if crate::host::host().is_none() || !held_only() {
+            return;
+        }
+        // As in `a_placed_texture_is_kept_from_the_level_viewed`: a copy from
+        // level 2, replaced by one from level 0.
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = placed_bytes(&desc).unwrap();
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        let texture = texture_at(at as u64, &desc).unwrap();
+        want_level(texture, 2);
+        let copy = host_copy(texture).unwrap();
+        want_level(texture, 0);
+        let replaced = || {
+            let replaced = REPLACED.lock().unwrap_or_else(|e| e.into_inner());
+            replaced.iter().any(|(_, (old, _))| std::sync::Arc::ptr_eq(old, &copy))
+        };
+        assert!(replaced());
+        // Long enough ago: four frames and a second.
+        for _ in 0..4 {
+            crate::frame::test_advance();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let_go_idle();
+        assert!(!replaced(), "the replaced copy is still held");
     }
 }

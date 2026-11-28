@@ -673,20 +673,100 @@ fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
 
 thread_local! {
     /// Room to read a texture's memory into: one buffer per submitting
-    /// thread. Each texture kept its own, a second copy in memory of every
-    /// write-watched or partly mapped texture ever sampled, for the run.
+    /// thread, of up to [`read_kept`] bytes. Each texture kept its own, a
+    /// second copy in memory of every write-watched or partly mapped texture
+    /// ever sampled, for the run.
     static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Calls `f` with `size` bytes of this thread's read buffer (their
-/// contents are whatever the last texture left).
+/// Read buffers of textures larger than [`read_kept`], shared by the threads
+/// that refresh textures, each with when it was given back
+/// ([`crate::host::coarse_ms`]). A thread's own buffer only grew, so each of
+/// those threads (the submitting one and the helpers of
+/// `crate::shadow::wide_each`, which live for the run) kept the room of the
+/// largest texture it ever read until the end: 22 MB for a 4096² BC7 texture
+/// with its levels, 89 MB for one in RGBA8, on each of them (five on a PC of
+/// 16 logical processors). Here such a buffer is still reused by the reads
+/// that come one after another while the world streams in, and the sweep
+/// lets it go once no read took it for a while ([`let_go_idle_reads`]).
+static LARGE_READS: Mutex<Vec<(Vec<u8>, u64)>> = Mutex::new(Vec::new());
+
+/// Calls `f` with `size` bytes of read buffer (their contents are whatever
+/// the last texture left).
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    if size > read_kept() {
+        let mut read = take_read(&mut LARGE_READS.lock().unwrap_or_else(|e| e.into_inner()), size);
+        if read.len() < size {
+            // None there was large enough (or none was there): the largest
+            // goes before a new one is made, outside the lock. The new one
+            // is asked for zeroed, which lets the allocator skip writing
+            // pages that come fresh from the system.
+            drop(read);
+            read = vec![0u8; size];
+        }
+        let out = f(&mut read[..size]);
+        let now = crate::host::coarse_ms();
+        LARGE_READS.lock().unwrap_or_else(|e| e.into_inner()).push((read, now));
+        return out;
+    }
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < size {
-            read.resize(size, 0);
+            // Exactly the room asked for, which stays under [`read_kept`]:
+            // grown by doubling, it could be twice that. The old contents
+            // need no copy.
+            *read = vec![0u8; size];
         }
         f(&mut read[..size])
+    })
+}
+
+/// A buffer for a read of `size` bytes from `pool`: the smallest there that
+/// is large enough, or else the largest, which the caller makes again larger;
+/// empty if the pool is. So the pool holds no more buffers than reads ran at
+/// once, each at most the size of the largest texture read.
+fn take_read(pool: &mut Vec<(Vec<u8>, u64)>, size: usize) -> Vec<u8> {
+    let fit = pool
+        .iter()
+        .enumerate()
+        .filter(|(_, (read, _))| read.len() >= size)
+        .min_by_key(|(_, (read, _))| read.len())
+        .or_else(|| pool.iter().enumerate().max_by_key(|(_, (read, _))| read.len()))
+        .map(|(i, _)| i);
+    fit.map(|i| pool.swap_remove(i).0).unwrap_or_default()
+}
+
+/// Takes out of `pool` the buffers given back `idle_ms` or more before
+/// `now`.
+fn idle_reads(pool: &mut Vec<(Vec<u8>, u64)>, now: u64, idle_ms: u64) -> Vec<(Vec<u8>, u64)> {
+    pool.extract_if(.., |(_, at)| now.saturating_sub(*at) >= idle_ms).collect()
+}
+
+/// Lets go of the read buffers of large textures no read took for `idle_ms`
+/// ([`crate::host::ram_idle_ms`]). They are freed on the reaper thread, not
+/// on the submitting thread that runs the sweep: freeing tens of MB of
+/// touched memory takes milliseconds, and nothing is in flight while the
+/// sweep runs, so the card would wait for it.
+fn let_go_idle_reads(idle_ms: u64) {
+    let now = crate::host::coarse_ms();
+    let gone = idle_reads(&mut LARGE_READS.lock().unwrap_or_else(|e| e.into_inner()), now, idle_ms);
+    if !gone.is_empty() {
+        crate::host::retire(gone);
+    }
+}
+
+/// The bytes of read buffer a thread keeps for itself from one texture to
+/// the next (`LEONIDA_TEXTURE_READ_KEEP_MB`, 16); larger textures are read
+/// into [`LARGE_READS`]. That holds a 4096² BC1 texture or a 2048² BC7 one
+/// with their levels (11 and 5.6 MB) without a lock.
+fn read_kept() -> usize {
+    static KEPT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| {
+        std::env::var("LEONIDA_TEXTURE_READ_KEEP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(16)
+            .saturating_mul(1 << 20)
     })
 }
 
@@ -759,10 +839,14 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// those of textures no longer sampled were kept for the run (2,246 of
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
 /// texture makes a staging buffer anew, detiles and uploads once more.
+/// Read buffers of large textures no read took for `idle_ms` go too
+/// ([`let_go_idle_reads`]), whether or not there are staging buffers.
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
+    let_go_idle_reads(idle_ms);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -770,7 +854,6 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
@@ -2797,6 +2880,93 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod read_buffer_tests {
+    use super::{LARGE_READS, READ, idle_reads, read_kept, take_read, with_read};
+
+    /// The capacity of this thread's own read buffer.
+    fn room() -> usize {
+        READ.with(|read| read.borrow().capacity())
+    }
+
+    /// A thread that refreshes textures keeps a read buffer of up to the
+    /// kept bytes from one texture to the next, but not the room of a larger
+    /// texture once its read is over: those threads (the submitting one and
+    /// the helpers of `shadow::wide_each`) live for the run, and each held
+    /// the largest texture it ever read until the end. That room waits in
+    /// the shared pool for the next large read instead. The reads run on
+    /// threads of their own, as refreshes do, so that the buffer of the
+    /// thread the harness runs the test on (shared by the tests with
+    /// `--test-threads=1`) plays no part. No other test reads a texture
+    /// larger than the kept bytes, so the shared pool is this test's alone.
+    #[test]
+    fn a_large_read_gives_its_room_back_when_it_is_over() {
+        let kept = read_kept();
+        // Larger than the kept bytes, whatever LEONIDA_TEXTURE_READ_KEEP_MB
+        // says.
+        let large = 2 * kept.max(1 << 20);
+        std::thread::scope(|threads| {
+            for _ in 0..2 {
+                threads.spawn(|| {
+                    // Up to the kept bytes: kept for the next texture, also
+                    // when the buffer grows from one under them.
+                    with_read(kept * 5 / 8, |read| read.fill(1));
+                    with_read(kept * 3 / 4, |read| read.fill(1));
+                    assert!(room() >= kept * 3 / 4, "a read under the kept bytes keeps its room");
+                    // A larger texture is read whole, then the thread does
+                    // not keep its room.
+                    with_read(large, |read| {
+                        assert_eq!(read.len(), large);
+                        read[large - 1] = 2;
+                    });
+                    assert!(room() <= kept, "{} MiB kept after a read of {} MiB", room() >> 20, large >> 20);
+                    // And the next read is served as before.
+                    with_read(4096, |read| assert_eq!(read.len(), 4096));
+                });
+            }
+        });
+        // The pool holds a buffer for each of the large reads that ran at
+        // once (one or two, as the threads overlapped), each large enough.
+        let pooled: Vec<(usize, usize)> = LARGE_READS
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(read, _)| (read.as_ptr() as usize, read.len()))
+            .collect();
+        assert!((1..=2).contains(&pooled.len()), "{} buffers pooled after two large reads", pooled.len());
+        assert!(pooled.iter().all(|&(_, len)| len >= large));
+        // The next large read, on another thread, takes one of them instead
+        // of making its room again.
+        let took = std::thread::spawn(move || with_read(large, |read| read.as_ptr() as usize)).join().unwrap();
+        assert!(pooled.iter().any(|&(at, _)| at == took), "a large read reuses a pooled buffer");
+        // (Their memory goes now, not at the end of the run of tests.)
+        LARGE_READS.lock().unwrap().clear();
+    }
+
+    /// The shared pool hands out the smallest buffer large enough for a
+    /// read, and the largest when none is (the reader makes it again
+    /// larger), so it holds no more buffers than reads ran at once; and it
+    /// lets go of those no read took for the idle time, while the ones given
+    /// back since stay.
+    #[test]
+    fn the_pool_of_large_reads_reuses_its_buffers_and_lets_the_idle_ones_go() {
+        const IDLE_MS: u64 = 10_000;
+        let mut pool: Vec<(Vec<u8>, u64)> = vec![(vec![0; 3000], 1_000), (vec![0; 9000], 1_000), (vec![0; 5000], 9_000)];
+        assert_eq!(take_read(&mut pool, 4000).len(), 5000, "the smallest buffer large enough");
+        assert_eq!(take_read(&mut pool, 20_000).len(), 9000, "the largest when none is large enough");
+        assert_eq!(take_read(&mut pool, 1).len(), 3000);
+        assert!(take_read(&mut pool, 1).is_empty(), "an empty pool has none to give");
+        // Two buffers given back at 1 s and one at 9 s.
+        let mut pool: Vec<(Vec<u8>, u64)> = vec![(vec![0; 3000], 1_000), (vec![0; 3000], 1_000), (vec![0; 3000], 9_000)];
+        assert!(idle_reads(&mut pool, 10_999, IDLE_MS).is_empty(), "none goes under the idle time");
+        let gone = idle_reads(&mut pool, 11_000, IDLE_MS);
+        assert_eq!(gone.len(), 2, "{} of the two idle buffers let go", gone.len());
+        assert_eq!(pool.iter().map(|(_, at)| *at).collect::<Vec<_>>(), [9_000]);
+        assert_eq!(idle_reads(&mut pool, 19_000, IDLE_MS).len(), 1);
+        assert!(pool.is_empty());
     }
 }
 

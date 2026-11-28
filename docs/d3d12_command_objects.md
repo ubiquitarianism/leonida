@@ -411,7 +411,9 @@ Slot 148 matters beyond the builder: the address it returns is written by the CP
 as a root SRV address, so console upload memory has the same address for the CPU and the GPU. On a PC the two
 address spaces differ, so `d3d12_xs_device.cpp` carves a bump arena out of persistently-mapped UPLOAD-heap
 buffers: the title writes the mapped memory and the six root descriptor setters and the IA/SO view setters
-translate the CPU pointer to the chunk's buffer device address before forwarding.
+translate the CPU pointer to the chunk's buffer device address before forwarding. The buffers belong to the command
+allocator the list records into: that allocator's Reset, which D3D12 allows only once the GPU has finished its
+lists, carves them from the front again, and its release frees them (`LEONIDA_UPLOAD_REWIND`, runtime/README.md).
 
 The function at `0xd580` uses the 71/73 pair instead of the slot-146 barrier when the byte at RVA `0xd773c` is set.
 That byte is one of seven bools at `0xd7738`–`0xd773e` in zero-initialised `.bss`. The only accesses to them in

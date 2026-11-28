@@ -4,7 +4,8 @@
 // retires (a title window, DeviceState::retire_orphan_windows) may still be named by a list recorded before the
 // retirement and executed, or executed again, after it; a held batch and the async worker keep copies of the lists
 // too. Each list, and each copy of it, carries the epoch its recording began in (Stamp, a CommandList member):
-// whatever was retired at epoch E is named by no list once the oldest live stamp is E or later.
+// whatever was retired at epoch E is named by no list once the oldest live stamp is E or later. A list whose recording
+// was dropped (CommandList::drop_recording) names nothing and carries no stamp until its next Reset.
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -24,6 +25,8 @@ inline Registry& registry() {
 
 // A new epoch: lists whose recording began before it carry a smaller stamp.
 inline std::uint64_t advance() { return registry().epoch.fetch_add(1, std::memory_order_acq_rel) + 1; }
+// The epoch a recording begun now carries.
+inline std::uint64_t current() { return registry().epoch.load(std::memory_order_acquire); }
 
 // The oldest stamp alive (UINT64_MAX with no list at all).
 inline std::uint64_t oldest() {
@@ -49,16 +52,25 @@ public:
         leave(epoch_);
         epoch_ = enter(registry().epoch.load(std::memory_order_acquire));
     }
+    // The recording was dropped (CommandList::drop_recording): no stamp until restamp(), and a copy made meanwhile
+    // has none either. epoch() is 0 then; the epochs begin at 1.
+    void drop() {
+        leave(epoch_);
+        epoch_ = kNone;
+    }
     std::uint64_t epoch() const { return epoch_; }
 
 private:
+    static constexpr std::uint64_t kNone = 0;
     static std::uint64_t enter(std::uint64_t epoch) {
+        if (epoch == kNone) return kNone;
         Registry& r = registry();
         std::lock_guard lock(r.mutex);
         r.live.insert(epoch);
         return epoch;
     }
     static void leave(std::uint64_t epoch) {
+        if (epoch == kNone) return;
         Registry& r = registry();
         std::lock_guard lock(r.mutex);
         if (const auto it = r.live.find(epoch); it != r.live.end()) r.live.erase(it);

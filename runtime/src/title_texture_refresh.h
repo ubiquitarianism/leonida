@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <bit>
 #include <map>
+#include <cstddef>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -39,6 +40,7 @@ public:
         pages_[shift][{number, key}] = {first, last};
         location_[key] = {shift, number};
     }
+    std::size_t size() const { return location_.size(); }  // the keys with a range
     template<class Visit>
     void overlapping(Address from, Address to, Visit visit) const {
         if (from >= to) return;

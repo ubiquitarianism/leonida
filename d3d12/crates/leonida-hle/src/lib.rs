@@ -19,6 +19,8 @@ pub use leonida_gpu::frame_phase;
 pub mod modules;
 mod registry;
 pub mod runtime;
+#[cfg(all(test, not(any(feature = "diagnostics", feature = "mimalloc"))))]
+mod test_alloc;
 
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};

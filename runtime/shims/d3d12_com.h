@@ -347,6 +347,29 @@ struct TitleShadowWatch {
     std::uint64_t asks = 0, written = 0, faults = 0, watched_bytes = 0, hot_bytes = 0;
 };
 TitleShadowWatch title_shadow_watch(ID3D12Device* device);
+// What waits for the console heaps' GPU pass (LEONIDA_CONSOLE_HEAP_GPU, src/console_heap_gpu.h) to drop from its key
+// table at the next submission that runs it: the arena ranges `device` released since the last one, and the alias
+// ranges removed since (the alias table's list, one for the process). `made`: the device made the pass's object at
+// all (LEONIDA_CONSOLE_HEAP_GPU=1 or LEONIDA_SHADOW_GPU=1). For tests.
+struct ConsoleHeapGpuPending {
+    bool made = false;
+    std::uint64_t released = 0, removed = 0;
+};
+ConsoleHeapGpuPending console_heap_gpu_pending(ID3D12Device* device);
+// The device's registry of textures in the title's own memory now (write_placed_texture_view): the images it made for
+// slot-70 texture views and their image memory, the slot-133 textures in it, the made images retired since the device
+// was created (of them, those a newer texture over their bytes retired and those whose pages went), and how many
+// retired images still wait for the GPU before their memory is freed. Then the made images that may be retired now,
+// and, since the device was created, the looks at their pages and the images a view named again after a newer texture
+// covered them. For tests.
+struct OwnedTitleImages {
+    std::uint64_t owned = 0, owned_bytes = 0, slot133 = 0, retired = 0, superseded = 0, gone = 0, waiting = 0;
+    std::uint64_t candidates = 0, looks = 0, named_again = 0;
+};
+OwnedTitleImages owned_title_images(ID3D12Device* device);
+// The image made for slot-70 texture views at `address`, with a reference added for the caller; null when the
+// registry holds none there. For tests.
+ID3D12Resource* owned_title_image(ID3D12Device* device, std::uint64_t address);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
 bool device_supports_ray_tracing(ID3D12Device* device);
 
@@ -393,6 +416,9 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
+// The bytes of the device's GPU address arena that hold shader programs now: the copies pipelines read their code
+// base from. 0 without an arena. For tests.
+std::uint64_t arena_shader_bytes(ID3D12Device* device);
 // Copies `bytes` of the device's GPU address arena at console VA `va` (what shaders read there: a heap's GPU copy,
 // the null slots after it) into `out`. False without an arena or when the range is not inside it. For tests.
 bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes);
@@ -405,6 +431,13 @@ struct ImageMemoryStats {
     std::uint64_t textures = 0;
 };
 ImageMemoryStats image_memory_stats(ID3D12Device* device);
+// The shared zero images a device keeps for placed BC textures with no memory of their own yet (one per shape) and
+// their bytes, which count against the 256 MiB they may take. For tests.
+struct SharedZeroImages {
+    std::uint64_t images = 0;
+    std::uint64_t bytes = 0;
+};
+SharedZeroImages shared_zero_images(ID3D12Device* device);
 
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
@@ -460,6 +493,18 @@ void note_refused_tsharp_for_test(std::uint64_t heap_va, std::size_t offset,
 // or TitleImage::unknown / TitleImage::not_tsharp.
 TitleImage test_bind_title_image(ID3D12Device* device, const std::array<std::uint32_t, 8>& words,
                                  const char** why = nullptr);
+// The title texture registry of `device` (the slot-133 textures and the images made for slot-70 views): its entries,
+// the keys of the async refresh's range index and the mapped textures that refresh visits every pass. Read under the
+// registry's lock, so a refresh pass on the worker (LEONIDA_TEXTURE_REFRESH_ASYNC=1) is over when it returns. For
+// tests.
+struct TitleTextureRegistry {
+    std::uint64_t textures = 0, ranges = 0, mapped = 0;
+};
+TitleTextureRegistry title_texture_registry(ID3D12Device* device);
+// Releases the caller's reference to `resource` with the registry's lock held on this thread, as a slot-70 view that
+// overwrites the descriptor holding a texture's last reference does (title_texture_gone inside the registry), then
+// lets drain_titles_gone remove what went. False when `device` is not a Vulkan device of this module. For tests.
+bool release_in_title_registry(ID3D12Device* device, ID3D12Resource* resource);
 
 // Returns the internal image address registered for a resource in the device's image table.
 std::uint64_t resource_image_address(ID3D12Resource* resource);
@@ -611,6 +656,9 @@ bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector
                           std::string& why);
 // PSOs of any Vulkan device not yet deleted, counting one whose deletion waits for its running build (tests).
 long live_pipeline_states();
+// The program copy a Vulkan device's PSO reads its code base from: its console VA (the code base replay pushes) and
+// its bytes. False for a PSO with no such copy or one of another implementation. For tests.
+bool pipeline_code_base(ID3D12PipelineState* pipeline, std::uint64_t& va, std::uint64_t& bytes);
 
 // Unwraps an Xbox-ABI heap proxy if needed and inspects one of this module's descriptor heaps; returns its owning
 // device identity pointer, or nullptr when `heap` is null or belongs to another implementation.
@@ -670,12 +718,20 @@ void set_global_realtime_privilege_override_for_test(int state);
 bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back);
 
 // Makes `list` hold a reference to `object` until its next Reset or its release, as it holds the pipeline states it
-// names: for an object only the recording uses, such as a shim's own scratch buffer. A list is Reset once it has
-// been executed (or a held batch, src/queue_holds.h, keeps it pinned until it has run), and a resource released
-// after its submission is destroyed through the device's deferred queue once that submission has retired, so the
-// object outlives every GPU use the recording makes of it. False when `list` is not one of this module's command
-// lists or `object` is null.
+// names: for an object only the recording uses, such as a shim's own scratch buffer. D3D12 lets the application
+// Reset or release a list as soon as ExecuteCommandLists returns, while the GPU still runs it, so each execution of
+// the list also keeps the object until that submission has completed (a held batch, src/queue_holds.h, until it
+// has run and then until its submission has completed). That is what keeps a default-heap buffer's arena range
+// from being handed out again under a build that still uses it: the range is free the moment the buffer is
+// destroyed. False when `list` is not one of this module's command lists or `object` is null.
 bool hold_until_reset(ID3D12GraphicsCommandList* list, IUnknown* object);
+
+// Drops what a closed `list` recorded, as its next Reset would, without beginning a new recording: for a list its
+// owner will not execute again before that Reset (a list-value cut's spare, d3d12_xs_device.cpp restart_recording).
+// It then keeps no commands and no reference to what they used (the pipeline states, root signatures and objects
+// hold_until_reset gave it), and holds back no retired title window (src/command_list_epochs.h). Executed anyway, it
+// replays nothing. False when `list` is not one of this module's command lists or is still recording.
+bool drop_recording(ID3D12GraphicsCommandList* list);
 
 // A copy of the commands `list` has recorded so far, for tests of what a bundle puts into its parent. False when
 // `list` is not one of this module's command lists.

@@ -511,6 +511,11 @@ public:
         std::unique_lock lock(mutex_);
         out.swap(removed_);
     }
+    // The removals recorded and not taken yet. For tests.
+    std::size_t removals_pending() const {
+        std::shared_lock lock(mutex_);
+        return removed_.size();
+    }
     void note_translation(Kind kind) { translated_[kind].fetch_add(1, std::memory_order_relaxed); }
     std::uint64_t translated(Kind kind) const { return translated_[kind].load(std::memory_order_relaxed); }
     std::uint64_t untranslated(Kind kind) const { return untranslated_[kind].load(std::memory_order_relaxed); }

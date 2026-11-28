@@ -2271,7 +2271,20 @@ void test_title_virtual_alloc() {
             generation = leonida::title_memory_map::generation();
             check(free(gfx, 0x1000, MEM_DECOMMIT), "title VirtualFree decommits a page");
             check(leonida::title_memory_map::generation() != generation, "title VirtualFree invalidates shadows");
+            // A release takes no size: the map change it records is the reservation's own two regions (one page
+            // decommitted, the rest committed), not the whole address space, so a reader whose pages are elsewhere
+            // need not look at them again.
+            generation = leonida::title_memory_map::generation();
             check(free(gfx, 0, MEM_RELEASE), "release the graphics allocation");
+            const auto base = reinterpret_cast<std::uintptr_t>(gfx);
+            std::uint64_t now = 0;
+            bool released = false, elsewhere = false;
+            const auto note = [&](std::uintptr_t from, std::uintptr_t to) {
+                (from == base && to == base + 0x10000 ? released : elsewhere) = true;
+            };
+            check(leonida::title_memory_map::changes_since(generation, now, 0, UINTPTR_MAX, note) && released &&
+                      !elsewhere,
+                  "title VirtualFree of a whole reservation records the reservation's range as the map change");
         }
         for (const DWORD bits : {kMemGraphics, kMemTitle, kMemGraphics | kMemTitle, DWORD{0}}) {
             void* const p = alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT | bits, PAGE_READWRITE);

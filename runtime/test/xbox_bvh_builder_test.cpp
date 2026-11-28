@@ -7,7 +7,9 @@
 // an element asking for offline statistics is skipped and leaves its destination untouched, a non-empty XDXR stream
 // is accepted, rehydration rebuilds from geometry with S_OK (with the title's scratch, with none, and two elements of
 // one batch without scratch, which the shim gives regions of their own; their structures go to check-build too) and
-// refuses a source-only element, and builders are released.
+// refuses a source-only element, the scratch the shim makes (and an object a list holds through hold_until_reset)
+// outlives a Reset or release of the list right after ExecuteCommandLists until that submission has completed, and
+// builders are released.
 //
 //   xbox_bvh_builder_test <out dir>        the shim
 //   xbox_bvh_builder_test --console        run with LEONIDA_BVH_BUILDER=console: nothing is registered
@@ -18,6 +20,7 @@
 #include "../shims/shims.h"
 #include "../src/xdxr_descs.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -26,6 +29,7 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace rt::shims {
@@ -50,6 +54,22 @@ template<class T> struct Ref {
     ~Ref() { if (p) p->Release(); }
     T* operator->() const { return p; }
     T** put() { return &p; }
+};
+
+// An object only a recording uses, as a shim's own scratch is, handed to a list with hold_until_reset. It counts its
+// references and is never freed, so a check can read when the layer let it go.
+struct Sentinel final : IUnknown {
+    std::atomic<ULONG> refs{1};
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (iid != __uuidof(IUnknown)) return E_NOINTERFACE;
+        AddRef();
+        *out = this;
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override { return --refs; }
 };
 
 int fail(const char* what, HRESULT hr = S_OK) {
@@ -520,6 +540,88 @@ int main(int argc, char** argv) {
                        ", \"triangles\": " + triangle_list(pair_tris[i]) + "}\n"),
               i ? "the batch's second element (its own scratch region) is written for check-build"
                 : "the batch's first element (its own scratch region) is written for check-build");
+    }
+
+    // ---- the shim's scratch outlives a Reset of the list until the submission that used it has completed ----
+    // D3D12 lets the title Reset a list as soon as ExecuteCommandLists returns (only its allocator waits for the GPU),
+    // and the title rehydrates with ScratchAccelerationStructureData = 0. The scratch the shim made for the build must
+    // not go back to the arena before the build has run: the next DEFAULT buffer of its size would get its range and
+    // be zeroed by the CPU while the GPU still uses it. A list released right after the call makes the same promise.
+    {
+        Ref<ID3D12CommandAllocator> next_allocator, other_allocator;
+        Ref<ID3D12GraphicsCommandList4> other_list;
+        Ref<ID3D12Resource> kept_as, kept_rb;
+        if (FAILED(hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                       IID_PPV_ARGS(next_allocator.put()))) ||
+            FAILED(hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                       IID_PPV_ARGS(other_allocator.put()))) ||
+            FAILED(hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, other_allocator.p, nullptr,
+                                                  IID_PPV_ARGS(other_list.put()))) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, blas_info.ResultDataMaxSizeInBytes, as_state, uav,
+                               kept_as.put())) ||
+            FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_READBACK, blas_info.ResultDataMaxSizeInBytes,
+                               D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, kept_rb.put())))
+            return fail("kept-scratch lists or buffers", hr);
+        if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, nullptr))) return fail("Reset for kept scratch");
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC kept_desc = zero_scratch_desc;
+        kept_desc.DestAccelerationStructureData = kept_as->GetGPUVirtualAddress();
+        check(rehydrate(builder, list.p, 1, &kept_desc, &source) == S_OK,
+              "a rehydrate without the title's scratch is recorded for the Reset check");
+        // The build's scratch is the one buffer the shim made for this call (one element: its region starts there).
+        UINT64 scratch_va = 0;
+        std::vector<leonida::Command> commands;
+        if (rt::d3d12::recorded_commands(list.p, commands))
+            for (const auto& command : commands)
+                if (const auto* build = std::get_if<leonida::BuildAccelerationStructure>(&command))
+                    scratch_va = build->scratch_va;
+        const UINT64 scratch_bytes = (blas_info.ScratchDataSizeInBytes + 255) / 256 * 256;
+        // Static, so a release that comes after this block (the queue's worker, or the teardown after a failed step
+        // returns early) still finds the object.
+        static Sentinel reset_sentinel, release_sentinel;
+        check(scratch_va && rt::d3d12::hold_until_reset(list.p, &reset_sentinel) &&
+                  rt::d3d12::hold_until_reset(other_list.p, &release_sentinel),
+              "the build has the shim's scratch, and both lists hold a sentinel");
+        list->ResourceBarrier(1, &barrier);
+        list->CopyBufferRegion(kept_rb.p, 0, kept_as.p, 0, blas_info.ResultDataMaxSizeInBytes);
+        if (FAILED(list->Close()) || FAILED(other_list->Close())) return fail("Close for kept scratch");
+        ID3D12CommandList* lists[] = {list.p, other_list.p};
+        queue->ExecuteCommandLists(2, lists);
+        // At once, before any Signal: the one list is Reset on another allocator, the other released.
+        if (FAILED(list->Reset(next_allocator.p, nullptr))) return fail("Reset right after ExecuteCommandLists");
+        other_list->Release();
+        other_list.p = nullptr;
+        Ref<ID3D12Resource> probe;
+        if (FAILED(hr = buffer(device.p, D3D12_HEAP_TYPE_DEFAULT, scratch_bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               uav, probe.put())))
+            return fail("probe buffer", hr);
+        const UINT64 probe_va = probe->GetGPUVirtualAddress();
+        std::printf("scratch VA 0x%llx, a DEFAULT buffer of its 0x%llx bytes made after the Reset at VA 0x%llx\n",
+                    static_cast<unsigned long long>(scratch_va), static_cast<unsigned long long>(scratch_bytes),
+                    static_cast<unsigned long long>(probe_va));
+        check(probe_va + scratch_bytes <= scratch_va || scratch_va + scratch_bytes <= probe_va,
+              "a DEFAULT buffer made right after the Reset does not get the range of the scratch the submission uses");
+        check(reset_sentinel.refs.load() > 1, "an object a list holds outlives the list's Reset after the call");
+        check(release_sentinel.refs.load() > 1, "and the list's release after the call");
+        // The queue lets go of what a submission kept in the first of its calls that finds the submission completed,
+        // after that call's own submission. On the queue's worker (LEONIDA_SUBMIT_ASYNC) the release can therefore
+        // still be running when the fence of that call's Signal is reached. The worker runs the calls in order, so it
+        // has finished by the time the fence of the next Signal is reached. After the Signal the build needs, the
+        // loop signals and waits until both objects are released, a few Signals at most.
+        const auto signal_and_wait = [&] {
+            if (FAILED(queue->Signal(fence.p, ++fence_value))) return false;
+            HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            const bool done = event && SUCCEEDED(fence->SetEventOnCompletion(fence_value, event)) &&
+                              WaitForSingleObject(event, 10000) == WAIT_OBJECT_0;
+            if (event) CloseHandle(event);
+            return done;
+        };
+        const auto released = [] { return reset_sentinel.refs.load() == 1 && release_sentinel.refs.load() == 1; };
+        bool settled = SUCCEEDED(list->Close()) && signal_and_wait();
+        for (int i = 0; settled && !released() && i < 8; ++i) settled = signal_and_wait();
+        if (!settled || FAILED(device->GetDeviceRemovedReason()))
+            return fail("the kept-scratch submission did not complete");
+        check(header_units(kept_rb.p) > 0, "the structure rehydrated with the kept scratch was built");
+        check(released(), "both objects are released once the submission has completed");
     }
 
     // ---- the destructor releases the builder ----

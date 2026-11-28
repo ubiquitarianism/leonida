@@ -101,16 +101,22 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
     let mut entry = id.to_vec();
     entry.push(shaders.len() as u8);
     for s in shaders {
-        let hash = *blake3::hash(&s.container).as_bytes();
+        let hash = s.full;
         let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u8;
         entry.push(stage);
         entry.extend(hash);
-        if book.shaders.insert(hash) {
+        // A translated shader has let its container go, but not before the first creation with
+        // it was noted here: `hand_out` notes a pipeline before it can start making one. (Were
+        // it gone, `make` would pass over the pipeline, whose shader the file would lack.)
+        if !book.shaders.contains(&hash)
+            && let Some(container) = s.container()
+        {
+            book.shaders.insert(hash);
             let new = &mut book.new[0];
             new.push(stage);
             new.extend(hash);
-            new.extend((s.container.len() as u32).to_le_bytes());
-            new.extend(&s.container);
+            new.extend((container.len() as u32).to_le_bytes());
+            new.extend(&*container);
         }
     }
     entry.push(u8::from(graphics.is_some()));

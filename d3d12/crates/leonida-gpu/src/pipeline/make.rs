@@ -21,9 +21,9 @@
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -32,7 +32,8 @@ use super::host::{GraphicsState, HostPipeline, TargetFormats};
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
-    pub(crate) graphics: Option<Box<GraphicsState>>,
+    /// Shared with every pipeline of the same state ([`shared_state`]).
+    pub(crate) graphics: Option<Arc<GraphicsState>>,
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
@@ -58,10 +59,24 @@ pub(crate) struct Pending {
     variant: OnceLock<Arc<Pending>>,
 }
 
-fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
-    shaders
+/// The compute programs [`left_out`] may leave out, by a name their container
+/// holds. Looked for once per shader (`Shader::facts`): a translated shader
+/// no longer has its container when the title creates another pipeline with it.
+const NAMES: [&[u8]; 2] = [b"CS_RaytracingResolve", b"CS_ScreenProbes_ActivateRays"];
+
+/// Which of [`NAMES`] `container` holds, a bit for each.
+pub(super) fn names(container: &[u8]) -> u8 {
+    NAMES
         .iter()
-        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+        .enumerate()
+        .filter(|(_, name)| container.windows(name.len()).any(|w| w == **name))
+        .fold(0, |bits, (n, _)| bits | 1 << n)
+}
+
+/// Whether one of `shaders` is a compute program with `name`, one of [`NAMES`].
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    let bit = NAMES.iter().position(|n| *n == name).map_or(0, |n| 1 << n);
+    shaders.iter().any(|s| s.facts().named & bit != 0)
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
@@ -153,17 +168,19 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+        let described = graphics.as_ref().map(|g| g.describe());
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        key.update(described.as_deref().unwrap_or_default().as_bytes());
         let scene_input = scene_input(&shaders);
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
         let left_out = left_out(&shaders);
+        let graphics = graphics.zip(described).map(|(g, described)| shared_state(g, &described));
         Pending {
             screen,
             scene_input,
@@ -223,6 +240,39 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// The one copy of the graphics state `state`, described as `described`:
+/// pipelines of the same state share it. The title creates 84,000 pipelines
+/// from some 5,700 different states, and each kept a copy of its own for
+/// the session (about 540 bytes, its input elements and their names on
+/// top). The description holds everything the state does (it names the
+/// host pipeline in the library), so equal descriptions are equal states.
+/// Held weakly: a state goes with the last pipeline that has it, and the
+/// table lets go of those gone each time it has doubled.
+fn shared_state(state: Box<GraphicsState>, described: &str) -> Arc<GraphicsState> {
+    struct Held(Weak<GraphicsState>);
+    // SAFETY: as for `Pending`: a state is only read after creation.
+    unsafe impl Send for Held {}
+    /// The states by the hash of their description, and the size at which
+    /// the table is next swept of states gone.
+    static STATES: Mutex<Option<(HashMap<[u8; 32], Held>, usize)>> = Mutex::new(None);
+    const SWEEP_AT: usize = 1024;
+    let id = *blake3::hash(described.as_bytes()).as_bytes();
+    let mut states = STATES.lock().unwrap_or_else(|e| e.into_inner());
+    let (table, sweep_at) = states.get_or_insert_with(|| (HashMap::new(), SWEEP_AT));
+    if let Some(shared) = table.get(&id).and_then(|held| held.0.upgrade()) {
+        return shared;
+    }
+    // (The input elements point into the names' own buffers, which the
+    // move into the shared allocation leaves where they are.)
+    let shared: Arc<GraphicsState> = Arc::from(state);
+    table.insert(id, Held(Arc::downgrade(&shared)));
+    if table.len() >= *sweep_at {
+        table.retain(|_, held| held.0.strong_count() > 0);
+        *sweep_at = (table.len() * 2).max(SWEEP_AT);
+    }
+    shared
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do

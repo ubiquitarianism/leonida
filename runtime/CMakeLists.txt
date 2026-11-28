@@ -1528,6 +1528,8 @@ if(BUILD_TESTING)
     add_test(NAME xs_proxy_mock_env_slots_74 COMMAND xs_proxy_mock_test --env-slots-74)
     # LEONIDA_SLOT133_LAYOUT_WORD=1 (set by the test itself): the slot 133 stand-in reads its fourth word as a layout.
     add_test(NAME xs_proxy_mock_slot133_layout COMMAND xs_proxy_mock_test --slot133-layout)
+    # LEONIDA_UPLOAD_REWIND=0 (set by the test itself): the upload arena only advances, as before the rewind.
+    add_test(NAME xs_proxy_mock_upload_rewind_off COMMAND xs_proxy_mock_test --upload-rewind-off)
   endif()
   # Reads d3d12.h and takes MSVC options, so only where the Windows runtime is built.
   if(TARGET gta6rt)
@@ -2309,6 +2311,23 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_fence_lost_by_counter COMMAND vk_fence_lost_by_counter_test)
     set_tests_properties(vk_fence_lost_by_counter PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  # The deferred deletion queue after a device loss: what was queued and what is released later is destroyed while
+  # the context lives, not at its teardown (driver vkDestroyBuffer interposed).
+  add_executable(vk_deferred_destroy_lost_test test/vk_deferred_destroy_lost_test.cpp)
+  target_link_libraries(vk_deferred_destroy_lost_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_deferred_destroy_lost_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(vk_deferred_destroy_lost_test PRIVATE Threads::Threads)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_deferred_destroy_lost_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_deferred_destroy_lost COMMAND vk_deferred_destroy_lost_test)
+    set_tests_properties(vk_deferred_destroy_lost PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   # The bindless set under view churn (bounded table, spare generations) and failed allocations (host table, in-place
   # rewrite, a degraded flush instead of a refused submission).
   add_executable(vk_bindless_grow_test test/vk_bindless_grow_test.cpp)
@@ -2677,6 +2696,18 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_pipeline_workers PROPERTIES ENVIRONMENT "LEONIDA_SERIAL_BIG_COMPILES=1")
     set_tests_properties(d3d12_pipeline_workers_eager PROPERTIES
                          ENVIRONMENT "LEONIDA_LAZY_PIPELINES=0;LEONIDA_LAZY_COMPUTE=0;LEONIDA_SERIAL_BIG_COMPILES=1")
+    # RT-SHARED-PIPELINE-LAYOUTS: the PSOs of one layout shape share one pipeline layout, made once on the device and
+    # destroyed once at its teardown; _eager builds every pipeline at creation with it.
+    add_executable(d3d12_shared_pipeline_layouts_test test/d3d12_shared_pipeline_layouts_test.cpp)
+    target_link_libraries(d3d12_shared_pipeline_layouts_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_shared_pipeline_layouts_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_shared_pipeline_layouts_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_shared_pipeline_layouts COMMAND d3d12_shared_pipeline_layouts_test)
+    add_test(NAME d3d12_shared_pipeline_layouts_eager COMMAND d3d12_shared_pipeline_layouts_test)
+    set_tests_properties(d3d12_shared_pipeline_layouts d3d12_shared_pipeline_layouts_eager PROPERTIES
+                         SKIP_RETURN_CODE 77 TIMEOUT 180 FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    set_tests_properties(d3d12_shared_pipeline_layouts_eager PROPERTIES
+                         ENVIRONMENT "LEONIDA_LAZY_PIPELINES=0;LEONIDA_LAZY_COMPUTE=0")
     # LEONIDA_ASYNC_PIPELINES=1 with LEONIDA_ASYNC_MIN_BYTES over every module and the compile worker held: with
     # LEONIDA_ASYNC_MIN_BYTES_GRAPHICS=0 the draws are skipped while every dispatch builds its pipeline in place; unset,
     # the draws build theirs in place too (src/async_pipeline_size.h).
@@ -2903,6 +2934,18 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_placed_heap_lifetime PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
+    # LEONIDA_SHADOW_GPU=1 alone keeps no released arena range or removed alias range for the console heap pass,
+    # which never runs then; with LEONIDA_CONSOLE_HEAP_GPU=1 an arena release is one range, taken by the next
+    # submission (RT-SHADOW-GPU-RELEASED-RANGES). The test sets both variables itself.
+    add_executable(d3d12_shadow_gpu_releases_test test/d3d12_shadow_gpu_releases_test.cpp)
+    target_link_libraries(d3d12_shadow_gpu_releases_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_shadow_gpu_releases_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_shadow_gpu_releases_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_shadow_gpu_releases COMMAND d3d12_shadow_gpu_releases_test)
+    add_test(NAME d3d12_console_heap_gpu_releases COMMAND d3d12_shadow_gpu_releases_test --console-heap-gpu)
+    set_tests_properties(d3d12_shadow_gpu_releases d3d12_console_heap_gpu_releases PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
     # ClearUnorderedAccessViewUint/Float on buffers and textures, read back through D3D12.
     add_executable(d3d12_uav_clear_test test/d3d12_uav_clear_test.cpp)
     target_link_libraries(d3d12_uav_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
@@ -2985,9 +3028,21 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_host_prefix COMMAND d3d12_existing_heap_test --host-prefix-only)
     set_tests_properties(d3d12_host_prefix PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(d3d12_existing_heap PROPERTIES SKIP_RETURN_CODE 77)
-    # LEONIDA_TEXTURE_REFRESH_ASYNC=1 (set by the test itself): a mapped plane's first submission reads its bytes.
+    # LEONIDA_TEXTURE_REFRESH_ASYNC=1 (set by the test itself): a mapped plane's first submission reads its bytes, and
+    # a mapped plane destroyed inside the registry leaves nothing for the refresh worker (RT-TITLE-TEXTURE-GONE-RANGES).
     add_test(NAME d3d12_mapped_plane_async COMMAND d3d12_existing_heap_test --mapped-plane-async)
     set_tests_properties(d3d12_mapped_plane_async PROPERTIES SKIP_RETURN_CODE 77)
+    # LEONIDA_TITLE_IMAGE_RETIRE=1, with LEONIDA_TITLE_IMAGE_IDLE_MS=0 and LEONIDA_TITLE_IMAGE_CHECKS=4 (set by the test
+    # itself): the images made for
+    # slot-70 views of textures a streaming title places at ever new addresses of the same memory stay at the textures
+    # still there, and a pass looks at the pages of a few of them, only of those under a change it knows the range of.
+    add_test(NAME d3d12_title_image_retire COMMAND d3d12_existing_heap_test --title-image-retire)
+    set_tests_properties(d3d12_title_image_retire PROPERTIES SKIP_RETURN_CODE 77
+                         ENVIRONMENT "LEONIDA_TITLE_IMAGE_RETIRE=1")
+    # LEONIDA_TITLE_IMAGE_IDLE_MS=500 (set by the test itself): such an image goes only after that long unnamed.
+    add_test(NAME d3d12_title_image_idle COMMAND d3d12_existing_heap_test --title-image-idle)
+    set_tests_properties(d3d12_title_image_idle PROPERTIES SKIP_RETURN_CODE 77
+                         ENVIRONMENT "LEONIDA_TITLE_IMAGE_RETIRE=1")
     # The same with write watching off: the guarded cases only, the concurrent writers among them.
     add_test(NAME d3d12_existing_heap_no_write_watch COMMAND d3d12_existing_heap_test)
     set_tests_properties(d3d12_existing_heap_no_write_watch PROPERTIES SKIP_RETURN_CODE 77
@@ -2996,6 +3051,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_existing_heap_write_watch COMMAND d3d12_existing_heap_test)
     set_tests_properties(d3d12_existing_heap_write_watch PROPERTIES SKIP_RETURN_CODE 77
                          ENVIRONMENT "LEONIDA_WRITE_WATCH=1")
+    # A placed BC texture's shape whose shared zero image could not be made gets one at a later placement, after a wait
+    # that doubles at each failure.
+    add_executable(d3d12_zero_image_retry_test test/d3d12_zero_image_retry_test.cpp)
+    target_link_libraries(d3d12_zero_image_retry_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_zero_image_retry_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_zero_image_retry_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_zero_image_retry COMMAND d3d12_zero_image_retry_test)
+    set_tests_properties(d3d12_zero_image_retry PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     # Slot 133 on untouched xmem physical pages: committed through the pages hook, then imported. xmem.cpp and
     # registry.cpp are compiled in, as xmem_test does, to reach the registered XMem* exports.
     add_executable(d3d12_xmem_placed_test test/d3d12_xmem_placed_test.cpp shims/xmem.cpp shims/registry.cpp)
@@ -3012,6 +3075,15 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(xbox_linear_texture_map PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
                          ENVIRONMENT "LEONIDA_LINEAR_MAP_FIRST=1")
     set_tests_properties(d3d12_xmem_placed PROPERTIES SKIP_RETURN_CODE 77)
+    # A vertex or index view of title memory that can be neither imported nor shadowed gets no stand-in buffer and is
+    # tried again after a delay, not at every bind; after a refusal no other view is tried for that second either.
+    add_executable(d3d12_title_buffer_fallback_test test/d3d12_title_buffer_fallback_test.cpp)
+    target_link_libraries(d3d12_title_buffer_fallback_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_title_buffer_fallback_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_title_buffer_fallback_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_title_buffer_fallback COMMAND d3d12_title_buffer_fallback_test)
+    set_tests_properties(d3d12_title_buffer_fallback PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+                         ENVIRONMENT "LEONIDA_SLOT133_IMPORT=0;LEONIDA_ARENA_MB=16")
 
     # Fences and timing (D3D-30): multiple-fence waits, clock calibration, adapter LUID, custom heap properties.
     add_executable(d3d12_fence_timing_test test/d3d12_fence_timing_test.cpp)
@@ -3292,6 +3364,15 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_view_slices COMMAND d3d12_view_slices_test)
     set_tests_properties(d3d12_view_slices PROPERTIES SKIP_RETURN_CODE 77)
 
+    # The shared zero image of a placed BC texture's shape is released once no texture shows it
+    # (RT-ZERO-IMAGES-RELEASE).
+    add_executable(d3d12_zero_image_release_test test/d3d12_zero_image_release_test.cpp)
+    target_link_libraries(d3d12_zero_image_release_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_zero_image_release_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_zero_image_release_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_zero_image_release COMMAND d3d12_zero_image_release_test)
+    set_tests_properties(d3d12_zero_image_release PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
     # Typed RTV clears and draws of every TYPELESS color family against the host on the same adapter and WARP
     # (D3D-275). The draws need glslangValidator for their GLSL stand-ins of translated shaders.
     add_executable(d3d12_typeless_families_test test/d3d12_typeless_families_test.cpp)
@@ -3496,6 +3577,14 @@ if(TARGET Vulkan::Headers)
     target_link_options(xbox_list_value_fallback_test PRIVATE /OPT:NOREF)
     add_test(NAME xbox_list_value_fallback COMMAND xbox_list_value_fallback_test)
     set_tests_properties(xbox_list_value_fallback PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    # The spare real lists a list-value cut leaves: an idle one drops its recording, so it holds back no retired title
+    # window (src/command_list_epochs.h) and holds nothing its recording used.
+    add_executable(xbox_list_cut_spares_test test/xbox_list_cut_spares_test.cpp shims/d3d12_xs_device.cpp
+                   shims/d3d12_xs_pso_stream.cpp)
+    target_link_libraries(xbox_list_cut_spares_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(xbox_list_cut_spares_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
+    add_test(NAME xbox_list_cut_spares COMMAND xbox_list_cut_spares_test)
+    set_tests_properties(xbox_list_cut_spares PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_executable(d3d12_present_test test/d3d12_present_test.cpp)
     target_link_libraries(d3d12_present_test PRIVATE gta6rt_d3d12_com user32 gdi32 dxgi)
     target_compile_definitions(d3d12_present_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -4020,6 +4109,10 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_compile_teardown_one_worker COMMAND d3d12_compile_teardown_test)
       set_tests_properties(d3d12_compile_teardown_one_worker PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300
                            ENVIRONMENT "LEONIDA_COMPILE_THREADS=1")
+      # The session file beside an offline seed: loaded alone, the seed not read and nothing merged, when
+      # pipeline_cache.session.seed says it was written beside the seed there now; otherwise the seed and a merge.
+      add_test(NAME d3d12_session_cache_seed COMMAND d3d12_compile_teardown_test --seed)
+      set_tests_properties(d3d12_session_cache_seed PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
       # A buffer at the title's own VA (device slot 133) read by the same shader through a root view and a V#.
       add_executable(d3d12_title_va_test test/d3d12_title_va_test.cpp shims/d3d12_xs_device.cpp
                      test/xmem_geometry_aliases_stub.cpp ${LEONIDA_TEST_CS})
@@ -4105,6 +4198,7 @@ if(TARGET Vulkan::Headers)
           VERBATIM)
       endforeach()
       add_executable(d3d12_draw_test test/d3d12_draw_test.cpp test/d3d12_stateful_indirect_pixels.cpp
+                     test/d3d12_draw_views_sharing.cpp
                      shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_TEST_VS}
                      ${LEONIDA_TEST_PS} ${LEONIDA_TEST_PS_UINT} ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_VS_INT})
       target_link_libraries(d3d12_draw_test PRIVATE gta6rt_d3d12_com)
@@ -4129,6 +4223,8 @@ if(TARGET Vulkan::Headers)
                            d3d12_stateful_indirect_nonindexed_counted_pixels PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
       add_test(NAME d3d12_title_index_window COMMAND d3d12_draw_test --title-index-window)
       add_test(NAME d3d12_title_vertex_window COMMAND d3d12_draw_test --title-vertex-window)
+      # Draws that keep the same render targets and vertex buffers share one views block (recording only).
+      add_test(NAME d3d12_draw_views_sharing COMMAND d3d12_draw_test --draw-views-sharing)
       # LEONIDA_STUB_PIPELINES: a pipeline with no translated shader is a stub when the switch is on.
       add_executable(d3d12_stub_pipelines_test test/d3d12_stub_pipelines_test.cpp)
       target_link_libraries(d3d12_stub_pipelines_test PRIVATE gta6rt_d3d12_com)
@@ -4144,7 +4240,8 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_stub_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_stub_draw COMMAND d3d12_stub_draw_test)
       set_tests_properties(d3d12_stub_draw PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
-      set_tests_properties(d3d12_draw d3d12_title_index_window d3d12_title_vertex_window PROPERTIES SKIP_RETURN_CODE 77)
+      set_tests_properties(d3d12_draw d3d12_title_index_window d3d12_title_vertex_window d3d12_draw_views_sharing
+                           PROPERTIES SKIP_RETURN_CODE 77)
       # Graphics & compute PSO descriptor validation parity against live Windows D3D12 (WARP and HW).
       add_executable(d3d12_pso_validation_test test/d3d12_pso_validation_test.cpp ${LEONIDA_TEST_VS}
                      ${LEONIDA_TEST_PS} ${LEONIDA_TEST_PS_UINT} ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_CS})
@@ -4161,6 +4258,19 @@ if(TARGET Vulkan::Headers)
       # the thread (d3d12_compile_teardown_test).
       set_tests_properties(d3d12_pso_validation PROPERTIES SKIP_RETURN_CODE 77
                            FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+      # The arena copy of a program that shaders read their code base from: one per program, shared by its PSOs.
+      add_executable(d3d12_code_base_share_test test/d3d12_code_base_share_test.cpp ${LEONIDA_TEST_CS}
+                     ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_PS})
+      target_link_libraries(d3d12_code_base_share_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_code_base_share_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
+                                 LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}")
+      target_compile_options(d3d12_code_base_share_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_code_base_share COMMAND d3d12_code_base_share_test)
+      # LEONIDA_SHARE_CODE_BASE=0: a copy for every PSO, as before.
+      add_test(NAME d3d12_code_base_per_pso COMMAND d3d12_code_base_share_test --per-pso)
+      set_tests_properties(d3d12_code_base_per_pso PROPERTIES ENVIRONMENT "LEONIDA_SHARE_CODE_BASE=0")
+      set_tests_properties(d3d12_code_base_share d3d12_code_base_per_pso PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
       # Conservative raster Tier 1, with geometric coverage bounds and host D3D12 references.
       set(LEONIDA_CONSERVATIVE_VS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_conservative.spv)
       set(LEONIDA_CONSERVATIVE_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_conservative.spv)
@@ -4864,6 +4974,17 @@ if(TARGET Vulkan::Headers)
       target_compile_options(memory_breakdown_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME memory_breakdown COMMAND memory_breakdown_test)
+    # The mem probe's vmmap line, its reading of the process on native Windows (src/mem_probe.h): the classifier over
+    # synthetic regions and ranges, and walks of this process around memory it commits and maps.
+    if(WIN32)
+      add_executable(mem_probe_vmmap_test test/mem_probe_vmmap_test.cpp)
+      target_link_libraries(mem_probe_vmmap_test PRIVATE Vulkan::Headers psapi)
+      target_compile_definitions(mem_probe_vmmap_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      if(MSVC)
+        target_compile_options(mem_probe_vmmap_test PRIVATE /W4 /permissive- /utf-8)
+      endif()
+      add_test(NAME mem_probe_vmmap COMMAND mem_probe_vmmap_test)
+    endif()
     # The address guard's page table (src/address_guard.h; docs/d3d12_vulkan.md, "Address guard").
     add_executable(address_guard_test test/address_guard_test.cpp)
     if(WIN32 AND MSVC)

@@ -220,7 +220,8 @@ inline int decode(BitReader& in, const Huffman& h) {
     return -1;
 }
 
-inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const Huffman& lengths,
+template <class Bytes>
+inline ZlibError inflate_codes(BitReader& in, Bytes& out, const Huffman& lengths,
                           const Huffman& distances, std::size_t limit, bool bulk = true) {
     static constexpr std::int16_t length_base[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
                                                      31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
@@ -276,8 +277,11 @@ inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, co
 // preset dictionary, a checksum mismatch, or output beyond `limit` bytes, and then stores the reason in `*why` when
 // it is given: `header` for the two header bytes (not deflate, a window over 32 KiB, a bad check value, a preset
 // dictionary), `data` for the deflate data or a missing trailer, `checksum` for an Adler-32 mismatch, `limit` for
-// output beyond `limit`. Bytes after the Adler-32 trailer are not read.
-inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint8_t>& out,
+// output beyond `limit`. Bytes after the Adler-32 trailer are not read. `out` may be any vector of bytes:
+// dstorage.cpp passes one whose growth leaves the new bytes unset, which is safe because every byte this appends is
+// written before anything reads it.
+template <class Bytes = std::vector<std::uint8_t>>
+inline bool zlib_inflate(std::span<const std::uint8_t> in, Bytes& out,
                          std::size_t limit = std::size_t(1) << 30, ZlibError* why = nullptr, bool bulk = true) {
     out.clear();
     const auto fail = [why](ZlibError reason) {

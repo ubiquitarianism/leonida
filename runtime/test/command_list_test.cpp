@@ -9,9 +9,46 @@
     }                                                            \
 } while (0)
 
+// Command-list epochs (src/command_list_epochs.h), checked before main records any list. A list closed and never
+// reset may be executed again, so it holds back every copy the layer retires after its recording began; one whose
+// recording was dropped (drop_recording: its owner does not execute it again before its next Reset) holds back
+// nothing, nor does a copy of it, until a Reset begins a new recording. Only a closed list drops its recording.
+static int check_epochs() {
+    using namespace leonida;
+    namespace epochs = command_list_epochs;
+    CHECK(epochs::oldest() == UINT64_MAX);  // no list yet
+    {
+        CommandList idle, busy;
+        const std::uint64_t first = epochs::oldest();
+        CHECK(idle.uav_barrier({0}) && idle.close() && busy.close());
+        const std::uint64_t retirement = epochs::advance();
+        CHECK(busy.reset() && !busy.drop_recording() && busy.close());  // a list still recording keeps its recording
+        CHECK(first < retirement && epochs::oldest() == first);  // the idle list, closed and never reset
+        {
+            const CommandList held = idle;  // a held batch's copy, made before the drop
+            CHECK(idle.drop_recording() && idle.closed() && idle.commands().empty());
+            CHECK(held.commands().size() == 1 && epochs::oldest() == first);  // the copy still names the recording
+        }
+        CHECK(epochs::oldest() == retirement);  // only the busy list, reset after the retirement
+        const std::uint64_t later = epochs::advance();
+        CHECK(busy.drop_recording() && epochs::oldest() == UINT64_MAX);
+        {
+            const CommandList copy = idle;  // copies of a dropped recording name nothing either
+            CommandList assigned;           // a new list's recording begins at once
+            CHECK(epochs::oldest() == later);
+            assigned = busy;
+            CHECK(epochs::oldest() == UINT64_MAX);
+        }
+        CHECK(idle.reset() && epochs::oldest() == later);  // a new recording counts again, from its Reset
+    }
+    CHECK(epochs::oldest() == UINT64_MAX);
+    return 0;
+}
+
 int main() {
     using namespace leonida;
     namespace s = d3d12_state;
+    if (check_epochs()) return 1;
     CommandList list;
     TargetView descriptor{12, 1, 2, 3};
     ClearColor color{1, 0, 0, 1};

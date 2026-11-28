@@ -76,6 +76,7 @@
 #include <thread>
 #include <deque>
 #include <condition_variable>
+#include <map>
 #include <set>
 #include <new>
 #include <vector>
@@ -186,6 +187,10 @@ bool call_presentation(DeviceProxy* self, F&& f) {
 // Freed in proxy_release; defined where the states are complete.
 void destroy_present_state(void* present_state);
 void destroy_upload_state(void* upload_state);
+// The upload memory console list slot 148 handed out under an allocator (the real one, as ListProxy::allocator names
+// it): rewound at the allocator proxy's Reset and freed with the proxy. Defined with the upload arena.
+void upload_allocator_reset(DeviceProxy* device, const void* allocator);
+void upload_allocator_gone(DeviceProxy* device, const void* allocator);
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
 
@@ -1616,7 +1621,12 @@ void destroy_child(ChildProxy* self) {
 
 unsigned long release_child_reference(ChildProxy* self) {
     const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
-    if (refs == 0) destroy_child(self);
+    if (refs == 0) {
+        // The last reference to an allocator: the upload memory handed out under it goes with it. D3D12 asks the same
+        // of a release as of a Reset, that the GPU has finished the allocator's lists.
+        if (self->kind == ChildKind::allocator) upload_allocator_gone(self->device, self->real);
+        destroy_child(self);
+    }
     return refs;
 }
 
@@ -2788,6 +2798,14 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t);
         auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
+        if constexpr (K == ChildKind::allocator && Slot == 8) {
+            // Reset. D3D12 allows it only once the GPU has finished every list recorded into the allocator, so the
+            // upload memory handed out under it is free again and upload_allocator_reset rewinds it. A refused Reset
+            // (the Vulkan layer's while a list still records into the allocator) gives nothing back.
+            const std::uint64_t result = fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+            if (SUCCEEDED(static_cast<HRESULT>(result))) upload_allocator_reset(self->device, self->real);
+            return result;
+        }
         if constexpr (K == ChildKind::fence && Slot == kFenceSignal) {
             const std::uint64_t result = fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
             if (FenceMirror* m = self->mirror.load(std::memory_order_acquire)) refresh_mirror(m);
@@ -2918,22 +2936,56 @@ constexpr unsigned kListSlots = 160;
 // address (the same backing memory) before forwarding. Translation covers the six root VA setters (console
 // 41-46); VAs inside view structs (IASetVertexBuffers/IASetIndexBuffer) and ExecuteIndirect arguments are not
 // rewritten yet and stay title addresses.
+//
+// The memory belongs to the command allocator the list records into, as the list's commands do. Each allocator has
+// its own chunks, carved from front to back; its Reset (allocator slot 8), which D3D12 allows only once the GPU has
+// finished every list recorded into it, starts them from the front again, and its release frees them. A list's own
+// Reset gives nothing back: the allocator's earlier lists may still be pending. The arena used to only advance, so
+// for as long as the title ran it grew by one 8 MiB buffer each time the newest was full, in VRAM with Resizable BAR
+// and in host memory without. An allocator the device hands out unwrapped (a PC runtime's, see
+// resolves_allocator_proxies) never reaches its Reset here: its chunks only advance, as before, until the device goes.
+// LEONIDA_UPLOAD_REWIND=0 keeps the one arena all lists share, which only advances, as before.
 
 struct UploadChunk {
-    UploadChunk* next;
+    UploadChunk* next;             // the allocator's next older chunk
     ID3D12Resource* resource;      // the mapped buffer; released with the chunk
     std::uint8_t* cpu_base;
     D3D12_GPU_VIRTUAL_ADDRESS gpu_base;
     std::size_t size;
     std::size_t used;
+    unsigned idle_resets;          // how many of its allocator's Resets in a row found it unused
 };
 
 struct UploadArena {
-    UploadChunk* chunks = nullptr;
+    // Each allocator's chunks, newest first, by the real allocator (ListProxy::allocator). The null key holds the
+    // chunks of a list whose allocator is not known and, with LEONIDA_UPLOAD_REWIND=0, every chunk: nothing rewinds it.
+    std::map<const void*, UploadChunk*> owners;
+    std::map<std::uint64_t, UploadChunk*> by_cpu;  // every chunk by its CPU base, for upload_translate
     std::mutex lock;
 };
 
 constexpr std::size_t kUploadChunkMin = 8 << 20;  // one chunk serves a title's whole frame of uploads
+// A chunk that served nothing for this many Resets of its allocator in a row goes back, so an allocator keeps what its
+// recent frames needed rather than the most they ever did. More than one, so that a load which comes and goes every
+// other frame does not make and free a buffer each time.
+constexpr unsigned kUploadIdleResets = 8;
+
+inline bool upload_rewind() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_UPLOAD_REWIND");
+        return !(v && v[0] == '0' && v[1] == '\0');
+    }();
+    return on;
+}
+
+// LEONIDA_UPLOAD_ALIAS=1 (experiment): see upload_chunk_new.
+inline bool upload_alias() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_UPLOAD_ALIAS");
+        return v && *v == '1';
+    }();
+    return on;
+}
 
 // LEONIDA_UPLOAD_LOG=1 (diagnostic): each upload chunk (its CPU base, device address and size), and the first 96 and
 // then every 8192nd AllocateUploadMemory result as an offset into its chunk, so the addresses the title builds
@@ -2991,11 +3043,7 @@ UploadChunk* upload_chunk_new(DeviceProxy* device, std::size_t size) {
         // the title VA table, the chunk's CPU range answers with the chunk's console VA (its device address minus
         // heap_base), so a V# the title wrote with such a pointer is rewritten to the chunk instead of left empty. A
         // chunk below the arena has a negative console VA, usable in a V# only with LEONIDA_IMPORT_BELOW_ARENA=1.
-        static const bool alias = [] {
-            const char* v = std::getenv("LEONIDA_UPLOAD_ALIAS");
-            return v && *v == '1';
-        }();
-        if (alias) {
+        if (upload_alias()) {
             const bool added = leonida::title_va_aliases().add(reinterpret_cast<std::uint64_t>(chunk->cpu_base),
                                                                chunk->size, chunk->gpu_base);
             std::fprintf(stderr, "[rt] d3d12_xs: upload chunk 0x%llx (%llu bytes) entered as an alias of console VA "
@@ -3020,7 +3068,34 @@ UploadChunk* upload_chunk_new(DeviceProxy* device, std::size_t size) {
     return chunk;
 }
 
-std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_t alignment) {
+// Unmaps and releases (or frees) a chunk that is out of its arena, so that no list is handed it again.
+void upload_chunk_free(UploadChunk* chunk) {
+    if (chunk->resource) {
+        if (upload_alias())
+            leonida::title_va_aliases().remove(reinterpret_cast<std::uint64_t>(chunk->cpu_base), chunk->gpu_base);
+        chunk->resource->Unmap(0, nullptr);
+        chunk->resource->Release();
+    } else {
+        VirtualFree(chunk->cpu_base, 0, MEM_RELEASE);
+    }
+    delete chunk;
+}
+
+// Frees a list of chunks (linked by `next`) taken out of their arena; `why` names the reason in the upload log.
+void upload_chunks_free(UploadChunk* chunk, const char* why) {
+    while (chunk) {
+        UploadChunk* next = chunk->next;
+        if (upload_log())
+            std::fprintf(stderr, "[rt] upload-log: chunk at 0x%llx, %llu bytes, given back (%s)\n",
+                         static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(chunk->cpu_base)),
+                         static_cast<unsigned long long>(chunk->size), why);
+        upload_chunk_free(chunk);
+        chunk = next;
+    }
+}
+
+// `allocator` is the real allocator the list records into (ListProxy::allocator), the owner of what it hands out.
+std::uint64_t upload_alloc(DeviceProxy* device, const void* allocator, std::uint64_t size, std::uint64_t alignment) {
     if (!device || !size) return 0;
     alignment = alignment < 16 ? 16 : alignment;  // every measured call asked for 16
     // Refuse what cannot be served before any arithmetic runs: only power-of-two alignments are measured,
@@ -3045,9 +3120,11 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
             arena = static_cast<UploadArena*>(expected);
         }
     }
+    const void* const owner = upload_rewind() ? allocator : nullptr;
     std::lock_guard<std::mutex> lock(arena->lock);
     const std::size_t need = static_cast<std::size_t>(size);
-    for (UploadChunk* chunk = arena->chunks; chunk; chunk = chunk->next) {
+    const auto owned = arena->owners.find(owner);
+    for (UploadChunk* chunk = owned != arena->owners.end() ? owned->second : nullptr; chunk; chunk = chunk->next) {
         const std::size_t aligned = (chunk->used + (alignment - 1)) & ~(static_cast<std::size_t>(alignment) - 1);
         if (aligned >= chunk->used && aligned <= chunk->size && need <= chunk->size - aligned) {
             chunk->used = aligned + need;
@@ -3058,13 +3135,22 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
     }
     const std::size_t chunk_size = need + alignment > kUploadChunkMin ? need + alignment : kUploadChunkMin;
     UploadChunk* chunk = upload_chunk_new(device, chunk_size);
+    if (chunk) {
+        try {
+            UploadChunk*& newest = arena->owners[owner];
+            arena->by_cpu.emplace(reinterpret_cast<std::uint64_t>(chunk->cpu_base), chunk);
+            chunk->next = newest;
+            newest = chunk;
+        } catch (const std::bad_alloc&) {  // no exception may leave a thunk for the title's code
+            upload_chunk_free(chunk);
+            chunk = nullptr;
+        }
+    }
     if (!chunk) {
         std::fprintf(stderr, "[rt] d3d12_xs: AllocateUploadMemory(%llu, %llu) failed\n",
                      static_cast<unsigned long long>(size), static_cast<unsigned long long>(alignment));
         return 0;
     }
-    chunk->next = arena->chunks;
-    arena->chunks = chunk;
     const std::size_t aligned = (alignment - 1) & ~(static_cast<std::size_t>(alignment) - 1);  // 0-based
     chunk->used = aligned + need;
     if (upload_log())
@@ -3078,36 +3164,70 @@ std::uint64_t upload_alloc(DeviceProxy* device, std::uint64_t size, std::uint64_
 }
 
 // An address inside an upload chunk becomes the chunk's device address plus the offset; anything else — a
-// real resource VA the title already holds — passes through.
+// real resource VA the title already holds — passes through. Every root CBV/SRV/UAV and IA/SO view asks, so the
+// chunk is found by its CPU base rather than by walking them all.
 std::uint64_t upload_translate(DeviceProxy* device, std::uint64_t va) {
     auto* arena = static_cast<UploadArena*>(
         device ? device->upload_state.load(std::memory_order_acquire) : nullptr);
     if (!arena) return va;
     std::lock_guard<std::mutex> lock(arena->lock);
-    for (UploadChunk* chunk = arena->chunks; chunk; chunk = chunk->next) {
-        const std::uint64_t base = reinterpret_cast<std::uint64_t>(chunk->cpu_base);
-        if (va >= base && va < base + chunk->size) return chunk->gpu_base + (va - base);
+    auto above = arena->by_cpu.upper_bound(va);  // the first chunk starting past va
+    if (above == arena->by_cpu.begin()) return va;
+    const auto& [base, chunk] = *--above;
+    return va - base < chunk->size ? chunk->gpu_base + (va - base) : va;
+}
+
+// The allocator proxy's Reset succeeded: the GPU is done with every list recorded into `allocator`, so its chunks are
+// carved from the front again. One that served nothing for kUploadIdleResets of these in a row is given back.
+void upload_allocator_reset(DeviceProxy* device, const void* allocator) {
+    auto* arena = static_cast<UploadArena*>(
+        device ? device->upload_state.load(std::memory_order_acquire) : nullptr);
+    if (!arena || !allocator) return;
+    UploadChunk* idle = nullptr;  // taken out under the lock, freed after it
+    {
+        std::lock_guard<std::mutex> lock(arena->lock);
+        const auto owned = arena->owners.find(allocator);
+        if (owned == arena->owners.end()) return;
+        UploadChunk** link = &owned->second;
+        while (UploadChunk* chunk = *link) {
+            chunk->idle_resets = chunk->used ? 0 : chunk->idle_resets + 1;
+            chunk->used = 0;
+            if (chunk->idle_resets < kUploadIdleResets) {
+                link = &chunk->next;
+                continue;
+            }
+            *link = chunk->next;
+            arena->by_cpu.erase(reinterpret_cast<std::uint64_t>(chunk->cpu_base));
+            chunk->next = idle;
+            idle = chunk;
+        }
+        if (!owned->second) arena->owners.erase(owned);
     }
-    return va;
+    upload_chunks_free(idle, "idle at its allocator's Resets");
+}
+
+// The allocator proxy's last reference went: its chunks go with it.
+void upload_allocator_gone(DeviceProxy* device, const void* allocator) {
+    auto* arena = static_cast<UploadArena*>(
+        device ? device->upload_state.load(std::memory_order_acquire) : nullptr);
+    if (!arena || !allocator) return;
+    UploadChunk* gone = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(arena->lock);
+        const auto owned = arena->owners.find(allocator);
+        if (owned == arena->owners.end()) return;
+        gone = owned->second;
+        for (const UploadChunk* chunk = gone; chunk; chunk = chunk->next)
+            arena->by_cpu.erase(reinterpret_cast<std::uint64_t>(chunk->cpu_base));
+        arena->owners.erase(owned);
+    }
+    upload_chunks_free(gone, "its allocator was released");
 }
 
 void destroy_upload_state(void* upload_state) {
     auto* arena = static_cast<UploadArena*>(upload_state);
     if (!arena) return;
-    for (UploadChunk* chunk = arena->chunks; chunk;) {
-        UploadChunk* next = chunk->next;
-        if (chunk->resource) {
-            const char* alias = std::getenv("LEONIDA_UPLOAD_ALIAS");
-            if (alias && *alias == '1')
-                leonida::title_va_aliases().remove(reinterpret_cast<std::uint64_t>(chunk->cpu_base), chunk->gpu_base);
-            chunk->resource->Unmap(0, nullptr);
-            chunk->resource->Release();
-        } else {
-            VirtualFree(chunk->cpu_base, 0, MEM_RELEASE);
-        }
-        delete chunk;
-        chunk = next;
-    }
+    for (const auto& entry : arena->by_cpu) upload_chunk_free(entry.second);
     delete arena;
 }
 
@@ -3376,17 +3496,30 @@ void note_list_state(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::u
     (void)self, (void)a1, (void)a2, (void)a3, (void)a4;
 }
 
+// A closed real list of the last recording becomes a spare. Nothing executes it again before a cut resets it: a
+// submission names the proxy's parts and `real`, and the title's Reset ended the recording they were. So it drops
+// that recording now: an idle spare would otherwise keep its commands and the pipeline states, root signatures and
+// scratch they hold, and its command-list epoch would hold back every title window retired after that recording
+// began (src/command_list_epochs.h) until a cut reset it, which never comes for a spare past the cuts later
+// recordings make (cut_list takes the newest spare first).
+void keep_spare(ListProxy* self, ID3D12GraphicsCommandList* list) {
+#ifdef LEONIDA_VULKAN_DEVICE
+    rt::d3d12::drop_recording(list);
+#endif
+    self->spares.push_back(list);
+}
+
 // A new recording (Reset): the primary list records again; the other real lists of the last recording are closed and
 // wait with the spares for later cuts.
 void restart_recording(ListProxy* self) {
     for (const ListProxy::Part& part : self->parts)
-        if (part.list != self->primary) self->spares.push_back(part.list);
+        if (part.list != self->primary) keep_spare(self, part.list);
     self->parts.clear();
     if (self->real != self->primary) {
         // A title resets a list it closed; one still open (a D3D12 error, which the real Reset reports) is closed
         // here so that a later cut can Reset it.
         if (!self->real_closed) self->real->Close();
-        self->spares.push_back(self->real);
+        keep_spare(self, self->real);
         self->real = self->primary;
     }
     self->pre_writes.clear();
@@ -3699,7 +3832,8 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             }
 #endif
             if constexpr (Slot == kConsoleAllocateUpload) {
-                return upload_alloc(self->device, a1, a2);  // (size, alignment); the comment at UploadChunk
+                // (size, alignment), under the allocator the list records into; the comment at UploadChunk
+                return upload_alloc(self->device, self->allocator, a1, a2);
             }
             if constexpr (Slot >= 69 && Slot <= 74) {  // memory writes and waits, by the layout (console_value_op)
                 const ConsoleValueOp op = console_value_op(Slot, layout);

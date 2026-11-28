@@ -232,10 +232,20 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
         let mut to = to as *mut [u32; 2];
         for &(a, b) in ranges.iter().filter(|r| short(r)) {
             for offset in (a..b).step_by(4) {
-                // SAFETY: inside the copy's mapping (its CPU side, which
-                // the thread that asked, and waits, alone writes in these
-                // ranges) and inside the memory, which has room for every
-                // pair, a piece of work's behind the last one's.
+                // SAFETY: inside the copy's mapping (its CPU side) and
+                // inside the memory, which has room for every pair, a piece
+                // of work's behind the last one's. The thread that asked,
+                // and waits, alone writes in these ranges of a CPU side,
+                // but for a side that is memory of ours (`Shadow::opened`,
+                // an arena of `crate::memory`'s): there a recording thread
+                // may write a word while it is read here, or while
+                // `copy_all` below reads its run. Two plain accesses at
+                // once are a race the language leaves undefined. What the
+                // processor reads is the old bytes or the new ones, and
+                // the writer resends what it wrote after it wrote it, so
+                // the next submission sends the new ones. (Before, a
+                // refresh read the arena through the kernel while it was
+                // written, with the same outcome.)
                 unsafe {
                     let word = ((from + offset) as *const u32).read_unaligned();
                     to.write([offset as u32, word]);

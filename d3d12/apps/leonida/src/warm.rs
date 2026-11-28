@@ -49,7 +49,9 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
     let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
-    let early: HashSet<&str> = early.lines().collect();
+    // A key, then the run that last drew with it (a list of an older build
+    // has the key alone).
+    let early: HashSet<&str> = early.lines().filter_map(|l| l.split(' ').next()).collect();
     // Those earlier runs drew with first, the others in no order (by key).
     let mut all: Vec<usize> = (0..keys.len())
         .filter(|&n| {

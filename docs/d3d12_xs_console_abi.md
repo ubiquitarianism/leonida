@@ -252,6 +252,11 @@ The runtime's model:
   state set so far (heaps, root signatures and arguments, pipeline, viewports, scissors, targets, vertex and index
   buffers, blend factor, stencil reference, predication; what an executed bundle set, and nothing from before a
   `ClearState`) is set on it again. A cut that would split an open query waits for the query's `EndQuery`.
+  At the title's next `Reset` the parts' real lists become spares for later cuts, the newest reused first. Nothing
+  executes a spare again before a cut resets it, so it drops its recording then (`rt::d3d12::drop_recording`): an
+  idle spare keeps no commands, no pipeline states, root signatures or scratch they held, and no command-list epoch
+  that would keep a retired title window from being freed (`src/command_list_epochs.h`). `xbox_list_cut_spares`
+  covers it.
   Bundles record neither method (`ExecuteBundle` names one real list, so a bundle cannot be cut).
 - At submission each part's waits are checked: met ones cost nothing; one that a write still in flight will meet
   becomes a queue `Wait` on that write's fence (the GPU orders the two queues); any other makes the queue `Wait` on

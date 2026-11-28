@@ -1,5 +1,6 @@
-// The two pure decisions behind D3D-704: how large a session cache may be (LEONIDA_PIPELINE_CACHE_BYTES) and
-// whether a blob's VkPipelineCacheHeaderVersionOne names this device. No Vulkan, no GPU, no files.
+// The pure decisions behind D3D-704: how large a session cache may be (LEONIDA_PIPELINE_CACHE_BYTES), whether a
+// blob's VkPipelineCacheHeaderVersionOne names this device, and whether a session file holds the offline seed it was
+// written beside (pipeline_cache.session.seed). No Vulkan, no GPU, no files.
 #include "../src/pipeline_cache_store.h"
 
 #include <cstdint>
@@ -95,7 +96,90 @@ static int test_header() {
     return 0;
 }
 
+// pipeline_cache.session.seed and the decision it serves: a session file written beside exactly this seed, and not
+// changed since, is loaded alone instead of the seed plus a merge.
+static int test_session_seed() {
+    // The RX 7900 XT figures: a 1.88 GB seed and a session file 124 KB over it.
+    const store::SeedStamp seed{1883920688, 134087654321098765ull};
+    const store::SessionSeed recorded{seed, 1884044916};
+    const std::string text = store::format_session_seed(recorded);
+    CHECK(text == "leonida pipeline_cache.session.seed 1\nseed_bytes 1883920688\nseed_time 134087654321098765\n"
+                  "session_bytes 1884044916\n");
+    const auto parsed = store::parse_session_seed(text);
+    CHECK(parsed && parsed->seed == seed && parsed->session_bytes == recorded.session_bytes);
+    CHECK(store::session_holds_seed(parsed, seed, recorded.session_bytes));
+    // The extremes survive the text.
+    constexpr std::uint64_t most = std::numeric_limits<std::uint64_t>::max();
+    const auto largest = store::parse_session_seed(store::format_session_seed({{most, most}, most}));
+    CHECK(largest && largest->seed.bytes == most && largest->seed.write_time == most && largest->session_bytes == most);
+
+    // A different seed: another size, or the same size with another time (a new corpus build, a seed copied in).
+    CHECK(!store::session_holds_seed(parsed, {seed.bytes + 1, seed.write_time}, recorded.session_bytes));
+    CHECK(!store::session_holds_seed(parsed, {seed.bytes - 1, seed.write_time}, recorded.session_bytes));
+    CHECK(!store::session_holds_seed(parsed, {seed.bytes, seed.write_time + 1}, recorded.session_bytes));
+    CHECK(!store::session_holds_seed(parsed, {seed.bytes, 0}, recorded.session_bytes));
+    // No seed now (zero), or a file too short to be a pipeline cache.
+    CHECK(!store::session_holds_seed(parsed, {}, recorded.session_bytes));
+    const auto tiny = store::parse_session_seed(store::format_session_seed({{8, 5}, 64}));
+    CHECK(tiny && !store::session_holds_seed(tiny, {8, 5}, 64));
+    CHECK(store::session_holds_seed(store::parse_session_seed(store::format_session_seed({{32, 5}, 32})), {32, 5}, 32));
+    // The session file changed size since the record: published again without it (a crash in between, an older
+    // build) or replaced by hand.
+    CHECK(!store::session_holds_seed(parsed, seed, recorded.session_bytes + 1));
+    CHECK(!store::session_holds_seed(parsed, seed, recorded.session_bytes - 1));
+    CHECK(!store::session_holds_seed(parsed, seed, 0));
+    // A session file smaller than the seed was not the driver's union of it, whatever the record says.
+    const auto smaller = store::parse_session_seed(store::format_session_seed({seed, seed.bytes - 1}));
+    CHECK(smaller && !store::session_holds_seed(smaller, seed, seed.bytes - 1));
+    // Exactly the seed's size (a session that added nothing) is still the union.
+    const auto equal = store::parse_session_seed(store::format_session_seed({seed, seed.bytes}));
+    CHECK(store::session_holds_seed(equal, seed, seed.bytes));
+    // No record.
+    CHECK(!store::session_holds_seed(std::nullopt, seed, recorded.session_bytes));
+
+    // A truncated or corrupt record is no record.
+    for (std::size_t cut = 0; cut < text.size(); ++cut) CHECK(!store::parse_session_seed(text.substr(0, cut)));
+    CHECK(!store::parse_session_seed(text + "extra\n"));
+    CHECK(!store::parse_session_seed(text + "\n"));
+    for (const char* bad : {
+             "leonida pipeline_cache.session.seed 2\nseed_bytes 1\nseed_time 1\nsession_bytes 1\n",  // another version
+             "leonida pipeline_cache.session.seed 1\nseed_time 1\nseed_bytes 1\nsession_bytes 1\n",  // out of order
+             "leonida pipeline_cache.session.seed 1\nseed_bytes 1\nseed_time 1\n",                   // a line short
+             "leonida pipeline_cache.session.seed 1\nseed_bytes \nseed_time 1\nsession_bytes 1\n",   // no number
+             "leonida pipeline_cache.session.seed 1\nseed_bytes -1\nseed_time 1\nsession_bytes 1\n", // a sign
+             "leonida pipeline_cache.session.seed 1\nseed_bytes 1x\nseed_time 1\nsession_bytes 1\n", // stray text
+             "leonida pipeline_cache.session.seed 1\nseed_bytes  1\nseed_time 1\nsession_bytes 1\n", // two spaces
+             "leonida pipeline_cache.session.seed 1\nseed_bytes=1\nseed_time 1\nsession_bytes 1\n",  // another separator
+             "leonida pipeline_cache.session.seed 1\r\nseed_bytes 1\r\nseed_time 1\r\nsession_bytes 1\r\n",  // CRLF
+             "leonida pipeline_cache.session.seed 1\nseed_bytes 18446744073709551616\nseed_time 1\nsession_bytes 1\n",
+         })
+        CHECK(!store::parse_session_seed(bad));
+    std::string flipped = text;
+    flipped[flipped.find("seed_time ") + 10] = '\x01';
+    CHECK(!store::parse_session_seed(flipped));
+
+    // Whether the session file just written may be recorded. From the seed itself: anything at least the seed's size.
+    const store::CacheOrigin from_seed{seed, seed.bytes};
+    CHECK(store::may_record_session_seed(from_seed, seed.bytes));
+    CHECK(store::may_record_session_seed(from_seed, recorded.session_bytes));
+    CHECK(!store::may_record_session_seed(from_seed, seed.bytes - 1));
+    // From a session file that holds the seed: a write-back smaller than that file lost entries (a damaged blob the
+    // driver took only part of), even when it is still larger than the seed, so it is not recorded and the next
+    // launch merges the seed again.
+    const store::CacheOrigin from_session{seed, recorded.session_bytes};
+    CHECK(store::may_record_session_seed(from_session, recorded.session_bytes));
+    CHECK(store::may_record_session_seed(from_session, recorded.session_bytes + 4096));
+    CHECK(!store::may_record_session_seed(from_session, recorded.session_bytes - 1));
+    CHECK(!store::may_record_session_seed(from_session, seed.bytes + 1));
+    CHECK(!store::may_record_session_seed(from_session, 0));
+    // No seed: never recorded, whatever the sizes.
+    CHECK(!store::may_record_session_seed({}, recorded.session_bytes));
+    CHECK(!store::may_record_session_seed({{}, 64}, recorded.session_bytes));
+    return 0;
+}
+
 int main() {
     if (const int failed = test_limit()) return failed;
+    if (const int failed = test_session_seed()) return failed;
     return test_header();
 }

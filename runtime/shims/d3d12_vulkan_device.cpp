@@ -1767,6 +1767,13 @@ std::filesystem::path pipeline_cache_session_path() {
     return path;
 }
 
+// Which offline seed the session file was written beside (pipeline_cache_store::SessionSeed).
+std::filesystem::path pipeline_cache_session_seed_path() {
+    std::filesystem::path path = pipeline_cache_path();
+    if (!path.empty()) path.replace_filename(L"pipeline_cache.session.seed");
+    return path;
+}
+
 // The pipelines the offline seed does not have, kept next to it and written while the game runs
 // (src/heavy_pipeline_cache.h).
 std::filesystem::path pipeline_cache_heavy_path() {
@@ -1934,6 +1941,23 @@ std::size_t pipeline_cache_save_limit() {
     return limit.bytes;
 }
 
+// LEONIDA_SESSION_CACHE_DIRECT_SEED=0: always load the offline seed and merge the session file into it, even when
+// pipeline_cache.session.seed says the session file already holds that seed (create_session_cache_over_seed). Read
+// for each device, like LEONIDA_PIPELINE_CACHE_BYTES.
+bool session_cache_direct_seed() {
+    wchar_t value[2]{};
+    return !(GetEnvironmentVariableW(L"LEONIDA_SESSION_CACHE_DIRECT_SEED", value, 2) == 1 && value[0] == L'0');
+}
+
+// The size and last-write time of an open file, from the handle, so they describe the bytes read through it.
+bool file_seed_stamp(HANDLE file, leonida::pipeline_cache_store::SeedStamp& out) {
+    BY_HANDLE_FILE_INFORMATION about{};
+    if (file == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(file, &about)) return false;
+    out.bytes = (std::uint64_t(about.nFileSizeHigh) << 32) | about.nFileSizeLow;
+    out.write_time = (std::uint64_t(about.ftLastWriteTime.dwHighDateTime) << 32) | about.ftLastWriteTime.dwLowDateTime;
+    return true;
+}
+
 // A corpus cache may be several GiB. Keep the read-only view alive through vkCreatePipelineCache
 // and deny writers while the view is in use.
 class PipelineCacheSeed {
@@ -1969,14 +1993,24 @@ public:
         return leonida::pipeline_cache_store::header_matches(data_, size_, identity);
     }
 
+    // The mapped file's size and time; zero when it is not mapped.
+    leonida::pipeline_cache_store::SeedStamp stamp() const {
+        leonida::pipeline_cache_store::SeedStamp out;
+        if (!data_ || !file_seed_stamp(file_, out)) return {};
+        return out;
+    }
+
 private:
     HANDLE file_ = INVALID_HANDLE_VALUE;
     const void* data_ = nullptr;
     std::size_t size_ = 0;
 };
 
+// `origin`, with the offline seed (not `session`): which pipeline_cache.bin the cache was created from, for the
+// session file's record (save_session_pipeline_cache); left as it was when no cache is created.
 VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_cache, VkDevice device,
-                                             const leonida::cached_pso::Identity& identity, bool session = false) {
+                                             const leonida::cached_pso::Identity& identity, bool session = false,
+                                             leonida::pipeline_cache_store::CacheOrigin* origin = nullptr) {
     auto start = compile_us();
     const auto name = session ? "pipeline_cache.session.bin" : "pipeline_cache.bin";
     const PipelineCacheSeed seed(session ? pipeline_cache_session_path() : pipeline_cache_path());
@@ -1995,9 +2029,78 @@ VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_ca
     }
     std::fprintf(stderr, "[rt] d3d12: loaded %zu bytes from %s\n", seed.size(), name);
     if (!session) g_offline_seed_bytes.store(seed.size(), std::memory_order_relaxed);
+    if (!session && origin) *origin = {seed.stamp(), seed.size()};
     if (trace_pipeline_compile())
         std::fprintf(stderr, "[rt] pipeline-cache op=load bytes=%zu map_us=%lld driver_us=%lld file=%s\n",
                      seed.size(), mapped-start, compile_us()-mapped, name);
+    return cache;
+}
+
+// The record of the seed the session file was written beside; nothing when there is none or it is not one.
+std::optional<leonida::pipeline_cache_store::SessionSeed> read_session_seed(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return std::nullopt;
+    char text[256];
+    in.read(text, sizeof(text));
+    const auto got = std::size_t(in.gcount());
+    if (got == sizeof(text)) return std::nullopt;  // larger than any record
+    return leonida::pipeline_cache_store::parse_session_seed(std::string_view(text, got));
+}
+
+// With an offline seed, the session file is what the driver wrote back of the shared cache: the seed's pipelines and
+// the session's together, about the seed's size again (1.88 GB of seed, 0.1 to 6 MB added on an RX 7900 XT). Loading
+// the seed and then merging the session file built two such driver caches at every launch (private commit 8.1 ->
+// 9.95 -> 8.3 GB in the first 20 s). When pipeline_cache.session.seed says the session file was written beside
+// exactly the pipeline_cache.bin there now, and it has not changed size since, the session file alone is the cache:
+// the seed is not mapped and nothing is merged. Anything else (no record, another seed, a session file the record
+// does not describe, one for another device or one the driver declines) returns no cache and the caller loads the
+// seed and merges as before. `origin`: the seed and the session file's size, when a cache is returned.
+VkPipelineCache create_session_cache_over_seed(PFN_vkCreatePipelineCache create_cache, VkDevice device,
+                                               const leonida::cached_pso::Identity& identity,
+                                               leonida::pipeline_cache_store::CacheOrigin& origin) {
+    const auto record_path = pipeline_cache_session_seed_path();
+    if (record_path.empty()) return VK_NULL_HANDLE;
+    std::error_code ec;
+    if (!std::filesystem::exists(record_path, ec)) return VK_NULL_HANDLE;  // written without a seed, or never
+    const auto recorded = read_session_seed(record_path);
+    // The seed's size and time without reading it: a handle for its attributes only.
+    leonida::pipeline_cache_store::SeedStamp seed;
+    const HANDLE seed_file = CreateFileW(pipeline_cache_path().c_str(), FILE_READ_ATTRIBUTES,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const bool seed_known = file_seed_stamp(seed_file, seed);
+    if (seed_file != INVALID_HANDLE_VALUE) CloseHandle(seed_file);
+    if (!seed_known) return VK_NULL_HANDLE;  // no seed: the session file is loaded directly as before
+    auto start = compile_us();
+    const PipelineCacheSeed session(pipeline_cache_session_path());
+    if (!leonida::pipeline_cache_store::session_holds_seed(recorded, seed, session.size())) {
+        std::fprintf(stderr, "[rt] d3d12: pipeline_cache.session.seed does not describe this pipeline_cache.bin and "
+                             "pipeline_cache.session.bin; loading the seed and merging\n");
+        return VK_NULL_HANDLE;
+    }
+    if (!session.compatible(identity)) {
+        std::fprintf(stderr, "[rt] d3d12: pipeline_cache.session.bin does not match this Vulkan device\n");
+        return VK_NULL_HANDLE;
+    }
+    const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, session.size(),
+                                           session.data()};
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    const auto mapped = compile_us();
+    if (create_cache(device, &create, nullptr, &cache) != VK_SUCCESS) {
+        std::fprintf(stderr, "[rt] d3d12: Vulkan declined pipeline_cache.session.bin; loading the seed and merging\n");
+        return VK_NULL_HANDLE;
+    }
+    std::fprintf(stderr, "[rt] d3d12: loaded %zu bytes from pipeline_cache.session.bin, which holds the %llu-byte "
+                         "pipeline_cache.bin it was written beside; the seed was not loaded and nothing merged "
+                         "(LEONIDA_SESSION_CACHE_DIRECT_SEED=0: load both)\n",
+                 session.size(), static_cast<unsigned long long>(seed.bytes));
+    // Still the seed's size: the save limit counts what a session adds to the seed, not to this file.
+    g_offline_seed_bytes.store(std::size_t(seed.bytes), std::memory_order_relaxed);
+    origin = {seed, session.size()};
+    if (trace_pipeline_compile())
+        std::fprintf(stderr, "[rt] pipeline-cache op=load bytes=%zu map_us=%lld driver_us=%lld "
+                             "file=pipeline_cache.session.bin seed_bytes=%llu\n",
+                     session.size(), mapped-start, compile_us()-mapped, static_cast<unsigned long long>(seed.bytes));
     return cache;
 }
 
@@ -2132,9 +2235,40 @@ bool startup_cache_checkpoints_enabled() {
     return enabled;
 }
 
+// pipeline_cache.session.seed after the session file was published: which offline seed it was written beside. With
+// none (no seed in `origin`) the session file holds no seed's pipelines for sure, and a record an earlier run left
+// goes, so it is never taken to describe this file. So does the record of a session file smaller than the blob the
+// cache was created from (may_record_session_seed): the next launch loads the seed again and merges. A failed publish
+// leaves the session file and its record as they were.
+void record_session_seed(const leonida::pipeline_cache_store::CacheOrigin& origin, std::size_t session_bytes) {
+    const auto path = pipeline_cache_session_seed_path();
+    if (path.empty()) return;
+    if (!leonida::pipeline_cache_store::may_record_session_seed(origin, session_bytes)) {
+        std::error_code ec;
+        if (!std::filesystem::remove(path, ec)) return;
+        if (!origin.seed.bytes)
+            std::fprintf(stderr, "[rt] d3d12: pipeline_cache.session.bin was written without an offline seed; "
+                                 "pipeline_cache.session.seed removed\n");
+        else
+            std::fprintf(stderr, "[rt] d3d12: pipeline_cache.session.bin (%zu bytes) is smaller than the %llu-byte "
+                                 "cache it was written from; pipeline_cache.session.seed removed, so the next launch "
+                                 "loads the seed and merges\n",
+                         session_bytes, static_cast<unsigned long long>(origin.loaded_bytes));
+        return;
+    }
+    const std::string text = leonida::pipeline_cache_store::format_session_seed({origin.seed, session_bytes});
+    CacheStagingFile staging(path, text.size());
+    if (staging.data) std::memcpy(staging.data, text.data(), text.size());
+    if (!staging.data || !staging.publish(path, text.size()))
+        std::fprintf(stderr, "[rt] d3d12: could not write pipeline_cache.session.seed; the next launch loads the seed "
+                             "and merges pipeline_cache.session.bin into it\n");
+}
+
 // Writes the session cache at a startup checkpoint or during device teardown. The size cap applies to either write.
+// `origin`: where this device's shared cache came from (DeviceState::cache_origin); no seed in it for none.
 void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
-                                 bool checkpoint = false, const char* op = nullptr) {
+                                 const leonida::pipeline_cache_store::CacheOrigin& origin, bool checkpoint = false,
+                                 const char* op = nullptr) {
     if (!cache || !vk.vkGetPipelineCacheData) return;
     // The output is an opaque Vulkan blob. A prefix is not an incremental cache, so past the limit nothing is written.
     const auto limit = pipeline_cache_save_limit();
@@ -2143,10 +2277,10 @@ void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDev
     std::size_t size = 0;
     if (vk.vkGetPipelineCacheData(device, cache, &size, nullptr) != VK_SUCCESS ||
         size <= sizeof(VkPipelineCacheHeaderVersionOne)) return;
-    const std::size_t seed = g_offline_seed_bytes.load(std::memory_order_relaxed);
-    if (leonida::pipeline_cache_store::over_save_limit(size, seed, limit)) {
+    const std::size_t seed_bytes = g_offline_seed_bytes.load(std::memory_order_relaxed);
+    if (leonida::pipeline_cache_store::over_save_limit(size, seed_bytes, limit)) {
         std::fprintf(stderr, "[rt] d3d12: pipeline cache is %zu bytes (%zu of them the offline seed), over the "
-                             "%zu-byte write limit for what a session adds\n", size, seed, limit);
+                             "%zu-byte write limit for what a session adds\n", size, seed_bytes, limit);
         return;
     }
     const auto queried = compile_us();
@@ -2168,8 +2302,12 @@ void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDev
         std::fprintf(stderr, "[rt] pipeline-cache op=%s bytes=%zu query_us=%lld fill_us=%lld publish_us=%lld ok=%d result=%d\n",
                      op ? op : checkpoint ? "checkpoint" : "teardown", written, queried-start, filled-queried,
                      compile_us()-filled, int(ok), int(result));
-    if (ok) std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes to pipeline_cache.session.bin\n", written);
-    else std::fprintf(stderr, "[rt] d3d12: pipeline cache snapshot incomplete (%d); previous session retained\n", int(result));
+    if (ok) {
+        std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes to pipeline_cache.session.bin\n", written);
+        record_session_seed(origin, written);
+    } else {
+        std::fprintf(stderr, "[rt] d3d12: pipeline cache snapshot incomplete (%d); previous session retained\n", int(result));
+    }
 }
 
 // The heavy cache, seeded from pipeline_cache.heavy.bin when it is there and made for this device; empty otherwise.
@@ -2881,6 +3019,11 @@ struct DeviceState {
     // The shared cache started from a file (the offline seed or an earlier session): a compute pipeline the journal
     // has no file for may still be in it (build_compute asks it first, when it can ask without a compile).
     bool pipeline_cache_seeded = false;
+    // The offline seed the shared cache holds, loaded or through a session file written beside it, and the size of
+    // the blob the cache was created from: which pipeline_cache.bin, for the session file's record
+    // (pipeline_cache.session.seed). No seed without one. This device's own, unlike g_offline_seed_bytes, which an
+    // earlier device may have set.
+    leonida::pipeline_cache_store::CacheOrigin cache_origin;
     std::atomic<unsigned> journal_hits{0}, journal_writes{0}, journal_shared_hits{0};
     std::atomic<std::uint64_t> journal_bytes{0};  // on disk: counted at the cache's creation, then added to
     std::uint64_t journal_budget = leonida::pipeline_journal::default_budget;
@@ -2893,17 +3036,77 @@ struct DeviceState {
     std::atomic<ULONGLONG> next_checkpoint{GetTickCount64() + 120000};
     std::atomic<unsigned> active_compiles{0};
 
+    // Pipeline layouts, one per distinct create info, shared by every PSO that asks for it (create_graphics and
+    // create_compute). A session makes ~50k PSOs from a handful of layout shapes, and a driver may copy the set
+    // layouts into every layout it makes (~2.3 KB each with the bindless set 0 on an RX 7900 XT): ~117 MB when each
+    // PSO made its own. The key is the whole create info, not a chosen part of it, so a create info that differs in
+    // anything gets its own layout. A PSO never destroys its layout: ~Device destroys them all, once every PSO, the
+    // compile workers and the GPU are done with them (destroy_pipeline_layouts).
+    std::mutex pipeline_layout_mutex;
+    std::map<std::vector<std::uint64_t>, VkPipelineLayout> pipeline_layouts;
+
+    // The device's layout for `create`, made on first use (PSOs are made on many threads). VK_NULL_HANDLE when the
+    // driver refuses it, or when `create` has a pNext chain, which the key does not describe.
+    VkPipelineLayout pipeline_layout(const VkPipelineLayoutCreateInfo& create) {
+        if (create.pNext) return VK_NULL_HANDLE;
+        std::vector<std::uint64_t> key;
+        key.reserve(2 + create.setLayoutCount + 1 + 2 * std::size_t(create.pushConstantRangeCount));
+        key.push_back(create.flags);
+        key.push_back(create.setLayoutCount);
+        for (std::uint32_t i = 0; i < create.setLayoutCount; ++i)
+            key.push_back(reinterpret_cast<std::uint64_t>(create.pSetLayouts[i]));
+        key.push_back(create.pushConstantRangeCount);
+        for (std::uint32_t i = 0; i < create.pushConstantRangeCount; ++i) {
+            const VkPushConstantRange& range = create.pPushConstantRanges[i];
+            key.push_back(std::uint64_t(range.stageFlags) << 32 | range.offset);
+            key.push_back(range.size);
+        }
+        std::lock_guard lock(pipeline_layout_mutex);
+        // The map entry first, then the layout: a layout made and then lost to a failed insert would be in no map,
+        // and destroy_pipeline_layouts would never free it.
+        const auto [it, inserted] = pipeline_layouts.try_emplace(std::move(key), VK_NULL_HANDLE);
+        if (!inserted) return it->second;
+        if (context->vk.vkCreatePipelineLayout(info.device, &create, nullptr, &it->second) != VK_SUCCESS) {
+            pipeline_layouts.erase(it);
+            return VK_NULL_HANDLE;
+        }
+        return it->second;
+    }
+    std::size_t pipeline_layout_count() {
+        std::lock_guard lock(pipeline_layout_mutex);
+        return pipeline_layouts.size();
+    }
+    void destroy_pipeline_layouts() {
+        std::lock_guard lock(pipeline_layout_mutex);
+        for (const auto& [key, layout] : pipeline_layouts)
+            context->vk.vkDestroyPipelineLayout(info.device, layout, nullptr);
+        pipeline_layouts.clear();
+    }
+
     VkPipelineCache pipeline_cache() {
         std::call_once(pipeline_cache_once, [this] {
             const auto& vk = context->vk;
             if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache) return;
-            if (pipeline_cache_save_limit()) clean_stale_cache_files(pipeline_cache_session_path());
+            if (pipeline_cache_save_limit()) {
+                clean_stale_cache_files(pipeline_cache_session_path());
+                clean_stale_cache_files(pipeline_cache_session_seed_path());
+            }
             // A build host (precompile, compile helper) journals every pipeline: no seed, no session file.
-            if (!compile_helper::build_host)
-                pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity);
+            bool holds_session = false;  // created from a session file that holds the seed: nothing to merge
+            if (!compile_helper::build_host) {
+                // LEONIDA_DIRECT_SESSION_CACHE=0 (no live cache created from a session file) turns this off too.
+                if (pipeline_cache_save_limit() && direct_session_cache() && session_cache_direct_seed()) {
+                    pipeline_cache_handle = create_session_cache_over_seed(vk.vkCreatePipelineCache, info.device,
+                                                                           pso_identity, cache_origin);
+                    holds_session = pipeline_cache_handle != VK_NULL_HANDLE;
+                }
+                if (!pipeline_cache_handle)
+                    pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device,
+                                                                         pso_identity, false, &cache_origin);
+            }
             if (pipeline_cache_handle) {
                 pipeline_cache_seeded = true;
-                merge_session_pipeline_cache(vk, info.device, pipeline_cache_handle, pso_identity);
+                if (!holds_session) merge_session_pipeline_cache(vk, info.device, pipeline_cache_handle, pso_identity);
             } else if (pipeline_cache_save_limit() && direct_session_cache() && !compile_helper::build_host) {
                 // With no offline seed the session file can initialize the actual cache directly.
                 pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity, true);
@@ -3377,7 +3580,12 @@ struct DeviceState {
         std::uint64_t start, shader_va, size, ticket, epoch;
         std::uint8_t* mapped;
         std::uint64_t lists;  // the command-list epoch of the retirement
+        std::chrono::steady_clock::time_point retired_at;  // for the warning in stamp_retired_windows
     };
+    // A retired window still without a ticket this long after its retirement is reported once: a replay that does
+    // not end, or a command list recorded before the retirement that is closed and never reset or released.
+    static constexpr std::chrono::seconds kRetiredWindowWait{30};
+    std::atomic<bool> retired_window_wait_reported{false};
     static constexpr std::size_t kWindowAliasRemovals = 4096;  // kept before every window is looked at instead
     std::mutex window_alias_removal_mutex;  // a leaf: taken in alias_changed, under the alias table's lock
     std::vector<std::pair<std::uint64_t, std::uint64_t>> window_alias_removals;  // (shader VA, bytes)
@@ -3489,12 +3697,13 @@ struct DeviceState {
         std::vector<RetiredWindow> retiring;
         const std::uint64_t epoch = geometry.execute_epoch();
         const std::uint64_t lists = leonida::command_list_epochs::advance();
+        const auto now = std::chrono::steady_clock::now();
         std::uint64_t bytes = 0;
         std::erase_if(title_windows, [&](const TitleWindow& window) {
             if (!is_gone(window.shader_va)) return false;
             retire_shadow(window.mapped);
             retiring.push_back({window.start, window.shader_va, window.size, rt::d3d12::GeometryViews::kAfterExecutes,
-                                epoch, window.mapped, lists});
+                                epoch, window.mapped, lists, now});
             title_window_bytes -= window.size;
             bytes += window.size;
             return true;
@@ -3553,12 +3762,34 @@ struct DeviceState {
         const std::uint64_t oldest_list = leonida::command_list_epochs::oldest();
         const std::uint64_t ticket = context->submitted_retire_ticket();
         bool left = false;
+        const RetiredWindow* longest = nullptr;  // the earliest retired of those left without a ticket
+        std::size_t waiting = 0;
+        std::uint64_t waiting_bytes = 0;
         for (RetiredWindow& window : retired_windows) {
             if (window.ticket != rt::d3d12::GeometryViews::kAfterExecutes) continue;
-            if (window.epoch < oldest && window.lists <= oldest_list) window.ticket = ticket;
-            else left = true;
+            if (window.epoch < oldest && window.lists <= oldest_list) {
+                window.ticket = ticket;
+                continue;
+            }
+            left = true;
+            ++waiting;
+            waiting_bytes += window.size;
+            if (!longest || window.retired_at < longest->retired_at) longest = &window;
         }
         retired_windows_unstamped.store(left, std::memory_order_release);
+        if (!longest || retired_window_wait_reported.load(std::memory_order_relaxed)) return;
+        const auto waited = std::chrono::steady_clock::now() - longest->retired_at;
+        if (waited < kRetiredWindowWait || retired_window_wait_reported.exchange(true, std::memory_order_relaxed))
+            return;
+        const std::uint64_t latest = leonida::command_list_epochs::current();
+        std::fprintf(stderr, "[rt] d3d12: a title window retired %lld s ago still waits for %s; %zu retired windows "
+                             "(%llu KiB) wait for a ticket, and the oldest command list alive began %llu command-list "
+                             "epochs ago (logged once)\n",
+                     static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(waited).count()),
+                     longest->epoch >= oldest ? "a replay in progress at its retirement"
+                                              : "a command list recorded before its retirement",
+                     waiting, static_cast<unsigned long long>(waiting_bytes >> 10),
+                     static_cast<unsigned long long>(latest - std::min(oldest_list, latest)));
     }
     // ExecuteCommandLists replays in progress, for GeometryViews::kAfterExecutes (see drain_geometry_releases).
     // A plain aggregate on purpose: a C++ thread_local with a destructor in gta6rt.exe adds TLS callbacks to the image
@@ -4100,8 +4331,9 @@ struct DeviceState {
     // or a build reaches the whole range by one address. A GPU-written structure (a BVH destination or its scratch)
     // keeps the GPU's writes in the copy: that is the only place the structure is read from afterwards, so the copy
     // is the structure. It is made even when a shorter range already maps the start: spreading a window's address over
-    // bytes it does not cover would be a lie. 0 when geometry copies are off (LEONIDA_GEOMETRY_MB), their cap refuses
-    // it, or the range is not the title's memory.
+    // bytes it does not cover would be a lie. It is not answered from inside a larger copy either (resolve's
+    // `contain`): a release elsewhere in that copy would retire the structure with it. 0 when geometry copies are off
+    // (LEONIDA_GEOMETRY_MB), their cap refuses it, or the range is not the title's memory.
     std::uint64_t copy_title_range(std::uint64_t va, std::uint64_t bytes) {
         const std::uint64_t span = std::max<std::uint64_t>(bytes, 1);
         auto& aliases = leonida::title_va_aliases();
@@ -4110,7 +4342,7 @@ struct DeviceState {
         const auto cpu = leonida::title_gpu_views::to_host_view(static_cast<std::uintptr_t>(va),
                                                                 static_cast<std::uintptr_t>(span));
         if (context->knows_buffer_va(cpu, span)) return 0;
-        const std::uint64_t copy = geometry.resolve(*this, cpu, span, copy_geometry);
+        const std::uint64_t copy = geometry.resolve(*this, cpu, span, copy_geometry, false);
         if (!copy) return 0;
         std::lock_guard lock(title_window_mutex);
         aliases.add(va, span, copy);
@@ -4584,7 +4816,7 @@ struct DeviceState {
         std::lock_guard lock(backing_mutex);
         backing_generation.fetch_add(1, std::memory_order_relaxed);
         note_slot_change(leonida::SlotChange::target_gone, address, bytes);
-        if (heap_gpu) released_ranges.emplace_back(address - arena.address, bytes);
+        if (heap_pass_enabled()) released_ranges.emplace_back(address - arena.address, bytes);
     }
     void backing(VkDeviceAddress address, uint64_t bytes, uint64_t id, bool add) {
         std::lock_guard lock(backing_mutex);
@@ -4599,7 +4831,7 @@ struct DeviceState {
             // The heap slots whose copy names it are fixed again at the next refresh.
             note_slot_change(leonida::SlotChange::target_gone, address, bytes);
             // LEONIDA_CONSOLE_HEAP_GPU: the key entries answering into it go at the next refresh.
-            if (heap_gpu) released_ranges.emplace_back(address - arena.address, bytes);
+            if (heap_pass_enabled()) released_ranges.emplace_back(address - arena.address, bytes);
         }
     }
 
@@ -4967,6 +5199,27 @@ struct DeviceState {
                          static_cast<unsigned long long>(pool_span_bytes >> 10),
                          static_cast<long long>(geometry_spans), static_cast<unsigned long long>(pool_spans_retired),
                          static_cast<unsigned long long>(unbacked_requests));
+            // The retired windows whose memory is not freed yet, and of those the ones still without a ticket, which
+            // wait for a replay in progress at their retirement or for a command list recorded before it
+            // (stamp_retired_windows); and how many command-list epochs ago the oldest list alive began.
+            std::lock_guard retired(retired_window_mutex);
+            std::size_t unstamped = 0;
+            std::uint64_t retired_bytes = 0, unstamped_bytes = 0;
+            for (const RetiredWindow& window : retired_windows) {
+                retired_bytes += window.size;
+                if (window.ticket != rt::d3d12::GeometryViews::kAfterExecutes) continue;
+                ++unstamped;
+                unstamped_bytes += window.size;
+            }
+            const std::uint64_t latest = leonida::command_list_epochs::current();
+            const std::uint64_t oldest_list = leonida::command_list_epochs::oldest();
+            std::fprintf(stderr,
+                         "[rt] d3d12: title memory: %zu retired windows (%llu KiB) not freed yet, %zu of them "
+                         "(%llu KiB) without a ticket; the oldest command list alive began %llu command-list epochs "
+                         "ago\n",
+                         retired_windows.size(), static_cast<unsigned long long>(retired_bytes >> 10), unstamped,
+                         static_cast<unsigned long long>(unstamped_bytes >> 10),
+                         static_cast<unsigned long long>(latest - std::min(oldest_list, latest)));
         }
     }
 
@@ -4977,11 +5230,10 @@ struct DeviceState {
         // had must not change them, and a double free must not count the bytes twice.
         const auto fault = arena.blocks.release(offset, bytes);
         if (fault != leonida::ArenaBlocks::Fault::outside_arena) {
+            // A heap copy re-fixes the slots that named a backing that has gone (slot_changes): the range is no view's.
             backing(arena.address + offset, bytes, offset, false);
             arena.in_use -= bytes;
             arena.use_in_use[use] -= bytes;
-            // A heap copy re-fixes the slots that named a backing that has gone (slot_changes): the range is no view's.
-            backing(arena.address + offset, bytes, offset, false);
         }
         if (fault != leonida::ArenaBlocks::Fault::none && arena_report_due()) {
             std::fprintf(stderr,
@@ -4996,6 +5248,66 @@ struct DeviceState {
 
         }
         check_arena("a release");
+    }
+
+    // The arena copies of the programs shaders read their code base from (s_getpc_b64 and the constant tables in the
+    // program's own bytes; PipelineState::create_compute and create_graphics). A copy belongs to a program, not to a
+    // PSO: every PSO made from a program used to get a copy of the same bytes, so N PSOs of one program held N copies
+    // of the fixed-size arena. The first PSO of a program makes the copy and the others take a reference to it; the
+    // last one returns it to the arena when that PSO is deleted, which is when a PSO's own copy was returned. The key
+    // is the SHA-256 the PSO found the program's translation by, which is that of the bytes copied.
+    // LEONIDA_SHARE_CODE_BASE=0, or an empty key, gives the PSO a copy of its own, as before.
+    struct CodeCopy {
+        VkDeviceSize offset = 0;
+        VkDeviceSize bytes = 0;
+        std::uint64_t users = 0;
+    };
+    std::mutex code_copy_mutex;  // taken before arena.mutex
+    std::unordered_map<std::string, CodeCopy> code_copies;  // by the program's SHA-256, guarded by code_copy_mutex
+
+    static bool share_code_copies() {
+        static const bool share = [] {
+            wchar_t v[2]{};
+            return !(GetEnvironmentVariableW(L"LEONIDA_SHARE_CODE_BASE", v, 2) == 1 && v[0] == L'0');
+        }();
+        return share;
+    }
+
+    // Gives `offset` the console VA of a copy of `code`; false when the arena has no room for one. `key` is cleared
+    // when the copy is the PSO's own; code_copy_release takes the key as this left it.
+    bool code_copy_acquire(std::string& key, std::span<const std::uint8_t> code, VkDeviceSize& offset) {
+        if (!share_code_copies()) key.clear();
+        if (key.empty()) {
+            if (!arena_allocate(code.size(), 256, offset, arena_shader)) return false;
+            std::memcpy(arena.mapped + offset, code.data(), code.size());
+            return true;
+        }
+        std::lock_guard lock(code_copy_mutex);
+        const auto [it, made] = code_copies.try_emplace(key);
+        CodeCopy& copy = it->second;
+        if (made) {
+            if (!arena_allocate(code.size(), 256, copy.offset, arena_shader)) {
+                code_copies.erase(it);
+                return false;
+            }
+            std::memcpy(arena.mapped + copy.offset, code.data(), code.size());
+            copy.bytes = code.size();
+        }
+        ++copy.users;
+        offset = copy.offset;
+        return true;
+    }
+
+    void code_copy_release(const std::string& key, VkDeviceSize offset, VkDeviceSize bytes) {
+        if (key.empty()) {
+            arena_release(offset, bytes, arena_shader);
+            return;
+        }
+        std::lock_guard lock(code_copy_mutex);
+        const auto it = code_copies.find(key);
+        if (it == code_copies.end() || --it->second.users) return;
+        arena_release(it->second.offset, it->second.bytes, arena_shader);
+        code_copies.erase(it);
     }
 
     // Console descriptor heaps (Xbox slot 14, docs/d3d12_vulkan.md section 3.4). The title gives the heap's address
@@ -5483,10 +5795,11 @@ struct DeviceState {
                 // entries looked at to find their slots, and the slots fixed again (apply_slot_changes).
                 std::fprintf(stderr,
                              "[rt] d3d12: console descriptor heap 0x%llx slot records per submission: %.1f changes, "
-                             "%.1f slots looked at, %.1f fixed again, %.3f ms; %zu V# halves recorded\n",
+                             "%.1f slots looked at, %.1f fixed again, %.3f ms; %zu V# halves recorded, %zu index "
+                             "buckets\n",
                              static_cast<unsigned long long>(heap->console_va), double(heap->record_changes) / count,
                              double(heap->record_looked) / count, double(heap->record_refixed) / count,
-                             heap->record_ms / count, heap->records.recorded());
+                             heap->record_ms / count, heap->records.recorded(), heap->records.buckets());
                 for (auto& n : heap->changed) n = 0;
                 heap->vsharp_halves = heap->vsharp_repeats = 0;
                 heap->record_changes = heap->record_looked = heap->record_refixed = 0;
@@ -5796,6 +6109,9 @@ struct DeviceState {
     std::unique_ptr<leonida::ConsoleHeapGpu> heap_gpu;
     std::array<ConsoleHeap*, leonida::ConsoleHeapGpu::kMaxHeaps> gpu_heaps{};  // console_heap_mutex
     std::vector<std::pair<std::uint64_t, std::uint64_t>> released_ranges;     // (shader VA, bytes); backing_mutex
+    // Whether the pass runs: only it takes released_ranges and the alias table's removals (console_heap_gpu_begin).
+    // LEONIDA_SHADOW_GPU=1 alone makes heap_gpu for the shadows' page copies, and a range kept for it is never taken.
+    bool heap_pass_enabled() const { return heap_gpu && console_heap_gpu_enabled(); }
     struct GpuKeyHash {
         std::size_t operator()(const leonida::ConsoleHeapKeys::Key& k) const {
             return leonida::ConsoleHeapKeys::hash(k);
@@ -6088,7 +6404,8 @@ struct DeviceState {
         }
         heap_gpu = std::move(gpu);
         heap_gpu->set_signed_offsets(signed_vsharp_offsets());
-        leonida::title_va_aliases().record_removals(true);
+        // Only the pass takes what the alias table records (heap_pass_enabled).
+        if (console_heap_gpu_enabled()) leonida::title_va_aliases().record_removals(true);
         context->set_prelude([this](VkCommandBuffer cb) { return heap_gpu->record(cb); },
                              [this](bool submitted, std::uint64_t ticket) { heap_gpu->commit(submitted, ticket); });
         gpu_resolver = std::make_unique<GpuResolver>();
@@ -7726,9 +8043,47 @@ struct DeviceState {
     std::unordered_map<VkImage, PendingImage> pending_image_keys;
     using ZeroShape = std::tuple<DXGI_FORMAT, UINT64, UINT, UINT16, UINT16>;
     std::mutex zero_image_mutex;
-    std::map<ZeroShape, Resource*> zero_images;
+    std::map<ZeroShape, Resource*> zero_images;  // null: past the 256 MiB the shared images may take
+    // Shapes whose image could not be made, with when to try again and how long they waited last
+    // (zero_sampled_image). Under zero_image_mutex.
+    struct ZeroImageRetry {
+        std::chrono::steady_clock::time_point at;
+        std::chrono::steady_clock::duration delay;
+    };
+    std::map<ZeroShape, ZeroImageRetry> zero_image_retry;
     std::atomic<VkDeviceSize> zero_image_bytes{0};
     VkImage zero_sampled_image(const D3D12_RESOURCE_DESC&, const Format&, VkDeviceSize);
+    // How many placed textures show each shape's shared image (Resource::shared_zero_). The images sit in host
+    // memory on a discrete GPU and count against the 256 MiB, so one no texture shows any more is released
+    // (release_zero_image) rather than kept for the device's life. Taken before zero_image_mutex.
+    std::mutex zero_user_mutex;
+    std::map<ZeroShape, std::size_t> zero_image_users;  // under zero_user_mutex
+    VkImage acquire_zero_image(const D3D12_RESOURCE_DESC&, const Format&, VkDeviceSize);
+    void release_zero_image(const D3D12_RESOURCE_DESC&, VkImage);
+    // A texture that got memory of its own gives its claim back here instead: it gets it inside command prepare, with
+    // the context's resource lock held (VulkanContext::resolve), where releasing the image would take that lock again
+    // and the user and image locks would be taken after it. Given back before a later submission (before_execute),
+    // once every ExecuteCommandLists replay in progress at the return has recorded its submissions: the replay that
+    // made it may already have commands that sample the image, and so may another queue's, whose views of it were
+    // resolved before they were forgotten. A replay of another queue starting meanwhile drains the returns before
+    // those submissions have their tickets; the image's deferred deletion (submitted ticket + 1 then) would be due
+    // when that queue's own submission completes, with theirs still pending. A return waits as a retired geometry
+    // view does (GeometryViews::kAfterExecutes): `epoch` is the last replay begun when it was made.
+    struct ZeroReturn {
+        D3D12_RESOURCE_DESC desc;
+        VkImage image;
+        std::uint64_t epoch;
+    };
+    std::mutex zero_return_mutex;  // taken last but for GeometryViews' execute_mutex_ (a leaf)
+    std::vector<ZeroReturn> zero_returns;  // under zero_return_mutex
+    std::atomic<bool> zero_returns_pending{false};
+    void return_zero_image(const D3D12_RESOURCE_DESC& d, VkImage image) {
+        std::lock_guard lock(zero_return_mutex);
+        // The texture's views of the image are forgotten already: a replay begun after this read cannot name them.
+        zero_returns.push_back({d, image, geometry.execute_epoch()});
+        zero_returns_pending.store(true, std::memory_order_release);
+    }
+    void drain_zero_returns();
     std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
     std::vector<ImageEntry> replaced_images;  // kept until their texture goes: work in flight may still use them
     std::map<leonida::DescriptorKey, VkSampler> sampler_entries;
@@ -8948,6 +9303,9 @@ public:
         if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
         if (image_range_)
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_memory, image_range_.release());
+        // After forget_image: this texture's views of the shared image are queued for deletion before the image.
+        // Not again when it gave its claim back on getting memory of its own (publish_streamed_texture).
+        if (zero_claim_.exchange(false)) device_.release_zero_image(desc_, shared_zero_);
     }
 
     VkDeviceAddress indexed_bda_{};
@@ -9706,8 +10064,10 @@ public:
             desc_.SampleDesc.Count == 1 && asked_castable.empty() && !format.typeless &&
             leonida::block_format(format.format, format.aspects).block > 1) {
             VkMemoryRequirements footprint{};
-            if (device_.memory_requirements(info, footprint))
-                shared_zero_ = device_.zero_sampled_image(desc_, format, footprint.size);
+            if (device_.memory_requirements(info, footprint)) {
+                shared_zero_ = device_.acquire_zero_image(desc_, format, footprint.size);
+                zero_claim_ = shared_zero_ != VK_NULL_HANDLE;
+            }
         }
         std::uint32_t plain_bits = 0;
         if (stage_title && (!shared_zero_ || no_host_copy) && allow_staged_title && origin != TitleImageOrigin::ordinary &&
@@ -9736,6 +10096,8 @@ public:
             image_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
             staged_title_ = false;
+            // No view of it was made yet; the retry below takes it again if it still fits.
+            if (zero_claim_.exchange(false)) device_.release_zero_image(desc_, shared_zero_);
             shared_zero_ = VK_NULL_HANDLE;
             log_once("no room for a staged title image; retrying host-copyable backing, format", int(info.format));
             return create_texture(format, asked_castable, origin, false);
@@ -9954,7 +10316,13 @@ public:
         }
         const auto owner = device_.images_by_address.find(image_address_);
         if (owner != device_.images_by_address.end() && owner->second == this) {
-            if (ready.zero) device_.forget_image_views_locked(image_address_);
+            if (ready.zero) {
+                device_.forget_image_views_locked(image_address_);
+                // Every view of the shared image is queued for deletion and no pending key leads to it any more: the
+                // texture's claim on it is given back (drain_zero_returns), so it does not stay pinned in host memory
+                // and in the 256 MiB for as long as this texture lives.
+                if (!from && zero_claim_.exchange(false)) device_.return_zero_image(desc_, shared_zero_);
+            }
             for (const auto& [words, image] : ready.keys)
                 device_.bind_image_locked(words, image, image_, format_, aspects_, false, has_view_format_list(),
                                           uint_backed_);
@@ -10735,6 +11103,9 @@ private:
     std::array<std::unique_ptr<Resource>, 2> storage_planes_;  // Xbox depth/stencil UAV, by plane
     bool console_d16s8_ = false;  // created from Xbox format 118 (even when pc_format made it D24S8)
     VkImage shared_zero_ = VK_NULL_HANDLE;  // owned by the device
+    // This texture still counts as a user of shared_zero_ (DeviceState::zero_image_users). shared_zero_ itself stays
+    // set once the claim is given back: descriptor_image and deferrable_sample answer by it.
+    std::atomic<bool> zero_claim_{false};
     std::unique_ptr<leonida::DeferredImageBinding> deferred_attachment_;
     std::atomic<bool> replay_seen_{false};
     bool staged_title_ = false;
@@ -10758,13 +11129,32 @@ VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Form
     const ZeroShape key{d.Format, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels};
     std::lock_guard lock(zero_image_mutex);
     if (auto it = zero_images.find(key); it != zero_images.end()) return it->second ? it->second->image() : VK_NULL_HANDLE;
+    // A shape whose image could not be made is tried again later. Under VRAM pressure create_texture fails, or its
+    // image loses host-transfer usage: a shape left without an image for good would have every later placement of it
+    // take memory of its own for the rest of the session, and one tried at every placement would make an image and ask
+    // for its memory each time. The wait is a second and doubles at each failure, up to 64 s, so a shape that fails
+    // every time (where the driver allows no memory type for host-transfer images, that usage is dropped at every try)
+    // is tried about once a minute, not once a second.
+    const auto now = std::chrono::steady_clock::now();
+    const auto retry = zero_image_retry.find(key);
+    if (retry != zero_image_retry.end() && now < retry->second.at) return VK_NULL_HANDLE;
     constexpr VkDeviceSize limit = 256ull << 20;
     const auto used = zero_image_bytes.load(std::memory_order_relaxed);
     if (used >= limit || bytes > limit - used) return VK_NULL_HANDLE;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0, 1, 1};
     auto* zero = new Resource(*this, d, heap, D3D12_HEAP_FLAG_NONE);
-    if (FAILED(zero->create_texture(format)) || (copy_memory_to_image && !zero->host_initialized_image()) ||
-        zero->image_backing_bytes() > limit - used) {
+    if (FAILED(zero->create_texture(format)) || (copy_memory_to_image && !zero->host_initialized_image())) {
+        zero->Release();
+        constexpr std::chrono::steady_clock::duration first = std::chrono::seconds(1),
+                                                      longest = std::chrono::seconds(64);
+        const auto delay = retry != zero_image_retry.end() ? std::min(retry->second.delay * 2, longest) : first;
+        zero_image_retry[key] = {now + delay, delay};
+        return VK_NULL_HANDLE;
+    }
+    if (retry != zero_image_retry.end()) zero_image_retry.erase(retry);
+    // A shape past the limit is left without an image (an empty entry) until room frees: release_zero_image drops the
+    // empty entries when it releases an image, so the shape gets another try.
+    if (zero->image_backing_bytes() > limit - used) {
         zero->Release();
         zero_images.emplace(key, nullptr);
         return VK_NULL_HANDLE;
@@ -10773,6 +11163,58 @@ VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Form
     zero_images.emplace(key, zero);
     zero_image_bytes.fetch_add(zero->image_backing_bytes(), std::memory_order_relaxed);
     return zero->image();
+}
+
+// The shape's shared image for one more placed texture, which gives it back with release_zero_image.
+VkImage DeviceState::acquire_zero_image(const D3D12_RESOURCE_DESC& d, const Format& format, VkDeviceSize bytes) {
+    std::lock_guard lock(zero_user_mutex);  // a release of the shape's last user cannot run between the two
+    const VkImage image = zero_sampled_image(d, format, bytes);
+    if (image) ++zero_image_users[ZeroShape{d.Format, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels}];
+    return image;
+}
+
+// A placed texture no longer shows the shared image of its shape. With no other user the image leaves the map and its
+// bytes leave the 256 MiB; the Resource's own destructor queues it for deletion after the submissions made so far, as
+// the views of it queued before. The shapes left without an image because they did not fit get another try too.
+void DeviceState::release_zero_image(const D3D12_RESOURCE_DESC& d, VkImage image) {
+    const ZeroShape key{d.Format, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels};
+    Resource* gone = nullptr;
+    {
+        std::lock_guard users_lock(zero_user_mutex);
+        const auto users = zero_image_users.find(key);
+        if (users == zero_image_users.end() || --users->second) return;
+        zero_image_users.erase(users);
+        std::lock_guard lock(zero_image_mutex);
+        const auto it = zero_images.find(key);
+        if (it == zero_images.end() || !it->second || it->second->image() != image) return;
+        gone = it->second;
+        zero_images.erase(it);
+        zero_image_bytes.fetch_sub(gone->image_backing_bytes(), std::memory_order_relaxed);
+        // Each entry with an image has a user: more entries than users means some shapes were left without one.
+        if (zero_images.size() > zero_image_users.size())
+            std::erase_if(zero_images, [](const auto& entry) { return !entry.second; });
+    }
+    gone->Release();  // outside the locks: its destructor takes the descriptor and context locks
+}
+
+// The claims textures gave back on getting memory of their own (return_zero_image) once no replay in progress at the
+// return is left. Called before each submission, outside the context's resource lock; the images released here are
+// deleted after the submissions made so far, which include every submission of those replays.
+void DeviceState::drain_zero_returns() {
+    if (!zero_returns_pending.load(std::memory_order_acquire)) return;
+    std::vector<ZeroReturn> due;
+    {
+        std::lock_guard lock(zero_return_mutex);
+        // Read under the lock: every return looked at was made before it. kAfterExecutes with no replay in progress.
+        const std::uint64_t oldest = geometry.oldest_execute();
+        std::erase_if(zero_returns, [&](const ZeroReturn& r) {
+            if (r.epoch >= oldest) return false;
+            due.push_back(r);
+            return true;
+        });
+        zero_returns_pending.store(!zero_returns.empty(), std::memory_order_relaxed);
+    }
+    for (const ZeroReturn& r : due) release_zero_image(r.desc, r.image);
 }
 
 
@@ -11999,14 +12441,13 @@ public:
         PipelineCompiler::instance().cancel(compile_owner());  // nothing left in practice (last_release)
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
+        // The pipeline layouts are the device's, shared with other PSOs (DeviceState::pipeline_layout): kept.
         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
-        if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
         if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
-        if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         modules_.clear();
-        if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
+        if (code_bytes_) device_.code_copy_release(code_key_, code_base_, code_bytes_);
         --live_pipeline_state_count;
     }
 
@@ -12167,6 +12608,12 @@ public:
     const std::vector<leonida::SubgroupRequest>& subgroup_requests() const {
         return native_owner_ ? native_owner_->subgroup_requests() : subgroup_requests_;
     }
+    // The program copy its shaders read their code base from: the console VA replay pushes, and its bytes (0: none).
+    std::uint64_t code_copy_va() const {
+        if (native_owner_) return native_owner_->code_copy_va();
+        return is_graphics_ ? graphics_.code_base : pipeline_.code_base;
+    }
+    VkDeviceSize code_copy_bytes() const { return native_owner_ ? native_owner_->code_copy_bytes() : code_bytes_; }
 
     // A VS (+ GS) (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the
     // VS's input signature by semantic name and index: location = the element's register, the translator's rule
@@ -12257,7 +12704,6 @@ public:
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
                             const D3D12_SHADER_BYTECODE* as = nullptr, const StencilFaceMasks* back_masks = nullptr, bool depth_bounds = false) {
         auto& vk = device_.context->vk;
-        const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
         if (as && as->pShaderBytecode && as->BytecodeLength) {
             return stream_unsupported("amplification shaders are not supported; stream subobject",
@@ -13008,7 +13454,8 @@ public:
             layout_info.pSetLayouts = &set0_layout;
             graphics_.bindless_set = device_.bindless->set();
         }
-        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
+        graphics_.layout = device_.pipeline_layout(layout_info);
+        if (!graphics_.layout) return E_FAIL;
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
@@ -13058,9 +13505,11 @@ public:
         graphics_.estimate = leonida::large_module_estimate(spirv_bytes);
 
         if (code_stage) {
+            // One copy per program, shared with the other PSOs of it (DeviceState::code_copy_acquire): the entry's
+            // key is the SHA-256 of these bytes, which the lookup above matched.
+            code_key_ = code_stage->entry->fssm_sha256;
             VkDeviceSize offset = 0;
-            if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
-            std::memcpy(device_.arena.mapped + offset, code_stage->fssm.data(), code_stage->fssm.size());
+            if (!device_.code_copy_acquire(code_key_, code_stage->fssm, offset)) return E_OUTOFMEMORY;
             code_bytes_ = code_stage->fssm.size();
             code_base_ = offset;
             graphics_.code_base = offset;
@@ -13102,8 +13551,6 @@ public:
     }
 
     HRESULT create_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
-        auto& vk = device_.context->vk;
-        const VkDevice dev = device_.info.device;
         if (!desc.CS.pShaderBytecode || !desc.CS.BytecodeLength) return E_INVALIDARG;
         if (desc.NodeMask & ~1u) return E_INVALIDARG;
         if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
@@ -13183,7 +13630,8 @@ public:
             layout_info.pSetLayouts = &set0_layout;
             pipeline_.bindless_set = device_.bindless->set();
         }
-        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
+        pipeline_.layout = device_.pipeline_layout(layout_info);
+        if (!pipeline_.layout) return E_FAIL;
         compute_entry_ = entry;
         stage_bytes_ = spirv_bytes;
         pipeline_.estimate = leonida::large_module_estimate(spirv_bytes);
@@ -13231,8 +13679,11 @@ public:
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
         if (entry->uses_code_base || !entry->code_base_known) {
             const auto& code = program.bytes;
-            if (!device_.arena_allocate(code.size(), 256, code_base_, DeviceState::arena_shader)) return E_OUTOFMEMORY;
-            std::memcpy(device_.arena.mapped + code_base_, code.data(), code.size());
+            // One copy per program, shared with the other PSOs of it (DeviceState::code_copy_acquire): the entry's
+            // key is the SHA-256 of these bytes, which program_candidates matched.
+            code_key_ = program.kind == leonida::ComputeProgram::Kind::fssm ? entry->fssm_sha256
+                                                                             : entry->fspx_code_sha256;
+            if (!device_.code_copy_acquire(code_key_, code, code_base_)) return E_OUTOFMEMORY;
             code_bytes_ = code.size();
             pipeline_.code_base = code_base_;
         }
@@ -13348,7 +13799,8 @@ private:
             queued = PipelineCompiler::instance().submit(state, state, SIZE_MAX, [state, cache] {
                 try {
                     if (!state->active_compiles.load() && !PipelineCompiler::instance().has_compile_waiter())
-                        save_session_pipeline_cache(state->context->vk, state->info.device, cache, true);
+                        save_session_pipeline_cache(state->context->vk, state->info.device, cache, state->cache_origin,
+                                                    true);
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "[rt] pipeline cache checkpoint failed: %s\n", e.what());
                 }
@@ -13912,6 +14364,7 @@ private:
     }
     VkDeviceSize code_base_ = 0;
     VkDeviceSize code_bytes_ = 0;
+    std::string code_key_;  // the program's key in DeviceState::code_copies; empty when the copy is this PSO's own
     bool registered_ = false;
     bool unregistered_ = false;  // taken out of the context's registry (unregister)
     bool is_graphics_ = false;
@@ -14432,6 +14885,12 @@ struct TitleTexture {
         device_local = (r->memory_flags() & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
     }
     bool owned = false;                     // made here for slot-70 views (a reference is held); else slot 133's
+    // Owned, for its retirement (Device::retire_idle_owned_images): when a slot-70 view last named it, whether a
+    // texture made or registered since then covers some of its bytes, and since when no page of it has been committed
+    // (time_point{}: some were at the last look after a map change, or a view has named it since).
+    std::chrono::steady_clock::time_point named{};
+    bool superseded = false;
+    std::chrono::steady_clock::time_point gone_since{};
     bool attachment_4k = false;             // slot 133: 3840x2160 color or depth attachment
     bool gpu_written = false;               // render target, depth or unordered access: never filled
     bool mapped = false;                    // a slot-133 texture the title mapped: checked before submissions
@@ -14564,8 +15023,15 @@ void DeviceState::drain_titles_gone() {
     if (!titles_gone_pending.load(std::memory_order_acquire)) return;
     std::lock_guard lock(title_texture_mutex);
     for (const auto& [resource, address] : titles_gone) {
+        // As title_texture_gone outside the registry: LEONIDA_TEXTURE_REFRESH_ASYNC's range index and mapped list
+        // name the entry too. A texture made at the address since has a resource and keeps all three.
         const auto it = title_textures.find(address);
-        if (it != title_textures.end() && !it->second->resource) title_textures.erase(it);
+        if (it != title_textures.end() && !it->second->resource) {
+            texture_ranges.erase(address);
+            title_textures.erase(it);
+        }
+        const auto mapped = mapped_title_textures.find(address);
+        if (mapped != mapped_title_textures.end() && !mapped->second->resource) mapped_title_textures.erase(mapped);
     }
     titles_gone.clear();
     titles_gone_pending.store(false, std::memory_order_release);
@@ -15333,6 +15799,7 @@ public:
                 full = refreshed_present_.exchange(serial, std::memory_order_relaxed) != serial;
             }
             state_.drain_geometry_releases();
+            state_.drain_zero_returns();
             state_.refresh_shadows(full || per_frame < 2, full);
             state_.retire_orphan_windows();
             // LEONIDA_GEOMETRY_ASYNC=1 (for runs that only need the title to go on): the geometry copies are brought
@@ -15499,13 +15966,15 @@ public:
                 std::snprintf(text, sizeof text,
                               "pipeline cache %.0f MiB; arena %.0f MiB (type %u), in use %.0f MiB (buffer %.0f, "
                               "descriptor heap %.0f, shader %.0f, heap %.0f), peak end %.0f MiB; title memory %llu "
-                              "ranges %.0f MiB reserved/committed VA; shadows %llu; fsdraw pipeline notes %zu",
+                              "ranges %.0f MiB reserved/committed VA; shadows %llu; fsdraw pipeline notes %zu; "
+                              "PSO pipeline layouts %zu",
                               leonida::mem_probe::mib(cache), leonida::mem_probe::mib(d.arena.size),
                               d.arena.memory_type, leonida::mem_probe::mib(in_use), leonida::mem_probe::mib(use[0]),
                               leonida::mem_probe::mib(use[1]), leonida::mem_probe::mib(use[2]),
                               leonida::mem_probe::mib(use[3]), leonida::mem_probe::mib(peak),
                               (unsigned long long)title_ranges, leonida::mem_probe::mib(title),
-                              (unsigned long long)shadows, leonida::fsdraw::pipeline_count());
+                              (unsigned long long)shadows, leonida::fsdraw::pipeline_count(),
+                              d.pipeline_layout_count());
                 return std::string(text);
             };
             facts.share = [this] {
@@ -16143,6 +16612,7 @@ public:
                 state_.context->observe_result(state_.context->vk.vkDeviceWaitIdle(state_.info.device),
                                               "vkDeviceWaitIdle");
             }
+            release_title_images();  // their Vulkan objects go to the deferred queue drained next
             state_.context->drain_deleted_resources(UINT64_MAX);
             state_.context->set_pipeline_workers(nullptr);  // before the pipeline cache is written and destroyed
             state_.context->set_bindless_release(nullptr, nullptr);
@@ -16151,6 +16621,10 @@ public:
         if (state_.context) {
             if (state_.gpu_resolver) state_.gpu_resolver->halt();  // it calls into the geometry copies
             ShadowPages::gpu_copy = nullptr;
+            // The console heap pass's pipeline and buffers (LEONIDA_CONSOLE_HEAP_GPU, LEONIDA_SHADOW_GPU) are the
+            // VkDevice's, and a device that owns its VkDevice destroys it below, before ~DeviceState: they go now.
+            state_.context->set_prelude(nullptr, nullptr);
+            state_.heap_gpu.reset();
             state_.geometry.release(state_);
             state_.external_windows.release(state_);
             std::lock_guard upload(state_.title_upload_mutex);
@@ -16158,6 +16632,9 @@ public:
         }
         state_.staging_queue.reset();  // they use the context
         state_.staging_copy_queue.reset();
+        // The PSOs' shared layouts: every PSO is gone, the compiler and the pipeline workers have stopped, and the GPU
+        // is idle with the deferred deletions drained, so no pipeline, build or command buffer uses one any more.
+        if (state_.context) state_.destroy_pipeline_layouts();
         if (state_.context && state_.bindless) {
             // Every texture is gone by now (each held this device), and its views with it; samplers remain.
             std::lock_guard lock(state_.descriptor_mutex);
@@ -16182,7 +16659,8 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: %u pipeline build(s) still running at device teardown; "
                                      "pipeline_cache.session.bin not written\n", building);
             else if (!compile_helper::build_host)
-                save_session_pipeline_cache(state_.context->vk, state_.info.device, state_.pipeline_cache_handle);
+                save_session_pipeline_cache(state_.context->vk, state_.info.device, state_.pipeline_cache_handle,
+                                            state_.cache_origin);
             state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
         }
         state_.context.reset();
@@ -16475,6 +16953,14 @@ public:
             state_.index_texture(*entry);
             slot = std::move(entry);
             ++title_stats_.registered;
+            if (owned_image_retirement_on()) {
+                forget_owned_range(address);
+                // What it covers is known from the title's XG computer of its shape. A texture the GPU writes has no
+                // layout here, and a guessed one (Layout 0 of the description) may be larger than what the title
+                // placed, over its neighbours: those cover what a slot-70 view gives them (place_title_view).
+                if (slot->layout_from_xg && !slot->gpu_written)
+                    supersede_owned_images(address, slot->cpu, slot->layout.layout.size);
+            }
         }
     }
 
@@ -16628,16 +17114,32 @@ public:
         // journal lost some changes, all are probed again, for whatever no change reports.
         constexpr auto kRetryAll = std::chrono::seconds(30);
         title_map_changes_.clear();
+        owned_map_changes_.clear();
+        const bool retire = owned_image_retirement_on();
         std::uint64_t map_now = 0;
         bool map_all = !leonida::title_memory_map::changes_since(
-            title_map_generation_, map_now, 0, UINTPTR_MAX,
-            [&](std::uintptr_t from, std::uintptr_t to) { title_map_changes_.emplace_back(from, to); });
+            title_map_generation_, map_now, 0, UINTPTR_MAX, [&](std::uintptr_t from, std::uintptr_t to) {
+                title_map_changes_.emplace_back(from, to);
+                // A change anywhere (title_memory_map::changed() with no range) says that something changed, not
+                // where: xmem records one for each run of pages it commits for a DirectStorage transfer on Windows.
+                // It names no owned image's pages. Taken for all of them, it would have nearly every pass of a
+                // streaming load look at the pages of every image.
+                if (retire && (from || to != UINTPTR_MAX)) owned_map_changes_.emplace_back(from, to);
+            });
         title_map_generation_ = map_now;
         if (now - title_retry_all_ >= kRetryAll) map_all = true;
         if (map_all) title_retry_all_ = now;
         leonida::merge_title_writes(title_map_changes_);
         stats.map_ranges += title_map_changes_.size();
         stats.map_all += map_all;
+        // The owned images over these changes may have lost their pages (retire_idle_owned_images looks). Changes the
+        // journal lost, and changes anywhere, are not looked for: such an image goes with the next change over its
+        // pages or a texture over its bytes.
+        if (retire) {
+            leonida::merge_title_writes(owned_map_changes_);
+            for (const auto& [from, to] : owned_map_changes_)
+                owned_ranges_.overlapping(from, to, [&](std::uint64_t key) { retire_candidates_[key] = true; });
+        }
         if (!written.empty() || overflow || map_all || !title_map_changes_.empty()) {
             stats.written_ranges += written.size();
             leonida::merge_title_writes(written);
@@ -16666,7 +17168,10 @@ public:
                 const auto apply = [&](const auto& ranges, bool write) {
                     for (const auto& [from, to] : ranges)
                         state_.texture_ranges.overlapping(from, to, [&](auto key) {
-                            auto& t = *state_.title_textures.at(key);
+                            // A key without an entry is skipped: an exception here would end the process.
+                            const auto it = state_.title_textures.find(key);
+                            if (it == state_.title_textures.end()) return;
+                            auto& t = *it->second;
                             invalidate(t, write, !write);
                             if (t.stale) queue_title_fill(key);
                         });
@@ -16744,6 +17249,7 @@ public:
         stats.hashed += checked;
         stats.filled_bytes += filled;
         stats.max_pass_bytes = std::max(stats.max_pass_bytes, filled);
+        if (!retire_candidates_.empty()) retire_idle_owned_images(now);
         std::vector<Resource*> release;
         std::erase_if(retired_title_textures_, [&](const auto& r) {
             if (now - r.first < std::chrono::seconds(3)) return false;  // descriptors may still be in flight
@@ -16772,6 +17278,36 @@ public:
         for (Resource* r : release) r->Release();
     }
 
+    // For tests (rt::d3d12::owned_title_images, owned_title_image).
+    OwnedTitleImages owned_title_images() {
+        std::lock_guard lock(state_.title_texture_mutex);
+        OwnedTitleImages out;
+        for (const auto& [address, t] : state_.title_textures) {
+            if (!t->resource) continue;
+            if (!t->owned) {
+                ++out.slot133;
+                continue;
+            }
+            ++out.owned;
+            out.owned_bytes += t->resource->image_backing_bytes();
+        }
+        out.retired = title_stats_.retired;
+        out.superseded = title_stats_.retired_superseded;
+        out.gone = title_stats_.retired_gone;
+        out.waiting = retired_title_textures_.size();
+        out.candidates = retire_candidates_.size();
+        out.looks = title_stats_.retire_looks;
+        out.named_again = title_stats_.superseded_named;
+        return out;
+    }
+    ID3D12Resource* owned_title_image(std::uint64_t address) {
+        std::lock_guard lock(state_.title_texture_mutex);
+        const auto it = state_.title_textures.find(address);
+        if (it == state_.title_textures.end() || !it->second->owned || !it->second->resource) return nullptr;
+        it->second->resource->AddRef();
+        return it->second->resource;
+    }
+
 private:
     struct TitleTextureStats {
         std::uint64_t mapped_checks = 0, mapped_changed = 0, mapped_fills = 0;
@@ -16780,6 +17316,9 @@ private:
         std::map<std::string, std::uint64_t> refused;  // why a view is a null view -> views
         std::uint64_t views = 0, null_views = 0, of_slot133 = 0, of_cache = 0, made = 0, retired = 0, registered = 0,
                       refusals = 0, written_ranges = 0, unmaps = 0, unreadable = 0, pending_views = 0;
+        // Of the retired: under a newer texture, with their pages gone (retire_idle_owned_images). Looks at the pages
+        // of owned images there; owned images a view named again after a newer texture covered them.
+        std::uint64_t retired_superseded = 0, retired_gone = 0, retire_looks = 0, superseded_named = 0;
         std::uint64_t fills = 0, fill_bytes = 0, fill_failures = 0;
         // Fills of some mips only; textures whose first fill was one; those that got larger mips later; first fills
         // refused by LEONIDA_TITLE_PARTIAL_MIPS_MB.
@@ -17058,6 +17597,12 @@ private:
     VkDeviceSize retired_backing_ = 0;
     VkDeviceSize title_partial_bytes_ = 0;  // likewise: image memory of the textures filled in part, as of this pass
     std::vector<std::pair<std::chrono::steady_clock::time_point, Resource*>> retired_title_textures_;  // likewise
+    // LEONIDA_TITLE_IMAGE_RETIRE, likewise: the owned images by the CPU bytes they are filled from, and those that may
+    // be retired (a newer texture covers them, or their pages may have gone: true until a pass has looked at them).
+    leonida::TitleTextureRangeIndex owned_ranges_;
+    std::map<std::uint64_t, bool> retire_candidates_;
+    std::uint64_t retire_cursor_ = 0;                  // the candidate the next pass starts from
+    leonida::TitleWriteRanges owned_map_changes_;      // scratch: this pass's map changes with a range
     std::vector<std::uint8_t> title_tiled_, title_linear_;         // scratch, under title_texture_mutex
     std::vector<std::uint64_t> title_columns_;
 
@@ -17152,6 +17697,7 @@ private:
                     state_.index_texture(*t);
                     t->layout_guessed = t->layout_from_xg = false;
                     t->hashed = false;
+                    if (owned_image_retirement_on()) supersede_owned_images(address, t->cpu, t->layout.layout.size);
                 } else {
                     refuse_title_view(why, d, address);  // counted; the view of its image is still written
                 }
@@ -17169,10 +17715,16 @@ private:
             }();
             retire_title_texture(*t);
             state_.texture_ranges.erase(address);
+            forget_owned_range(address);
             textures.erase(address);
             t = make_title_texture(d, words, srv, address, view_mip, same_shape ? formats : std::vector<DXGI_FORMAT>{});
         } else if (t) {
             ++title_stats_.of_cache;
+            // Named again: in use, whatever covers its bytes now, and a view of a texture whose pages may come back.
+            title_stats_.superseded_named += t->superseded;
+            t->named = std::chrono::steady_clock::now();
+            t->superseded = false;
+            t->gone_since = {};
             if (t->view_mip != view_mip) {
                 t->view_mip = view_mip;
                 if (!t->fills) t->memory.retry();  // what is readable may do for this view
@@ -17253,6 +17805,11 @@ private:
             log_once("an image for a slot-70 texture view could not be made; HRESULT", int(hr));
             return refuse_title_view("image not created", d, address), nullptr;
         }
+        // The registry's reference keeps the image and the device keeps the registry, so the image holds no device
+        // reference: with one, a device its title (or a test) released stayed alive, with all its Vulkan objects,
+        // while an image made here was in the registry or retired and not yet released (3 s on, at a refresh pass a
+        // released device never runs). ~Device releases what is left (release_title_images).
+        r->attach_device(nullptr);
         if (!title_layout_fits(entry->layout, d, *r, why)) {
             r->Release();
             return refuse_title_view(why, d, address), nullptr;
@@ -17275,8 +17832,13 @@ private:
         }
         ++title_stats_.made;
         TitleTexture* t = entry.get();
+        t->named = std::chrono::steady_clock::now();
         state_.index_texture(*entry);
         state_.title_textures[address] = std::move(entry);
+        if (owned_image_retirement_on()) {
+            owned_ranges_.set(address, t->cpu, t->layout.layout.size);
+            supersede_owned_images(address, t->cpu, t->layout.layout.size);
+        }
         if (title_fill_async() && readable) queue_title_fill(address);
         return t;
     }
@@ -17290,6 +17852,130 @@ private:
         retired_title_textures_.emplace_back(std::chrono::steady_clock::now(), t.resource);
         t.resource = nullptr;
         ++title_stats_.retired;
+    }
+
+    // Device teardown, after the GPU is idle: the last release of the images made for slot-70 views, those in the
+    // registry and those retired. Each destructor reaches the device state, so this comes before the context goes.
+    void release_title_images() {
+        std::vector<Resource*> release;
+        {
+            std::lock_guard lock(state_.title_texture_mutex);
+            for (auto& [address, t] : state_.title_textures)
+                if (t && t->owned && t->resource) release.push_back(std::exchange(t->resource, nullptr));
+            for (const auto& [when, r] : retired_title_textures_) release.push_back(r);
+            retired_title_textures_.clear();
+            retired_backing_ = 0;
+        }
+        for (Resource* r : release) r->Release();
+    }
+
+    // LEONIDA_TITLE_IMAGE_RETIRE=1 (off by default). An image made for slot-70 views was retired only when
+    // its own address got another description or a slot-133 texture, and a title that streams places its textures at
+    // ever new addresses: each kept its image (in VRAM, then in system memory), its bindless index and its turn in the
+    // refresh passes for the device's life. Now one is also retired once a texture made or registered after the last
+    // view of it covers some of its bytes, or once no page of it has been committed for a while, when no slot-70 view
+    // has named it for LEONIDA_TITLE_IMAGE_IDLE_MS (2000 by default): the bytes now hold another texture, or nothing,
+    // as they would for its T# on the console. Two textures over the same bytes that views keep naming both stay.
+    // A slot-133 texture covers with its XG layout, or with the one a slot-70 view gives it, never with the guess from
+    // its description. Its pages are looked at after a title_memory_map change over them, not after a change anywhere.
+    // A view that names an image whose pages went keeps it, until a later change over them finds them still gone.
+    // A view of a retired image's address makes it again (place_title_view): its T# names the title address
+    // (Resource::place_at_title_address), so the copies of its descriptors the title kept find the new image once it
+    // is filled. Until then, and for a T# whose address no view names again, a shader samples the fallback.
+    static bool owned_image_retirement_on() {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_TITLE_IMAGE_RETIRE");
+            return v && *v && std::strcmp(v, "0") != 0;
+        }();
+        return on;
+    }
+    static std::chrono::milliseconds owned_image_idle() {
+        static const std::chrono::milliseconds idle([] {
+            const char* v = std::getenv("LEONIDA_TITLE_IMAGE_IDLE_MS");
+            return v && *v ? (std::max)(0ll, std::strtoll(v, nullptr, 10)) : 2000ll;
+        }());
+        return idle;
+    }
+    static std::size_t owned_image_checks() {
+        static const std::size_t checks = [] {
+            const char* v = std::getenv("LEONIDA_TITLE_IMAGE_CHECKS");
+            return v && *v ? std::size_t(std::strtoull(v, nullptr, 10)) : std::size_t(128);
+        }();
+        return checks;
+    }
+
+    // A texture at `key` now holds the title's bytes [cpu, cpu + size): the owned images at other keys over some of
+    // them are superseded. One over exactly these bytes is the same texture named through the other view of a
+    // stream pool (title_gpu_views::other_view), or the same bytes in another shape, and is left alone.
+    void supersede_owned_images(std::uint64_t key, std::uint64_t cpu, std::uint64_t size) {
+        if (!size) return;
+        owned_ranges_.overlapping(cpu, cpu + size, [&](std::uint64_t other) {
+            const auto it = state_.title_textures.find(other);
+            if (other == key || it == state_.title_textures.end() || !it->second->owned || !it->second->resource)
+                return;
+            TitleTexture& t = *it->second;
+            if (t.cpu == cpu && t.layout.layout.size == size) return;
+            t.superseded = true;
+            retire_candidates_.try_emplace(other, false);
+        });
+    }
+
+    // The registry no longer holds an owned image at `key` (retired, or replaced by another texture).
+    void forget_owned_range(std::uint64_t key) {
+        owned_ranges_.erase(key);
+        retire_candidates_.erase(key);
+    }
+
+    // Once a pass, after its visits: the candidates of LEONIDA_TITLE_IMAGE_RETIRE. One over a map change since the
+    // last pass is looked at first (a filled image none of whose pages is committed has gone; an image never filled
+    // is the view of a texture whose pages have not come yet, and stays). A superseded image goes once no view has
+    // named it for the idle time, one whose pages went once they have been gone that long; the others stay
+    // candidates. Its Release waits as every retired image's does (retired_title_textures_).
+    // A pass visits at most LEONIDA_TITLE_IMAGE_CHECKS of them (128 by default; 0: all), from where the last pass
+    // stopped. A look walks the pages with VirtualQuery, about a microsecond a call, and this runs under the registry
+    // lock on the title's submitting thread: a change over a large unloaded pool marks tens of thousands of images at
+    // once, and they are looked at over the following passes, a candidate not reached keeping its mark.
+    void retire_idle_owned_images(std::chrono::steady_clock::time_point now) {
+        const auto idle = owned_image_idle();
+        const std::size_t limit = owned_image_checks();
+        std::size_t visits = limit ? std::min(limit, retire_candidates_.size()) : retire_candidates_.size();
+        auto it = retire_candidates_.lower_bound(retire_cursor_);
+        for (; visits; --visits) {
+            if (it == retire_candidates_.end()) it = retire_candidates_.begin();
+            const std::uint64_t key = it->first;
+            const auto entry = state_.title_textures.find(key);
+            TitleTexture* t = entry == state_.title_textures.end() || !entry->second->owned || !entry->second->resource
+                                  ? nullptr
+                                  : entry->second.get();
+            if (t && std::exchange(it->second, false)) {
+                bool committed = !t->fills;
+                if (!committed) {
+                    ++title_stats_.retire_looks;
+                    committed = leonida::texture_memory_committed(std::uintptr_t(t->cpu), t->layout.layout.size);
+                }
+                if (committed)
+                    t->gone_since = {};
+                else if (t->gone_since == std::chrono::steady_clock::time_point{})
+                    t->gone_since = now;
+            }
+            const bool gone = t && t->gone_since != std::chrono::steady_clock::time_point{};
+            if (!t || (!t->superseded && !gone)) {
+                it = retire_candidates_.erase(it);
+                continue;
+            }
+            const bool covered = t->superseded && now - t->named >= idle;
+            if (!covered && !(gone && now - t->gone_since >= idle)) {
+                ++it;
+                continue;
+            }
+            ++(covered ? title_stats_.retired_superseded : title_stats_.retired_gone);
+            retire_title_texture(*t);
+            it = retire_candidates_.erase(it);
+            owned_ranges_.erase(key);
+            state_.texture_ranges.erase(key);
+            state_.title_textures.erase(entry);
+        }
+        retire_cursor_ = it == retire_candidates_.end() ? 0 : it->first;
     }
 
     // LEONIDA_TITLE_PARTIAL_MIPS=1 (off by default). A slot-70 2D texture whose larger mips are not readable is filled from the
@@ -17591,14 +18277,17 @@ private:
                          double(s.staged_ns) / 1e9, double(state_.title_upload.capacity()) / 1048576.0);
         std::fprintf(stderr,
                      "[rt] d3d12: title textures (%s): %llu slot-70 texture views (%zu kinds), %llu of slot-133 textures, "
-                     "%llu of images made for them (%llu made, %llu over memory not readable yet, %llu retired), %llu "
+                     "%llu of images made for them (%llu made, %llu over memory not readable yet, %llu retired: %llu "
+                     "under a newer texture, %llu with their pages gone; %llu named again under a newer texture), %llu "
                      "null views; registry %zu images "
                      "(%zu made, %zu slot 133 of %llu registered, %zu mapped, %zu filled); %llu fills %.1f MiB, %llu "
                      "failed\n",
                      when, static_cast<unsigned long long>(s.views), s.asked.size(),
                      static_cast<unsigned long long>(s.of_slot133), static_cast<unsigned long long>(s.of_cache),
                      static_cast<unsigned long long>(s.made), static_cast<unsigned long long>(s.unreadable),
-                     static_cast<unsigned long long>(s.retired),
+                     static_cast<unsigned long long>(s.retired), static_cast<unsigned long long>(s.retired_superseded),
+                     static_cast<unsigned long long>(s.retired_gone),
+                     static_cast<unsigned long long>(s.superseded_named),
                      static_cast<unsigned long long>(s.null_views), state_.title_textures.size(), owned, slot133,
                      static_cast<unsigned long long>(s.registered), mapped, filled,
                      static_cast<unsigned long long>(s.fills), double(s.fill_bytes) / 1048576.0,
@@ -19713,7 +20402,9 @@ public:
     // TitleVaAliases::want_buffer: a vertex or index view names `va` in the title's own memory and no buffer covers
     // it. A buffer over the 64 KiB-aligned committed pages around it is made the way slot 133 makes one (the pages
     // imported, or a shadow copied from them before every submission) and kept until the device goes, up to
-    // LEONIDA_TITLE_BUFFERS_MB (512 by default).
+    // LEONIDA_TITLE_BUFFERS_MB (512 by default). Only a buffer that covers the view is made and kept. After a range
+    // got none, no range is tried for a second (title_buffer_retry_), and a range refused again waits twice as long
+    // as the last time, up to 64 s (refused_title_ranges_).
     void make_title_buffer(std::uint64_t va, std::uint64_t bytes) {
         if (!&context()) return;
         static const bool check_size = [] {
@@ -19739,9 +20430,23 @@ public:
             const bool set = getenv_s(&length, text, "LEONIDA_TITLE_BUFFERS_MB") == 0 && length > 1;
             return (set ? std::strtoull(text, nullptr, 10) : 512ull) << 20;
         }();
+        // The title binds the same views draw after draw, and many views of one pool when its pages are refused. Each
+        // try asks for an import and a shadow, and their memory, under memory_mutex(), where the title's own
+        // allocations wait. So after a refusal no range is tried for a second, whichever range it is, and a range
+        // refused before waits its own time too, which doubles at each refusal: one that keeps failing (its pages
+        // cannot be imported, and no shadow of its size fits) does not take every second's try from ranges that
+        // could get a buffer. Both are checked before the page walk below (its VirtualQuery calls), which only
+        // shortens `asked`.
+        const auto now = std::chrono::steady_clock::now();
+        if (now < title_buffer_retry_) return;
         constexpr std::uint64_t align = 65536, most = 64ull << 20;
         const std::uint64_t start = std::max(va & ~(align - 1), lo);
-        std::uint64_t end = std::min(hi, (va + std::clamp<std::uint64_t>(bytes, 1, most) + align - 1) & ~(align - 1));
+        const std::uint64_t asked =
+            std::min(hi, (va + std::clamp<std::uint64_t>(bytes, 1, most) + align - 1) & ~(align - 1));
+        const auto refused = refused_title_ranges_.find(start);
+        if (refused != refused_title_ranges_.end() && asked <= refused->second.end && now < refused->second.retry)
+            return;
+        std::uint64_t end = asked;
         for (std::uint64_t at = start; at < end;) {  // the committed, readable part only
             MEMORY_BASIC_INFORMATION region{};
             if (!VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &region, sizeof(region)) ||
@@ -19767,13 +20472,35 @@ public:
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         ID3D12Resource* made = nullptr;
+        // When the pages can be neither imported nor shadowed, slot 133 answers with an ordinary DEFAULT buffer that
+        // has neither the title's VA nor its bytes. It would not cover the view: kept, it would hold its memory until
+        // the device goes, and another would be made at the next bind of the same view, until
+        // LEONIDA_TITLE_BUFFERS_MB is used up. So it is not asked for (the shadow's failure comes back instead), and
+        // a buffer that still does not cover the view is let go.
         const HRESULT hr = create_at_host_address(reinterpret_cast<void*>(static_cast<std::uintptr_t>(start)), desc,
                                                   0xFFFFFFFFu, __uuidof(ID3D12Resource),
-                                                  reinterpret_cast<void**>(&made), nullptr);
-        if (FAILED(hr) || !made) {
-            log_once("a buffer over the title's memory for a vertex or index view could not be made; HRESULT", int(hr));
+                                                  reinterpret_cast<void**>(&made), nullptr, false);
+        const bool kept = SUCCEEDED(hr) && made && state_.context->knows_buffer_va(va, check_size ? end - va : 1);
+        if (!kept) {
+            if (SUCCEEDED(hr) && made)
+                log_once("a buffer over the title's memory for a vertex or index view does not cover it, so it is not "
+                         "kept; KiB",
+                         int((end - start) >> 10));
+            else
+                log_once("a buffer over the title's memory for a vertex or index view could not be made; HRESULT",
+                         int(hr));
+            if (made) made->Release();
+            constexpr std::chrono::steady_clock::duration first = std::chrono::seconds(1),
+                                                          longest = std::chrono::seconds(64);
+            const auto delay =
+                refused != refused_title_ranges_.end() ? std::min(refused->second.delay * 2, longest) : first;
+            if (refused_title_ranges_.size() >= 256)
+                std::erase_if(refused_title_ranges_, [&](const auto& range) { return range.second.retry <= now; });
+            refused_title_ranges_[start] = {asked, now + delay, delay};
+            title_buffer_retry_ = now + first;
             return;
         }
+        if (refused != refused_title_ranges_.end()) refused_title_ranges_.erase(refused);
         title_buffers_.push_back(made);
         title_buffer_bytes_ += end - start;
         if (title_buffers_.size() <= 8 || !(title_buffers_.size() & (title_buffers_.size() - 1)))
@@ -19787,9 +20514,21 @@ public:
     std::mutex title_buffer_mutex_;
     std::vector<ID3D12Resource*> title_buffers_;  // kept: the title's views name their addresses frame after frame
     std::uint64_t title_buffer_bytes_ = 0;
+    // Ranges [start, end) that got no buffer, by start (`end` as asked, before the page walk), with when they may be
+    // tried again and how long they waited last. Under title_buffer_mutex_; the entries past their time are dropped
+    // once there are 256.
+    struct RefusedTitleRange {
+        std::uint64_t end;
+        std::chrono::steady_clock::time_point retry;
+        std::chrono::steady_clock::duration delay;
+    };
+    std::map<std::uint64_t, RefusedTitleRange> refused_title_ranges_;
+    std::chrono::steady_clock::time_point title_buffer_retry_{};  // no range is tried before then (a refusal's second)
 
+    // `ordinary_fallback` false: a buffer whose pages can be neither imported nor shadowed fails with the shadow's
+    // HRESULT instead of being an ordinary DEFAULT buffer (make_title_buffer).
     HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout, REFIID riid,
-                                   void** out, const D3D12_CLEAR_VALUE* clear) {
+                                   void** out, const D3D12_CLEAR_VALUE* clear, bool ordinary_fallback = true) {
         constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
             // A texture cannot be placed on the title's pages (the PC GPU does not sample the console layout): it gets
@@ -19909,8 +20648,11 @@ public:
             }
             // No memory for the shadow either: the boot goes on with an ordinary DEFAULT buffer of the same
             // description, as #6915's stand-in did. The title gets a resource, but neither its VA nor its writes at
-            // `address` reach it.
+            // `address` reach it. make_title_buffer asks for no such buffer: it would not cover the view it is made
+            // for, and making it would only take device-local memory, under the pressure that refused the shadow,
+            // to be let go at once.
             resource->Release();
+            if (!ordinary_fallback) return d3d12_trace::result(method, shadow);
             log_once("a title-placed buffer (device slot 133) could neither import its pages nor get a shadow, so it "
                      "is an ordinary buffer the title's writes do not reach; HRESULT",
                      int(shadow));
@@ -21763,8 +22505,8 @@ bool save_pipeline_caches_at_exit(unsigned wait_ms) {
             bool done = false;
         };
         auto write = std::make_shared<Write>();
-        std::thread([write, d] {
-            save_session_pipeline_cache(d->context->vk, d->info.device, d->pipeline_cache_handle, false, "exit");
+        std::thread([write, d, origin = d->cache_origin] {
+            save_session_pipeline_cache(d->context->vk, d->info.device, d->pipeline_cache_handle, origin, false, "exit");
             std::lock_guard done_lock(write->mutex);
             write->done = true;
             write->done_cv.notify_all();
@@ -21949,6 +22691,14 @@ bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector
 
 long live_pipeline_states() { return live_pipeline_state_count.load(); }
 
+bool pipeline_code_base(ID3D12PipelineState* pipeline, std::uint64_t& va, std::uint64_t& bytes) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (!p || !p->code_copy_bytes()) return false;
+    va = p->code_copy_va();
+    bytes = p->code_copy_bytes();
+    return true;
+}
+
 bool write_placed_buffer_view(ID3D12Device* device, bool unordered, const void* view, std::uint64_t address,
                               std::uint64_t width, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
     Device* d = Device::from<Device>(device);
@@ -22095,6 +22845,14 @@ TitleWindows title_windows(ID3D12Device* device) {
     windows.waiting = state.retired_windows.size();
     return windows;
 }
+OwnedTitleImages owned_title_images(ID3D12Device* device) {
+    auto* d = Device::from<Device>(device);
+    return d ? d->owned_title_images() : OwnedTitleImages{};
+}
+ID3D12Resource* owned_title_image(ID3D12Device* device, std::uint64_t address) {
+    auto* d = Device::from<Device>(device);
+    return d ? d->owned_title_image(address) : nullptr;
+}
 std::uint64_t title_shadow_trackers(ID3D12Device* device) {
     auto* d = Device::from<Device>(device);
     if (!d) return 0;
@@ -22116,6 +22874,21 @@ TitleShadowWatch title_shadow_watch(ID3D12Device* device) {
         watch.hot_bytes += shadow->hot_bytes();
     }
     return watch;
+}
+ConsoleHeapGpuPending console_heap_gpu_pending(ID3D12Device* device) {
+    ConsoleHeapGpuPending pending;
+    if (!device) return pending;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    if (!d) return pending;
+    auto& state = d->state();
+    pending.made = state.heap_gpu != nullptr;
+    {
+        std::lock_guard lock(state.backing_mutex);
+        pending.released = state.released_ranges.size();
+    }
+    pending.removed = leonida::title_va_aliases().removals_pending();
+    return pending;
 }
 
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
@@ -22242,6 +23015,16 @@ std::uint64_t device_arena_size(ID3D12Device* device) {
     return d ? d->state().arena.size : 0;
 }
 
+std::uint64_t arena_shader_bytes(ID3D12Device* device) {
+    if (!device) return 0;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    Device* d = Device::from<Device>(real);
+    if (!d) return 0;
+    std::lock_guard lock(d->state().arena.mutex);
+    return d->state().arena.use_in_use[DeviceState::arena_shader];
+}
+
 ImageMemoryStats image_memory_stats(ID3D12Device* device) {
     if (!device) return {};
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
@@ -22250,6 +23033,19 @@ ImageMemoryStats image_memory_stats(ID3D12Device* device) {
     if (!d || !d->state().image_memory) return {};
     const auto stats = d->state().image_memory->stats();
     return {stats.blocks, stats.block_bytes, stats.ranges};
+}
+
+SharedZeroImages shared_zero_images(ID3D12Device* device) {
+    if (!device) return {};
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    if (!d) return {};
+    auto& state = d->state();
+    SharedZeroImages out;
+    std::lock_guard lock(state.zero_image_mutex);
+    for (const auto& [shape, image] : state.zero_images) out.images += image != nullptr;
+    out.bytes = state.zero_image_bytes.load(std::memory_order_relaxed);
+    return out;
 }
 
 bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes) {
@@ -24049,6 +24845,35 @@ TitleImage test_bind_title_image(ID3D12Device* device, const std::array<std::uin
     leonida::gfx10::ImageWords w;
     std::memcpy(w.data(), words.data(), sizeof(w));
     return bind_title_image(d->state(), w, why);
+}
+
+TitleTextureRegistry title_texture_registry(ID3D12Device* device) {
+    TitleTextureRegistry registry;
+    if (!device) return registry;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return registry;
+    DeviceState& state = d->state();
+    std::lock_guard lock(state.title_texture_mutex);
+    registry.textures = state.title_textures.size();
+    registry.ranges = state.texture_ranges.size();
+    registry.mapped = state.mapped_title_textures.size();
+    return registry;
+}
+
+bool release_in_title_registry(ID3D12Device* device, ID3D12Resource* resource) {
+    if (!device || !resource) return false;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return false;
+    DeviceState& state = d->state();
+    {
+        std::lock_guard lock(state.title_texture_mutex);
+        const InTitleTextures inside;
+        resource->Release();
+    }
+    state.drain_titles_gone();
+    return true;
 }
 
 std::uint64_t resource_image_address(ID3D12Resource* resource) {

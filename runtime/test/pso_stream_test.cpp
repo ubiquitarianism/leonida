@@ -1,9 +1,15 @@
 // Pipeline state stream copies and the derived-state patch (device slot 55) with synthetic streams only: no D3D12
 // device, no game data. The layout rule is the one measured on the console's slot 86 stream (see the offsets check).
 #include <d3d12.h>
+#include <psapi.h>
 
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <set>
+#include <thread>
 #include <vector>
 
 #include "d3d12_xs_pso_stream.h"
@@ -288,6 +294,194 @@ void test_refusals() {
           "a stream with an unmodelled subobject type is not captured");
 }
 
+// A hand-built container of `size` bytes: the DXBC magic, 16 checksum bytes made from `checksum` (all zero when it is
+// 0, as a container without a checksum has) and a body filled from `seed`. The record parses none of it.
+std::vector<unsigned char> container(std::size_t size, unsigned char checksum, unsigned seed) {
+    std::vector<unsigned char> bytes(size);
+    std::memcpy(bytes.data(), "DXBC", 4);
+    for (std::size_t i = 4; i < 20; ++i) bytes[i] = static_cast<unsigned char>(checksum ? checksum + i : 0);
+    for (std::size_t i = 20; i < size; ++i) bytes[i] = static_cast<unsigned char>(seed * 131 + i * 7 + (i >> 8));
+    return bytes;
+}
+
+// Root signature (null), VS and PS, as the title's slot 86 streams start.
+std::vector<unsigned char> shader_stream(const std::vector<unsigned char>& vs, const std::vector<unsigned char>& ps) {
+    StreamBuilder s;
+    ID3D12RootSignature* root = nullptr;
+    s.entry(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &root, 8, 8);
+    D3D12_SHADER_BYTECODE code{vs.data(), vs.size()};
+    s.entry(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &code, sizeof(code), 8);
+    code = {ps.data(), ps.size()};
+    s.entry(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &code, sizeof(code), 8);
+    return s.bytes;
+}
+
+// Captures a stream the test built; the record reads the stream and never writes it.
+std::unique_ptr<rt::d3d12_xs::PsoStreamRecord> keep(const std::vector<unsigned char>& stream) {
+    return rt::d3d12_xs::PsoStreamRecord::capture({stream.size(), const_cast<unsigned char*>(stream.data())});
+}
+
+D3D12_SHADER_BYTECODE stage_of(const rt::d3d12_xs::PsoStreamRecord& record, unsigned type) {
+    D3D12_SHADER_BYTECODE code{};
+    std::memcpy(&code, record.bytes().data() + payload_of_type(record.bytes(), type), sizeof(code));
+    return code;
+}
+
+bool holds(const D3D12_SHADER_BYTECODE& code, const std::vector<unsigned char>& bytes) {
+    return code.pShaderBytecode && code.BytecodeLength == bytes.size() &&
+           std::memcmp(code.pShaderBytecode, bytes.data(), bytes.size()) == 0;
+}
+
+std::uint64_t private_bytes() {
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                              sizeof(counters)))
+        return 0;
+    return counters.PrivateUsage;
+}
+
+void test_equal_bytecode_is_kept_once() {
+    // The title creates tens of thousands of PSOs from far fewer shaders, and every slot 86 stream points at the
+    // bytecode it was made from. Equal bytecode in many streams, from different source buffers, is kept once.
+    constexpr std::size_t kMeanContainer = 9800;  // the corpus mean is about 9.6 KB per container
+    const auto vs_a = container(kMeanContainer, 0x40, 1);
+    const auto vs_a_again = vs_a;  // another buffer with the same bytes, as a second load of the shader would be
+    const auto ps = container(kMeanContainer + 512, 0x80, 2);
+    const auto ps_again = ps;
+    const auto first_stream = shader_stream(vs_a, ps);
+    const auto second_stream = shader_stream(vs_a_again, ps_again);
+
+    auto first = keep(first_stream);
+    auto second = keep(second_stream);
+    if (!first || !second) { check(false, "shader streams captured"); return; }
+    const auto vs1 = stage_of(*first, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS);
+    const auto vs2 = stage_of(*second, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS);
+    const auto ps1 = stage_of(*first, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS);
+    const auto ps2 = stage_of(*second, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS);
+    check(holds(vs1, vs_a) && holds(vs2, vs_a) && holds(ps1, ps) && holds(ps2, ps),
+          "every stage of the kept streams holds the source bytes");
+    check(vs1.pShaderBytecode != vs_a.data() && vs2.pShaderBytecode != vs_a_again.data(),
+          "the kept bytecode is not the caller's buffer");
+    check(vs1.pShaderBytecode == vs2.pShaderBytecode && ps1.pShaderBytecode == ps2.pShaderBytecode,
+          "two streams with equal bytecode in different buffers share one copy of each stage");
+    check(vs1.pShaderBytecode != ps1.pShaderBytecode, "stages with different bytecode keep different copies");
+
+    // Bytecode with the same DXBC checksum and size but other bytes (hand-built containers can share one) stays apart.
+    auto vs_b = vs_a;
+    vs_b[kMeanContainer / 2] ^= 0xff;
+    const auto third_stream = shader_stream(vs_b, ps);
+    auto third = keep(third_stream);
+    if (!third) { check(false, "the equal-checksum stream is captured"); return; }
+    const auto vs3 = stage_of(*third, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS);
+    check(vs3.pShaderBytecode != vs1.pShaderBytecode && holds(vs3, vs_b) && holds(vs1, vs_a),
+          "equal checksums with different bytes are not merged, and each keeps its own bytes");
+    check(stage_of(*third, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS).pShaderBytecode == ps1.pShaderBytecode,
+          "the third stream's PS, equal to the others, is still shared");
+
+    // Containers without a checksum (all zero, as hand-built ones have) are told apart by their bytes too.
+    const auto bare = container(4096, 0, 3);
+    const auto bare_again = bare;
+    auto bare_other = bare;
+    bare_other.back() ^= 0x01;
+    const auto s4 = shader_stream(bare, ps), s5 = shader_stream(bare_again, ps), s6 = shader_stream(bare_other, ps);
+    auto r4 = keep(s4);
+    auto r5 = keep(s5);
+    auto r6 = keep(s6);
+    if (!r4 || !r5 || !r6) { check(false, "the checksum-less streams are captured"); return; }
+    const auto b4 = stage_of(*r4, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS);
+    const auto b5 = stage_of(*r5, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS);
+    const auto b6 = stage_of(*r6, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS);
+    check(b4.pShaderBytecode == b5.pShaderBytecode && holds(b4, bare), "equal checksum-less bytecode is shared");
+    check(b6.pShaderBytecode != b4.pShaderBytecode && holds(b6, bare_other),
+          "checksum-less bytecode that differs in its last byte is not merged");
+
+    // A derived PSO keeps the base's copies, and a record keeps the shared bytes alive after the others are gone.
+    std::vector<unsigned char> patched = first->bytes();
+    auto derived = rt::d3d12_xs::PsoStreamRecord::derived(*first, std::move(patched));
+    first.reset();
+    second.reset();
+    const auto vs_derived = stage_of(*derived, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS);
+    check(vs_derived.pShaderBytecode == vs1.pShaderBytecode && holds(vs_derived, vs_a),
+          "a derived record shares the base's bytecode and keeps it after the base records are freed");
+    derived.reset();
+    auto again = keep(first_stream);
+    check(again && holds(stage_of(*again, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS), vs_a) &&
+              holds(stage_of(*again, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS), ps),
+          "bytecode captured again after every record that held it was freed holds the source bytes");
+}
+
+void test_many_streams_share_their_bytecode() {
+    // N records of one VS and one PS: the streams' bytes are each record's own, the bytecode is kept once.
+    constexpr unsigned kRecords = 10000;
+    const auto vs = container(9800, 0x11, 4);
+    const auto ps = container(9400, 0x22, 5);
+    const auto stream = shader_stream(vs, ps);
+    std::vector<std::unique_ptr<rt::d3d12_xs::PsoStreamRecord>> records;
+    records.reserve(kRecords);
+    const std::uint64_t before = private_bytes();
+    for (unsigned i = 0; i < kRecords; ++i)
+        if (auto record = keep(stream))
+            records.push_back(std::move(record));
+    const std::uint64_t after = private_bytes();
+    check(records.size() == kRecords, "10000 streams are captured");
+    if (records.size() != kRecords) return;
+    const void* vs_kept = stage_of(*records[0], D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS).pShaderBytecode;
+    const void* ps_kept = stage_of(*records[0], D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS).pShaderBytecode;
+    std::size_t vs_shared = 0, ps_shared = 0, intact = 0;
+    for (const auto& record : records) {
+        const auto v = stage_of(*record, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS);
+        const auto p = stage_of(*record, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS);
+        vs_shared += v.pShaderBytecode == vs_kept;
+        ps_shared += p.pShaderBytecode == ps_kept;
+        intact += holds(v, vs) && holds(p, ps) && record->bytes().size() == stream.size();
+    }
+    check(intact == kRecords, "every one of the 10000 records holds the source bytecode and stream size");
+    check(vs_shared == kRecords && ps_shared == kRecords, "the 10000 records share one copy of each stage");
+    std::printf("INFO 10000 records of a %zu + %zu byte VS/PS: private bytes %+.1f MiB (%.1f MiB if each record kept "
+                "its own bytecode)\n",
+                vs.size(), ps.size(), (double(after) - double(before)) / (1024.0 * 1024.0),
+                double(kRecords) * double(vs.size() + ps.size()) / (1024.0 * 1024.0));
+}
+
+void test_streams_from_many_threads() {
+    // PSOs are created on many threads. Records made and freed side by side from the same three containers each hold
+    // their own source bytes, and the ones still alive at the end share one copy per content.
+    const std::vector<unsigned char> shaders[3] = {container(6000, 0x31, 6), container(7000, 0x32, 7),
+                                                   container(8000, 0x33, 8)};
+    const std::vector<unsigned char> streams[3] = {shader_stream(shaders[0], shaders[1]),
+                                                   shader_stream(shaders[1], shaders[2]),
+                                                   shader_stream(shaders[2], shaders[0])};
+    constexpr unsigned kThreads = 8, kRounds = 2000;
+    std::vector<std::vector<std::unique_ptr<rt::d3d12_xs::PsoStreamRecord>>> kept(kThreads);
+    std::atomic<unsigned> wrong{0};
+    std::vector<std::thread> threads;
+    for (unsigned t = 0; t < kThreads; ++t)
+        threads.emplace_back([&, t] {
+            for (unsigned i = 0; i < kRounds; ++i) {
+                const unsigned which = (t + i) % 3;
+                auto record = keep(streams[which]);
+                if (!record || !holds(stage_of(*record, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS), shaders[which]) ||
+                    !holds(stage_of(*record, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS), shaders[(which + 1) % 3]))
+                    ++wrong;
+                if (i % 16 == t % 16) kept[t].push_back(std::move(record));  // the others are freed at once
+            }
+        });
+    for (auto& thread : threads) thread.join();
+    std::set<const void*> copies;
+    bool intact = true;
+    for (const auto& list : kept)
+        for (const auto& record : list) {
+            const auto v = stage_of(*record, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS);
+            const auto p = stage_of(*record, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS);
+            copies.insert(v.pShaderBytecode);
+            copies.insert(p.pShaderBytecode);
+            intact = intact && (holds(v, shaders[0]) || holds(v, shaders[1]) || holds(v, shaders[2]));
+        }
+    check(wrong.load() == 0 && intact, "records made and freed on 8 threads each hold their source bytecode");
+    check(copies.size() == 3, "the records alive after 8 threads share one copy per container (3 in all)");
+}
+
 // Tags 0, 1 and 5 on a base whose depth-stencil is DEPTH_STENCIL2 and whose rasterizer is RASTERIZER1 or RASTERIZER2:
 // the record's D3D12 v0 description is converted into the later version (RT-STATE-PSO-OVERLAY-DS2-RS12).
 void test_later_subobject_versions() {
@@ -411,6 +605,9 @@ int main() {
     test_stencil_mask_record();
     test_view_instancing_is_captured();
     test_refusals();
+    test_equal_bytecode_is_kept_once();
+    test_many_streams_share_their_bytecode();
+    test_streams_from_many_threads();
     test_later_subobject_versions();
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);
     return g_failures ? 1 : 0;

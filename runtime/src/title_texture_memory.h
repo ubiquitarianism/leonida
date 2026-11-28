@@ -89,4 +89,22 @@ inline bool texture_memory_readable(std::uintptr_t base, std::uint64_t size, Tex
     return size && texture_memory_readable_bytes(base, size, commit) == size;
 }
 
+// Whether any page of [base, base + size) is committed, whatever its protection. False when the title has freed,
+// decommitted or unmapped every page of the footprint: a texture there has gone whole, where one whose larger mips
+// went (texture_memory_readable_bytes stops at the first missing page) still has its smaller ones. A page the layer
+// write-protects to watch it stays committed.
+inline bool texture_memory_committed(std::uintptr_t base, std::uint64_t size) {
+    if (!base || !size || size > (std::numeric_limits<std::uintptr_t>::max)() - base) return false;
+    const auto end = base + size;
+    for (auto at = base; at < end;) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region))) return false;
+        if (region.State == MEM_COMMIT) return true;
+        const auto next = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+        if (next <= at) return false;
+        at = next;
+    }
+    return false;
+}
+
 }  // namespace leonida

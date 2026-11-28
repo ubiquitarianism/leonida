@@ -372,7 +372,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            // `XMemVirtualAlloc` told the GPU side of this memory, so it is
+            // freed as the title's own `VirtualFree` frees: what was noted of
+            // it must not be taken for true of the next memory there.
+            title_virtual_free(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
@@ -2337,10 +2340,20 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         leonida_gpu::title_memory_freed(address as usize, size);
+        #[cfg(test)]
+        TOLD_FREED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(address as usize);
     }
     // SAFETY: the title's own arguments.
     unsafe { VirtualFree(address, size, kind) }
 }
+
+/// The addresses [`title_virtual_free`] told the GPU side were freed, so the
+/// tests can see which frees reach it.
+#[cfg(test)]
+static TOLD_FREED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 pub(crate) fn module() -> HleModule {
     HleModule {
@@ -2392,6 +2405,21 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+    }
+
+    #[test]
+    fn free_default_tells_the_gpu_side_of_32bit_memory() {
+        // `XMemAllocDefault` told the GPU side of this memory
+        // (`XMemVirtualAlloc`), so freeing it must say it is gone, or what
+        // was noted of it is taken for true of the next memory there.
+        let p = XMemAllocDefault(4096, ALLOC_32BIT);
+        assert!(!p.is_null());
+        XMemFreeDefault(p, ALLOC_32BIT);
+        let told = TOLD_FREED.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            told.contains(&(p as usize)),
+            "the free of {p:p} never reached the GPU side"
+        );
     }
 
     #[test]

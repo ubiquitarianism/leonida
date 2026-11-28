@@ -9,10 +9,26 @@
 //!    an entry whose description differs, so neither is ever used. NVIDIA
 //!    pipelines with static samplers are named by the places of their
 //!    samplers too ([`super::places`]), or left to the driver's own cache.
+//!
+//!    The library is kept for one set of translated shaders: the
+//!    fingerprint of what made them (the translator, its settings, what it
+//!    was told of the host, and the driver: [`super::known::fingerprint`],
+//!    the one `leonida warm` keeps its list by) is written beside it as
+//!    `host-pipelines.fingerprint`. A start whose fingerprint is not the
+//!    one written there (or finds none) starts an empty library, and its
+//!    first save writes that over the old one. Entries of an earlier
+//!    translation are never loaded again (their names hash the old code),
+//!    yet they were kept: every save wrote the whole library back, so the
+//!    file (and what the host reads of it) only grew with each translator
+//!    change. A save deletes the fingerprint before it renames a library
+//!    of other shaders over the file and writes the new one after, so a
+//!    save cut short leaves no fingerprint (an empty library next start),
+//!    never a stale library under the current fingerprint.
 //! 2. The title pipelines a run drew or dispatched with are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
-//!    creation, during loading.
+//!    creation, during loading. A pipeline stays listed for two runs after
+//!    the last one that drew with it ([`early_runs`]).
 //!
 //! Library calls overlap: the host documents the library as safe to use
 //! from several threads ("The pipeline library is thread-safe to use, and
@@ -49,7 +65,7 @@
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `LEONIDA_LIBRARY_HANDLE=0`: closed, as before.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
@@ -209,12 +225,36 @@ enum Blob {
 
 impl Blob {
     /// The library file in `dir`: a library a save left beside it
-    /// ([`NEXT_FILE`]) takes its place first.
+    /// ([`NEXT_FILE`]) takes its place first. None when it was saved for
+    /// other shaders than this run's ([`reuse_blob`]).
     fn of(dir: &std::path::Path) -> Blob {
         let path = dir.join(LIBRARY_FILE);
         let next = dir.join(NEXT_FILE);
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
+        }
+        // The fingerprint is that of the library the next start opens: of
+        // the waiting one while it is still there, so the older file under
+        // the name is not taken for it. That file may be of the shaders
+        // before them (a save that started empty and could not replace it
+        // left the waiting one), so even under this run's fingerprint it is
+        // not opened: the run starts empty, and its first save replaces a
+        // library of these shaders with what it made. Pipelines to compile
+        // again, once, rather than stale ones kept for good.
+        let stored = if next.exists() {
+            None
+        } else {
+            std::fs::read_to_string(dir.join(FINGERPRINT_FILE)).ok()
+        };
+        if !reuse_blob(stored.as_deref(), shaders()) {
+            if path.exists() {
+                tracing::info!(
+                    stored = stored.as_deref().unwrap_or("none").trim(),
+                    current = shaders(),
+                    "host pipeline library saved for other shaders; starting an empty one"
+                );
+            }
+            return Blob::None;
         }
         if mapped()
             && let Some(file) = Mapped::open(&path)
@@ -440,6 +480,27 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
+/// The fingerprint of the shaders the library on disk was made for
+/// ([`shaders`]), of the library the next start opens.
+const FINGERPRINT_FILE: &str = "host-pipelines.fingerprint";
+
+/// What this run's host pipelines are made from, as [`FINGERPRINT_FILE`]
+/// holds it: the translator, its settings and what it was told of the
+/// host, and the driver ([`super::known::fingerprint`]). Not our
+/// executable: a rebuild that translates the same way keeps the library.
+fn shaders() -> &'static str {
+    static NOW: OnceLock<String> = OnceLock::new();
+    NOW.get_or_init(super::known::fingerprint)
+}
+
+/// Whether a library saved with the fingerprint `stored` is opened by a run
+/// whose shaders have the fingerprint `current`: only when they are the
+/// same. With none (a library saved before fingerprints were written, or a
+/// save cut short between its rename and the fingerprint) it is not: the
+/// stale pipelines of an earlier translation would stay in it for good.
+fn reuse_blob(stored: Option<&str>, current: &str) -> bool {
+    !current.is_empty() && stored.is_some_and(|stored| stored.trim() == current)
+}
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
@@ -645,42 +706,70 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!(error = %e, "host pipeline library not saved");
-        return;
-    }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
-    let bytes = {
+    // of the library again: run 60's second save). None: nothing to save.
+    save_in(dir, |tmp| {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
-            return;
+            return None;
         }
         if added == 0 {
-            0
+            Some(0)
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
             let _call = call("serialise", "the whole library");
-            if let Err(e) = serialise(&library.library, &tmp, size) {
+            if let Err(e) = serialise(&library.library, tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
-                let _ = std::fs::remove_file(&tmp);
-                return;
+                let _ = std::fs::remove_file(tmp);
+                return None;
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
-            size
+            Some(size)
         }
-    };
+    });
+}
+
+/// One save into `dir`: `serialised` writes the library to the file it is
+/// given (its bytes; 0: none added, only the lists are written; None:
+/// nothing to save), then the library takes the old one's place with its
+/// fingerprint, then the slow and early lists are written. The result,
+/// unless there was nothing to save.
+///
+/// Saves never overlap, from the first byte serialised to the early list:
+/// they share the file the library is serialised to. A worker save that
+/// had serialised and was renaming that file into place while the
+/// shutdown save truncated and refilled it (the shutdown save's own lock
+/// on the library is free once the worker's serialisation ends) renamed a
+/// library still being written, under its fingerprint; the shutdown save
+/// then found no file to rename, failed, and wrote neither list. One lock
+/// for the whole save rather than a file of its own for each: two saves
+/// cannot then rename in the other order (an older library over a newer
+/// one), and nothing is left to clean up. Taken after the `SAVE_EVERY`
+/// check, so a worker that finds a save running returns there instead of
+/// waiting for it; no caller of [`save`] holds a lock, and no lock taken
+/// inside is held by anyone who saves, so it cannot deadlock.
+fn save_in(
+    dir: &std::path::Path,
+    serialised: impl FnOnce(&std::path::Path) -> Option<usize>,
+) -> Option<std::io::Result<usize>> {
+    static SAVING: Mutex<()> = Mutex::new(());
+    let _whole = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %e, "host pipeline library not saved");
+        return Some(Err(e));
+    }
+    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let bytes = serialised(&tmp)?;
     // Through `used`: a process that asked for none yet (`leonida shaders`)
     // must not write the earlier runs' list over with nothing.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    let used: Vec<String> = used().as_ref().map(|e| e.lines(early_runs())).unwrap_or_default();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -700,7 +789,7 @@ pub(crate) fn save(now: bool) {
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
-    match written {
+    match &written {
         Ok(()) => tracing::info!(
             bytes,
             early = used.len(),
@@ -711,6 +800,7 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
+    Some(written.map(|()| bytes))
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through
@@ -737,9 +827,42 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// the mapping goes on reading the old one for as long as a handle on it
 /// is open ([`holds`]; with none, only the pages in memory at that moment
 /// stay: the rest read as zeros). Where a system refuses, the new library
-/// is left beside it as [`NEXT_FILE`] for the next start.
+/// is left beside it as [`NEXT_FILE`] for the next start. The new library
+/// was made for this run's shaders ([`replace_library_for`]).
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    replace_library_for(dir, tmp, shaders())
+}
+
+/// As [`replace_library`], for a library made for the shaders with the
+/// fingerprint `current` ([`shaders`]). When [`FINGERPRINT_FILE`] holds
+/// another (this run started empty), it is deleted before the rename and
+/// written after: a save cut short in between leaves a library with no
+/// fingerprint, which the next start does not open. Written first, a crash
+/// before the rename would leave the old library under this fingerprint,
+/// and every later save would keep its stale pipelines. Saves never overlap
+/// ([`save_in`]): one could delete the fingerprint the other just wrote and
+/// then fail its rename.
+fn replace_library_for(dir: &std::path::Path, tmp: &std::path::Path, current: &str) -> std::io::Result<()> {
+    let noted = dir.join(FINGERPRINT_FILE);
+    let same = reuse_blob(std::fs::read_to_string(&noted).ok().as_deref(), current);
+    if !same {
+        match std::fs::remove_file(&noted) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    if std::fs::rename(tmp, dir.join(LIBRARY_FILE)).is_ok() {
+        // A library an earlier save left waiting is older than this one,
+        // yet the next start would rename it over this one, and open it
+        // under this fingerprint.
+        match std::fs::remove_file(dir.join(NEXT_FILE)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound && !same => return Err(e),
+            _ => {}
+        }
+    } else {
+        std::fs::rename(tmp, dir.join(NEXT_FILE))?;
+    }
+    if same { Ok(()) } else { write_atomically(&noted, current.as_bytes()) }
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -803,25 +926,97 @@ pub(crate) fn note_time(key: &str, ms: u64) {
     }
 }
 
-/// Title pipeline keys requested by draws or dispatches (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Title pipeline keys requested by draws or dispatches (this run and the
+/// last, [`early_runs`]).
+static USED: Mutex<Option<Early>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+/// How many runs' title pipelines the early list keeps: 2, those this run
+/// requested and those the run before did, so a pipeline is started early
+/// by the two runs after the last one that drew with it. The list held
+/// every run's: each pipeline drawn with in any earlier run was started at
+/// the title's creation of it, at every load, and kept as a host pipeline
+/// for the whole session whether this run drew with it or not. It grew
+/// with every place visited, and at `EARLY_MAX` it stopped taking new ones.
+/// `LEONIDA_EARLY_RUNS=<n>`: n runs; 0: every run's, as before.
+fn early_runs() -> u64 {
+    static RUNS: OnceLock<u64> = OnceLock::new();
+    *RUNS.get_or_init(|| {
+        std::env::var("LEONIDA_EARLY_RUNS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2)
+    })
+}
+
+/// The early list ([`EARLY_FILE`]): a key and the run that last requested
+/// it on each line. Runs are counted by the list itself: this one is one
+/// past the newest written down. A line with a key alone (a list written
+/// before runs were counted) is one of run 0.
+struct Early {
+    /// This run's number.
+    run: u64,
+    keys: HashMap<String, u64>,
+}
+
+impl Early {
+    fn read(text: &str) -> Early {
+        let mut keys: HashMap<String, u64> = HashMap::new();
+        for line in text.lines() {
+            let mut words = line.split_ascii_whitespace();
+            let Some(key) = words.next() else { continue };
+            let run = words.next().and_then(|r| r.parse().ok()).unwrap_or(0);
+            let last = keys.entry(key.to_owned()).or_insert(run);
+            *last = run.max(*last);
+        }
+        let run = keys.values().copied().max().unwrap_or(0).saturating_add(1);
+        Early { run, keys }
+    }
+
+    /// Whether a run on the list requested `key`.
+    fn has(&self, key: &str) -> bool {
+        self.keys.contains_key(key)
+    }
+
+    /// This run requested `key`; whether the list changed: a key new to it,
+    /// or one an earlier run requested last (its run is written again).
+    fn note(&mut self, key: &str) -> bool {
+        if let Some(last) = self.keys.get_mut(key) {
+            return std::mem::replace(last, self.run) != self.run;
+        }
+        self.keys.len() < EARLY_MAX && self.keys.insert(key.to_owned(), self.run).is_none()
+    }
+
+    /// The lines to write, by key: the keys requested in the last `runs`
+    /// runs (0: in any). They are counted back from the newest run on the
+    /// list, which is this one once it has requested a pipeline: a process
+    /// that requests none (one that only translates shaders) writes the
+    /// list back as it found it, and is not a run that ages the others out.
+    fn lines(&self, runs: u64) -> Vec<String> {
+        let newest = self.keys.values().copied().max().unwrap_or(0);
+        let mut kept: Vec<(&String, &u64)> = self
+            .keys
+            .iter()
+            .filter(|&(_, &last)| runs == 0 || last.saturating_add(runs) > newest)
+            .collect();
+        kept.sort_unstable();
+        kept.into_iter().map(|(key, last)| format!("{key} {last}")).collect()
+    }
+}
+
+fn used() -> std::sync::MutexGuard<'static, Option<Early>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
         let listed = DIR
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
-        *used = Some(set);
+        let early = Early::read(&listed);
+        tracing::info!(pipelines = early.keys.len(), "title pipelines to start early");
+        *used = Some(early);
     }
     used
 }
 
-/// Whether the title pipeline with `key` was requested in this or an earlier run.
+/// Whether the title pipeline with `key` was requested in this run or one
+/// of the earlier runs the early list keeps ([`early_runs`]).
 ///
 /// `LEONIDA_EARLY_ALL=1`: every title pipeline is started at creation,
 /// requested before or not, so that the driver's own cache holds it for
@@ -831,14 +1026,12 @@ pub(crate) fn wanted_early(key: &str) -> bool {
     if *ALL.get_or_init(|| std::env::var_os("LEONIDA_EARLY_ALL").is_some_and(|v| v == "1")) {
         return true;
     }
-    used().as_ref().is_some_and(|s| s.contains(key))
+    used().as_ref().is_some_and(|early| early.has(key))
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    if used().get_or_insert_with(|| Early::read("")).note(key) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -892,6 +1085,8 @@ mod tests {
     fn the_library_file_is_mapped_and_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LIBRARY_FILE);
+        // A library of this run's shaders.
+        std::fs::write(dir.path().join(FINGERPRINT_FILE), shaders()).unwrap();
         assert!(matches!(Blob::of(dir.path()), Blob::None), "no file yet");
         std::fs::write(&path, b"").unwrap();
         assert!(matches!(Blob::of(dir.path()), Blob::None), "an empty file");
@@ -915,6 +1110,112 @@ mod tests {
         drop(blob);
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
+        assert!(!dir.path().join(NEXT_FILE).exists());
+    }
+
+    #[test]
+    fn a_library_is_reused_only_for_the_same_shaders() {
+        assert!(reuse_blob(Some("0123456789abcdef"), "0123456789abcdef"));
+        // As a file holds it, with a line end added by hand.
+        assert!(reuse_blob(Some("0123456789abcdef\r\n"), "0123456789abcdef"));
+        assert!(!reuse_blob(Some("fedcba9876543210"), "0123456789abcdef"), "a translator change");
+        assert!(!reuse_blob(None, "0123456789abcdef"), "saved before fingerprints, or a save cut short");
+        assert!(!reuse_blob(Some(""), "0123456789abcdef"));
+        assert!(!reuse_blob(Some(""), ""));
+    }
+
+    /// The library of an earlier translation is not opened (main opened
+    /// whatever the file held, and saved it back whole with the new
+    /// pipelines); one saved for this run's shaders is.
+    #[test]
+    fn a_library_saved_for_other_shaders_is_not_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = b"pipelines of an earlier translation".repeat(64);
+        std::fs::write(dir.path().join(LIBRARY_FILE), &old).unwrap();
+        let noted = dir.path().join(FINGERPRINT_FILE);
+        assert!(matches!(Blob::of(dir.path()), Blob::None), "no fingerprint written");
+        std::fs::write(&noted, "not these shaders").unwrap();
+        assert!(matches!(Blob::of(dir.path()), Blob::None), "the fingerprint of other shaders");
+        std::fs::write(&noted, shaders()).unwrap();
+        assert_eq!(Blob::of(dir.path()).bytes(), &old[..], "the fingerprint of these shaders");
+    }
+
+    /// A save writes the fingerprint of its shaders with the library, drops
+    /// a library left waiting by an earlier save, and leaves no fingerprint
+    /// that names other shaders than the library's.
+    #[test]
+    fn a_save_writes_its_fingerprint_with_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let (library, next, noted) =
+            (dir.path().join(LIBRARY_FILE), dir.path().join(NEXT_FILE), dir.path().join(FINGERPRINT_FILE));
+        let tmp = library.with_extension("tmp");
+        std::fs::write(&library, b"old").unwrap();
+        std::fs::write(&next, b"older, waiting").unwrap();
+        std::fs::write(&noted, "old shaders").unwrap();
+        std::fs::write(&tmp, b"new").unwrap();
+        replace_library_for(dir.path(), &tmp, "new shaders").unwrap();
+        assert_eq!(std::fs::read(&library).unwrap(), b"new");
+        assert!(!next.exists(), "the waiting library would have taken the new one's place");
+        assert_eq!(std::fs::read_to_string(&noted).unwrap(), "new shaders");
+        // A later save of the same shaders keeps the fingerprint.
+        std::fs::write(&tmp, b"newer").unwrap();
+        replace_library_for(dir.path(), &tmp, "new shaders").unwrap();
+        assert_eq!(std::fs::read(&library).unwrap(), b"newer");
+        assert_eq!(std::fs::read_to_string(&noted).unwrap(), "new shaders");
+        // A save for other shaders cut short before its library is in place
+        // (here: no new library to rename) leaves no fingerprint: the
+        // library on disk is opened by neither the old shaders nor these.
+        replace_library_for(dir.path(), &tmp, "other shaders").unwrap_err();
+        assert!(!noted.exists());
+    }
+
+    /// A worker save and the shutdown save overlapping: the second starts
+    /// once the first has serialised its library and not yet renamed it into
+    /// place. Both succeed, and what is left is the second's whole library
+    /// under this run's fingerprint, with the lists. (With only the
+    /// serialisation and the rename locked, the second refilled the file the
+    /// first then renamed, and the first failed its own rename and wrote no
+    /// list.)
+    #[test]
+    fn overlapping_saves_leave_one_whole_library_and_its_lists() {
+        const LEN: usize = 1 << 20;
+        // Worked out once, first: in the second save it may outlast the gap.
+        let current = shaders();
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join(LIBRARY_FILE);
+        std::fs::write(&library, b"a library of other shaders").unwrap();
+        std::fs::write(dir.path().join(FINGERPRINT_FILE), "old shaders").unwrap();
+        // Serialises a library of `LEN` bytes of `byte`, as `serialise` does.
+        fn fill(tmp: &std::path::Path, byte: u8) -> Option<usize> {
+            match Mapped::create(tmp, LEN) {
+                Some(mut file) => file.bytes_mut().fill(byte),
+                None => std::fs::write(tmp, vec![byte; LEN]).unwrap(),
+            }
+            Some(LEN)
+        }
+        let (serialised, gap) = std::sync::mpsc::channel();
+        let first = {
+            let dir = dir.path().to_owned();
+            std::thread::spawn(move || {
+                save_in(&dir, |tmp| {
+                    let bytes = fill(tmp, 1);
+                    serialised.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    bytes
+                })
+            })
+        };
+        gap.recv().unwrap();
+        let second = save_in(dir.path(), |tmp| fill(tmp, 2));
+        let first = first.join().unwrap();
+        assert_eq!(first.unwrap().unwrap(), LEN);
+        assert_eq!(second.unwrap().unwrap(), LEN);
+        let saved = std::fs::read(&library).unwrap();
+        assert_eq!(saved.len(), LEN);
+        assert!(saved.iter().all(|&b| b == 2), "the second save's library, whole");
+        assert_eq!(std::fs::read_to_string(dir.path().join(FINGERPRINT_FILE)).unwrap(), current);
+        assert!(dir.path().join(SLOW_FILE).exists() && dir.path().join(EARLY_FILE).exists());
+        assert!(!library.with_extension("tmp").exists());
         assert!(!dir.path().join(NEXT_FILE).exists());
     }
 
@@ -985,6 +1286,93 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+
+    /// The keys an early list's text holds, sorted.
+    fn listed(text: &str) -> Vec<&str> {
+        let mut keys: Vec<&str> = text.lines().filter_map(|l| l.split(' ').next()).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Five runs, each drawing with pipelines of its own: the list the last
+    /// one writes holds those of that run and the one before, and the next
+    /// run starts only those early. It held every run's, so each pipeline
+    /// drawn with in any run ever became a host pipeline at every load.
+    #[test]
+    fn the_early_list_keeps_the_last_two_runs() {
+        let mut text = String::new();
+        for run in 1..=5 {
+            let mut early = Early::read(&text);
+            for n in 0..2 {
+                assert!(early.note(&format!("run{run}-{n}")));
+            }
+            text = early.lines(2).join("\n");
+        }
+        assert_eq!(listed(&text), ["run4-0", "run4-1", "run5-0", "run5-1"]);
+        let next = Early::read(&text);
+        assert!(next.has("run4-0") && next.has("run5-1"));
+        assert!(!next.has("run3-0") && !next.has("run1-0"));
+    }
+
+    /// A pipeline drawn with again in a later run stays listed from then on.
+    #[test]
+    fn a_pipeline_drawn_with_again_stays_listed() {
+        let mut text = String::new();
+        for run in 1..=5 {
+            let mut early = Early::read(&text);
+            early.note(&format!("run{run}"));
+            if run % 2 == 1 {
+                // The list changes (its run is written down), once a run.
+                assert!(early.note("odd-runs"));
+                assert!(!early.note("odd-runs"));
+            }
+            text = early.lines(2).join("\n");
+        }
+        assert_eq!(listed(&text), ["odd-runs", "run4", "run5"]);
+    }
+
+    /// A list written before runs were counted (a key alone on each line)
+    /// still loads: its keys are started early, kept for one more run and
+    /// then age as the others do.
+    #[test]
+    fn an_early_list_without_runs_still_loads() {
+        let mut early = Early::read("old-a\nold-b\n\n");
+        assert!(early.has("old-a") && early.has("old-b"));
+        early.note("new");
+        let text = early.lines(2).join("\n");
+        assert_eq!(listed(&text), ["new", "old-a", "old-b"]);
+        let mut next = Early::read(&text);
+        next.note("new");
+        next.note("old-b");
+        assert_eq!(listed(&next.lines(2).join("\n")), ["new", "old-b"]);
+    }
+
+    /// A process that requests no pipeline (one that only translates
+    /// shaders) writes the list back as it found it: it is not a run that
+    /// ages the others out.
+    #[test]
+    fn a_process_that_requests_nothing_writes_the_list_back() {
+        let mut text = String::new();
+        for run in 1..=3 {
+            let mut early = Early::read(&text);
+            early.note(&format!("run{run}"));
+            text = early.lines(2).join("\n");
+        }
+        assert_eq!(Early::read(&text).lines(2).join("\n"), text);
+        assert_eq!(listed(&text), ["run2", "run3"]);
+    }
+
+    /// `LEONIDA_EARLY_RUNS=0`: every run's pipelines stay listed, as before.
+    #[test]
+    fn no_count_of_runs_keeps_every_run() {
+        let mut text = String::new();
+        for run in 1..=4 {
+            let mut early = Early::read(&text);
+            early.note(&format!("run{run}"));
+            text = early.lines(0).join("\n");
+        }
+        assert_eq!(listed(&text), ["run1", "run2", "run3", "run4"]);
     }
 
     #[test]

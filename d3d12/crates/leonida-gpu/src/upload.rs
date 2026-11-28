@@ -122,8 +122,17 @@ impl Upload {
     }
 }
 
+/// Where the uploads given back started, in order, so the tests can see
+/// which were.
+#[cfg(test)]
+pub(crate) static GIVEN_BACK: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
 impl Drop for Upload {
     fn drop(&mut self) {
+        // Noted before the blocks are free, so that an upload made at the
+        // same place later is noted after this one.
+        #[cfg(test)]
+        GIVEN_BACK.lock().unwrap_or_else(|e| e.into_inner()).push(self.start() as usize);
         let Kind::Low(at, len) = self.0 else { return };
         let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(arena) = arenas.iter_mut().find(|a| (a.at..a.at + a.taken.len() * BLOCK).contains(&at)) {

@@ -229,6 +229,8 @@ struct TargetView {
     std::uint32_t first_layer;
     std::uint32_t layer_count;
     ColorViewFormat format = ColorViewFormat::resource;
+
+    bool operator==(const TargetView&) const = default;
 };
 
 // D3D12_RECT: right and bottom are exclusive.
@@ -399,6 +401,8 @@ struct VertexBufferView {
     std::uint64_t va;
     std::uint32_t size;
     std::uint32_t stride;
+
+    bool operator==(const VertexBufferView&) const = default;
 };
 
 struct IndexBufferView {
@@ -985,6 +989,17 @@ public:
         active_.clear();
         closed_ = false;
         stamp_.restamp();
+        return true;
+    }
+
+    // The recording is dropped and no new one begins, for a closed list its owner will not execute again before its
+    // next Reset (a list-value cut's spare, d3d12_xs_device.cpp restart_recording): it keeps no commands and no
+    // stamp, so it holds back no copy the layer retires (command_list_epochs.h). Executed anyway, it replays nothing.
+    bool drop_recording() {
+        if (!closed_) return false;
+        commands_.clear();
+        active_.clear();
+        stamp_.drop();
         return true;
     }
 

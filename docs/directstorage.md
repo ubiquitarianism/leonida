@@ -226,10 +226,14 @@ shim beyond the size check it already does. The last one is behaviour the first 
 - Two adjacent file-backed transforms can read and decode concurrently into private buffers. A queue has
   one ordered publisher. Mutable memory inputs, page-list resolution, status slots, events, fences, and
   overlapping destinations retain their enqueue order. At most two helpers run across all queues and each
-  assisted request has a 16 MiB eligibility limit. A shared 64 MiB window covers private source,
-  intermediate, output and page-number buffers across queues. Each transform releases its previous input
-  and each request releases the final buffer at retirement. A valid request larger than the window runs
-  alone, bounded by the ABI maximum of two 1 GiB payloads. Raw buffer reads use no private staging.
+  assisted request has a 16 MiB eligibility limit. A shared 64 MiB window covers the private source,
+  intermediate, output and page-number buffers of the requests running across queues. A valid request
+  larger than the window runs alone, bounded by the ABI maximum of two 1 GiB payloads. Raw buffer reads
+  use no private staging.
+  Each queue's worker keeps its staging buffers from one request to the next (its own and its helper's),
+  so streaming does not allocate and zero-fill them per request. Between requests it keeps at most
+  16 MiB of them, dropping the largest first; a larger request has its buffers for its own time. What the
+  workers keep is outside the 64 MiB window: idle queues hold up to 16 MiB each until they close.
   With tracing enabled, `ds-staging` reports the process peak reservation and return to zero. The figure
   excludes title destinations, allocator overhead and fixed decoder stacks. `LEONIDA_DSTORAGE_WORKERS=1`
   restores serial execution.

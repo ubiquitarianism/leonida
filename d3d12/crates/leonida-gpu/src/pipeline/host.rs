@@ -174,8 +174,10 @@ fn linear_filter(filter: u32) -> u32 {
     }
 }
 
-/// The filter of an immediate sampler of `shader` ([`LinearScope`]).
-fn static_filter(shader: &Shader, filter: u32) -> u32 {
+/// Whether the immediate samplers of the program with `hash` and `container`
+/// are made linear ([`LinearScope`]). Asked when it is translated, as its
+/// container goes then (`Shader::translated`).
+pub(super) fn linear_samplers(hash: &str, container: &[u8]) -> bool {
     static SCOPE: std::sync::OnceLock<LinearScope> = std::sync::OnceLock::new();
     let scope = SCOPE.get_or_init(|| {
         let scope = LinearScope::parse(&std::env::var("LEONIDA_STATIC_SAMPLERS_LINEAR").unwrap_or_default());
@@ -184,7 +186,12 @@ fn static_filter(shader: &Shader, filter: u32) -> u32 {
         }
         scope
     });
-    if scope.takes(&shader.hash, &shader.container) { linear_filter(filter) } else { filter }
+    scope.takes(hash, container)
+}
+
+/// The filter of an immediate sampler of `shader` ([`linear_samplers`]).
+fn static_filter(shader: &Shader, filter: u32) -> u32 {
+    if shader.translated().is_some_and(|t| t.linear_samplers) { linear_filter(filter) } else { filter }
 }
 
 fn integer_format(f: DXGI_FORMAT) -> bool {
@@ -829,7 +836,7 @@ impl HostPipeline {
                 Err(e) => {
                     {
                     let names: Vec<_> =
-                        stages.iter().filter_map(|(s, _)| crate::pipeline::program_name(&s.container)).collect();
+                        stages.iter().filter_map(|(s, _)| s.translated()?.program.clone()).collect();
                     tracing::warn!(error = %e, ?shaders, ?names, "host pipeline refused");
                 }
                     host.log_messages();
@@ -997,7 +1004,7 @@ impl HostPipeline {
             Err(e) => {
                 {
                     let names: Vec<_> =
-                        stages.iter().filter_map(|(s, _)| crate::pipeline::program_name(&s.container)).collect();
+                        stages.iter().filter_map(|(s, _)| s.translated()?.program.clone()).collect();
                     tracing::warn!(error = %e, ?shaders, ?names, "host pipeline refused");
                 }
                 host.log_messages();

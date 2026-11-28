@@ -7,7 +7,7 @@
 //! The title creates some 60,000 pipelines in its first 20
 //! seconds and draws with a few dozen (decision 0007, step 3). Shader
 //! containers are shared by content hash and translated once, on first
-//! use (decision 0003).
+//! use (decision 0003); a translated shader lets its container go.
 //!
 //! shortcut: only vertex plus pixel pipelines from streams and compute
 //! pipelines get host pipelines; mesh, tessellation and geometry stages,
@@ -60,12 +60,38 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
-    container: Vec<u8>,
+    /// Its whole BLAKE3 (its key in [`SHADERS`]) and its size, which stay
+    /// when the container goes.
+    full: [u8; 32],
+    size: usize,
+    /// The container, until the shader is translated ([`Shader::translated`]).
+    /// The title passes one for each of its programs, and only a minority is
+    /// ever translated, but a translated one has every later read of its
+    /// container answered apart: the program's name and whether its samplers
+    /// are made linear in [`Translated`], what pipeline creation asks in
+    /// [`Facts`]. Readers take a reference, so that one that still reads it
+    /// (a translation, the pipeline book) does not hold the others up.
+    container: Mutex<Option<Arc<[u8]>>>,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
+    facts: OnceLock<Facts>,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+}
+
+/// What creating a pipeline asks of the containers of its shaders. It is
+/// answered once per shader, at the first creation or at the latest when the
+/// container goes ([`Shader::translated`]): a pipeline created afterwards
+/// from the same bytes gets the shader, which no longer has its container.
+#[cfg(windows)]
+struct Facts {
+    /// A program of the ray-tracing structure builder ([`of_builder`]).
+    builder: bool,
+    /// Which of the programs `make` may leave out by name it is, a bit for
+    /// each of `make::NAMES`.
+    named: u8,
 }
 
 impl std::fmt::Debug for Shader {
@@ -78,7 +104,8 @@ impl std::fmt::Debug for Shader {
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
 /// For the memory lines: containers kept and their bytes, translations
-/// kept and the bytes of their host code. None of them is ever let go.
+/// kept and the bytes of their host code. A container is let go when its
+/// shader is translated ([`Shader::translated`]); a translation never is.
 static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// What the shader table and the pipeline library keep in memory:
@@ -130,14 +157,55 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
+                full: *full.as_bytes(),
+                size: bytes.len(),
+                container: Mutex::new(Some(bytes.into())),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
+                facts: OnceLock::new(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
         })
         .clone()
+}
+
+impl Shader {
+    /// The container, while the shader keeps it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn container(&self) -> Option<Arc<[u8]>> {
+        let kept = self.container.lock().unwrap_or_else(|e| e.into_inner());
+        kept.clone()
+    }
+
+    /// Lets the container go: what is read of it later is kept apart.
+    #[cfg(windows)]
+    pub(crate) fn let_container_go(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut kept = self.container.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.take().is_some() {
+            KEPT[0].fetch_sub(1, Relaxed);
+            KEPT[1].fetch_sub(self.size as u64, Relaxed);
+        }
+    }
+
+    /// What creating a pipeline asks of the container ([`Facts`]).
+    #[cfg(windows)]
+    fn facts(&self) -> &Facts {
+        self.facts.get_or_init(|| {
+            let Some(container) = self.container().filter(|_| self.stage == "compute") else {
+                return Facts {
+                    builder: false,
+                    named: 0,
+                };
+            };
+            Facts {
+                builder: spilled(&container),
+                named: make::names(&container),
+            }
+        })
+    }
 }
 
 /// A translated shader and the console resources its code reads.
@@ -164,6 +232,11 @@ pub(crate) struct Translated {
     /// A compute program translated to run several console groups to a host group
     /// (`LEONIDA_GROUP_PACK`): where its console grid goes (`crate::draw::pack_of`).
     pub(crate) pack: Option<crate::draw::PackWords>,
+    /// The program's own name in its container ([`program_name`]), for the
+    /// logs of a refused host pipeline after the container has gone.
+    pub(crate) program: Option<String>,
+    /// Whether its immediate samplers filter linearly (`host::linear_samplers`).
+    pub(crate) linear_samplers: bool,
     /// Whether a bound packed program was logged (`crate::draw::pack_of`).
     pub(crate) pack_logged: std::sync::atomic::AtomicBool,
     /// Whether it stores through a view it picks from the heap by an index,
@@ -177,18 +250,21 @@ pub(crate) struct Translated {
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
-    /// translate is logged once.
+    /// translate is logged once. A shader that translates lets its container
+    /// go then.
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                // Still here: it goes below, once, after the translation.
+                let container = self.container()?;
+                let done = translate(&container, &self.hash);
                 // `LEONIDA_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("LEONIDA_SHADER_SAVE") {
                     let dir = std::path::PathBuf::from(dir);
                     let _ = std::fs::create_dir_all(&dir);
                     let stem = format!("{}.{}", self.hash, self.stage);
-                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
+                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &*container);
                     if let Ok(t) = &done {
                         let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
                     }
@@ -212,6 +288,16 @@ impl Shader {
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
+                // Nothing translates it again, and what is read of the container from here on
+                // was kept above or is in its facts, so the container goes. Not while
+                // `crate::picked` may still read the programs of a shader that stores: it lets
+                // the container go when it has its answer.
+                if let Ok(t) = &done {
+                    self.facts();
+                    if !(t.stores && crate::picked::on()) {
+                        self.let_container_go();
+                    }
+                }
                 done.ok()
             })
             .as_ref()
@@ -220,17 +306,20 @@ impl Shader {
 
 #[cfg(windows)]
 impl Shader {
-    /// The console programs of the container; `None` if they are not known.
+    /// The console programs of the container; `None` if they are not known,
+    /// or if the container has gone ([`Shader::translated`] keeps it for
+    /// `crate::picked`, the one caller).
     pub(crate) fn programs(&self) -> Option<Vec<leonida_shader::NativeProgram>> {
         use leonida_shader::{Container, FourCC};
-        let c = Container::parse(&self.container).ok()?;
+        let container = self.container()?;
+        let c = Container::parse(&container).ok()?;
         let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
         leonida_shader::native_programs(part.data).ok()
     }
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate(container: &[u8], hash: &str) -> Result<Translated, String> {
     use leonida_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -275,6 +364,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         stores_past_views,
         writes,
         pack,
+        program: program_name(container),
+        linear_samplers: crate::pipeline::host::linear_samplers(hash, container),
         pack_logged: Default::default(),
         picks: Default::default(),
         bound: Default::default(),
@@ -326,12 +417,16 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
-    use leonida_shader::{Container, FourCC};
     let [shader] = shaders else { return false };
-    if shader.stage != "compute" {
-        return false;
-    }
-    let Ok(c) = Container::parse(&shader.container) else {
+    shader.facts().builder
+}
+
+/// Whether a compute container has a program with a spilled user-data table,
+/// as the structure builder's programs do ([`Facts::builder`]).
+#[cfg(windows)]
+fn spilled(container: &[u8]) -> bool {
+    use leonida_shader::{Container, FourCC};
+    let Ok(c) = Container::parse(container) else {
         return false;
     };
     c.part(FourCC::DXIL)
@@ -685,7 +780,7 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.size, hash = %shader.hash, "first bind");
     }
 }
 
@@ -1270,7 +1365,7 @@ mod tests {
         pipeline(p)
             .shaders
             .iter()
-            .map(|s| (s.stage, s.container.clone()))
+            .map(|s| (s.stage, s.container().expect("not translated").to_vec()))
             .collect()
     }
 
@@ -1316,13 +1411,113 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 
+    /// The bytes of its container that a shader still keeps.
+    #[cfg(windows)]
+    fn held(shader: &Shader) -> usize {
+        shader.container().map_or(0, |c| c.len())
+    }
+
+    /// A console compute container as the title passes one: a `DXBC` header
+    /// and an `ACCC` part with an `FSPX` program of 64 threads that only ends
+    /// (`s_endpgm`), then `tail`, past the size the header gives (the parser
+    /// stops there), which tells containers apart.
+    #[cfg(windows)]
+    fn compute_container(tail: &[u8]) -> Vec<u8> {
+        fn put(out: &mut Vec<u8>, words: &[u32]) {
+            out.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+        }
+        // The pipeline registers: threads 64x1x1 (+0x0c), wave32 (+0x12 bit 4).
+        let mut packet = vec![0u8; 0x1c];
+        for (at, half) in [(0x0c, 64u16), (0x0e, 1), (0x10, 1), (0x12, 1 << 4)] {
+            packet[at..at + 2].copy_from_slice(&half.to_le_bytes());
+        }
+        let code = 0xbf81_0000u32.to_le_bytes();
+        // The program metadata: no records, one dword of code.
+        let mut meta = Vec::new();
+        put(&mut meta, &[0x403, 0x18 - 0x14, 1, 0, 0, 0]);
+        let parts: [(u32, &[u8]); 3] = [(0, &packet), (6, &code), (7, &meta)];
+        let mut fspx = b"FSPX".to_vec();
+        let mut at = 0x10 + 16 * parts.len();
+        let size = at + parts.iter().map(|(_, data)| data.len()).sum::<usize>();
+        put(&mut fspx, &[1, parts.len() as u32, size as u32]);
+        for (kind, data) in parts {
+            put(&mut fspx, &[kind, at as u32, data.len() as u32, 0]);
+            at += data.len();
+        }
+        for (_, data) in parts {
+            fspx.extend(data);
+        }
+        let mut out = b"DXBC".to_vec();
+        out.extend([0; 16]);
+        put(&mut out, &[1, (0x24 + 8 + fspx.len()) as u32, 1, 0x24]);
+        out.extend(b"ACCC");
+        put(&mut out, &[fspx.len() as u32]);
+        out.extend(fspx);
+        out.extend(tail);
+        out
+    }
+
+    /// A translated shader keeps what is still read of its container, and
+    /// lets the container go: the title passes one for each of its tens of
+    /// thousands of programs, and every pipeline that shares the shader
+    /// shares the translation. A pipeline created afterwards from the same
+    /// bytes shares the shader, and pipeline creation answers for it what it
+    /// answered while the container was there.
+    #[cfg(windows)]
+    #[test]
+    fn translated_shaders_let_their_containers_go() {
+        const COUNT: usize = 64;
+        let tail = |n: usize| {
+            let mut tail = vec![0u8; 32 << 10];
+            tail[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            // Each a program `make` leaves out by its name, as long as the
+            // ray-tracing structure builder is off (`make::left_out`).
+            tail[100..120].copy_from_slice(b"CS_RaytracingResolve");
+            tail
+        };
+        let containers: Vec<Vec<u8>> = (0..COUNT).map(|n| compute_container(&tail(n))).collect();
+        let create = |container: &[u8]| {
+            let desc = ComputeHead {
+                root: std::ptr::null(),
+                stage: Bytecode {
+                    code: container.as_ptr(),
+                    size: container.len(),
+                },
+            };
+            let mut p = std::ptr::null();
+            let hr = create_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
+            assert_eq!(hr, S_OK);
+            p
+        };
+        let pipelines: Vec<This> = containers.iter().map(|c| create(c)).collect();
+        let shaders: Vec<&Arc<Shader>> =
+            pipelines.iter().map(|&p| &pipeline(p).shaders[0]).collect();
+        let all_held = || shaders.iter().map(|s| held(s)).sum::<usize>();
+        let total: usize = containers.iter().map(Vec::len).sum();
+        assert_eq!(all_held(), total);
+
+        for s in &shaders {
+            assert!(s.translated().is_some(), "{s:?} translates");
+        }
+        assert_eq!(all_held(), 0, "of {total} bytes");
+
+        let again = create(&containers[0]);
+        assert!(Arc::ptr_eq(&pipeline(again).shaders[0], shaders[0]));
+        assert!(pipeline(again).shaders[0].translated().is_some());
+        // Left out by its name, as the first pipeline with it was.
+        assert_eq!(why_gone(again), why_gone(pipelines[0]));
+        for p in pipelines.into_iter().chain([again]) {
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+        }
+    }
+
     /// The stream layout the title builds (title+0x86f090): root
     /// signature, five shader slots (the first a mesh shader), blend, sample
     /// mask, rasterizer, depth-stencil 1, sample description, input layout,
-    /// topology, render target and depth formats: 0x2b0 bytes.
-    #[test]
-    fn streams_yield_their_shaders() {
-        let (ms, ps) = ([9u8; 7], [4u8; 5]);
+    /// topology, render target and depth formats: 0x2b0 bytes. With mesh
+    /// shader `ms`, pixel shader `ps`, topology type `topology` and one
+    /// render target of format 28.
+    fn mesh_stream(ms: &[u8], ps: &[u8], topology: u64) -> This {
         let mut stream = vec![0u8; 0x2b0];
         let mut put = |at: usize, v: u64| stream[at..at + 8].copy_from_slice(&v.to_le_bytes());
         for (at, kind) in [
@@ -1347,8 +1542,7 @@ mod tests {
         put(0x20, ms.len() as u64);
         put(0x30, ps.as_ptr() as u64);
         put(0x38, ps.len() as u64);
-        // Topology type 3 (triangles), one render target of format 28.
-        put(0x278, 14 | 3 << 32);
+        put(0x278, 14 | topology << 32);
         put(0x280, 15 | 28 << 32);
         put(0x2a0, 1 << 32);
         let desc = StreamDesc {
@@ -1358,6 +1552,14 @@ mod tests {
         let mut p = std::ptr::null();
         let hr = create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
         assert_eq!(hr, S_OK);
+        p
+    }
+
+    #[test]
+    fn streams_yield_their_shaders() {
+        let (ms, ps) = ([9u8; 7], [4u8; 5]);
+        // Topology type 3 (triangles).
+        let p = mesh_stream(&ms, &ps, 3);
         assert_eq!(shaders(p), [("mesh", ms.to_vec()), ("pixel", ps.to_vec())]);
         #[cfg(windows)]
         {
@@ -1368,5 +1570,24 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    /// Pipelines created with the same graphics state share one copy of it,
+    /// and one with another state has its own. Each title pipeline kept a
+    /// copy of its own for the session: 84,000 of them, of some 5,700
+    /// different states.
+    #[cfg(windows)]
+    #[test]
+    fn pipelines_of_one_graphics_state_share_it() {
+        let (ms, ps) = ([7u8; 9], [6u8; 3]);
+        let state = |p: This| -> *const host::GraphicsState {
+            pipeline(p).host.graphics.as_deref().unwrap()
+        };
+        let (a, b) = (mesh_stream(&ms, &ps, 3), mesh_stream(&ms, &ps, 3));
+        assert_eq!(state(a), state(b));
+        // Topology type 2 (lines).
+        let lines = mesh_stream(&ms, &ps, 2);
+        assert_ne!(state(a), state(lines));
+        assert_eq!(pipeline(lines).host.graphics.as_deref().unwrap().topology.0, 2);
     }
 }

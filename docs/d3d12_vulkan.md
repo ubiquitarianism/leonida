@@ -92,7 +92,8 @@ enough for the bundled middleware's `d3d12_xs` calls, not for the game. The laye
   start handles returned in RAX at heap slots 9/10. Implement the public chain plus those measured overrides
   explicitly; do not assume every slot. On the retail executable's higher device slots (`runtime/shims/d3d12_xs_device.cpp`),
   slot 86 routes `CreatePipelineState(desc, riid, out)` to PC slot 47 (`ID3D12Device2::CreatePipelineState`) and keeps
-  a deep copy of the stream on the PSO it returns; slot 55 (`CreateDerivedPipelineState(pBasePSO, n, pRecords, riid,
+  a deep copy of the stream on the PSO it returns (its shader bytecode once per content for the process, shared by
+  every PSO whose stream carries the same bytes); slot 55 (`CreateDerivedPipelineState(pBasePSO, n, pRecords, riid,
   out)`, `n` = 1..4 records of 0x14c bytes: a u32 tag, then the payload at +4) patches a copy of that stream and creates
   the PSO through the same path. Tags 0 (`D3D12_DEPTH_STENCIL_DESC`, on DEPTH_STENCIL or DEPTH_STENCIL1), 1
   (`D3D12_RASTERIZER_DESC`), 2 (`D3D12_BLEND_DESC`) and 3 (sample mask) are the TomBox layout (GPL-3.0,
@@ -916,7 +917,8 @@ The compute path, end to end:
   - Shader-visible descriptor heaps also live in it: the CPU handle is its host mapping and the GPU handle is the VA,
     so descriptor bytes the application writes itself are what shaders load.
   - Upload and readback buffers keep their own memory, and their VA is their device address minus the heap base.
-  - Shader programs (FSSM blobs) are copied in as the code base.
+  - Shader programs (FSSM blobs) are copied in as the code base, once per program: the PSOs made from one program
+    share its copy, which goes back to the arena with the last of them (`LEONIDA_SHARE_CODE_BASE`).
 - **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts, both
   the console's (one dword per table; section 3.5, D3D-448): `pack_stage(Stage::Pixel)` for the graphics bind point
   (from s8; a signature past s31 there keeps `pack()`'s s0 layout, logged) and `pack_stage(Stage::Compute)` for the
@@ -1719,7 +1721,10 @@ The copies:
   began before the retirement is gone (reset, released, or a held batch's or the async worker's copy of it run), and
   the submissions recorded by then have completed: a list resolves its root views when they are recorded, so one
   recorded before the retirement and executed, or executed again, after it still names the window
-  (`src/command_list_epochs.h`). Until then its copy stays a target of its pages' tracker, refreshed like the others,
+  (`src/command_list_epochs.h`). A list-value cut's spare drops its recording when it becomes one
+  ([d3d12_xs_console_abi.md](d3d12_xs_console_abi.md)); a list the title closes and then neither resets nor releases
+  keeps every window retired after its recording began, and a retired window still waiting after 30 s is logged once.
+  Until it is freed its copy stays a target of its pages' tracker, refreshed like the others,
   and what the GPU wrote in it goes back to the title's pages: with its submissions' write-back, and once more when it
   is freed (a range noted when a list was recorded can be copied back before a held batch has run). A retired copy goes
   back only on the bytes no live copy over them changed, byte by byte (the window and the buffer that replaced it can
@@ -1780,10 +1785,16 @@ The copies:
   whole gets a copy of its whole range, so the BVH builder's commands are recorded.
 - `LEONIDA_GEOMETRY_MB` sets the device-local memory cap for streamed buffer views. The default is 0.
   A positive cap enables persistent copies of placed buffer SRVs and buffer descriptors in title memory.
-  A GPU-only reservation uses its paired CPU mapping. Matching source ranges share one copy.
+  A GPU-only reservation uses its paired CPU mapping. Matching source ranges share one copy, and a range inside a
+  live, filled copy is answered from that copy at its offset instead of being copied again
+  (`LEONIDA_GEOMETRY_CONTAINED=0`: a copy of its own, as before). The copy of an acceleration structure's whole
+  range (`copy_title_range`: a destination, scratch or input no other range holds whole) is never answered that way,
+  so a release elsewhere in a larger copy cannot take a structure the GPU wrote with it.
   The resource descriptor heap keeps its console indices and original CPU bytes. Its shader-visible copy
   encodes each resolved buffer's offset from the arena base. CPU writes through either physical mapping,
-  file reads and XMem remaps invalidate the affected copies before their next submission.
+  file reads and XMem remaps invalidate the affected copies before their next submission. A filled copy over a
+  64 KiB tile that a file read is still writing (it cannot be guarded yet) takes its other written tiles at once,
+  and that tile once the read has ended (`geometry_views_test` case 18).
   During an untyped heap scan, an extent above 16 MiB with no format or an unrecognized descriptor
   encoding reuses only an independently established geometry view. An explicit table or placed SRV can
   establish that view. The Vulkan memory probe reports populated views, payload and reserved bytes,
@@ -1799,8 +1810,12 @@ The copies:
     extent is forgotten, and its memory is freed only after every ExecuteCommandLists replay in progress at the
     retirement has recorded its submissions and those have completed (`kAfterExecutes`). Before it leaves the
     refresh it is copied once more from its pages if they are still readable (a heap block freed in memory that
-    stays committed). The next view of the range makes a new copy.
-    `geometry_views_test` cases 14-16 cover this without a GPU.
+    stays committed). The ranges answered from inside it go with it, each invalidated by its own address; when the
+    release did not touch one of them, the view's memory also waits until no command list is left whose recording
+    began before those invalidations had run. Unlike a retired title window, the view is not refreshed meanwhile: a
+    list recorded before the retirement and executed after it reads such a range as the last copy left it. The
+    `geometry buffers` line counts the retired views waiting for command lists. The next view of the range makes a
+    new copy. `geometry_views_test` cases 14-17 cover this without a GPU.
 - **Which pages changed** since the last refresh: where xmem reserved the title's memory with `MEM_WRITE_WATCH`
   (`XMemVirtualAlloc`'s ordinary regions and the title's `VirtualAlloc` reservations, not placeholders or
   physical-page windows), the kernel says (`GetWriteWatch` with reset, its answers kept for every copy over the page:
@@ -1903,8 +1918,8 @@ texture coverage and the game's use of tile streaming remain open.
   lookups a summary by format, type and tiling.
 - `LEONIDA_UNBACKED_VSHARP=1`: the buffer V#s `fix_vsharp` writes empty because nothing backs their base; one line for
   each of the first 120 distinct bases and every 8192 a summary by 4 GiB range of the base.
-- `LEONIDA_UPLOAD_LOG=1` (`d3d12_xs_device.cpp`): each upload chunk (CPU base, device address, size) and the first 96,
-  then every 8192nd, `AllocateUploadMemory` result as an offset into its chunk.
+- `LEONIDA_UPLOAD_LOG=1` (`d3d12_xs_device.cpp`): each upload chunk (CPU base, device address, size), made and given
+  back, and the first 96, then every 8192nd, `AllocateUploadMemory` result as an offset into its chunk.
 - `LEONIDA_UPLOAD_ALIAS=1` (an experiment, changes behaviour): enters each upload chunk's CPU range in the title VA
   table, so a V# the title wrote with the CPU pointer `AllocateUploadMemory` handed it is rewritten to the chunk
   instead of left empty. A chunk below the arena needs `LEONIDA_IMPORT_BELOW_ARENA=1` as well.
@@ -2146,9 +2161,11 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    (a backing, an alias range, title memory) go on an unbounded per-device list; at the next submission each heap
    fixes again exactly the slots whose records a change touches: a release or removal every half naming it, an
    addition the waiting halves over it. Nothing walks the heap or reads the copy for this. A zeroed range, a slot
-   the title rewrote and a heap destroyed drop their records. `console_heap_slot_records_test` checks that a release
-   of a buffer 10 of 60,010 slots name looks at those 10, and compares the copy with a full re-resolution through
-   random writes, releases, additions and alias changes.
+   the title rewrote and a heap destroyed drop their records, and an index bucket goes with the last half it holds:
+   the indexes hold the granules of the live halves, not every granule the session wrote a V# into.
+   `console_heap_slot_records_test` checks that a release of a buffer 10 of 60,010 slots name looks at those 10,
+   compares the copy with a full re-resolution and each lookup with a walk of every half through random writes,
+   releases, additions and alias changes, and that two halves moved 200,001 times hold 3 buckets (600,003 before).
    Console resource heap copies and shader-visible CBV/SRV/UAV heaps with at least 65,536 slots request
    64 MiB of zeroed padding after their last descriptor. `LEONIDA_HEAP_GUARD_MB` sets the padding in MiB
    (0 disables it). When arena space is tight, allocation can fall back to the heap alone. Only indices
@@ -2759,6 +2776,23 @@ Pipeline creation:
   Replacing part of the previous file would corrupt it.
   `LEONIDA_PIPELINE_CACHE_BYTES` caps what a session adds, at a checkpoint or at teardown (an offline `pipeline_cache.bin` seed, which the driver hands back as part of the union, is not counted; 4 GiB by default, zero disables
   the session file).
+  With an offline seed the session file is the driver's whole union, the seed's pipelines and the session's together:
+  with a 1.88 GB seed on an RX 7900 XT it came back 0.1 to 6 MB larger, so loading the seed and then merging the
+  session file built two 1.9 GB driver caches at every launch (private commit 8.1 -> 9.95 -> 8.3 GB in the first
+  20 s). So each time the session file is published beside a seed this device loaded, a small
+  `pipeline_cache.session.seed` next to it records that seed's size and last-write time and the session file's own
+  size (`runtime/src/pipeline_cache_store.h`, `SessionSeed`); a session file published without one removes it. At
+  launch, when the record matches the `pipeline_cache.bin` there now, the session file still has the size recorded and
+  is at least the seed's size, and its header names this device, the cache is created from the session file alone:
+  `pipeline_cache.bin` is not read and nothing is merged (one line says so; the save limit still counts what a session
+  adds to the seed). A new or touched seed, a missing or damaged record, a session file whose size differs from the
+  record (another build wrote it since), or a blob the driver declines falls back to loading the seed and merging the
+  session file into it. A session file written back smaller than the blob its cache was created from removes the
+  record instead of writing it (`may_record_session_seed`): the driver's union does not shrink, so entries were lost on
+  the way, and the next launch loads the seed again to put them back. Nothing is skipped or deleted but a stale
+  record. `LEONIDA_SESSION_CACHE_DIRECT_SEED=0`, or `LEONIDA_DIRECT_SESSION_CACHE=0`, always loads the seed and merges
+  (the record is still written); with `LEONIDA_PIPELINE_CACHE_BYTES=0`, `pipeline_cache.session.bin` and
+  `pipeline_cache.session.seed` are neither read nor written (the seed still loads).
   The session file can't keep a crashed run's compiles: it is written at teardown and at the optional checkpoints
   below only. The heavy pipeline cache (RT-HEAVY-PIPELINE-CACHE, `runtime/src/heavy_pipeline_cache.h`) keeps the graphics ones; compute pipelines go to the per-pipeline journal
   described below. Every graphics build first asks the corpus cache with
@@ -3628,6 +3662,32 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   complete CPU read. Copies of descriptors written earlier resolve to the fallback until that upload succeeds.
   `LEONIDA_TITLE_IMAGE_DEFER=0` allocates these textures eagerly. The memory probe reports the live unbound
   image count and its Vulkan memory requirements in MiB.
+- **When a slot-70 image goes**: an image made for slot-70 views was retired only when its address got another
+  description or a slot-133 texture. A title that streams places its textures at ever new addresses of its memory,
+  so each address named kept an image, its bindless index (65,536 per dimension) and its turn in every refresh
+  pass for the device's life. Now an image is also retired once a texture made or registered after its last view
+  covers some of its bytes, or once none of its pages has been committed (freed, decommitted or unmapped: a
+  `title_memory_map` change over it, then a look at its pages) for `LEONIDA_TITLE_IMAGE_IDLE_MS` (2000), in both
+  cases when no slot-70 view has named it for that long. An image over exactly the same bytes (the other view of a
+  stream pool) does not cover it; one never filled (the view of a texture whose pages have not come) does not go
+  with its pages; two textures over the same bytes that views keep naming both stay. Its T# keys go at once and the
+  image 3 s later, as for an address given another description. A later view of the address makes it again: a T#
+  names the title address, so descriptors the title kept find the new image once it is filled; until then, and for
+  an address no view names again, they sample the fallback. A slot-133 texture covers an image with the layout of
+  the title's XG computer of its shape, or with the one its first slot-70 view gives it; the guess from its
+  description (Layout 0) can be larger than what the title placed, and covers nothing. A view that names an image
+  whose pages went keeps it, until a later change over its pages finds them still gone. Pages are looked at only
+  after a change with a range: xmem records a change anywhere for each run of pages it commits for a DirectStorage
+  transfer on Windows, and it names no image's pages. A whole release (`VirtualFree` with `MEM_RELEASE` and no size)
+  records the range of the reservation. A look walks the pages with VirtualQuery on the title's submitting thread,
+  so a pass visits at most `LEONIDA_TITLE_IMAGE_CHECKS` (128) of the images that may go, from where the last one
+  stopped. The title textures census line counts the retirements under a newer texture and with their pages gone,
+  and the images a view named again after a newer texture covered them (overlapping textures both in use).
+  It is off by default (`LEONIDA_TITLE_IMAGE_RETIRE=1` turns it on) until a game session has measured it: a title
+  that samples an image through a descriptor it wrote once (a heap it copies from, a table it keeps), with no later
+  slot-70 view of the address, would sample the fallback once the image goes, and the census cannot see that. The
+  range a whole release records is there for every reader of the map, whatever the switch.
+  `d3d12_title_image_retire` and `d3d12_title_image_idle` cover it without game files, with the switch on.
 - With `LEONIDA_TITLE_PARTIAL_MIPS=1`, such a texture can be filled before all its pages are readable. The XG
   layout of a 2D texture of one slice stores its mips from the smallest to the largest, so the mips from `m` on are
   the first `mip_chain_bytes(layout, m)` bytes from its base (`xg_xs_layout.h`; checked in `xg_xs_test` for tiled,
@@ -3649,6 +3709,11 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   over the map itself would step into a freed node (measured: an access violation reading the nil flag of a null
   child, 0x19, in `Device::refresh_title_textures`). The snapshot also holds a reference to each entry, so an entry
   retired during the pass is still alive when its turn comes.
+- An image made for slot-70 views (`make_title_texture`) is held by the registry and holds no reference to the device;
+  a retired one is released by the first refresh pass 3 s later, and `~Device` releases the rest after the GPU is idle
+  (`release_title_images`). With a device reference, a device released before those passes never went: it kept every
+  Vulkan object it had (`d3d12_existing_heap`'s device without host image copies: 93 at `vkDestroyDevice` on an
+  RX 7900 XT, VUID-vkDestroyDevice-device-05137).
 - Sampled title images can use device-local memory even when Vulkan host image copies require a
   host-visible memory type. The runtime queries the same image with and without host-transfer usage.
   When only the latter permits plain device-local backing, it detiles the complete image into a reusable

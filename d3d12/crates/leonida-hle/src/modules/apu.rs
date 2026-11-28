@@ -137,6 +137,11 @@ struct State {
     results: VecDeque<ApuResult>,
     commands: u32,
     dequeued: u32,
+    /// What a packet decodes into before its frames are copied out: room for
+    /// the longest packet of two channels, made once. Each packet had its
+    /// own, 46 KB allocated and zeroed for each of the 50 packets a second
+    /// of every stream that plays.
+    pcm: Vec<f32>,
 }
 
 fn lock(c: &Connection) -> std::sync::MutexGuard<'_, State> {
@@ -210,6 +215,7 @@ pub extern "system" fn XApuConnect(
             results: VecDeque::new(),
             commands: 0,
             dequeued: 0,
+            pcm: vec![0.0; MAX_FRAMES * 2],
         }),
     });
     // SAFETY: checked non-null.
@@ -249,6 +255,9 @@ pub extern "system" fn XApuEnqueueCommand(
     // SAFETY: a connection from `XApuConnect`; every command starts with an id.
     let (connection, id) = unsafe { (&*handle, command.read_unaligned()) };
     let mut state = lock(connection);
+    // (Through a plain reference, so a decoder and the PCM memory can be
+    // borrowed at once.)
+    let state = &mut *state;
     let stream = id.stream as usize;
     if stream >= state.streams.len() {
         return INVALID_STREAM;
@@ -300,7 +309,7 @@ pub extern "system" fn XApuEnqueueCommand(
             // SAFETY: a process command is this struct.
             let command = unsafe { command.cast::<Process>().read_unaligned() };
             match decoder {
-                Some(d) => process(d, connection.options, &command, &mut result),
+                Some(d) => process(d, connection.options, &command, &mut state.pcm, &mut result),
                 None => result.error = INVALID_STREAM,
             }
         }
@@ -321,8 +330,15 @@ pub extern "system" fn XApuEnqueueCommand(
 }
 
 /// Decodes one packet into the command's output buffer, keeping the frames
-/// from `first_frame` on, at most `frame_count` of them.
-fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) {
+/// from `first_frame` on, at most `frame_count` of them; `pcm` is room for
+/// the longest packet of two channels.
+fn process(
+    decoder: &mut OpusDecoder,
+    options: u32,
+    command: &Process,
+    pcm: &mut [f32],
+    result: &mut ApuResult,
+) {
     let channels = decoder.channels();
     let (input, input_length) = (command.input, command.input_length);
     let (output, output_length) = (command.output, command.output_length);
@@ -335,8 +351,10 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     }
     // SAFETY: the title's packet in its connection memory.
     let packet = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
-    let mut pcm = vec![0f32; MAX_FRAMES * channels];
-    let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm) {
+    // Only what this packet decodes is read back, so what an earlier one
+    // left in it does not matter.
+    let pcm = &mut pcm[..MAX_FRAMES * channels];
+    let decoded = match decoder.decode(packet, MAX_FRAMES, pcm) {
         Ok(n) => n,
         Err(_) => {
             result.error = BAD_PACKET;
@@ -416,7 +434,7 @@ pub(crate) fn module() -> HleModule {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use opus_pure::{Application, OpusEncoder};
 
@@ -537,6 +555,106 @@ mod tests {
         // SAFETY: written above.
         let error = unsafe { result.assume_init() }.error;
         assert_eq!(error, INVALID_STREAM);
+        assert_eq!(XApuDisconnect(handle), S_OK);
+    }
+
+    /// Counts this thread's allocations of a stereo packet's PCM or larger,
+    /// for what a packet costs. The test binary's allocator (`test_alloc`)
+    /// tells it of each block. Not with the allocators the features bring.
+    #[cfg(not(any(feature = "diagnostics", feature = "mimalloc")))]
+    pub(crate) mod counting {
+        use std::cell::Cell;
+
+        const LARGE: usize = super::MAX_FRAMES * 2 * size_of::<f32>();
+
+        std::thread_local! {
+            pub(crate) static COUNT: Cell<usize> = const { Cell::new(0) };
+        }
+
+        pub(crate) fn note(size: usize) {
+            if size >= LARGE {
+                let _ = COUNT.try_with(|n| n.set(n.get() + 1));
+            }
+        }
+    }
+
+    /// A packet decodes into memory the connection keeps: each of the 50
+    /// packets a second of every stream that plays allocated and zeroed
+    /// 46 KB of its own.
+    #[cfg(not(any(feature = "diagnostics", feature = "mimalloc")))]
+    #[test]
+    fn packets_decode_without_memory_of_their_own() {
+        let input = ConnectInput {
+            process: DECODE_OPUS,
+            streams: 1,
+            commands_per_stream: 2,
+            memory: 0x2_0000,
+            frames_per_output: 0,
+            options: 0,
+        };
+        let mut output = ConnectOutput {
+            memory: std::ptr::null_mut(),
+            result_event: std::ptr::null_mut(),
+        };
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+        let base = output.memory.cast::<u8>();
+        let activate = Activate {
+            id: id(ACTIVATE, 0),
+            channels: 2,
+            init_length: 0,
+            init: std::ptr::null(),
+            start_pitch: 1.0,
+            processing_length: 0,
+            processing: std::ptr::null_mut(),
+        };
+        let mut result = std::mem::MaybeUninit::<ApuResult>::zeroed();
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const activate).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK);
+
+        let tone: Vec<f32> = (0..960 * 2)
+            .map(|i| ((i / 2) as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5)
+            .collect();
+        let mut encoder = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+        let mut packet = [0u8; 1500];
+        let n = encoder.encode(&tone, 960, &mut packet).unwrap();
+        // SAFETY: inside the connection memory.
+        unsafe { std::ptr::copy_nonoverlapping(packet.as_ptr(), base, n) };
+        let process = Process {
+            id: id(PROCESS, 0),
+            pitch_ramp: 0.0,
+            target_pitch: 1.0,
+            first_frame: 0,
+            frame_count: 960,
+            input_length: n as u32,
+            input: base,
+            output_length: 960 * 8,
+            output: base.wrapping_add(0x1_0000),
+        };
+        let mut decode = || {
+            assert_eq!(
+                XApuEnqueueCommand(handle, (&raw const process).cast(), std::ptr::null_mut()),
+                S_OK
+            );
+            assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK);
+            // SAFETY: written above.
+            let error = unsafe { result.assume_init() }.error;
+            assert_eq!(error, S_OK);
+        };
+        // The first packet may set up the decoder's own memory.
+        decode();
+        let before = counting::COUNT.with(|n| n.get());
+        for _ in 0..10 {
+            decode();
+        }
+        let large = counting::COUNT.with(|n| n.get()) - before;
+        assert_eq!(
+            large, 0,
+            "10 packets made {large} allocations of a packet's PCM or larger"
+        );
         assert_eq!(XApuDisconnect(handle), S_OK);
     }
 

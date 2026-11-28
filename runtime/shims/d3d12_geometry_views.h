@@ -1,8 +1,10 @@
 #pragma once
 
 #include "d3d12_title_buffer_windows.h"
+#include "../src/command_list_epochs.h"
 #include "../src/memory_breakdown.h"
 #include "../src/title_geometry_watch.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -21,7 +23,7 @@ namespace rt::d3d12 {
 // Every CPU mapping of a source tile is watched; a physical remap changes which aliases must be watched.
 // Views whose title range is released are retired immediately and their backing storage is reclaimed once
 // in-flight GPU submissions up to their retire ticket have completed; previously cap-refused ranges retry
-// once budget has been freed.
+// once budget has been freed. A range inside a live view is answered from that view's bytes, not copied again.
 enum class GeometryCopy { copied, unreadable, interrupted };
 
 class GeometryViews {
@@ -51,13 +53,18 @@ class GeometryViews {
     struct FastEntry {
         VkDeviceSize va{};
         std::uint64_t refused_at{};  // free_generation_ when refused (only meaningful when va == 0)
+        bool inside{};               // answered from inside a live view (contained_)
     };
     struct Retired {
         VkDeviceSize va{};
         std::size_t size{};
         std::uint64_t ticket{};  // kAfterExecutes until execute_end() stamps it
         std::uint64_t epoch{};   // the last execute begun when it was retired (kAfterExecutes only)
+        std::uint64_t lists{};   // the command-list epoch it waits for (retire_range), 0 for none
     };
+    // Retired::lists until retire_range has taken the epoch, once nothing answers the ranges inside the view: until
+    // then execute_end does not stamp the view.
+    static constexpr std::uint64_t kListsPending = UINT64_MAX;
     std::uint64_t cap_override_{};
     mutable std::mutex mutex_;
     std::mutex refresh_mutex_;  // refresh() only, held for its whole run, before mutex_
@@ -84,9 +91,9 @@ class GeometryViews {
     mutable std::shared_mutex structure_mutex_;
     mutable std::shared_mutex fast_mutex_;
     std::unordered_map<Key, FastEntry, KeyHash> fast_;
-    void publish(const Key& key, VkDeviceSize va, std::uint64_t refused_at = 0) {  // mutex_ held
+    void publish(const Key& key, VkDeviceSize va, std::uint64_t refused_at = 0, bool inside = false) {  // mutex_ held
         std::unique_lock lock(fast_mutex_);
-        fast_[key] = {va, refused_at};
+        fast_[key] = {va, refused_at, inside};
     }
     bool fast_find(const Key& key, VkDeviceSize& va) const {
         std::shared_lock lock(fast_mutex_);
@@ -95,12 +102,13 @@ class GeometryViews {
         va = it->second.va;
         return true;
     }
-    bool fast_find_resolve(const Key& key, VkDeviceSize& va) const {
+    bool fast_find_resolve(const Key& key, VkDeviceSize& va, bool contain) const {
         std::shared_lock lock(fast_mutex_);
         const auto it = fast_.find(key);
         if (it == fast_.end()) return false;
         if (it->second.va == 0 && it->second.refused_at != free_generation_.load(std::memory_order_acquire))
             return false;
+        if (it->second.inside && !contain) return false;
         va = it->second.va;
         return true;
     }
@@ -109,6 +117,16 @@ class GeometryViews {
     std::size_t live_views_{};
     bool refreshing_{};
     std::map<VkDeviceAddress, std::size_t> by_address_;
+    // The live views that no other live view holds, by their first byte: source -> {end, id}. As none holds another,
+    // their ends rise with their sources, so the last one starting at or before an address reaches furthest past it,
+    // and a range is inside some live view exactly when it is inside that one (outer_view_locked). A view held by one
+    // that is retired takes its place (retire_range). Under mutex_.
+    std::map<Address, std::pair<Address, std::size_t>> outer_;
+    // The keys resolve() answered from inside a live view instead of with a view of their own, with that view's id.
+    // They are its bytes at their offsets, watched and refreshed with it, and they leave with it (retire_range).
+    // Under mutex_.
+    std::map<Key, std::size_t> contained_;
+    std::uint64_t contained_hits_{};
     std::map<Address, Tile> tiles_;
     std::vector<Retired> retired_;
     std::atomic<std::size_t> retired_count_{0};
@@ -152,6 +170,24 @@ class GeometryViews {
                 tiles_.erase(it);
             }
         }
+    }
+
+    static constexpr std::size_t kNoView = SIZE_MAX;
+    // The live view that holds all of [cpu, cpu + bytes), or kNoView. mutex_ held; cpu + bytes does not wrap.
+    std::size_t outer_view_locked(Address cpu, std::size_t bytes) const {
+        auto it = outer_.upper_bound(cpu);
+        if (it == outer_.begin()) return kNoView;
+        --it;
+        return it->second.first >= cpu + bytes ? it->second.second : kNoView;
+    }
+    // A live view enters outer_ unless one there holds it, and the ones there that it holds leave. mutex_ held.
+    void enter_outer_locked(Address source, std::size_t size, std::size_t id) {
+        const Address end = source + size;
+        auto it = outer_.upper_bound(source);
+        if (it != outer_.begin() && std::prev(it)->second.first >= end) return;
+        // The ones it holds start at or after it, their ends rising: they leave until one reaches past its end.
+        for (it = outer_.lower_bound(source); it != outer_.end() && it->second.first <= end;) it = outer_.erase(it);
+        outer_.emplace(source, std::make_pair(end, id));
     }
 
     bool update(Address va, Tile& t) {
@@ -245,6 +281,15 @@ public:
     }
     int system_memory() const { return pool_.system_memory(); }
 
+    // LEONIDA_GEOMETRY_CONTAINED=0: a range inside a live view gets a copy of its own, as before.
+    static bool contain_setting() {
+        static const bool value = [] {
+            const char* v = std::getenv("LEONIDA_GEOMETRY_CONTAINED");
+            return !v || std::strcmp(v, "0") != 0;
+        }();
+        return value;
+    }
+
     bool has_released() const { return leonida::geometry_writes::has_released(releases_); }
     bool has_retired() const { return retired_count_.load(std::memory_order_acquire) != 0; }
     bool has_pending_reclaim() const { return has_released() || has_retired(); }
@@ -296,18 +341,34 @@ public:
         return it == keys_.end() || !views_[it->second].alive ? 0 : views_[it->second].va;
     }
 
+    // `contain` false: a range inside a live view gets a view of its own all the same. A structure the GPU writes
+    // (copy_title_range) needs one: in another view's bytes it would leave with that view when a release elsewhere in
+    // it retires it, and its next copy would be made from the title's pages.
     template<class Device, class Copy>
-    std::uint64_t resolve(Device& device, Address cpu, std::size_t bytes, Copy copy) {
+    std::uint64_t resolve(Device& device, Address cpu, std::size_t bytes, Copy copy, bool contain = true) {
         if (!bytes || bytes > UINTPTR_MAX - cpu) return 0;
         const std::uint64_t limit = effective_cap();
         if (!limit) return 0;
         const Key key = std::make_pair(cpu, bytes);
-        if (VkDeviceSize known = 0; fast_find_resolve(key, known)) return known;
+        if (VkDeviceSize known = 0; fast_find_resolve(key, known, contain)) return known;
         std::lock_guard lock(mutex_);
         if (const auto it = keys_.find(key); it != keys_.end()) {
             const VkDeviceSize known = views_[it->second].va;
             publish(key, known, 0);
             return known;
+        }
+        // A range inside a live view is that view's bytes at its offset: the view's tiles already watch it and its
+        // refresh copies it, so a copy of its own would hold the same title bytes again, against the same cap. The
+        // view must be filled: one made over pages not all readable then is zeroed, also where the range is readable.
+        if (contain && contain_setting()) {
+            if (const std::size_t id = outer_view_locked(cpu, bytes); id != kNoView && views_[id].ready) {
+                const VkDeviceSize at = views_[id].va + (cpu - views_[id].source);
+                // Two threads that missed the lock-free answer for the same key both come here, one after the other.
+                if (contained_.insert_or_assign(key, id).second) ++contained_hits_;
+                refused_.erase(key);
+                publish(key, at, 0, true);
+                return at;
+            }
         }
         const std::uint64_t gen = free_generation_.load(std::memory_order_acquire);
         const auto refused_it = refused_.find(key);
@@ -352,6 +413,7 @@ public:
             keys_[key] = id;
             by_address_.emplace(bda, id);
         }
+        if (contain_setting()) enter_outer_locked(cpu, bytes, id);
         if (bytes > max_view_bytes_) max_view_bytes_ = bytes;
         ++live_views_;
         bytes_ += bytes;
@@ -411,11 +473,13 @@ public:
             std::lock_guard execute(execute_mutex_);
             for (const auto s : executing_) oldest = (std::min)(oldest, s);
         }
+        // Before the ticket: a list released after this read has had its submissions counted in it.
+        const std::uint64_t oldest_list = leonida::command_list_epochs::oldest();
         const std::uint64_t ticket = submitted();
         bool left = false;
         for (auto& r : retired_) {
             if (r.ticket != kAfterExecutes) continue;
-            if (r.epoch < oldest) r.ticket = ticket;
+            if (r.epoch < oldest && r.lists != kListsPending && r.lists <= oldest_list) r.ticket = ticket;
             else left = true;
         }
         unstamped_.store(left, std::memory_order_release);
@@ -429,6 +493,8 @@ public:
     // committed) may hold new bytes, and a list recorded before the release that runs in a submission the view waits
     // for reads those, as it would have read them in the console's memory. Decommitted or unmapped memory is not
     // readable, so such a view keeps what it held.
+    // The ranges resolve() answered from inside a retired view go with it, each told to `on_retire` with the address
+    // it was answered with. Returns the number of views retired.
     template<class OnRetire = NoopRetire, class Copy = NoCopy>
     std::size_t retire_range(Address begin, Address end, std::uint64_t retire_ticket = 0,
                              OnRetire&& on_retire = {}, Copy&& final_copy = {}) {
@@ -439,6 +505,8 @@ public:
             VkDeviceSize va;
         };
         std::vector<CallbackItem> callbacks;
+        std::vector<VkDeviceSize> pending;  // the retired views at kListsPending, by address
+        std::size_t retired_views = 0;
         {
             std::lock_guard lock(mutex_);
             std::vector<std::size_t> ids;
@@ -456,6 +524,7 @@ public:
                 if (begin < key.first + key.second) stale_refused.push_back(key);
             }
             if (ids.empty() && stale_refused.empty()) return 0;
+            retired_views = ids.size();
             if (retire_ticket == kAfterExecutes && !ids.empty()) unstamped_.store(true, std::memory_order_release);
             callbacks.reserve(ids.size());
             const std::size_t first_retired = retired_.size();
@@ -476,6 +545,40 @@ public:
                 callbacks.push_back({v.source, v.size, v.va});
                 retired_.push_back({v.va, v.size, retire_ticket, 0});
             }
+            // The ranges answered from inside these views are their bytes and leave with them. A view that was in
+            // outer_ leaves it; the live views it held take its place below, once the retired ones are out of keys_.
+            std::vector<Key> inner;
+            std::vector<std::pair<Address, Address>> vacated;
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                const std::size_t id = ids[i];
+                const View& v = views_[id];
+                bool untouched = false;
+                for (auto it = contained_.lower_bound({v.source, 0});
+                     it != contained_.end() && it->first.first < v.source + v.size;) {
+                    if (it->second != id) {
+                        ++it;
+                        continue;
+                    }
+                    const auto [source, size] = it->first;
+                    untouched |= source >= end || source + size <= begin;
+                    callbacks.push_back({source, size, v.va + (source - v.source)});
+                    inner.push_back(it->first);
+                    it = contained_.erase(it);
+                }
+                // A range inside it that the release did not touch is still the title's, and a command list recorded
+                // while it is still answered may name it and be executed after: the view's memory also waits until no
+                // such list is left (src/command_list_epochs.h). It is answered until fast_ forgets it below and the
+                // aliases and heap slots that hold its address are dropped (on_retire, after the lock), so the epoch is
+                // taken after on_retire.
+                if (untouched && retire_ticket == kAfterExecutes) {
+                    retired_[first_retired + i].lists = kListsPending;
+                    pending.push_back(v.va);
+                }
+                if (const auto it = outer_.find(v.source); it != outer_.end() && it->second.second == id) {
+                    vacated.emplace_back(v.source, v.source + v.size);
+                    outer_.erase(it);
+                }
+            }
             if (!ids.empty()) {
                 std::unique_lock structure(structure_mutex_);
                 for (const auto id : ids) {
@@ -485,9 +588,13 @@ public:
                     v.alive = false;
                 }
             }
+            for (const auto& [from, to] : vacated)
+                for (auto it = keys_.lower_bound({from, 0}); it != keys_.end() && it->first.first < to; ++it)
+                    enter_outer_locked(it->first.first, it->first.second, it->second);
             {
                 std::unique_lock fast(fast_mutex_);
                 for (const auto id : ids) fast_.erase({views_[id].source, views_[id].size});
+                for (const auto& k : inner) fast_.erase(k);
                 for (const auto& k : stale_refused) fast_.erase(k);
             }
             // No resolve() or find() answers these views from here on, so a replay that begins now cannot name them:
@@ -509,7 +616,17 @@ public:
             retired_count_.store(retired_.size(), std::memory_order_release);
         }
         for (const auto& item : callbacks) on_retire(item.source, item.size, item.va);
-        return callbacks.size();
+        // Nothing answers the ranges inside those views now, so a list whose recording begins from here on cannot name
+        // them. reap() may have compacted retired_ meanwhile, but it cannot have freed these entries, which execute_end
+        // leaves unstamped while they are pending: their addresses find them.
+        if (!pending.empty()) {
+            const std::uint64_t lists = leonida::command_list_epochs::advance();
+            std::lock_guard lock(mutex_);
+            for (auto& r : retired_)
+                if (r.lists == kListsPending && std::find(pending.begin(), pending.end(), r.va) != pending.end())
+                    r.lists = lists;
+        }
+        return retired_views;
     }
 
     // Frees backing storage for retired views whose GPU retire_ticket <= completed_ticket, returning their budget
@@ -584,8 +701,11 @@ public:
         }();
         // One pass over the tiles: each written tile is read once and copied into every view over it, not view by
         // view (speed-16: up to 63 written tiles under 918 views a refresh, ~58,000 per-view lookups and copies,
-        // 30-80 ms). A view over a tile that cannot be guarded yet (retry) is left as it is this time; a view not
-        // filled yet is filled whole, once.
+        // 30-80 ms). A view over a tile that cannot be guarded yet (retry) is not filled whole this time, as that
+        // would read the tile; a view not filled yet is filled whole, once. A filled view over such a tile still takes
+        // its other written tiles: update() has taken their versions, so a tile skipped now would not be copied again
+        // until it is written again, and every range inside the view would keep the old bytes. The retry tile itself
+        // is not among the written ones, and is copied once it can be guarded.
         marks_.assign(views_.size(), 0);
         written_vas_.clear();
         // The pass over the watched tiles makes a VirtualQuery and a VirtualProtect for each written one (tens of
@@ -628,7 +748,7 @@ public:
                 View& v = views_[id];
                 if (!v.alive) continue;
                 std::uint8_t& mark = marks_[id];
-                if (mark & (kPinned | kWhole)) continue;
+                if (mark & kWhole) continue;
                 if (!(mark & kTouched)) {
                     mark |= kTouched;
                     ++changed_views;
@@ -647,7 +767,7 @@ public:
                     std::memcpy(v.dst + (from - v.source), read + (from - va), to - from);
                 } else if (copy(v.dst + (from - v.source), reinterpret_cast<const std::uint8_t*>(from), to - from) !=
                            GeometryCopy::copied) {
-                    mark |= kWhole;  // filled whole below, which zeroes it if that fails too
+                    mark |= kWhole;  // filled whole below (unless pinned), which zeroes it if that fails too
                     continue;
                 }
                 uploaded_ += to - from;
@@ -708,18 +828,29 @@ public:
     void report() const {
         if (!effective_cap()) return;
         std::lock_guard lock(mutex_);
+        // A command list kept for long (an idle one, or a bundle) holds these, and keeps execute_end walking retired_.
+        std::size_t waiting = 0;
+        std::uint64_t waiting_bytes = 0;
+        for (const auto& r : retired_)
+            if (r.ticket == kAfterExecutes && r.lists) {
+                ++waiting;
+                waiting_bytes += r.size;
+            }
         std::fprintf(stderr, "[rt] geometry buffers: seen %zu, backed %zu (%llu bytes), populated %llu, cap %llu MiB, "
                              "cap refused %llu, retried ok %llu, evicted %llu (reaped %llu, retired %zu, copied at "
                              "retirement %llu), allocation failures %llu, uploads %llu (%llu bytes), watched tiles %zu, "
-                             "reserved %llu bytes (%s)\n",
-                     keys_.size() + refused_.size(), live_views_, (unsigned long long)bytes_, (unsigned long long)ready_,
+                             "reserved %llu bytes (%s), ranges inside a live view %zu (%llu so far), retired views "
+                             "waiting for older command lists %zu (%llu bytes)\n",
+                     keys_.size() + refused_.size() + contained_.size(), live_views_, (unsigned long long)bytes_,
+                     (unsigned long long)ready_,
                      (unsigned long long)(effective_cap() >> 20), (unsigned long long)cap_refusals_,
                      (unsigned long long)retries_succeeded_, (unsigned long long)evicted_,
                      (unsigned long long)reaped_, retired_.size(), (unsigned long long)final_copies_,
                      (unsigned long long)allocation_failures_,
                      (unsigned long long)uploads_, (unsigned long long)uploaded_, tiles_.size(),
                      static_cast<unsigned long long>(pool_.reserved()),
-                     pool_.system_memory() ? "system memory" : "device-local");
+                     pool_.system_memory() ? "system memory" : "device-local", contained_.size(),
+                     (unsigned long long)contained_hits_, waiting, (unsigned long long)waiting_bytes);
         std::fprintf(stderr, "[rt] geometry refresh: %llu/%llu submissions uploaded dirty views, %llu bytes (%llu views by "
                              "their written tiles only); %.3f s checking and refreshing sources, %llu bytes cleared\n",
                      static_cast<unsigned long long>(dirty_refreshes_), static_cast<unsigned long long>(submissions_),
@@ -740,6 +871,8 @@ public:
             by_address_.clear();
             views_.clear();
         }
+        outer_.clear();
+        contained_.clear();
         {
             std::unique_lock fast(fast_mutex_);
             fast_.clear();

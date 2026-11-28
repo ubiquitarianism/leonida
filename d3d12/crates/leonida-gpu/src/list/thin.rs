@@ -83,6 +83,11 @@ impl Front {
         {
             recording.abandoned.store(true, Release);
         }
+        // Upload memory that only these words name is given back by
+        // `translate`, which they never reach now: it goes here, or its
+        // blocks stay taken for good. (Words handed over are always
+        // translated, also those of a recording let go of.)
+        free_uploads(&self.words);
         self.words.clear();
     }
 
@@ -690,6 +695,21 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+/// Gives back the upload memory the `UPLOAD` calls of `stream` name, for a
+/// stream that is never translated ([`translate`] keeps it for its list).
+fn free_uploads(stream: &[u64]) {
+    let mut i = 0;
+    while i < stream.len() {
+        let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
+        if op == UPLOAD {
+            // SAFETY: made by `allocate_upload`, named once, in a stream that
+            // is never translated.
+            drop(unsafe { Box::from_raw(stream[i + 1] as *mut Upload) });
+        }
+        i += 1 + len;
+    }
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
@@ -928,5 +948,29 @@ mod tests {
         slot[1] = 99;
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    /// Upload memory that only words not handed over yet name is given back
+    /// when the list is reset or released before it is closed: those words
+    /// are never translated, which is where it is given back otherwise.
+    #[test]
+    fn uploads_of_words_never_handed_over_are_given_back() {
+        for released in [false, true] {
+            let mut f = Front::default();
+            f.begin(0, std::ptr::null());
+            let mut upload = Upload::new(100).unwrap();
+            let start = upload.start() as usize;
+            // Only what is given back from now on counts: an upload at this
+            // place before was another one.
+            let before = held(&crate::upload::GIVEN_BACK).len();
+            f.put(UPLOAD, &[Box::into_raw(Box::new(upload)) as u64]);
+            if released {
+                drop(f);
+            } else {
+                f.begin(0, std::ptr::null());
+            }
+            let given_back = held(&crate::upload::GIVEN_BACK);
+            assert!(given_back[before..].contains(&start), "released {released}: never given back");
+        }
     }
 }

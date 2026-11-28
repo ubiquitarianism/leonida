@@ -117,6 +117,13 @@ struct Mock {
     Mock* completes_with;    // fence: once its completed value reaches completes_at, a GetCompletedValue first
     std::uint64_t completes_at, completes_value;  // signals that fence to completes_value (GPU order across queues)
     bool signals_complete;   // queue: a Signal (slot 14) completes the fence at once, as an idle GPU would
+    // device: an UPLOAD-heap committed resource it makes is a mapped buffer of its own (`mapped`, freed with the last
+    // reference) with a device address of its own (`gpu_va`, outside the CPU's user range), as the upload chunks of
+    // console list slot 148 are on a real device. Off, Map hands out g_mock_mapped and the address is 0.
+    bool mapped_uploads;
+    std::uint8_t* mapped;    // resource: what Map (slot 8) hands out, when set
+    std::uint64_t gpu_va;    // resource: what GetGPUVirtualAddress (slot 11) returns, when set
+    HRESULT reset_result;    // allocator: what Reset (slot 8) returns
     const void* observed_queue;  // optional proxy pair to sample during a forwarded fence call
     const void* observed_fence;
     unsigned long observed_queue_refs, observed_fence_refs;
@@ -552,8 +559,10 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         *reinterpret_cast<UINT64*>(a2) = mock_cpu_origin();
     }
     if (m->kind == Kind::resource && slot == 8 && a3) {  // Map(subresource, range, data): the test's readback
-        *reinterpret_cast<void**>(a3) = g_mock_mapped;
+        *reinterpret_cast<void**>(a3) = m->mapped ? m->mapped : g_mock_mapped;
     }
+    if (m->kind == Kind::resource && slot == 11 && m->gpu_va) return m->gpu_va;  // GetGPUVirtualAddress
+    if (m->kind == Kind::allocator && slot == 8) return static_cast<std::uint32_t>(m->reset_result);  // Reset
     if (m->kind == Kind::heap && slot == 9) {
         if (a1) reinterpret_cast<D3D12_CPU_DESCRIPTOR_HANDLE*>(a1)->ptr = kMockHeapCpuStart;
         return kMockHeapCpuStart;
@@ -605,6 +614,10 @@ std::uint64_t WINAPI mock_slot(Mock* self, std::uint64_t a1, std::uint64_t a2, s
             IUnknown* const held = self->held;
             self->held = nullptr;
             held->Release();
+        }
+        if (left == 0 && self->mapped) {  // a mapped upload buffer's memory goes with it (gpu_va stays, for checks)
+            VirtualFree(self->mapped, 0, MEM_RELEASE);
+            self->mapped = nullptr;
         }
         return static_cast<std::uint64_t>(left);
     } else if constexpr (Slot == 5) {  // SetPrivateDataInterface(guid, object): keeps one reference
@@ -699,6 +712,13 @@ HRESULT WINAPI mock_create_committed_resource(Mock* self, const D3D12_HEAP_PROPE
     if (self->create_null || FAILED(self->create_result)) return self->create_result;
     Mock* child = new_mock(Kind::resource);
     self->last_child = child;
+    if (self->mapped_uploads && heap && heap->Type == D3D12_HEAP_TYPE_UPLOAD && desc && desc->Width) {
+        static std::uint64_t made = 0;
+        child->mapped = static_cast<std::uint8_t*>(
+            VirtualAlloc(nullptr, static_cast<SIZE_T>(desc->Width), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!child->mapped) return E_OUTOFMEMORY;
+        child->gpu_va = 0x0001000000000000ull + (++made << 32);
+    }
     return mock_query(child, riid, out);
 }
 
@@ -2507,6 +2527,199 @@ int check_lists() {
     EXPECT(release(pc_device) == 0 && pc_mock->refs == 0);
     std::printf("%s: lists come back console-shaped (cursor pinned, GetDevice, Dispatch forwarded, extras "
                 "recorded); AllocateUploadMemory hands out arena pointers a root SRV receives\n", g_label);
+    return 0;
+}
+
+// ---- 9a. Upload memory comes back at its allocator's Reset ----
+// AllocateUploadMemory (console list slot 148) is asked every frame (the XDXR builder takes count * 40 bytes per
+// build, docs/d3d12_command_objects.md §3.3a). The arena only ever advanced: 200 frames of 1 MiB made 25 chunks of
+// 8 MiB, and kept them. D3D12 allows an allocator Reset only once the GPU has finished the lists recorded into it, so
+// the memory handed out under that allocator is free again then. A list Reset gives nothing back (the allocator's
+// other lists may still be pending), and one allocator's Reset leaves another's memory alone.
+
+constexpr std::uint64_t kUploadMiB = 1 << 20;
+
+// The resource of the one upload chunk made on `mock` since `seen` CreateCommittedResource calls, or null when there
+// was not exactly one; `seen` moves on.
+Mock* new_upload_chunk(const Mock* mock, unsigned& seen) {
+    const unsigned made = mock->calls[27] - seen;
+    seen = mock->calls[27];
+    Mock* const chunk = mock->last_child;
+    return made == 1 && chunk && chunk->kind == Kind::resource && chunk->mapped ? chunk : nullptr;
+}
+
+// 200 frames on one allocator: list Reset, 1 MiB at alignment 16, Close, allocator Reset. `moved` counts the frames
+// whose pointer was not the first frame's, `chunks` the chunks they made.
+int upload_frames(const Mock* mock, void* list, void* allocator, unsigned& moved, unsigned& chunks) {
+    const unsigned before = mock->calls[27];
+    std::uint64_t first = 0;
+    moved = 0;
+    for (int frame = 0; frame < 200; ++frame) {
+        EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK);
+        const std::uint64_t p = raw(list, 148, kUploadMiB, 16);
+        EXPECT(p && (p & 15) == 0);
+        std::memset(reinterpret_cast<void*>(p), frame & 0xff, 64);  // the title writes what it was handed
+        if (!first) first = p;
+        if (p != first) ++moved;
+        EXPECT(hr_of(raw(list, 9)) == S_OK);           // Close
+        EXPECT(hr_of(raw(allocator, 8)) == S_OK);      // the allocator's Reset, once the GPU is done with it
+    }
+    chunks = mock->calls[27] - before;
+    std::printf("%s: 200 frames of 1 MiB on one allocator: the pointer moved in %u, %u upload chunks made\n", g_label,
+                moved, chunks);
+    return 0;
+}
+
+// A device whose upload chunks are mapped buffers with their own device addresses, two allocator proxies and a
+// closed list on each.
+struct UploadSetup {
+    Mock* mock = nullptr;
+    void* device = nullptr;
+    void* allocator[2] = {};
+    Mock* real_allocator[2] = {};
+    void* list[2] = {};
+    Mock* real_list[2] = {};
+};
+
+int make_upload_setup(UploadSetup& s) {
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    const IID gcl_iid = __uuidof(ID3D12GraphicsCommandList);
+    s.device = make_device(s.mock, 9, true, true, true);
+    EXPECT(s.device);
+    s.mock->mapped_uploads = true;
+    for (int i = 0; i < 2; ++i) {
+        EXPECT(hr_of(raw(s.device, 9, 0, word(&allocator_iid), word(&s.allocator[i]))) == S_OK);
+        s.real_allocator[i] = s.mock->last_child;
+        EXPECT(xs::is_allocator_proxy(s.allocator[i]));
+        EXPECT(hr_of(raw(s.device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, word(s.allocator[i]), 0, word(&gcl_iid),
+                         word(&s.list[i]))) == S_OK);
+        s.real_list[i] = s.mock->last_child;
+        EXPECT(hr_of(raw(s.list[i], 9)) == S_OK);  // closed, as a title's list is between frames
+    }
+    return 0;
+}
+
+bool upload_ranges_apart(std::uint64_t a, std::uint64_t b, std::uint64_t bytes) {
+    return a + bytes <= b || b + bytes <= a;
+}
+
+int check_upload_rewind() {
+    UploadSetup s;
+    if (make_upload_setup(s)) return 1;
+    void* const list_a = s.list[0];
+    void* const list_b = s.list[1];
+    void* const allocator_a = s.allocator[0];
+    void* const allocator_b = s.allocator[1];
+    unsigned seen = s.mock->calls[27];
+
+    // One chunk serves every frame, and the pointer is the same each time.
+    unsigned moved = 0, made = 0;
+    if (upload_frames(s.mock, list_a, allocator_a, moved, made)) return 1;
+    EXPECT(moved == 0 && made == 1);
+    Mock* const chunk_a1 = new_upload_chunk(s.mock, seen);
+    EXPECT(chunk_a1 && chunk_a1->refs == 1);
+    const std::uint64_t a1 = word(chunk_a1->mapped);
+
+    // The root SRV setter (console 43 -> PC 39) gets the chunk's device address for a pointer into it.
+    EXPECT(hr_of(raw(list_a, 139, word(allocator_a), 0)) == S_OK);
+    EXPECT(raw(list_a, 148, kUploadMiB, 16) == a1);
+    EXPECT(hr_of(raw(list_a, 43, 0, a1 + 0x123)) == S_OK && s.real_list[0]->args[39][1] == chunk_a1->gpu_va + 0x123);
+    EXPECT(hr_of(raw(list_a, 9)) == S_OK);
+
+    // A failed allocator Reset (the Vulkan layer refuses one while a list records into it) gives nothing back.
+    s.real_allocator[0]->reset_result = E_FAIL;
+    EXPECT(hr_of(raw(allocator_a, 8)) == E_FAIL);
+    s.real_allocator[0]->reset_result = S_OK;
+    EXPECT(hr_of(raw(list_a, 139, word(allocator_a), 0)) == S_OK);
+    EXPECT(raw(list_a, 148, kUploadMiB, 16) == a1 + kUploadMiB);
+    EXPECT(hr_of(raw(list_a, 9)) == S_OK);
+    EXPECT(hr_of(raw(allocator_a, 8)) == S_OK);
+
+    // Allocator B's memory is its own: A's Resets do not hand it out again.
+    EXPECT(hr_of(raw(list_b, 139, word(allocator_b), 0)) == S_OK);
+    const std::uint64_t b1 = raw(list_b, 148, kUploadMiB, 16);
+    EXPECT(b1 && upload_ranges_apart(b1, a1, 8 * kUploadMiB));
+    std::memset(reinterpret_cast<void*>(b1), 0xb1, kUploadMiB);
+    EXPECT(hr_of(raw(list_b, 9)) == S_OK);
+    Mock* const chunk_b = new_upload_chunk(s.mock, seen);
+    EXPECT(chunk_b && b1 == word(chunk_b->mapped));
+    // Two frames of 16 MiB on A meanwhile: a second chunk for A, then both again.
+    for (int frame = 0; frame < 2; ++frame) {
+        EXPECT(hr_of(raw(list_a, 139, word(allocator_a), 0)) == S_OK);
+        for (int i = 0; i < 16; ++i) {
+            const std::uint64_t p = raw(list_a, 148, kUploadMiB, 16);
+            EXPECT(p && upload_ranges_apart(p, b1, kUploadMiB));
+            std::memset(reinterpret_cast<void*>(p), 0xa0, kUploadMiB);
+        }
+        EXPECT(hr_of(raw(list_a, 9)) == S_OK);
+        EXPECT(hr_of(raw(allocator_a, 8)) == S_OK);
+    }
+    Mock* const chunk_a2 = new_upload_chunk(s.mock, seen);
+    EXPECT(chunk_a2);
+    const auto* b_bytes = reinterpret_cast<const std::uint8_t*>(b1);
+    EXPECT(std::all_of(b_bytes, b_bytes + kUploadMiB, [](std::uint8_t v) { return v == 0xb1; }));
+
+    // A list Reset gives nothing back: B's next pointer is new memory, and B's own Reset brings b1 back.
+    EXPECT(hr_of(raw(list_b, 139, word(allocator_b), 0)) == S_OK);
+    const std::uint64_t b2 = raw(list_b, 148, kUploadMiB, 16);
+    EXPECT(b2 && upload_ranges_apart(b2, b1, kUploadMiB));
+    EXPECT(hr_of(raw(list_b, 9)) == S_OK);
+    EXPECT(hr_of(raw(allocator_b, 8)) == S_OK);
+    EXPECT(hr_of(raw(list_b, 139, word(allocator_b), 0)) == S_OK);
+    EXPECT(raw(list_b, 148, kUploadMiB, 16) == b1);
+    EXPECT(hr_of(raw(list_b, 9)) == S_OK);
+    // A list records into the allocator of its last Reset: list A on allocator B takes B's memory.
+    EXPECT(hr_of(raw(allocator_b, 8)) == S_OK);
+    EXPECT(hr_of(raw(list_a, 139, word(allocator_b), 0)) == S_OK);
+    EXPECT(raw(list_a, 148, kUploadMiB, 16) == b1);
+    EXPECT(hr_of(raw(list_a, 9)) == S_OK);
+
+    // A chunk its allocator has not used for a while goes back; the one in use stays. A's frames now fit in its
+    // newest chunk, so its first one is idle.
+    EXPECT(chunk_a1->refs == 1 && chunk_a2->refs == 1);
+    std::uint64_t kept = 0;
+    for (int frame = 0; frame < 32; ++frame) {
+        EXPECT(hr_of(raw(list_a, 139, word(allocator_a), 0)) == S_OK);
+        const std::uint64_t p = raw(list_a, 148, kUploadMiB, 16);
+        EXPECT(p && (!kept || p == kept));
+        kept = p;
+        EXPECT(hr_of(raw(list_a, 9)) == S_OK);
+        EXPECT(hr_of(raw(allocator_a, 8)) == S_OK);
+    }
+    EXPECT(chunk_a1->refs == 0 && chunk_a1->calls[9] == 1 && chunk_a2->refs == 1 && kept == word(chunk_a2->mapped));
+    EXPECT(s.mock->calls[27] == seen);  // no chunk made since A's second one
+    // A pointer into a chunk that went back is no longer translated: it passes through as any other address.
+    EXPECT(hr_of(raw(list_a, 139, word(allocator_a), 0)) == S_OK);
+    EXPECT(hr_of(raw(list_a, 43, 0, a1)) == S_OK && s.real_list[0]->args[39][1] == a1);
+    EXPECT(hr_of(raw(list_a, 9)) == S_OK);
+
+    // An allocator's chunks go with it, and another allocator's stay.
+    EXPECT(release(list_b) == 0 && release(allocator_b) == 0);
+    EXPECT(chunk_b->refs == 0 && chunk_b->calls[9] == 1 && chunk_a2->refs == 1);
+    EXPECT(release(list_a) == 0 && release(allocator_a) == 0);
+    EXPECT(chunk_a2->refs == 0);
+    EXPECT(release(s.device) == 0 && s.mock->refs == 0);
+    std::printf("%s: upload memory comes back at its own allocator's Reset (not a list's), idle chunks go back, an "
+                "allocator's chunks go with it\n", g_label);
+    return 0;
+}
+
+// --upload-rewind-off: LEONIDA_UPLOAD_REWIND=0 (set here, before the device's first upload) keeps one arena that
+// only advances, as before the rewind: the 200 frames make 25 chunks, and an allocator's release frees none of them.
+int run_upload_rewind_off() {
+    g_label = "xs_proxy_mock --upload-rewind-off";
+    EXPECT(_putenv_s("LEONIDA_UPLOAD_REWIND", "0") == 0);
+    UploadSetup s;
+    if (make_upload_setup(s)) return 1;
+    unsigned moved = 0, made = 0;
+    if (upload_frames(s.mock, s.list[0], s.allocator[0], moved, made)) return 1;
+    EXPECT(moved == 199 && made == 25);
+    Mock* const last_chunk = s.mock->last_child;
+    EXPECT(last_chunk->kind == Kind::resource && last_chunk->refs == 1);
+    for (int i = 0; i < 2; ++i) EXPECT(release(s.list[i]) == 0 && release(s.allocator[i]) == 0);
+    EXPECT(last_chunk->refs == 1);
+    EXPECT(release(s.device) == 0 && s.mock->refs == 0 && last_chunk->refs == 0);
+    std::printf("%s: PASS (one arena, never rewound)\n", g_label);
     return 0;
 }
 
@@ -5403,12 +5616,13 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[1], "--env-slots-74") == 0) return run_env_slots(true, true);
         if (std::strcmp(argv[1], "--env-slots-70") == 0) return run_env_slots(true, false, true);
         if (std::strcmp(argv[1], "--slot133-layout") == 0) return run_slot133_layout_word();
+        if (std::strcmp(argv[1], "--upload-rewind-off") == 0) return run_upload_rewind_off();
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_host_device_floor() || check_levels() || check_slot48() || check_fence1() ||
         check_fence_completed_value() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_lists() ||
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_lists() || check_upload_rewind() ||
         check_signalx_detection() || check_list_tail_names() || check_console_command_list() ||
         check_custom_heap_properties() ||
         check_resource_allocation_info() || check_slot70() || check_slot70_raw_buffer() ||

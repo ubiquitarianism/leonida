@@ -127,18 +127,57 @@ struct Model {
         changes.push_back({SlotChange::source_gone, title, a.end});
         changes.push_back({SlotChange::target_gone, kArena + a.shader, kArena + a.shader + (a.end - title)});
     }
-    // apply_slot_changes: the slots looked at (index entries) and fixed again.
+    // touched() as a walk of every recorded half answers it: the slots whose target (target changes, halves with one)
+    // or base range (source changes) overlaps a change, waiting halves only for an addition.
+    std::vector<std::uint32_t> walk(const std::vector<SlotChange>& list) const {
+        std::vector<std::uint32_t> out;
+        for (std::size_t slot = 0; slot < slots.size(); ++slot) {
+            bool hit = false;
+            for (unsigned half = 0; half < 2 && !hit; ++half) {
+                const auto state = records.state(slot, half);
+                if (state == ConsoleHeapSlotRecords::none) continue;
+                const Words& w = slots[slot][half];
+                const std::uint64_t target = records.target(slot, half);
+                for (const SlotChange& change : list) {
+                    const bool on_target =
+                        change.kind == SlotChange::target_gone || change.kind == SlotChange::target_added;
+                    const bool waiting_only =
+                        change.kind == SlotChange::target_added || change.kind == SlotChange::source_added;
+                    if (change.hi <= change.lo || (on_target && !target)) continue;
+                    if (waiting_only && state != ConsoleHeapSlotRecords::waiting) continue;
+                    const std::uint64_t start = on_target ? target : w.base;
+                    if (start < change.hi && start + w.span > change.lo) {
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+            if (hit) out.push_back(std::uint32_t(slot));
+        }
+        return out;
+    }
+    // apply_slot_changes: the slots looked at (index entries) and fixed again. Each answer is also compared with the
+    // walk; a difference is kept until consistent() reports it.
     std::uint64_t looked = 0;
     std::vector<std::uint32_t> touched;
+    std::size_t walk_differs = 0;  // touched() answers that differed from the walk
     void apply() {
+        const std::vector<std::uint32_t> walked = walk(changes);
         const std::uint64_t before = records.looked_at();
         records.touched(changes.data(), changes.size(), touched);
         looked = records.looked_at() - before;
+        if (touched != walked) {
+            if (!walk_differs)
+                std::fprintf(stderr, "touched() names %zu slots, a walk of every half %zu\n", touched.size(),
+                             walked.size());
+            ++walk_differs;
+        }
         changes.clear();
         for (const std::uint32_t slot : touched) fix(slot);
     }
     // Every slot as a full re-resolution would leave it: the copy the walk this replaced would have produced.
     bool consistent() const {
+        if (walk_differs) return false;
         for (std::size_t slot = 0; slot < slots.size(); ++slot)
             for (unsigned half = 0; half < 2; ++half) {
                 const Words& w = slots[slot][half];
@@ -326,13 +365,56 @@ int differential() {
             std::fprintf(stderr, "round %d\n", round);
             return 1;
         }
+        // A half is held at most once in each index, so the buckets held are at most twice the halves recorded.
+        if (m.records.buckets() > 2 * m.records.recorded()) {
+            std::fprintf(stderr, "round %d: %zu index buckets held for %zu halves recorded\n", round,
+                         m.records.buckets(), m.records.recorded());
+            return 1;
+        }
     }
     EXPECT(m.records.recorded() > 0);
     // The model's address space is a few MiB, so most changes touch most of it: this case checks results, not cost.
-    std::printf("differential: 400 rounds, copy equal to a full re-resolution after each; %llu entries looked at, "
-                "%llu slots fixed again, %zu halves recorded at the end\n",
+    std::printf("differential: 400 rounds, copy equal to a full re-resolution and touched() to a walk of every half "
+                "after each; %llu entries looked at, %llu slots fixed again, %zu halves recorded and %zu index "
+                "buckets held at the end\n",
                 static_cast<unsigned long long>(looked), static_cast<unsigned long long>(touched),
-                m.records.recorded());
+                m.records.recorded(), m.records.buckets());
+    return 0;
+}
+
+// A half that moves to another granule leaves its old bucket. Slot 0's counter half waits at a new 1 MiB step 200,001
+// times (data the title keeps in a slot reads as a V# with a new base whenever it changes), and slot 1's buffer half
+// resolves into a new step as often, so both indexes see it: the buckets held stay those of the two live halves, and
+// none is left once both slots are cleared. The lookups give what they gave before.
+int buckets_follow_live_halves() {
+    ConsoleHeapSlotRecords records;
+    records.reset(16);
+    constexpr std::uint64_t kMoves = 200001;
+    for (std::uint64_t i = 0; i < kMoves; ++i) {
+        records.set(0, 1, ConsoleHeapSlotRecords::waiting, i << 20, 4096, 0);
+        records.set(1, 0, ConsoleHeapSlotRecords::resolved, (i << 20) + 0x800, 0x100, kArena + (i << 20));
+    }
+    const std::size_t held = records.buckets();
+    // The last ranges are found, every earlier one names nothing.
+    constexpr std::uint64_t last = (kMoves - 1) << 20;
+    std::vector<std::uint32_t> out;
+    const SlotChange now[] = {{SlotChange::source_gone, last, last + 0x1000},
+                              {SlotChange::target_gone, kArena + last, kArena + last + 0x100}};
+    records.touched(now, 1, out);
+    EXPECT(out.size() == 2 && out[0] == 0 && out[1] == 1);
+    records.touched(now + 1, 1, out);
+    EXPECT(out.size() == 1 && out[0] == 1);
+    const SlotChange before[] = {{SlotChange::source_gone, 0, last}, {SlotChange::target_gone, kArena, kArena + last},
+                                 {SlotChange::source_added, 0, last}};
+    records.touched(before, 3, out);
+    EXPECT(out.empty());
+    records.clear(0);
+    records.clear(1);
+    std::printf("buckets: %llu moves of two halves: %zu index buckets held for the 2 live halves, %zu once both slots "
+                "are cleared\n",
+                static_cast<unsigned long long>(kMoves), held, records.buckets());
+    EXPECT(held <= 2 * 2);
+    EXPECT(records.recorded() == 0 && records.buckets() == 0);
     return 0;
 }
 
@@ -341,6 +423,7 @@ int differential() {
 int main() {
     if (release_looks_at_its_slots_only()) return 1;
     if (cases()) return 1;
+    if (buckets_follow_live_halves()) return 1;
     if (differential()) return 1;
     std::printf("console_heap_slot_records_test: ok\n");
     return 0;

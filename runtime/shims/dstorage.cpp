@@ -589,6 +589,59 @@ void log_hold(const char* event, uint64_t n, unsigned capacity, size_t held_now)
 
 // ---- Queues -------------------------------------------------------------------------------------------------------
 
+// A vector of bytes whose growth leaves the new bytes unset. Each stage of a request (the read, inflate, BCPack,
+// unshuffle) writes every byte of its output or fails, and a failed request publishes nothing, so zero-filling these
+// first only cost a pass over each buffer.
+template <class T>
+struct Uninitialised {
+    using value_type = T;
+    Uninitialised() = default;
+    template <class U>
+    Uninitialised(const Uninitialised<U>&) noexcept {}
+    T* allocate(size_t n) { return std::allocator<T>{}.allocate(n); }
+    void deallocate(T* p, size_t n) noexcept { std::allocator<T>{}.deallocate(p, n); }
+    template <class U>
+    void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }
+    template <class U, class... A>
+    void construct(U* p, A&&... args) { ::new (static_cast<void*>(p)) U(std::forward<A>(args)...); }
+    template <class U>
+    bool operator==(const Uninitialised<U>&) const noexcept { return true; }
+};
+using Bytes = std::vector<uint8_t, Uninitialised<uint8_t>>;
+
+// `n` bytes of `buffer` for a stage to overwrite. A buffer that holds enough is reused as it is; one that is too small
+// is replaced rather than grown, since nothing in it needs copying, and freed first so both are never held at once.
+void room(Bytes& buffer, size_t n) {
+    if (buffer.capacity() < n) buffer = Bytes();
+    buffer.resize(n);
+}
+
+// A worker's buffers for one request at a time: the source and each stage's output, two in turn. They are kept from
+// one request to the next: new ones for every request cost an allocation each, and blocks of 1 MiB and more come
+// from fresh virtual memory each time and go back at the end. What they keep between requests is apart from the
+// staging pool, which counts the requests running.
+struct Scratch {
+    Bytes data, spare;
+    // What a queue's worker keeps of its two sets (its own and its helper's) between requests, the budget of a request
+    // that may run beside another (can_prepare): a larger request has its buffers for its own time. Each queue has its
+    // own worker, so idle queues hold at most this each.
+    static constexpr uint64_t kKept = 16ull << 20;
+    // Gives up buffers of both sets, largest first, until those kept hold at most kKept. Both sets count together:
+    // trimmed apart, a queue whose requests pair would keep twice the cap.
+    static void trim(Scratch& own, Scratch& helper) {
+        Bytes* buffers[] = {&own.data, &own.spare, &helper.data, &helper.spare};
+        std::sort(std::begin(buffers), std::end(buffers),
+                  [](const Bytes* a, const Bytes* b) { return a->capacity() > b->capacity(); });
+        uint64_t kept = 0;
+        for (const Bytes* b : buffers) kept += b->capacity();
+        for (Bytes* b : buffers) {
+            if (kept <= kKept) break;
+            kept -= b->capacity();
+            *b = Bytes();
+        }
+    }
+};
+
 // Only sampled when request tracing is enabled. Times include work done by the file/decode worker.
 struct Timing {
     using Clock = std::chrono::steady_clock;
@@ -969,14 +1022,14 @@ private:
     struct Prepared {
         Entry& entry;
         HRESULT result = S_OK;
-        std::vector<uint8_t> bytes;
+        Scratch& scratch;  // the worker's second set: the helper's request runs beside the worker's own
     };
     // Each queue publishes in order. Only an adjacent pair of file transforms can
     // overlap. Memory inputs, direct reads, page resolution and notifications remain barriers.
     static bool can_prepare(const Entry& e) {
         const auto& r = e.request;
         const auto o = r.Options.AsUINT64;
-        constexpr uint64_t budget = 16ull << 20;
+        constexpr uint64_t budget = Scratch::kKept;
         return e.type == Entry::Type::Request && !e.cancelled && SUCCEEDED(e.enqueue_error) && e.file &&
                (options::zlib(o) || options::bcpack(o) || options::swizzle(o)) &&
                leonida::dstorage::staging_bytes(r) <= budget;
@@ -987,15 +1040,17 @@ private:
         q.set_pending(+1);
         auto& job = *q.helper_job_;
         job.result = q.validate_request(job.entry);
-        if (SUCCEEDED(job.result)) job.result = q.prepare(job.entry, job.bytes);
+        if (SUCCEEDED(job.result)) job.result = q.prepare(job.entry, job.scratch);
         else job.entry.reason = "request-validation";
     }
 
     void run() {
+        // This worker's buffers, in its own frame for as long as it runs (no thread_local: AGENTS.md).
+        Scratch own, helper;
         for (;;) {
             Entry head, next;
             leonida::dstorage::StagingPool::Lease reservation(leonida::dstorage::staging_pool());
-            Prepared prepared{next, S_OK, {}};
+            Prepared prepared{next, S_OK, helper};
             bool paired = false;
             {
                 std::unique_lock lock(mutex_);
@@ -1020,14 +1075,15 @@ private:
                 }
                 in_flight_ = paired ? 2 : 1;
             }
-            process(head, nullptr, paired);
+            process(head, nullptr, own, paired);
             release_references(head);
             if (paired) {
                 WaitForThreadpoolWorkCallbacks(preparation_work_, FALSE);
-                process(next, &prepared);
+                process(next, &prepared, helper);
                 release_references(next);
                 helper_job_ = nullptr;
             }
+            Scratch::trim(own, helper);
             {
                 std::lock_guard lock(mutex_);
                 in_flight_ = 0;
@@ -1039,7 +1095,7 @@ private:
 
     // Runs on the worker. since_notify_ is the first failure since the last status entry or fence signal: the
     // HRESULT a status entry reports.
-    void process(Entry& e, Prepared* prepared, bool pair_reserved = false) {
+    void process(Entry& e, Prepared* prepared, Scratch& scratch, bool pair_reserved = false) {
         HRESULT hr = e.enqueue_error;
         if (FAILED(hr)) e.reason = "enqueue";
         const auto begin = Timing::start();
@@ -1053,10 +1109,10 @@ private:
                     // Pending: processing has started and not completed (DSTORAGE_PRIORITY_STATS).
                     if (prepared) {
                         hr = prepared->result;
-                        if (SUCCEEDED(hr)) hr = publish(e, prepared->bytes);
+                        if (SUCCEEDED(hr)) hr = publish(e, prepared->scratch.data);
                     } else {
                         set_pending(+1);
-                        hr = execute_request(e, pair_reserved);
+                        hr = execute_request(e, pair_reserved, scratch);
                     }
                     set_pending(-1);
                 }
@@ -1178,7 +1234,7 @@ private:
         return S_OK;
     }
 
-    HRESULT execute_request(Entry& e, bool pair_reserved) {
+    HRESULT execute_request(Entry& e, bool pair_reserved, Scratch& scratch) {
         const HRESULT valid = validate_request(e);
         if (FAILED(valid)) { e.reason = "request-validation"; return valid; }
         const auto& r = e.request;
@@ -1188,9 +1244,8 @@ private:
             options::bcpack(o) || options::swizzle(o)) {
             leonida::dstorage::StagingPool::Lease reservation(leonida::dstorage::staging_pool());
             if (!pair_reserved) reservation.acquire(leonida::dstorage::staging_bytes(r));
-            std::vector<uint8_t> data;
-            const auto hr = prepare(e, data);
-            return FAILED(hr) ? hr : publish(e, data);
+            const auto hr = prepare(e, scratch);
+            return FAILED(hr) ? hr : publish(e, scratch.data);
         }
         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
         void* const destination = cpu_destination(r);
@@ -1240,14 +1295,17 @@ private:
         return HRESULT_FROM_WIN32(GetLastError());
     }
 
-    static HRESULT inflate(const std::vector<uint8_t>& src, std::vector<uint8_t>& out, size_t size) {
+    static HRESULT inflate(const Bytes& src, Bytes& out, size_t size) {
         leonida::ZlibError why{};
         static const bool bulk = [] {
             wchar_t value[2]{};
             return GetEnvironmentVariableW(L"LEONIDA_DSTORAGE_FAST_INFLATE", value, 2) != 1 || value[0] != L'0';
         }();
+        // inflate appends at most `size` bytes (the limit below), so this room is the only allocation.
+        if (out.capacity() < size) out = Bytes();
+        out.clear();
         out.reserve(size);
-        if (leonida::zlib_inflate(src, out, size, &why, bulk))
+        if (leonida::zlib_inflate(std::span<const uint8_t>(src), out, size, &why, bulk))
             return out.size() == size ? S_OK : E_DSTORAGE_DECOMPRESSION_ERROR;
         switch (why) {
             case leonida::ZlibError::header: return E_DSTORAGE_ZLIB_BAD_HEADER;
@@ -1257,20 +1315,23 @@ private:
         }
     }
 
-    static HRESULT decode_stages(Entry& e, unsigned bc, unsigned sw, std::vector<uint8_t>& data) {
+    // Each stage reads scratch.data and writes scratch.spare, then the two swap: the result ends in scratch.data.
+    static HRESULT decode_stages(Entry& e, unsigned bc, unsigned sw, Scratch& scratch) {
         const auto& r = e.request;
+        Bytes& data = scratch.data;
+        Bytes& out = scratch.spare;
         if (options::zlib(r.Options.AsUINT64)) {
-            std::vector<uint8_t> scratch;
             static const bool reported = (log_once("zlib", "zlib requests use CPU inflate (RFC 1950)"), true);
             (void)reported;
             const auto begin = Timing::start();
-            const auto hr = inflate(data, scratch, bc ? r.IntermediateSize : r.DestinationSize);
+            const auto hr = inflate(data, out, bc ? r.IntermediateSize : r.DestinationSize);
             e.timing.inflate = Timing::elapsed(begin);
             if (FAILED(hr)) { e.reason = "inflate"; return hr; }
-            data = std::move(scratch);
+            data.swap(out);
         }
         if (bc) {
-            std::vector<uint8_t> scratch(r.DestinationSize);
+            // decode writes every byte of each block it returns: BC6H/BC7 clear theirs before setting bits.
+            room(out, r.DestinationSize);
             static const bool allow_fitted = [] {
                 char value[2]{};
                 return GetEnvironmentVariableA("LEONIDA_DSTORAGE_FITTED", value, sizeof value) != 1 || value[0] != '0';
@@ -1299,7 +1360,7 @@ private:
             }();
             const char* failure = nullptr;
             leonida::bcpack::Report report;
-            const auto quality = leonida::bcpack::decode(bc, data, scratch, allow_fitted, bc >= 6 ? bcpack_history() : nullptr,
+            const auto quality = leonida::bcpack::decode(bc, data, out, allow_fitted, bc >= 6 ? bcpack_history() : nullptr,
                                                          &failure, fast_entropy, lost_divisor, &report);
             e.timing.bcpack = Timing::elapsed(begin);
             if (quality == leonida::bcpack::Quality::failed) { e.reason = failure; return E_DSTORAGE_DECOMPRESSION_ERROR; }
@@ -1319,24 +1380,26 @@ private:
                 if (leonida::dstorage::trace_enabled())
                     std::fprintf(stderr, "[rt] ds-fitted bc=%u bytes=%u\n", bc, r.DestinationSize);
             }
-            data = std::move(scratch);
+            data.swap(out);
         }
         if (sw) {
-            std::vector<uint8_t> scratch(r.DestinationSize);
+            room(out, r.DestinationSize);  // the stripes of a group cover all of it
             const auto begin = Timing::start();
-            if (!leonida::dstorage::unshuffle(sw, data, scratch)) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+            if (!leonida::dstorage::unshuffle(sw, data, out)) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
             e.timing.unshuffle = Timing::elapsed(begin);
-            data = std::move(scratch);
+            data.swap(out);
         }
         return S_OK;
     }
 
-    HRESULT prepare(Entry& e, std::vector<uint8_t>& data) try {
+    HRESULT prepare(Entry& e, Scratch& scratch) try {
         const auto& r = e.request;
         const auto o = r.Options.AsUINT64;
         const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
         const auto bc = unsigned(options::bcpack(o)), sw = unsigned(options::swizzle(o));
-        data.resize(r.SourceSize);
+        // Each read below fills all of it or fails.
+        Bytes& data = scratch.data;
+        room(data, r.SourceSize);
         HRESULT hr = S_OK;
         const auto read_begin = Timing::start();
         if (!memory) hr = read_file_range(e.file->handle(), r.FileOffset, data.data(), r.SourceSize, ReadTarget::Staging);
@@ -1347,7 +1410,7 @@ private:
         if (bc || sw || options::zlib(o)) {
             set_decompression_pending(+1);
             try {
-                hr = decode_stages(e, bc, sw, data);
+                hr = decode_stages(e, bc, sw, scratch);
             } catch (const std::bad_alloc&) {
                 hr = E_OUTOFMEMORY;
             }
@@ -1361,7 +1424,7 @@ private:
         return S_OK;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 
-    HRESULT publish(Entry& e, std::vector<uint8_t>& data) try {
+    HRESULT publish(Entry& e, Bytes& data) try {
         const auto& r = e.request;
         const auto o = r.Options.AsUINT64;
         const auto bc = options::bcpack(o), sw = options::swizzle(o);
