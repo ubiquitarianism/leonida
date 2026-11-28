@@ -12051,6 +12051,8 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // Leonida: held to a fraction of the recent mean interval (`LEONIDA_PRESENT_SMOOTH`).
+            crate::smooth::hold();
             // Leonida: for the A/B phase lines, when each frame is handed over to be shown.
             #[cfg(feature = "diagnostics")]
             crate::ab::shown();
@@ -12068,6 +12070,7 @@ impl Host {
             } else {
                 let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             }
+            crate::smooth::presented();
             crate::fg::present_end(frame);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]

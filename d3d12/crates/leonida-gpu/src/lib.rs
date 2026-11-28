@@ -62,6 +62,8 @@ pub mod aspect;
 pub mod streamline;
 #[cfg(windows)]
 mod fg;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod smooth;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
