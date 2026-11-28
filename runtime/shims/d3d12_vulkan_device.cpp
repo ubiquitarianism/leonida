@@ -22168,10 +22168,12 @@ bool depth_stencil_resolve_supported(DXGI_FORMAT format, ID3D12Resource* dst, UI
     if (!d || !s) return false;
     // The format names the depth format, or one plane by its shader-resource format. Measured on the PC runtime
     // (RTX 5070 and WARP): Close fails for AVERAGE with the depth format or a stencil plane; the depth plane's
-    // own format (R32_FLOAT, R24_UNORM_X8_TYPELESS) takes AVERAGE as well as MIN and MAX.
+    // own format (R16_UNORM, R32_FLOAT, R24_UNORM_X8_TYPELESS, R32_FLOAT_X8X24_TYPELESS) takes AVERAGE as well
+    // as MIN and MAX.
     DXGI_FORMAT family = format;
     int named_plane = -1;  // -1: any plane of the depth format
     switch (format) {
+    case DXGI_FORMAT_R16_UNORM: family = DXGI_FORMAT_D16_UNORM, named_plane = 0; break;
     case DXGI_FORMAT_R32_FLOAT: family = DXGI_FORMAT_D32_FLOAT, named_plane = 0; break;
     case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: family = DXGI_FORMAT_D24_UNORM_S8_UINT, named_plane = 0; break;
     case DXGI_FORMAT_X24_TYPELESS_G8_UINT: family = DXGI_FORMAT_D24_UNORM_S8_UINT, named_plane = 1; break;

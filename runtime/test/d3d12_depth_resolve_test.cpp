@@ -1,6 +1,7 @@
 ﻿// Compare depth/stencil ResolveSubresourceRegion with Windows D3D12 on the layer's own adapter and on WARP, through
 // clears, resolves, copies and Map on both sides: MIN and MAX of either plane, named by the depth format or the
-// plane's own format, and AVERAGE of the depth plane by its own format (R32_FLOAT, R24_UNORM_X8_TYPELESS).
+// plane's own format, and AVERAGE of the depth plane by its own format (R16_UNORM, R32_FLOAT, R24_UNORM_X8_TYPELESS,
+// R32_FLOAT_X8X24_TYPELESS).
 // Clears write whole pixels, so all samples of a pixel are equal and every mode returns that value: these cases
 // check planes, formats, rectangles and layouts, not the reduction over differing samples. D32_FLOAT_S8X24_UINT takes
 // the same cases as D24S8, by its own format and by its planes' (R32_FLOAT_X8X24_TYPELESS, X32_TYPELESS_G8X24_UINT)
@@ -27,6 +28,7 @@
 #include <d3dcompiler.h>
 #endif
 #include <dxgi1_4.h>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -65,6 +67,16 @@ struct Case {
     DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;      // the DSV format, when not `format`
     bool edge = false;  // a triangle drawn over the clears, so the samples of the pixels on its edge differ
 };
+
+// The depth plane holds 16-bit UNORM (D16_UNORM and its typeless and plane formats).
+bool unorm16(const Case& c) {
+    switch (c.resource ? c.resource : c.format) {
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_R16_UNORM: return true;
+    default: return false;
+    }
+}
 
 // The depth plane holds 24-bit UNORM (D24S8 and its typeless and plane formats) rather than a float.
 bool unorm24(const Case& c) {
@@ -255,10 +267,11 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool che
     const D3D12_RANGE range{0, SIZE_T(total)};
     CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
     const auto* base = static_cast<unsigned char*>(mapped);
-    out.depth.resize(width * height * 4);
+    const UINT depth_bytes = unorm16(c) ? 2u : 4u;
+    out.depth.resize(width * height * depth_bytes);
     for (UINT row = 0; row < height; ++row)
-        std::memcpy(out.depth.data() + row * width * 4, base + placed[0].Offset + row * placed[0].Footprint.RowPitch,
-                    width * 4);
+        std::memcpy(out.depth.data() + row * width * depth_bytes,
+                    base + placed[0].Offset + row * placed[0].Footprint.RowPitch, width * depth_bytes);
     if (unorm24(c))
         for (std::size_t i = 3; i < out.depth.size(); i += 4) out.depth[i] = 0;  // the X8 byte is undefined
     out.stencil.clear();
@@ -291,21 +304,38 @@ Planes expected_planes(const Case& c, bool resolved = true) {
             if (!resolved || !in(area, x, y)) depth = 0.0f, stencil = 0x5a;
             if (c.plane == 1) depth = 0.0f;
             else stencil = 0x5a;
-            std::uint32_t bits = 0;
-            if (unorm24(c))
-                bits = std::uint32_t(double(depth) * 16777215.0 + 0.5);
-            else
-                std::memcpy(&bits, &depth, 4);
-            for (int i = 0; i < 4; ++i) out.depth.push_back(static_cast<unsigned char>(bits >> (8 * i)));
+            if (unorm16(c)) {
+                const auto bits = std::uint16_t(double(depth) * 65535.0 + 0.5);
+                out.depth.push_back(static_cast<unsigned char>(bits & 0xffu));
+                out.depth.push_back(static_cast<unsigned char>(bits >> 8));
+            } else {
+                std::uint32_t bits = 0;
+                if (unorm24(c))
+                    bits = std::uint32_t(double(depth) * 16777215.0 + 0.5);
+                else
+                    std::memcpy(&bits, &depth, 4);
+                for (int i = 0; i < 4; ++i) out.depth.push_back(static_cast<unsigned char>(bits >> (8 * i)));
+            }
             if (c.stencil) out.stencil.push_back(stencil);
         }
     }
     return out;
 }
 
-bool same_planes(const Planes& a, const Planes& b, bool only_resolved, UINT plane) {
-    if (only_resolved) return plane ? a.stencil == b.stencil : a.depth == b.depth;
-    return a.depth == b.depth && a.stencil == b.stencil;
+bool same_planes(const Planes& a, const Planes& b, bool only_resolved, const Case& c) {
+    if (c.plane) return only_resolved ? a.stencil == b.stencil : a.depth == b.depth && a.stencil == b.stencil;
+    if (!only_resolved && a.stencil != b.stencil) return false;
+    if (a.depth == b.depth) return true;
+    // D16_UNORM clears and mixed-sample AVERAGE resolves can differ by 1 LSB (1/65535) across GPUs
+    // (e.g. Apple GPUs under MoltenVK/KosmicKrisp round a 0.25 clear down to 16383 instead of 16384).
+    if (!unorm16(c) || a.depth.size() != b.depth.size())
+        return false;
+    for (std::size_t i = 0; i + 1 < a.depth.size(); i += 2) {
+        const auto u = int(std::uint16_t(a.depth[i] | (a.depth[i + 1] << 8)));
+        const auto v = int(std::uint16_t(b.depth[i] | (b.depth[i + 1] << 8)));
+        if (std::abs(u - v) > 1) return false;
+    }
+    return true;
 }
 
 const char* mode_name(D3D12_RESOLVE_MODE mode) {
@@ -332,17 +362,19 @@ int main() {
     std::printf("Vulkan resolve modes: depth 0x%x, stencil 0x%x\n", unsigned(resolve.supportedDepthResolveModes),
                 unsigned(resolve.supportedStencilResolveModes));
 
-    constexpr auto d32 = DXGI_FORMAT_D32_FLOAT, d24 = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    constexpr auto d16 = DXGI_FORMAT_D16_UNORM, d32 = DXGI_FORMAT_D32_FLOAT, d24 = DXGI_FORMAT_D24_UNORM_S8_UINT;
     constexpr auto min = D3D12_RESOLVE_MODE_MIN, max = D3D12_RESOLVE_MODE_MAX, average = D3D12_RESOLVE_MODE_AVERAGE;
-    constexpr auto r32 = DXGI_FORMAT_R32_FLOAT, x8 = DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
-                   g8 = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
-    constexpr auto r32_typeless = DXGI_FORMAT_R32_TYPELESS, r24g8_typeless = DXGI_FORMAT_R24G8_TYPELESS;
+    constexpr auto r16 = DXGI_FORMAT_R16_UNORM, r32 = DXGI_FORMAT_R32_FLOAT,
+                   x8 = DXGI_FORMAT_R24_UNORM_X8_TYPELESS, g8 = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    constexpr auto r16_typeless = DXGI_FORMAT_R16_TYPELESS, r32_typeless = DXGI_FORMAT_R32_TYPELESS,
+                   r24g8_typeless = DXGI_FORMAT_R24G8_TYPELESS;
     constexpr auto d32s8 = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, r32x8 = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
                    g8x24 = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, r32g8x24_typeless = DXGI_FORMAT_R32G8X24_TYPELESS;
     std::vector<Case> cases;  // resolved, and compared with the host
     for (const bool edge : {false, true}) {
         for (const bool rect : {false, true}) {
             for (const auto mode : {min, max}) {
+                cases.push_back({"D16 depth", d16, false, 0, mode, rect, -1, -1, false, {}, {}, edge});
                 cases.push_back({"D32 depth", d32, false, 0, mode, rect, -1, -1, false, {}, {}, edge});
                 cases.push_back({"D24S8 depth", d24, true, 0, mode, rect, -1, -1, false, {}, {}, edge});
                 cases.push_back({"D24S8 stencil", d24, true, 1, mode, rect, -1, -1, false, {}, {}, edge});
@@ -353,6 +385,7 @@ int main() {
                                  edge});
             }
             for (const auto mode : {min, max, average}) {
+                cases.push_back({"D16 depth as R16_UNORM", r16, false, 0, mode, rect, -1, -1, false, d16, d16, edge});
                 cases.push_back({"D32 depth as R32_FLOAT", r32, false, 0, mode, rect, -1, -1, false, d32, d32, edge});
                 cases.push_back({"D24S8 depth as R24_X8", x8, true, 0, mode, rect, -1, -1, false, d24, d24, edge});
                 cases.push_back({"D32S8 depth as R32_X8X24", r32x8, true, 0, mode, rect, -1, -1, false, d32s8, d32s8,
@@ -360,6 +393,9 @@ int main() {
             }
         }
     }
+    cases.push_back({"R16_TYPELESS depth as D16", d16, false, 0, min, false, -1, -1, false, r16_typeless});
+    cases.push_back({"R16_TYPELESS depth as R16_UNORM", r16, false, 0, average, true, -1, -1, false, r16_typeless,
+                     d16});
     cases.push_back({"R32_TYPELESS depth as D32", d32, false, 0, min, false, -1, -1, false, r32_typeless});
     cases.push_back({"R24G8_TYPELESS stencil as D24S8", d24, true, 1, max, true, -1, -1, false, r24g8_typeless});
     cases.push_back({"R24G8_TYPELESS depth as R24_X8", x8, true, 0, average, true, -1, -1, false, r24g8_typeless, d24});
@@ -367,6 +403,7 @@ int main() {
     cases.push_back({"R32G8X24_TYPELESS depth as R32_X8X24", r32x8, true, 0, average, false, -1, -1, false,
                      r32g8x24_typeless, d32s8});
     const Case refused[] = {
+        {"D16 depth", d16, false, 0, average, false, -1, -1, true},
         {"D32 depth", d32, false, 0, average, false, -1, -1, true},
         {"D24S8 depth", d24, true, 0, average, true, -1, -1, true},
         {"D24S8 stencil", d24, true, 1, average, false, -1, -1, true},
@@ -458,10 +495,10 @@ int main() {
             // Successful edge resolves have no CPU coverage model and are compared with the host below.
             const Planes expected = expected_planes(c, can);
             if (results[i].close != (can ? S_OK : E_INVALIDARG) ||
-                ((!c.edge || !can) && !same_planes(results[i], expected, false, c.plane))) {
+                ((!c.edge || !can) && !same_planes(results[i], expected, false, c))) {
                 std::fprintf(stderr, "%s %s rect %d: Close 0x%08lx, destination %s the clears\n", c.name,
                              mode_name(c.mode), int(c.rect), results[i].close,
-                             same_planes(results[i], expected, false, c.plane) ? "matches" : "differs from");
+                             same_planes(results[i], expected, false, c) ? "matches" : "differs from");
                 ++failures;
             }
             if (!can) {
@@ -480,7 +517,7 @@ int main() {
                     results[j].depth.empty())
                     continue;
                 ++edges;
-                if (same_planes(results[i], results[j], true, c.plane)) {
+                if (same_planes(results[i], results[j], true, c)) {
                     std::fprintf(stderr, "edge %s rect %d: MIN and MAX agree everywhere; the samples did not differ" "\n",
                                  c.name, int(c.rect));
                     ++failures;
@@ -490,10 +527,10 @@ int main() {
         for (const Case& c : refused) {
             Planes p;
             if (!resolve_and_read(ours.p, c, p, true)) return 1;
-            if (p.close != E_INVALIDARG || !same_planes(p, expected_planes(c, false), false, c.plane)) {
+            if (p.close != E_INVALIDARG || !same_planes(p, expected_planes(c, false), false, c)) {
                 std::fprintf(stderr, "refused %s %s rect %d: Close 0x%08lx, destination %s\n", c.name,
                              mode_name(c.mode), int(c.rect), p.close,
-                             same_planes(p, expected_planes(c, false), false, c.plane) ? "kept" : "changed");
+                             same_planes(p, expected_planes(c, false), false, c) ? "kept" : "changed");
                 ++failures;
             }
             ++refusals;
@@ -554,25 +591,25 @@ int main() {
                 // a Ryzen 7 9700X iGPU (AMD 32.0.21042.62) depth MIN/MAX; whole subresources and rectangles alike.
                 // Only report edge differences if a clear comparison found a quirk, or if WARP is a second reference.
                 if (c.edge && ((warp && !warp_stencil) || quirky(c))) {
-                    if (FAILED(expected.close) || !same_planes(expected, results[i], true, c.plane))
+                    if (FAILED(expected.close) || !same_planes(expected, results[i], true, c))
                         std::printf("edge %s %s rect %d: %s differs from the layer (information)\n", c.name,
                                     mode_name(c.mode), int(c.rect), name);
                     else
                         ++same;
                     continue;
                 }
-                if (!c.edge && SUCCEEDED(expected.close) && !same_planes(expected, expected_planes(c), warp, c.plane)) {
+                if (!c.edge && SUCCEEDED(expected.close) && !same_planes(expected, expected_planes(c), warp, c)) {
                     quirks_seen.push_back(&c);
                     std::printf("%s %s rect %d against %s: host quirk: the host differs from the clears; the layer "
                                 "matches them\n", c.name, mode_name(c.mode), int(c.rect), name);
                     ++quirks;
                     continue;
                 }
-                if (FAILED(expected.close) || !same_planes(expected, results[i], warp, c.plane)) {
+                if (FAILED(expected.close) || !same_planes(expected, results[i], warp, c)) {
                     std::fprintf(stderr, "%s %s rect %d against %s: host Close 0x%08lx, host %s the clears, "
                                  "layer and host %s\n", c.name, mode_name(c.mode), int(c.rect), name, expected.close,
-                                 same_planes(expected, expected_planes(c), warp, c.plane) ? "matches" : "differs from",
-                                 same_planes(expected, results[i], warp, c.plane) ? "agree" : "differ");
+                                 same_planes(expected, expected_planes(c), warp, c) ? "matches" : "differs from",
+                                 same_planes(expected, results[i], warp, c) ? "agree" : "differ");
                     ++failures;
                     continue;
                 }
