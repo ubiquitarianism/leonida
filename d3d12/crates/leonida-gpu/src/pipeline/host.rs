@@ -949,7 +949,14 @@ impl HostPipeline {
         // two do not combine yet): `draw` completes its rectangles as it does
         // when the host refuses that stage.
         let mut bary_gs = None;
+        // (A mesh program run as compute draws through `mesh_vs`, which writes
+        // the stand-ins itself: every corner is its own vertex there.)
+        let mesh_vs = stages
+            .first()
+            .and_then(|(s, _)| s.translated())
+            .is_some_and(|t| t.host.root_srvs.contains(&leonida_shader::emit::SLOT_MESH_IN));
         if let Some(ps) = stages.get(1).and_then(|(s, _)| s.translated())
+            && !mesh_vs
             && leonida_shader::emit::needs_bary_gs(&ps.host.dxil)
         {
             let vs = &stages[0].0.translated()?.host.dxil;

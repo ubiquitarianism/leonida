@@ -4082,6 +4082,45 @@ mod barycentric_tests {
         assert_eq!(vertex_source(vertex_index(2, 31, 3)), (2, 31, 3));
     }
 
+    /// A mesh program run as compute draws through `mesh_vs`, which writes the
+    /// pixel shader's stand-ins itself (each corner is its own vertex there):
+    /// every stand-in the pixel shader reads is a `mesh_vs` output in the same
+    /// register, and dxil.dll takes the vertex shader.
+    #[test]
+    fn mesh_vs_writes_the_barycentrics_stand_ins() {
+        let element = |name: &str, kind, row| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let outputs = [element("SV_Position", 3, 0), element("TEXCOORD", 0, 1)];
+        let layout = MeshOut::new(32, 32, &outputs, &[]);
+        for (name, words, ena, _) in barycentric_programs() {
+            let ps = pixel_without_barycentrics(&words, ena).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let (_, inputs) = parts(&ps);
+            let vs = mesh_vs(&layout, Some(&ps.dxil)).unwrap_or_else(|e| panic!("{name}: mesh_vs: {e}"));
+            let c = Container::parse(&vs).unwrap();
+            let written = signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+            for e in inputs.iter().filter(|e| e.name == BARY_INPUT || e.name == VERTEX_INPUT) {
+                assert!(
+                    written.iter().any(|o| o.name == e.name && o.index == e.index && o.row == e.row && o.col == e.col),
+                    "{name}: {e:?} not written: {written:?}"
+                );
+            }
+            #[cfg(windows)]
+            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                v.validate(&mut vs.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
+    }
+
     /// The vertex shader of the device tests: POSITION and TEXCOORD0 through,
     /// TEXCOORD in output row 0 as the translated pixel shaders read it.
     #[cfg(windows)]

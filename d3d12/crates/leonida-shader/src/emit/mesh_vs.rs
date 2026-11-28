@@ -46,11 +46,18 @@ pub fn mesh_vs(layout: &MeshOut, ps: Option<&[u8]>) -> Result<Vec<u8>, ShaderErr
     build(layout, vertex, &primitive, &wanted)
 }
 
-/// Where an output's value comes from: byte `at` of its vertex (`false`)
-/// or of its primitive past the indices (`true`).
-struct Source {
-    primitive: bool,
-    at: u32,
+/// Where an output's value comes from.
+enum Source {
+    /// Byte `at` of its vertex (`false`) or of its primitive past the
+    /// indices (`true`).
+    Out { primitive: bool, at: u32 },
+    /// [`super::BARY_INPUT`] on a host without barycentrics: 1 at the
+    /// corner's column, 0 elsewhere (each corner is its own vertex here, so
+    /// interpolated they are the weights).
+    Weights,
+    /// [`super::VERTEX_INPUT`]: corner `k`'s value of the vertex output at
+    /// byte `at` (none there: 0), the same at all three corners.
+    Corner { k: u32, at: Option<u32> },
 }
 
 fn build(
@@ -69,14 +76,33 @@ fn build(
     if layout.max_primitives == 0 {
         return Err(unsupported("a mesh program without primitives"));
     }
+    // The pixel shader's barycentrics stand-ins (a host without
+    // barycentrics) are placed past its own inputs, not knowing the mesh
+    // program's registers: a vertex output there that the pixel shader does
+    // not read is left out, a system value moves past them (as `bary_gs`).
+    let ours: Vec<&SigElement> = ps_inputs
+        .iter()
+        .filter(|e| e.name == super::BARY_INPUT || e.name == super::VERTEX_INPUT)
+        .collect();
+    if ours.iter().any(|e| e.row.is_none()) {
+        return Err(unsupported("a barycentrics stand-in without a register"));
+    }
+    let taken = |row: Option<u32>| ours.iter().any(|e| e.row == row);
     let mut outputs = Vec::new();
     let mut sources = Vec::new();
-    for (e, &at) in vertex.iter().zip(&layout.vertex_at) {
+    let mut moved = Vec::new();
+    for (id, (e, &at)) in vertex.iter().zip(&layout.vertex_at).enumerate() {
+        if taken(e.row) {
+            if e.kind != 0 {
+                moved.push(id);
+            }
+            continue;
+        }
         outputs.push(SigElement {
             usage: (1 << e.cols) - 1,
             ..e.clone()
         });
-        sources.push(Source { primitive: false, at });
+        sources.push(Source::Out { primitive: false, at });
     }
     // A per-primitive output goes where the pixel shader reads it; one the
     // pixel shader does not read is not drawn with.
@@ -102,7 +128,50 @@ fn build(
             usage: (1 << p.cols) - 1,
             ..p.clone()
         });
-        sources.push(Source { primitive: true, at });
+        sources.push(Source::Out { primitive: true, at });
+    }
+    let used = outputs.iter().chain(ours.iter().copied()).filter_map(|e| e.row).max();
+    let mut free = used.map_or(0, |r| r + 1);
+    let mut rows: Vec<(Option<u32>, u32)> = Vec::new();
+    for id in moved {
+        let mut e = vertex[id].clone();
+        let row = match rows.iter().find(|(old, _)| *old == e.row) {
+            Some(&(_, new)) => new,
+            None => {
+                rows.push((e.row, free));
+                free += 1;
+                free - 1
+            }
+        };
+        e.row = Some(row);
+        e.usage = (1 << e.cols) - 1;
+        outputs.push(e);
+        sources.push(Source::Out { primitive: false, at: layout.vertex_at[id] });
+    }
+    if free > 32 {
+        return Err(unsupported("a mesh vertex shader with more than 32 output registers"));
+    }
+    for e in &ours {
+        let source = if e.name == super::BARY_INPUT {
+            Source::Weights
+        } else {
+            let (k, row, col) = super::vertex_source(e.index);
+            if !(1..=2).contains(&k) {
+                return Err(unsupported("a vertex stand-in of a vertex other than 1 or 2"));
+            }
+            let at = vertex.iter().zip(&layout.vertex_at).find_map(|(o, &at)| {
+                (o.row == Some(row) && col >= o.col && col < o.col + o.cols).then(|| at + 4 * u32::from(col - o.col))
+            });
+            Source::Corner { k: u32::from(k), at }
+        };
+        // (as `bary_gs`: a signature has no interpolation mode)
+        let interp = if e.name == super::VERTEX_INPUT { 1 } else { 2 };
+        outputs.push(SigElement {
+            usage: (1 << e.cols) - 1,
+            interp,
+            ..(*e).clone()
+        });
+        sources.push(source);
     }
 
     let mut s = Shader::new(false);
@@ -165,17 +234,49 @@ fn build(
     let vertex_at = s.m.bin(b, Bin::Mul, index, vstride);
     let vertex_at = s.m.bin(b, Bin::Add, vertex_at, base);
 
+    let f32t = s.t.f32;
     for (id, source) in sources.iter().enumerate() {
-        let (from, cols, float) = {
-            let e = &s.outputs[id];
-            (if source.primitive { prim_at } else { vertex_at }, e.cols, e.comp == 9)
+        let (cols, float) = (s.outputs[id].cols, s.outputs[id].comp == 9);
+        // Corner `k`'s vertex, for a vertex stand-in.
+        let corner_vertex = match *source {
+            Source::Corner { k: c, .. } => {
+                let off = k(&mut s, 4 * c);
+                let at = s.m.bin(b, Bin::Add, prim_at, off);
+                let i = load(&mut s, at);
+                let i = s.m.select(b, past, zero, i);
+                let last = k(&mut s, layout.max_vertices.saturating_sub(1));
+                let i = s.op(b, "binary.i32", Attr::ReadNone, i32t, 40, &[i, last]);
+                s.m.tag(i, super::bitcode::Tag::Clamp);
+                let v = s.m.bin(b, Bin::Mul, i, vstride);
+                Some(s.m.bin(b, Bin::Add, v, base))
+            }
+            _ => None,
         };
         for col in 0..cols {
-            let off = k(&mut s, source.at + 4 * u32::from(col));
-            let at = s.m.bin(b, Bin::Add, from, off);
-            let bits = load(&mut s, at);
+            let bits = match *source {
+                Source::Out { primitive, at } => {
+                    let from = if primitive { prim_at } else { vertex_at };
+                    let off = k(&mut s, at + 4 * u32::from(col));
+                    let at = s.m.bin(b, Bin::Add, from, off);
+                    load(&mut s, at)
+                }
+                Source::Weights => {
+                    let c = k(&mut s, u32::from(col));
+                    let here = s.m.cmp(b, super::bitcode::pred::EQ, corner, c);
+                    let (one, nought) = (s.m.f32(1.0f32.to_bits()), s.m.f32(0));
+                    let w = s.m.select(b, here, one, nought);
+                    s.m.cast(b, super::bitcode::Cast::Bitcast, w, i32t)
+                }
+                Source::Corner { at, .. } => match (at, corner_vertex) {
+                    (Some(at), Some(v)) => {
+                        let off = k(&mut s, at);
+                        let at = s.m.bin(b, Bin::Add, v, off);
+                        load(&mut s, at)
+                    }
+                    _ => zero,
+                },
+            };
             let (name, value) = if float {
-                let f32t = s.t.f32;
                 ("storeOutput.f32", s.m.cast(b, super::bitcode::Cast::Bitcast, bits, f32t))
             } else {
                 ("storeOutput.i32", bits)
