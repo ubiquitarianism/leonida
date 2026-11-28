@@ -6,11 +6,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 namespace leonida {
@@ -114,7 +116,9 @@ struct DescriptorEntry {
     std::uint32_t index = 0;
     std::uint32_t kind = 0; // 0 when empty, kSlotOccupiedMarker | (kKindMask bits) when occupied
 };
-static_assert(sizeof(DescriptorEntry) == 40);
+static_assert(std::is_trivially_copyable_v<DescriptorEntry> && sizeof(DescriptorEntry) == 40 &&
+              offsetof(DescriptorEntry, key) == 0 && offsetof(DescriptorEntry, index) == 32 &&
+              offsetof(DescriptorEntry, kind) == 36);
 
 inline constexpr bool slot_occupied(const DescriptorEntry& entry) {
     return (entry.kind & kSlotOccupiedMarker) != 0;
@@ -247,13 +251,7 @@ public:
     std::vector<std::uint32_t> build_gpu_buffer(bool clear_occupied = false) const {
         std::lock_guard lock(mutex_);
         std::vector<std::uint32_t> out(1 + entries_.size() * 10, 0);
-        out[0] = mask_;
-        for (std::size_t s = 0; s < entries_.size(); ++s) {
-            const std::size_t base = 1 + s * 10;
-            std::memcpy(&out[base], entries_[s].key, sizeof(entries_[s].key));
-            out[base + 8] = entries_[s].index;
-            out[base + 9] = clear_occupied ? slot_kind(entries_[s]) : entries_[s].kind;
-        }
+        write_locked(out.data(), clear_occupied);
         return out;
     }
 
@@ -281,12 +279,7 @@ public:
         if (count > 0 && !dest) return false;
         std::lock_guard lock(mutex_);
         if (first > entries_.size() || count > entries_.size() - first) return false;
-        for (std::uint32_t i = 0; i < count; ++i) {
-            const DescriptorEntry& entry = entries_[first + i];
-            std::memcpy(dest + i * 10, entry.key, sizeof(entry.key));
-            dest[i * 10 + 8] = entry.index;
-            dest[i * 10 + 9] = entry.kind;
-        }
+        if (count) std::memcpy(dest, entries_.data() + first, count * sizeof(DescriptorEntry));
         return true;
     }
 
@@ -294,20 +287,21 @@ public:
     void write_to_buffer(void* dest, bool clear_occupied = false) const {
         if (!dest) return;
         std::lock_guard lock(mutex_);
-        auto* out = static_cast<std::uint8_t*>(dest);
-        std::memcpy(out, &mask_, sizeof(mask_));
-        out += sizeof(mask_);
-        for (const auto& entry : entries_) {
-            std::uint32_t slot[10];
-            std::memcpy(slot, entry.key, sizeof(entry.key));
-            slot[8] = entry.index;
-            slot[9] = clear_occupied ? slot_kind(entry) : entry.kind;
-            std::memcpy(out, slot, sizeof(slot));
-            out += sizeof(slot);
-        }
+        write_locked(dest, clear_occupied);
     }
 
 private:
+    void write_locked(void* dest, bool clear_occupied) const {
+        auto* out = static_cast<std::uint8_t*>(dest);
+        std::memcpy(out, &mask_, sizeof(mask_));
+        out += sizeof(mask_);
+        std::memcpy(out, entries_.data(), entries_.size() * sizeof(DescriptorEntry));
+        if (clear_occupied)
+            for (std::size_t i = 0; i < entries_.size(); ++i) {
+                const auto kind = slot_kind(entries_[i]);
+                std::memcpy(out + i * sizeof(DescriptorEntry) + offsetof(DescriptorEntry, kind), &kind, sizeof(kind));
+            }
+    }
     void mark(std::uint32_t slot) { changed_slots_.push_back(slot); }
 
     // All eight slots for the incoming key are occupied. Try moving one resident
