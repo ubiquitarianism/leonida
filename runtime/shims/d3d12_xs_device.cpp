@@ -3483,8 +3483,11 @@ void apply_deferred_waits(ListProxy* self) {
 
 // write64 with flag 1 (the GPU's timestamp) or 2 (the system's): the GPU takes its timestamp here, at the write's
 // place in the list (the title's GPU timing reads these back: a begin/end pair must be its work's, not one landing
-// time). Without the device's timestamp heap the write lands the CPU's clock, as before.
+// time). Without the device's timestamp heap the write lands the CPU's clock, as before. So does a write on a COPY
+// list: the device's heap is a TIMESTAMP one, and a copy list needs a COPY_QUEUE_TIMESTAMP heap (the queue would
+// refuse the submission).
 void take_timestamp(ListProxy* self, list_values::Write& write) {
+    if (self->real->GetType() == D3D12_COMMAND_LIST_TYPE_COPY) return;
     DeviceProxy* device = self->device;
     std::shared_ptr<list_values::Timestamps> stamps;
     {
@@ -3962,6 +3965,8 @@ void WINAPI list_om_set_depth_bounds(ListProxy* self, FLOAT min, FLOAT max) {
     using Fn = void(WINAPI*)(IUnknown*, FLOAT, FLOAT);
     auto** const real_vtable = *reinterpret_cast<void***>(self->real);
     reinterpret_cast<Fn>(real_vtable[kPcOMSetDepthBounds])(self->real, min, max);
+    // Kept with the rest of the list's state: a list cut replays it, and a bundle's stays set in the list running it.
+    if (self->track_state) self->state.depth_bounds(min, max);
 }
 
 template <std::size_t... I>

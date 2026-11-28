@@ -1185,6 +1185,12 @@ public:
         stencil_ = ref;
         set_ |= kStencil;
     }
+    // OMSetDepthBounds (ID3D12GraphicsCommandList1, PC slot 62), recorded only once the real list took it.
+    void depth_bounds(FLOAT min, FLOAT max) {
+        depth_bounds_[0] = min;
+        depth_bounds_[1] = max;
+        set_ |= kDepthBounds;
+    }
     void blend_factor(const FLOAT* factor) {
         set_ |= kBlend;
         blend_null_ = !factor;
@@ -1272,6 +1278,7 @@ public:
         if (bundle.set_ & kTopology) topology(bundle.topology_);
         if (bundle.set_ & kStencil) stencil_ref(bundle.stencil_);
         if (bundle.set_ & kBlend) blend_factor(bundle.blend_null_ ? nullptr : bundle.blend_);
+        if (bundle.set_ & kDepthBounds) depth_bounds(bundle.depth_bounds_[0], bundle.depth_bounds_[1]);
         if (bundle.set_ & kIndexBuffer) index_buffer(bundle.ib_null_ ? nullptr : &bundle.ib_);
         for (UINT i = 0; i < kMaxVertexBuffers; ++i)
             if (bundle.vb_mask_ >> i & 1) vertex_buffers(i, 1, &bundle.vbs_[i]);
@@ -1353,6 +1360,11 @@ public:
         if (scissor_count_) list->RSSetScissorRects(scissor_count_, scissors_);
         if (set_ & kBlend) list->OMSetBlendFactor(blend_null_ ? nullptr : blend_);
         if (set_ & kStencil) list->OMSetStencilRef(static_cast<UINT>(stencil_));
+        if (set_ & kDepthBounds) {
+            // ID3D12GraphicsCommandList1::OMSetDepthBounds, slot 62 of the real list (which took it before the cut).
+            using Fn = void(WINAPI*)(ID3D12GraphicsCommandList*, FLOAT, FLOAT);
+            reinterpret_cast<Fn>((*reinterpret_cast<void***>(list))[62])(list, depth_bounds_[0], depth_bounds_[1]);
+        }
         if (set_ & kIndexBuffer) list->IASetIndexBuffer(ib_null_ ? nullptr : &ib_);
         for (UINT i = 0; i < kMaxVertexBuffers; ++i)
             if (vb_mask_ >> i & 1) list->IASetVertexBuffers(i, 1, &vbs_[i]);
@@ -1374,6 +1386,7 @@ private:
     static constexpr UINT kMaxSoTargets = 4;
     enum : std::uint32_t {
         kPipeline = 1, kTopology = 2, kStencil = 4, kBlend = 8, kIndexBuffer = 16, kTargets = 32, kPredication = 64,
+        kDepthBounds = 128,
     };
     struct Side {
         bool signature_set = false;
@@ -1398,6 +1411,7 @@ private:
     std::uint32_t set_ = 0;
     std::uint64_t pso_ = 0, topology_ = 0, stencil_ = 0;
     FLOAT blend_[4] = {};
+    FLOAT depth_bounds_[2] = {};
     bool blend_null_ = false, ib_null_ = false, rt_has_dsv_ = false;
     BOOL rt_single_ = FALSE;
     UINT viewport_count_ = 0, scissor_count_ = 0, heap_count_ = 0, rt_count_ = 0;

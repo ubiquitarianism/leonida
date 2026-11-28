@@ -137,6 +137,8 @@ struct Mock {
     D3D12_CLEAR_FLAGS clear_dsv_flags;
     FLOAT clear_dsv_depth;
     UINT8 clear_dsv_stencil;
+    unsigned list_type;                  // list: what GetType (slot 8) answers, the type it was created with
+    FLOAT depth_bounds[2];               // list slot 62 (OMSetDepthBounds): typed float-ABI capture
     UINT clear_dsv_num_rects;
     const D3D12_RECT* clear_dsv_rects;
     D3D_FEATURE_LEVEL max_level;  // device: the highest level FEATURE_LEVELS reports (0: the query is refused)
@@ -580,6 +582,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         m->om_dsv = dsv ? dsv->ptr : 0;
     }
     if (m->kind == Kind::list || m->kind == Kind::command_list) {
+        if (slot == 8) return m->list_type;                                                  // GetType
         if (slot == 9) return static_cast<std::uint32_t>(m->list_error ? E_INVALIDARG : S_OK);  // Close
         if (slot == 48 && mock_is_null_rtv(static_cast<SIZE_T>(a1))) m->list_error = true;  // ClearRenderTargetView
         if (slot == 80) mock_barrier(m, a1, a2);                                             // Barrier
@@ -637,6 +640,13 @@ void WINAPI mock_clear_depth_stencil_view(Mock* self, D3D12_CPU_DESCRIPTOR_HANDL
     self->clear_dsv_rects = rects;
 }
 
+// PC ID3D12GraphicsCommandList1::OMSetDepthBounds: its FLOAT arguments arrive in XMM1 and XMM2.
+void WINAPI mock_om_set_depth_bounds(Mock* self, FLOAT min, FLOAT max) {
+    ++self->calls[62];
+    self->depth_bounds[0] = min;
+    self->depth_bounds[1] = max;
+}
+
 // PC ID3D12Device::CreateCommandList takes six words after `this`, one more than the generic mock thunk declares, so
 // it gets its own entry in the table: the out pointer is a6 (first stack argument on x64) and has to be written.
 HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std::uint64_t type,
@@ -655,6 +665,7 @@ HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std
     if (self->create_null || FAILED(self->create_result)) return self->create_result;
     Mock* child = new_mock(self->full_chain_lists ? Kind::list : Kind::command_list);
     child->list_level = self->list_level;
+    child->list_type = static_cast<unsigned>(type);
     self->last_child = child;
     return mock_query(child, riid, out);
 }
@@ -772,6 +783,7 @@ void** mock_list_vtable() {
     static const bool filled = [] {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
         table[47] = reinterpret_cast<void*>(&mock_clear_depth_stencil_view);
+        table[62] = reinterpret_cast<void*>(&mock_om_set_depth_bounds);
         return true;
     }();
     (void)filled;
@@ -4027,6 +4039,88 @@ std::uint64_t submit(void* queue, void* list) {
     return raw(queue, 35, 1, word(lists));
 }
 
+// ---- List values: no GPU timestamp on a COPY list; depth bounds survive a cut (RT-XS-LIST-VALUES-COPY-...) ----
+// 1. A write64 timestamp (flag 1) on a COPY list records no TIMESTAMP query there (a COPY list needs a
+//    COPY_QUEUE_TIMESTAMP heap, and the queue would refuse the submission): it lands the CPU's clock. A DIRECT list
+//    still takes the GPU's.
+// 2. OMSetDepthBoundsX (console slot 70) is replayed on the spare list a wait cuts to, and a bundle's stays set in the
+//    list that executes it, across a cut there too.
+int check_list_values_copy_and_depth_bounds() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);
+    EXPECT(device);
+    mock->zero_fences = true;
+    xs::reset_list_value_stats();
+    xs::set_list_value_wait_timeout_ms(5000);
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    const IID gcl_iid = __uuidof(ID3D12GraphicsCommandList);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    alignas(64) static std::uint64_t cells[3];
+    std::memset(cells, 0, sizeof(cells));
+
+    // 1.
+    void* copy = nullptr;
+    EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_COPY, word(allocator), 0, word(&gcl_iid),
+                     word(&copy))) == S_OK);
+    Mock* const copy_real = mock->last_child;
+    EXPECT(copy_real->list_type == D3D12_COMMAND_LIST_TYPE_COPY);
+    raw(copy, 72, word(&cells[0]), 0, 0, 1);   // write64 flag 1: a GPU timestamp
+    EXPECT(copy_real->calls[53] == 0 && copy_real->calls[54] == 0);   // no EndQuery, no ResolveQueryData
+    EXPECT(hr_of(raw(copy, 9)) == S_OK);
+    Mock* direct_real = nullptr;
+    void* direct = make_console_list(device, allocator, mock, &direct_real);
+    EXPECT(direct);
+    raw(direct, 72, word(&cells[1]), 0, 0, 1);
+    EXPECT(direct_real->calls[53] == 1 && direct_real->calls[54] == 1 &&
+           std::uint32_t(direct_real->args[53][1]) == D3D12_QUERY_TYPE_TIMESTAMP);
+    EXPECT(hr_of(raw(direct, 9)) == S_OK);
+
+    // 2. Depth bounds set on the list, then work and an unmet wait: the cut's spare list gets them again.
+    using DepthBoundsFn = void(WINAPI*)(void*, FLOAT, FLOAT);
+    const auto depth_bounds = [](void* list, FLOAT min, FLOAT max) {
+        reinterpret_cast<DepthBoundsFn>((*reinterpret_cast<void* const* const*>(list))[70])(list, min, max);
+    };
+    EXPECT(hr_of(raw(direct, 139, word(allocator), 0)) == S_OK);
+    depth_bounds(direct, 0.25f, 0.75f);
+    EXPECT(direct_real->calls[62] == 1 && direct_real->depth_bounds[0] == 0.25f && direct_real->depth_bounds[1] == 0.75f);
+    raw(direct, 14, 1, 1, 1);
+    const unsigned creates = mock->calls[12];
+    raw(direct, 74, word(&cells[2]), 7, 1, 1);   // unmet, after work: a cut
+    EXPECT(xs::list_proxy_part_count(direct) == 2 && mock->calls[12] == creates + 1);
+    Mock* const spare = mock->last_child;
+    EXPECT(spare->calls[62] == 1 && spare->depth_bounds[0] == 0.25f && spare->depth_bounds[1] == 0.75f);
+    EXPECT(hr_of(raw(direct, 9)) == S_OK);
+
+    //    A Reset forgets them: the next cut does not set them.
+    EXPECT(hr_of(raw(direct, 139, word(allocator), 0)) == S_OK);
+    raw(direct, 14, 1, 1, 1);
+    const unsigned spare_bounds = spare->calls[62];
+    raw(direct, 74, word(&cells[2]), 7, 1, 1);
+    EXPECT(xs::list_proxy_part_count(direct) == 2 && spare->calls[62] == spare_bounds);
+    EXPECT(hr_of(raw(direct, 9)) == S_OK);
+
+    //    A bundle's depth bounds stay set in the list that executes it, and its next cut replays them.
+    void* bundle = nullptr;
+    EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE, word(allocator), 0, word(&gcl_iid),
+                     word(&bundle))) == S_OK);
+    depth_bounds(bundle, 0.125f, 0.5f);
+    EXPECT(hr_of(raw(bundle, 9)) == S_OK);
+    EXPECT(hr_of(raw(direct, 139, word(allocator), 0)) == S_OK);
+    raw(direct, 31, word(bundle));                   // ExecuteBundle
+    raw(direct, 14, 1, 1, 1);
+    raw(direct, 74, word(&cells[2]), 7, 1, 1);
+    EXPECT(xs::list_proxy_part_count(direct) == 2 && spare->calls[62] == spare_bounds + 1 &&
+           spare->depth_bounds[0] == 0.125f && spare->depth_bounds[1] == 0.5f);
+    EXPECT(hr_of(raw(direct, 9)) == S_OK);
+
+    EXPECT(release(bundle) == 0 && release(copy) == 0 && release(direct) == 0 && release(allocator) == 0);
+    EXPECT(release(device) == 0);
+    std::printf("%s: a timestamp write on a COPY list records no TIMESTAMP query; depth bounds, the list's own or a "
+                "bundle's, are replayed on the list a wait cuts to\n", g_label);
+    return 0;
+}
+
 int check_list_values() {
     // The slot decode: newer layout (and an undetected one) 71-74, older 69-72.
     static_assert(xs::console_value_op(71, 0) == xs::ConsoleValueOp::write32);
@@ -5427,6 +5521,7 @@ int main(int argc, char** argv) {
         return 1;
     if (check_placed_resource_x() || check_depth_provider_refusal()) return 1;
     if (check_list_values()) return 1;       // last: it starts the list-values threads
+    if (check_list_values_copy_and_depth_bounds()) return 1;
     if (check_list_values_more()) return 1;  // and this one stops them
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
