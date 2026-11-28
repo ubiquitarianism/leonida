@@ -18,6 +18,7 @@ import contextlib
 from contextlib import redirect_stdout
 import io
 import json
+import math
 import os
 from pathlib import Path
 import struct
@@ -117,6 +118,10 @@ class FirstLightTests(unittest.TestCase):
             )
         with open(os.path.join(self.out, "manifest.json"), encoding="utf-8") as f:
             self.manifest = json.load(f)
+        if self.manifest.get("layer_texture"):
+            # A --texture ramp folder feeds d3d12_first_light_textured (LEONIDA_FIRST_LIGHT_TEX_DIR): its PS samples a
+            # T# that only the D3D12 layer binds, so vk_harness has nothing to draw it with (@zzEmmazz, #2906).
+            self.skipTest("a --texture ramp folder is for d3d12_first_light_textured, not vk_harness")
 
     def test_draw_matches_the_manifest(self):
         raw = os.path.join(self.out, "image_first_light.raw")
@@ -1069,6 +1074,230 @@ class CameraTests(unittest.TestCase):
             with open(out, encoding="utf-8") as f:
                 self.assertEqual(f.read(), '{"keep": true}\n')
 
+
+class LayerTexturedOracleTests(unittest.TestCase):
+    """The D3D12-layer textured first light's CPU reference (#2906), without a GPU or a package."""
+
+    def test_ramp_inputs_leave_the_harness_texture_keys_alone(self):
+        # @zzEmmazz (#2906): the ramp's manifest keys once shared "texture" and files["texture"] with the --dds
+        # harness path, so harness_env read the string "ramp" as the --dds dict and the tool exited with a
+        # TypeError. The ramp's keys are layer_*; harness_env must neither fail nor bind a harness texture.
+        with tempfile.TemporaryDirectory() as tmp:
+            verts = [(-0.5, -0.5, 0.5, 0.0, 0.0), (0.5, -0.5, 0.5, 1.0, 0.0), (-0.5, 0.5, 0.5, 0.0, 1.0)]
+            manifest = {"files": {"mesh": "mesh.bin"}}
+            manifest.update(fl.write_textured_inputs(tmp, verts, [0, 1, 2], 8, 8))
+            manifest["files"].update(layer_texture="texture.bin", expected="expected.raw")
+            self.assertNotIn("texture", manifest)
+            self.assertNotIn("texture", manifest["files"])
+            env = fl.harness_env(manifest, tmp, base_env={})
+            self.assertNotIn("VKH_TEX_RGBA", env)
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "texture.bin")))
+
+    def test_tsharp_load_offset_reads_the_first_8_dword_load(self):
+        # The T# slot comes from the PS's own s_load_dwordx8; a missing listing or a null offset is slot 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            listing = os.path.join(tmp, "ps.s")
+            with open(listing, "w", encoding="utf-8") as f:
+                f.write("\ts_load_dwordx4 s[8:11], s[2:3], 0x40\n\ts_load_dwordx8 s[0:7], s[2:3], 0xa0 ; T#\n"
+                        "\ts_load_dwordx8 s[12:19], s[2:3], 0x20\n")
+            self.assertEqual(fl.tsharp_load_offset(listing), 0xA0)
+            with open(listing, "w", encoding="utf-8") as f:
+                f.write("\ts_load_dwordx8 s[4:11], s[8:9], null\n")
+            self.assertEqual(fl.tsharp_load_offset(listing), 0)
+            self.assertEqual(fl.tsharp_load_offset(os.path.join(tmp, "missing.s")), 0)
+
+    @staticmethod
+    def _dds(path, width, height, fmt, payload):
+        head = bytearray(148)
+        head[0:4] = b"DDS "
+        struct.pack_into("<I", head, 4, 124)
+        struct.pack_into("<II", head, 12, height, width)
+        head[84:88] = b"DX10"
+        struct.pack_into("<I", head, 128, fmt)
+        with open(path, "wb") as f:
+            f.write(bytes(head) + payload)
+
+    def test_dds_channel_rules(self):
+        # A8 samples as (0, 0, 0, a); R8 as (r, 0, 0, 1); an sRGB texel is linearised before filtering; a BC1 block
+        # decodes through ttpf_mips; an RGBA8 alpha is not predicted (NaN, so the layer test skips it).
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "t.dds")
+            self._dds(p, 2, 1, 65, bytes([0, 255]))
+            w, h, fmt, payload = fl.read_dds_mip0(p)
+            self.assertEqual((w, h, fmt), (2, 1, 65))
+            self.assertEqual(fl.dds_texels(w, h, fmt, payload), [(0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)])
+            self._dds(p, 1, 1, 61, bytes([255]))
+            self.assertEqual(fl.dds_texels(*fl.read_dds_mip0(p)), [(1.0, 0.0, 0.0, 1.0)])
+            self._dds(p, 1, 1, 91, bytes([0, 0, 188, 255]))               # B8G8R8A8_SRGB: R = 188
+            (r, g, b, a), = fl.dds_texels(*fl.read_dds_mip0(p))
+            self.assertAlmostEqual(r, fl.srgb_to_linear(188 / 255), places=6)
+            self.assertTrue(math.isnan(a))
+            block = struct.pack("<HHI", 0xF800, 0x001F, 0)                 # BC1: every texel index 0 = pure red
+            self._dds(p, 4, 4, 71, block)
+            texels = fl.dds_texels(*fl.read_dds_mip0(p))
+            self.assertEqual(len(texels), 16)
+            self.assertEqual(texels[5][:3], (1.0, 0.0, 0.0))
+
+    def test_dds_rejects_unsupported_or_short(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "t.dds")
+            self._dds(p, 4, 4, 2, bytes(256))                             # R32G32B32A32_FLOAT: not a game format
+            with self.assertRaises(SystemExit):
+                fl.read_dds_mip0(p)
+            self._dds(p, 8, 8, 71, bytes(8))                              # BC1 8x8 needs 32 bytes
+            with self.assertRaises(SystemExit):
+                fl.read_dds_mip0(p)
+
+    def test_dds_tolerance_keeps_mapping_errors_out(self):
+        # Every per-format tolerance stays far below a mapping error (a missed sRGB decode measured 0.31).
+        for fmt in fl.DDS_FORMATS:
+            self.assertLess(fl.dds_tolerance(fmt), 0.05, fmt)
+
+    def test_ramp_texels_hold_their_own_centre(self):
+        texels, data = fl.ramp_texture(4)
+        self.assertEqual(struct.unpack_from("<III", data), (4, 4, fl.DXGI_FORMAT_R16G16B16A16_FLOAT))
+        self.assertEqual(len(data), 12 + 4 * 4 * 8)
+        self.assertEqual(texels[1 * 4 + 2], (2.5 / 4, 1.5 / 4, 0.0, 1.0))
+        self.assertEqual(struct.unpack_from("<4e", data, 12 + (1 * 4 + 2) * 8), (0.625, 0.375, 0.0, 1.0))
+
+    def test_bilinear_ramp_gives_back_the_uv_and_clamps(self):
+        texels, _ = fl.ramp_texture(64)
+        for u, v in ((0.3, 0.7), (0.51, 0.49), (0.123, 0.9)):
+            r, g, b, a = fl.sample_bilinear_clamp(texels, 64, 64, u, v)
+            self.assertAlmostEqual(r, u, places=6)
+            self.assertAlmostEqual(g, v, places=6)
+            self.assertEqual((b, a), (0.0, 1.0))
+        r, g, _, _ = fl.sample_bilinear_clamp(texels, 64, 64, 0.001, 0.999)
+        self.assertAlmostEqual(r, 0.5 / 64, places=7)       # clamp to the first texel centre
+        self.assertAlmostEqual(g, 63.5 / 64, places=7)      # and to the last
+
+    def test_point_sampling_fails_the_tolerance(self):
+        # What the draw gave before literal S#s were registered (#2887): the nearest texel centre, up to half a
+        # texel (1/128) from the UV, which the manifest's 0.002 tolerance rejects.
+        texels, _ = fl.ramp_texture(64)
+        u = 10.5 / 64 + 0.49 / 64
+        nearest = (round(u * 64 - 0.5) + 0.5) / 64
+        self.assertGreater(abs(nearest - fl.sample_bilinear_clamp(texels, 64, 64, u, 0.5)[0]), 0.002)
+
+    def test_uv_map_matches_uv_at(self):
+        # Two overlapping triangles: the later one wins where both cover, as uv_at says.
+        vertices = [(-1.0, -1.0, 0.5, 0.0, 0.0), (1.0, -1.0, 0.5, 1.0, 0.0), (-1.0, 1.0, 0.5, 0.0, 1.0),
+                    (-0.5, -0.5, 0.5, 0.9, 0.9), (0.9, -0.5, 0.5, 0.8, 0.9), (-0.5, 0.9, 0.5, 0.9, 0.8)]
+        indices = [0, 1, 2, 3, 4, 5]
+        got, ambiguous = fl.uv_map(vertices, indices, 16, 12)
+        for py in range(12):
+            for px in range(16):
+                want = fl.uv_at(vertices, indices, px, py, 16, 12)
+                # uv_map measures in pixels and uv_at in NDC, so the same UV can differ in the last bits.
+                if want is None:
+                    self.assertIsNone(got[py * 16 + px], (px, py))
+                else:
+                    for g, w in zip(got[py * 16 + px], want):
+                        self.assertAlmostEqual(g, w, places=12, msg=(px, py))
+        self.assertTrue(any(g is None for g in got) and any(g is not None for g in got))
+        self.assertEqual(ambiguous, set())   # overlapping interiors, not a seam: draw order decides
+
+    def test_uv_seam_pixels_are_not_guessed(self):
+        # @whattheflop's fixture (#2906): a quad over framebuffer (4,4)-(28,28) on 32x32, split on its diagonal, the
+        # two halves with constant but different UVs. Which triangle owns a diagonal sample is the rasteriser's edge
+        # rule, so swapping the draw order must change nothing outside the reported seam.
+        def ndc(v):
+            return v / 32 * 2 - 1
+        p = [(ndc(4), ndc(4)), (ndc(28), ndc(4)), (ndc(28), ndc(28)), (ndc(4), ndc(28))]
+        vertices = [(p[0][0], p[0][1], 0.5, 0.25, 0.75), (p[1][0], p[1][1], 0.5, 0.25, 0.75),
+                    (p[2][0], p[2][1], 0.5, 0.25, 0.75),
+                    (p[0][0], p[0][1], 0.5, 0.75, 0.25), (p[2][0], p[2][1], 0.5, 0.75, 0.25),
+                    (p[3][0], p[3][1], 0.5, 0.75, 0.25)]
+        forward, seam_f = fl.uv_map(vertices, [0, 1, 2, 3, 4, 5], 32, 32)
+        backward, seam_b = fl.uv_map(vertices, [3, 4, 5, 0, 1, 2], 32, 32)
+        self.assertEqual(seam_f, seam_b)
+        self.assertEqual(len(seam_f), 24)    # the diagonal's sample points
+        self.assertEqual(sum(uv is not None for uv in forward), 576)
+        for k in range(32 * 32):
+            if k not in seam_f:
+                self.assertEqual(forward[k], backward[k], k)
+
+    def test_a_sample_just_off_an_edge_is_an_edge_sample(self):
+        # @throny's finding (#4251): pixel centres 1e-5 off a triangle edge were given to one triangle by the exact
+        # float test, while the GPU, which snaps vertices to 1/256 pixel, gave them to the one behind. Two layers
+        # with different UVs whose upper triangle's edge passes 0.001 pixel from a column of pixel centres: those
+        # samples are reported, not guessed. 0.02 pixel away is past EDGE_PX, so the upper triangle owns it.
+        def tri(pts, uv):
+            return [((x / 64) * 2 - 1, (y / 64) * 2 - 1, 0.5, uv[0], uv[1]) for x, y in pts]
+        for off, column_ambiguous in ((0.001, True), (-0.001, True), (0.02, False)):
+            with self.subTest(off=off):
+                below = tri([(2, 2), (60, 2), (2, 60)], (0.25, 0.75))
+                above = tri([(20.5 + off, 10), (40, 10), (20.5 + off, 40)], (0.75, 0.25))
+                _, seam = fl.uv_map(below + above, [0, 1, 2, 3, 4, 5], 64, 64)
+                self.assertEqual(bool(seam) and {k % 64 for k in seam} == {20}, column_ambiguous)
+
+    def test_band_widens_only_where_the_texture_changes_at_pixel_scale(self):
+        # The band is how much the reference moves when the sample moves by BAND_PX: zero over a flat texture, and
+        # under strong minification (here 16 texels per pixel across a hard edge) wide enough for the GPU's snapped
+        # position.
+        flat = [(0.5, 0.5, 0.5, 1.0)] * 64
+        edge = [((1.0 if x >= 4 else 0.0), 0.0, 0.0, 1.0) for y in range(8) for x in range(8)]
+        uv = (4.0 / 8, 0.5)
+        grads = [(16.0 / 8, 0.0, 0.0, 16.0 / 8)]
+        _, band, _ = fl.reference_pixels(flat, 8, 8, [uv], set(), grads)
+        self.assertEqual(struct.unpack("<4f", band), (0.0, 0.0, 0.0, 0.0))
+        _, band, _ = fl.reference_pixels(edge, 8, 8, [uv], set(), grads)
+        self.assertGreater(struct.unpack("<4f", band)[0], 0.2)
+        # At one texel per pixel the same edge moves the sample by only BAND_PX of a texel.
+        _, band, _ = fl.reference_pixels(edge, 8, 8, [uv], set(), [(1.0 / 8, 0.0, 0.0, 1.0 / 8)])
+        self.assertLessEqual(struct.unpack("<4f", band)[0], fl.BAND_PX + 1e-6)
+
+    def test_float_formats_get_a_relative_tolerance(self):
+        relative = {f for f, spec in fl.DDS_FORMATS.items() if spec[3] is None}
+        self.assertEqual(relative, {10, 54, 95, 96})
+
+    def test_an_interior_hides_earlier_edges(self):
+        # @whattheflop's second fixture (#2906): an inner triangle whose left edge (x = 24.5, on pixel centres) lies
+        # inside a larger outer one, the two with different UVs. Drawn inner-then-outer, the outer interior owns
+        # every sample on the inner's edge: nothing is ambiguous and the image equals a solid outer reference.
+        # Drawn outer-then-inner, the inner is last and those samples are on its edge, so the edge rule decides
+        # whether they show the inner or the outer UV: exactly those 48 samples are ambiguous.
+        def tri(pts, uv):
+            return [((x / 128) * 2 - 1, (y / 128) * 2 - 1, 0.5, uv[0], uv[1]) for x, y in pts]
+        outer = tri([(8, 8), (104, 8), (8, 103)], (0.25, 0.75))
+        inner = tri([(24.5, 20), (56, 20), (24.5, 68)], (0.75, 0.25))
+        vertices = outer + inner
+        uvs_oi, seam_oi = fl.uv_map(vertices, [0, 1, 2, 3, 4, 5], 128, 128)
+        uvs_io, seam_io = fl.uv_map(vertices, [3, 4, 5, 0, 1, 2], 128, 128)
+        self.assertEqual(seam_io, set())
+        self.assertEqual(len(seam_oi), 48)
+        self.assertEqual({k % 128 for k in seam_oi}, {24})   # pixel column 24: centre x = 24.5
+        solid, _ = fl.uv_map(outer, [0, 1, 2], 128, 128)
+        self.assertEqual(uvs_io, solid)   # outer drawn last covers the inner one everywhere
+
+    def test_a_shared_edge_over_an_older_interior_is_not_ambiguous(self):
+        # A front quad (two triangles sharing a diagonal, continuous UVs) drawn over a back triangle with another
+        # UV: the diagonal's samples belong to one of the two front triangles, both of which give the same UV.
+        def tri(pts, uvs):
+            return [((x / 64) * 2 - 1, (y / 64) * 2 - 1, 0.5, u, v) for (x, y), (u, v) in zip(pts, uvs)]
+        back = tri([(2, 2), (62, 2), (2, 62)], [(0.9, 0.9)] * 3)
+        quad = [(8.5, 8.5), (40.5, 8.5), (40.5, 40.5), (8.5, 40.5)]
+        quv = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+        front = tri([quad[0], quad[1], quad[2]], [quv[0], quv[1], quv[2]]) + \
+            tri([quad[0], quad[2], quad[3]], [quv[0], quv[2], quv[3]])
+        _, seam = fl.uv_map(back + front, list(range(9)), 64, 64)
+        self.assertEqual(seam & {32 * 64 + 32, 20 * 64 + 20}, set())   # two diagonal samples
+        # The quad's outer edges over the back triangle are lone edges with another UV behind: ambiguous.
+        self.assertIn(20 * 64 + 8, seam)
+
+    def test_overlapping_edges_on_the_same_side_are_ambiguous(self):
+        # @whattheflop's third fixture (#2906): two front triangles with equal UVs whose right edges overlap and
+        # whose interiors both lie to the left, over an older triangle with another UV. They don't share an edge
+        # (different endpoints, same side), so a top-left rule can exclude both: those samples stay ambiguous.
+        def tri(pts, uv):
+            return [((x / 128) * 2 - 1, (y / 128) * 2 - 1, 0.5, uv[0], uv[1]) for x, y in pts]
+        outer = tri([(8, 8), (104, 8), (8, 103)], (0.25, 0.75))
+        f1 = tri([(16, 20), (32.5, 20), (32.5, 52)], (0.75, 0.25))
+        f2 = tri([(12, 16), (32.5, 16), (32.5, 56)], (0.75, 0.25))
+        for order in ([0, 1, 2, 3, 4, 5, 6, 7, 8], [0, 1, 2, 6, 7, 8, 3, 4, 5]):
+            _, seam = fl.uv_map(outer + f1 + f2, order, 128, 128)
+            column = {k for k in seam if k % 128 == 32}
+            self.assertGreaterEqual(len(column), 32, order)
 
 if __name__ == "__main__":
     sys.exit(unittest.main())

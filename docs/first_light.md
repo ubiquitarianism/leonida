@@ -201,7 +201,130 @@ python -I tools/first_light.py --game "<package>" --work ~/leonida-work \
 LEONIDA_FIRST_LIGHT_DIR=~/leonida-work/first_light/camera python -I tests/test_first_light.py -v
 ```
 
-## 8. Limits and next
+## 8. With a texture, through the D3D12 layer
+
+`runtime/test/d3d12_first_light_textured_test.cpp` (ctest `d3d12_first_light_textured`, TEST-524) draws the same
+mesh through the D3D12 layer (as section 5 does for section 3) with a game pixel shader that samples a texture. The PS is chosen by census:
+
+- Of the corpus's 12,101 PS, 780 do one `image_sample` and no other memory access.
+- 148 of those link with this VS (`shader_link_check.py`).
+- The pick is `$PS_PassthroughCopy`. It interpolates the TEXCOORD, `s_load`s an 8-dword T# through the 32-bit
+  table pointer in user SGPR `s8`, samples with a **literal S#** (`0x92, 0xC00000, 0x14500000, 0`: CLAMP_LAST_TEXEL,
+  bilinear, mip point) and exports the colour with `v_cvt_pkrtz_f16_f32`.
+
+How the draw is fed:
+
+- The root signature is [0] eight 32-bit constants (`s0..s7`, zero) and [1] a one-SRV descriptor table. The layer's
+  packing ([d3d12_vulkan.md](d3d12_vulkan.md) 3.5) puts the table at `s8:s9`.
+- The texture goes through `CopyTextureRegion` into a DEFAULT texture, and `CreateShaderResourceView` writes its T#
+  into a shader-visible heap.
+- The literal S# is in no heap. `CreateGraphicsPipelineState` registers it from the index (`literal_samplers`; see
+  `docs/design.md`, Literal samplers).
+
+The texture is a 64×64 R16G16B16A16_FLOAT **coordinate ramp**: texel (x, y) holds its own centre,
+((x+½)/64, (y+½)/64, 0, 1). Bilinear sampling with clamp therefore gives back the UV, clamped to the outer texel
+centres, so the image has an exact oracle. `first_light.py --texture ramp` writes `texture.bin` and
+`expected.raw`, which samples the ramp on the CPU at every covered pixel's interpolated UV.
+
+On an RTX 3060 (Windows 11, driver 616.64), the draw covers the same **12,804 pixels** as section 5, with no
+coverage mismatch. The worst channel error is **0.00028** and the mean 0.000045, against a tolerance of 0.002.
+Point sampling would be off by up to half a texel (1/128 = 0.0078). That is what this draw gave before literal S#s
+were registered (#2887), because the shader's lookup found the fallback sampler: worst error 0.0078, with 19,041
+channels over the tolerance. The same count was measured on an RTX 3070, a Ryzen RDNA2 iGPU and an RTX 5090.
+
+The test takes the PS's layout from the PS itself. The pointer SGPR comes from the index (`user_sgpr_reads`,
+`layer_ptr_sgpr`), and the root signature pads up to it. The T#'s byte offset in the table comes from the PS's
+`s_load_dwordx8` (`layer_tsharp_offset`), and the SRV goes in that slot. So any 2D copy PS can be checked, not only
+`$PS_PassthroughCopy`. Of the 148 single-sample PS that link with this VS (section 6's census), 24 sample once and
+export the result with no arithmetic. On an RTX 3060:
+
+| group | PS | result |
+|---|---:|---|
+| plain copies (`PS_Copy*`, `PS_TexCopy`, `PS_mipMap`, `$PS_PassthroughCopy`, `#PS_DownsampleCopy`, `PS_CopyWetMap`, `'PS_FreezeFrameCapture`, `!PS_AIFComposite`, `-PS_SecondPassRefractionBlit`) | 11 | pass, worst 0.00028 |
+| copies that remap channels: `&PS_HDRPassThroughRGB` exports (r, g, b, b) and `PS_BlitNormal` (r, g, 1, 1), checked per channel | 2 | pass, worst 0.00028 |
+| the UV transformed before the sample (overlays, zoom, live renderer, lens distortion) | 7 | not a copy, so not comparable to the ramp |
+| 2D-array or cube textures | 4 | not run |
+
+All 13 comparable game PS give the same worst error as `$PS_PassthroughCopy`. `!PS_AIFComposite` reads its T# at
+offset `0xA0` (slot 5), which a single-slot table had missed. Pass `--ps=<name>` when the name starts with `-`.
+
+The ramp folder is for this test only: its PS samples a T# that only the D3D12 layer binds, so
+`tests/test_first_light.py`'s `vk_harness` tests skip it.
+
+```sh
+python -I tools/first_light.py ... --no-fit --out ~/leonida-work/first_light/out_tex --vs VS_main_170e32e6_Wrapped --ps '$PS_PassthroughCopy_1a08fc46_Wrapped' --texture ramp
+LEONIDA_FIRST_LIGHT_TEX_DIR=~/leonida-work/first_light/out_tex ctest --test-dir <build> -R d3d12_first_light_textured -V
+```
+
+Without `LEONIDA_FIRST_LIGHT_TEX_DIR` the test prints SKIP and exits 77. The drawn image is written next to the
+inputs as `d3d12_textured.raw`; it stays in the user's folder.
+
+## 9. Every texture format the game uses, through the layer
+
+The package's 357,115 TTPF descriptors use 20 DXGI formats (counted with `ttpf_mips.py` on a 1.0.2.1 copy):
+- BC1: 174,674, plus 82,177 sRGB.
+- BC7: 52,612, plus 25,226 sRGB.
+- BC5: 6,904. BC4: 4,656. BC3: 3,045, plus 3,880 sRGB.
+- BC6H: 1,000 UF16 and 25 SF16.
+- RGBA8: 1,774. R16F: 947. A8: 121. BGRA8: 50, plus 4 sRGB. R8: 8.
+- RGBA16 UNORM: 5. RGBA16F: 3. BC2: 2. RGBA8 sRGB: 2.
+
+`first_light.py --texture-dds <file>` takes one exported texture (`ttpf_mips.py export … --mips 1`) and writes its mip
+0 to `texture.bin` in its own format, BC blocks included. `d3d12_first_light_textured` uploads it through
+`CopyTextureRegion` and draws it with `$PS_PassthroughCopy`. The CPU reference decodes the texture with
+`ttpf_mips.decode_pixels`, then applies each format's rules:
+- sRGB is linearised per texel, before filtering.
+- A8 samples as (0, 0, 0, a).
+- R8, BC4 and R16F sample as (r, 0, 0, 1). BC5 samples as (r, g, 0, 1).
+- An alpha the decoder doesn't give is not compared.
+
+One game texture per format (at least 64 distinct values where the package has one), on an RTX 3060:
+
+| formats | worst error | tolerance |
+|---|---:|---:|
+| RGBA8, R8, R16F, BC7, BC7 sRGB, BC2 | ≤ 0.003 | 2/255 |
+| A8, BGRA8, BGRA8 sRGB | ≤ 2/255 except ≤ 4 edge texels | 2/255 |
+| BC4, BC5 | 0.0089 | 3/255 |
+| BC1, BC3 | 0.020 | 6/255 |
+| BC1 sRGB, BC3 sRGB | 0.026 | 7/255 |
+| BC6H UF16, SF16 | 0.033 | 0.04 |
+| RGBA16F (256×2), RGBA16 UNORM (128×4) | ≤ 0.0045 | 2/255 |
+| RGBA8 sRGB (4×4) | 0 | 2/255 |
+
+All 20 formats pass. RGBA8 sRGB is a weak case: its only 2D texture is a uniform 4×4. Its sRGB decode is the same
+one that BGRA8 sRGB and the BC1/BC3/BC7 sRGB rows exercise with real content. The small RGBA16 textures are the
+package's only 2D ones in those formats.
+
+The wider tolerances are decoder arithmetic, not the layer. The BC1/BC3 colour palette on the RTX 3060 follows
+integer weights: regenerating the reference with `(43a + 21b + 32) >> 6` instead of `(2a + b) / 3` cuts the channels
+off by more than 2/255 five- to sevenfold. BC4/BC5 interpolate their 8-entry palette above 8 bits. A wrong mapping is
+far outside every tolerance: declaring the BC1 sRGB texture as BC1 UNORM (a missed sRGB decode) gives a worst error
+of 0.31 with 28,829 channels over, and fails.
+
+**What the reference allows for, and why (@throny, #4251).** With other models and textures than the ones above,
+the first version of this check failed on a few hundred of 29,000 channels with a tiny mean error. Two effects of
+the rasteriser, not the layer, explained every one:
+- **Edge ownership.** The GPU snaps vertices to its sub-pixel grid (1/256 pixel) before it tests coverage, so a
+  pixel centre a hair from an edge (1e-5 pixel was enough) can go to the triangle behind it. A sample within
+  `EDGE_PX` (1/128 pixel) of an edge is now an edge sample. Where the triangles under it give different UVs, it is
+  reported, not compared.
+- **Minification with only mip 0.** On one game model the texture covers about 37 texels per pixel, so the same
+  sub-pixel shift moves the UV by a tenth of a texel. Every failing channel there was the reference moved by 0.002
+  to 0.02 pixel. `expected_band.raw` gives each pixel and channel how much the reference changes when the sample
+  moves by `BAND_PX` (1/32 pixel) along the triangle's UV gradient. The harness adds that to the format's
+  tolerance, so it widens only where the texture changes fast at that pixel's scale.
+
+Float formats (R16F, RGBA16F, BC6H) hold HDR values up to 34 in the game's textures, so their tolerance is relative
+to the expected value. A seam-heavy model may have up to 5% of its pixels reported, not 1%: a flattened 3D model
+stacks front and back layers whose edges cross many pixel centres (1.4% on one model). That limit depends on the
+model, not the GPU, so pick one that covers a few thousand pixels: thin models covering 500 to 1,600 pixels have
+reached 5 to 8% seam pixels and fail it before any colour is compared.
+
+Re-run on four game models (37 textures across the 20 formats, 4 to 10 thousand covered pixels each, up to 37
+texels per pixel): all 148 draws pass on an RTX 3060, 0 channels over. The missed-sRGB control (BC1 sRGB declared
+as UNORM) still fails with the band: 9,992 channels over on the most minified model.
+
+## 10. Limits and next
 
 * The camera draw (section 7) runs in `vk_harness` only. Through the D3D12 layer, s9 and the table it points at
   have to come from root arguments, which `d3d12_first_light_test` does not set up yet.
