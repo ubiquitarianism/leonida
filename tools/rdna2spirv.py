@@ -20477,6 +20477,35 @@ def _limit_arg(text):
     return value
 
 
+def shard_bucket(files, index, count):
+    """The `index`-th of `count` buckets of a size-balanced partition: largest first, each file to the lightest bucket.
+
+    `files[index::count]` balanced nothing. Shaders differ in size by two orders of magnitude, so a round-robin split
+    can hand one shard most of the work while every other process waits for it; on a synthetic corpus whose largest
+    shader is 11% of the total that cost 1.18x at 4 shards and 1.30x at 8. Every shard derives this partition from the
+    file sizes, so the buckets agree without the processes talking to each other, and each bucket is still handed out
+    in name order.
+    """
+    weight = {}
+    for path in files:
+        try:
+            weight[path] = os.path.getsize(path)
+        except OSError as error:
+            # Not a weight of 0: a shard that cannot size one file would place it by a number no other shard has, so
+            # the buckets would overlap and leave another shader out of the set, and the merge would publish a corpus
+            # with a hole in it (reported by @Zhenyettta on #7479). Every shard derives this partition on its own, so
+            # a size it cannot read has to stop the run and be retried, not be guessed at.
+            raise OSError(f"cannot read the size of {path} for the shard partition: {error}; "
+                          "fix or restore the file and run the shard again") from error
+    buckets = [[] for _ in range(count)]
+    loads = [0] * count
+    for path in sorted(files, key=lambda p: (-weight[p], p)):
+        target = min(range(count), key=lambda b: (loads[b], b))
+        buckets[target].append(path)
+        loads[target] += weight[path]
+    return sorted(buckets[index])
+
+
 def _shard_arg(text):
     """--shard i/n with n >= 1 and 0 <= i < n. n = 0 was a ValueError (slice step 0) and i >= n translated nothing."""
     try:
@@ -20520,8 +20549,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=_limit_arg)
     ap.add_argument("--shard", type=_shard_arg,
-                    help="i/n: translate every n-th shader starting at i (run n processes in parallel, "
-                         "then merge the index.part*.json files with --merge)")
+                    help="i/n: translate the i-th of n size-balanced buckets of shaders (run n processes in "
+                         "parallel, then merge the index.part*.json files with --merge)")
     ap.add_argument("--no-asm", action="store_true",
                     help="delete each .spvasm once its .spv is written (the text is ~2.7x the binary: 35 GB for the corpus)")
     ap.add_argument("--assembler", choices=("spirv-as", "python"), default="spirv-as",
@@ -20700,7 +20729,7 @@ def main():
     if a.limit is not None:
         files = files[:a.limit]
     if shard is not None:
-        files = files[shard::sn]
+        files = shard_bucket(files, shard, sn)
     why, ok, valid = Counter(), 0, 0
     meta = {}
     invalid = set()
