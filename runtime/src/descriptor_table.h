@@ -282,10 +282,11 @@ public:
         std::lock_guard lock(mutex_);
         if (first > entries_.size() || count > entries_.size() - first) return false;
         for (std::uint32_t i = 0; i < count; ++i) {
-            const DescriptorEntry& entry = entries_[first + i];
-            std::memcpy(dest + i * 10, entry.key, sizeof(entry.key));
-            dest[i * 10 + 8] = entry.index;
-            dest[i * 10 + 9] = entry.kind;
+            const DescriptorEntry& entry = entries_[std::size_t(first) + i];
+            const std::size_t base = std::size_t(i) * 10;
+            std::memcpy(dest + base, entry.key, sizeof(entry.key));
+            dest[base + 8] = entry.index;
+            dest[base + 9] = entry.kind;
         }
         return true;
     }
@@ -308,7 +309,14 @@ public:
     }
 
 private:
-    void mark(std::uint32_t slot) { changed_slots_.push_back(slot); }
+    // Reserve dirty-slot storage before mutating entries_ so OOM cannot leave CPU/GPU tables desynchronized.
+    // Once all_changed_ is set, the next upload sends the full table and per-slot tracking is skipped.
+    void reserve_marks(std::size_t count) {
+        if (!all_changed_) changed_slots_.reserve(changed_slots_.size() + count);
+    }
+    void mark(std::uint32_t slot) {
+        if (!all_changed_) changed_slots_.push_back(slot);
+    }
 
     // All eight slots for the incoming key are occupied. Try moving one resident
     // to the first empty slot beyond that window, within its own eight probes.
@@ -346,6 +354,7 @@ private:
                     if (std::memcmp(entry.key, key, sizeof(entry.key)) == 0) {
                         if (entry.index == index && slot_kind(entry) == kind) return InsertResult::unchanged;
                         // A new index or a new kind: either way the slot's copy of the entry must reach the GPU.
+                        reserve_marks(1);
                         entry.index = index;
                         entry.kind = kSlotOccupiedMarker | (kind & kKindMask);
                         mark(slot);
@@ -356,13 +365,8 @@ private:
                 }
             }
 
-            if ((occupied_count_ + 1) * 2 > entries_.size()) {
-                grow_locked();
-                continue;
-            }
-
             // Nine distinct keys with the same full hash can never fit the shader's eight probes,
-            // regardless of capacity. Refuse before allocating ever larger tables.
+            // regardless of capacity. Refuse before growing or allocating ever larger tables.
             if (empty_slot < 0) {
                 std::uint32_t same_hash = 0;
                 for (std::uint32_t k = 0; k < kDescriptorProbes; ++k) {
@@ -372,7 +376,14 @@ private:
                 if (same_hash == kDescriptorProbes)
                     throw std::length_error("Descriptor hash collision exceeds shader probe limit");
             }
+
+            if ((occupied_count_ + 1) * 2 > entries_.size()) {
+                grow_locked();
+                continue;
+            }
+
             const bool relocate = empty_slot < 0;
+            reserve_marks(relocate ? 2 : 1);
             std::uint32_t moved_to = 0;
             if (relocate) empty_slot = make_probe_slot(entries_, h, hash_kind_, &moved_to);
             if (empty_slot >= 0) {
@@ -405,10 +416,11 @@ private:
         }
         if (!found) return false;
 
+        reserve_marks(1);
         // No backward shift: see erase().
         entries_[found_slot] = DescriptorEntry{};
-        mark(found_slot);
         --occupied_count_;
+        mark(found_slot);
         return true;
     }
 

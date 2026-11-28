@@ -3,12 +3,41 @@
 // GPU buffer serialization, and multithreaded insertion.
 #include "../src/descriptor_table.h"
 
+#include <atomic>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <random>
 #include <thread>
 #include <vector>
+
+// Single-threaded OOM injection gate, armed only during OOM regression checks.
+static std::atomic<int> allocations_before_failure{-1};
+
+void* operator new(std::size_t size) {
+    int remaining = allocations_before_failure.load(std::memory_order_relaxed);
+    if (remaining >= 0) {
+        if (remaining == 0) {
+            allocations_before_failure.store(-1, std::memory_order_relaxed);
+            throw std::bad_alloc();
+        }
+        allocations_before_failure.store(remaining - 1, std::memory_order_relaxed);
+    }
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t size) { return operator new(size); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+
+struct ScopedAllocFailure {
+    explicit ScopedAllocFailure(int after) { allocations_before_failure.store(after, std::memory_order_relaxed); }
+    ~ScopedAllocFailure() { allocations_before_failure.store(-1, std::memory_order_relaxed); }
+};
 
 #define EXPECT(condition) do { \
     if (!(condition)) { \
@@ -546,6 +575,137 @@ int test_capacity_overflow() {
     return 0;
 }
 
+int test_unresolvable_collision_does_not_grow_at_load_threshold() {
+    std::array<DescriptorKey, 9> keys{};
+    for (std::uint32_t i = 0; i < keys.size(); ++i) {
+        keys[i][0] = i;
+        std::uint32_t prefix = kFnvOffsetBasis;
+        for (int word = 0; word < 7; ++word) prefix = (prefix ^ keys[i][word]) * kFnvPrime;
+        keys[i][7] = prefix;
+        EXPECT(hash_descriptor_key(keys[i]) == 0);
+    }
+    for (const DescriptorHashKind kind : {DescriptorHashKind::fnv1a, DescriptorHashKind::fnv1a_fmix32}) {
+        // Capacity 16 reaches its 50% load factor at 8 entries: the 9th key must fail the full-hash collision check
+        // before grow_locked() doubles capacity to 32 or sets all_changed_.
+        DescriptorTable table(16, kind);
+        for (std::uint32_t i = 0; i < 8; ++i) EXPECT(table.insert(keys[i], i + 1));
+        EXPECT(table.capacity() == 16 && table.size() == 8);
+        table.take_changes();
+        const auto before = table.build_gpu_buffer();
+
+        bool rejected = false;
+        try { table.insert(keys[8], 9); }
+        catch (const std::length_error&) { rejected = true; }
+        EXPECT(rejected);
+        EXPECT(table.capacity() == 16 && table.size() == 8);
+        const DescriptorTable::Changes changes = table.take_changes();
+        EXPECT(!changes.all && changes.slots.empty());
+        EXPECT(table.build_gpu_buffer() == before);
+    }
+    return 0;
+}
+
+int test_all_changed_skips_redundant_slot_tracking() {
+    DescriptorTable table(16);
+    const DescriptorKey k1{1, 2, 3, 4, 5, 6, 7, 8};
+    const DescriptorKey k2{9, 10, 11, 12, 13, 14, 15, 16};
+    EXPECT(table.insert(k1, 10));
+    table.clear();  // sets all_changed_ = true
+
+    EXPECT(table.insert(k1, 11));
+    EXPECT(table.insert_or_update(k1.data(), 12) == DescriptorTable::InsertResult::replaced);
+    EXPECT(table.insert(k2, 22));
+    EXPECT(table.erase(k1));
+    const DescriptorTable::Changes after_clear = table.take_changes();
+    EXPECT(after_clear.all && after_clear.slots.empty());
+
+    // After take_changes() clears all_changed_, incremental slot tracking resumes.
+    EXPECT(table.insert(k1, 13));
+    const DescriptorTable::Changes incremental = table.take_changes();
+    EXPECT(!incremental.all && incremental.slots.size() == 1);
+    return 0;
+}
+
+int test_change_tracking_oom_strong_guarantee() {
+    // 1. Insert, replace, and erase must leave entries_, occupied_count_, and dirty list unchanged on bad_alloc.
+    {
+        DescriptorTable table(32);
+        const DescriptorKey k1{1, 2, 3, 4, 5, 6, 7, 8};
+        const DescriptorKey k2{10, 20, 30, 40, 50, 60, 70, 80};
+        EXPECT(table.insert(k1, 42));
+        table.take_changes();  // frees changed_slots_ buffer (size 0, capacity 0)
+        const auto before = table.build_gpu_buffer();
+
+        // Insert OOM
+        bool threw = false;
+        {
+            ScopedAllocFailure fail(0);
+            try { table.insert(k2, 77); }
+            catch (const std::bad_alloc&) { threw = true; }
+        }
+        EXPECT(threw);
+        EXPECT(table.size() == 1 && !table.contains(k2) && table.lookup(k1) == 42);
+        EXPECT(table.build_gpu_buffer() == before);
+        const auto c_add = table.take_changes();
+        EXPECT(!c_add.all && c_add.slots.empty());
+
+        // Replace OOM
+        threw = false;
+        {
+            ScopedAllocFailure fail(0);
+            try { table.insert_or_update(k1.data(), 99); }
+            catch (const std::bad_alloc&) { threw = true; }
+        }
+        EXPECT(threw);
+        EXPECT(table.size() == 1 && table.lookup(k1) == 42);
+        EXPECT(table.build_gpu_buffer() == before);
+        const auto c_rep = table.take_changes();
+        EXPECT(!c_rep.all && c_rep.slots.empty());
+
+        // Erase OOM
+        threw = false;
+        {
+            ScopedAllocFailure fail(0);
+            try { table.erase(k1); }
+            catch (const std::bad_alloc&) { threw = true; }
+        }
+        EXPECT(threw);
+        EXPECT(table.size() == 1 && table.contains(k1) && table.lookup(k1) == 42);
+        EXPECT(table.build_gpu_buffer() == before);
+        const auto c_erase = table.take_changes();
+        EXPECT(!c_erase.all && c_erase.slots.empty());
+    }
+
+    // 2. Relocation OOM must not move a resident or overwrite its slot before changed_slots_ is reserved.
+    {
+        DescriptorTable table(64);
+        const std::uint32_t slots = std::uint32_t(table.capacity());
+        std::array<DescriptorKey, kDescriptorProbes + 1> keys{};
+        for (std::uint32_t i = 0; i < keys.size(); ++i) {
+            auto& key = keys[i];
+            key[0] = i + 1;
+            const std::uint32_t target = (slots - 4 + i % kDescriptorProbes) & (slots - 1);
+            while ((hash_descriptor_key(key) & (slots - 1)) != target) ++key[7];
+        }
+        for (std::uint32_t i = 0; i < kDescriptorProbes; ++i) EXPECT(table.insert(keys[i].data(), 100 + i));
+        table.take_changes();
+        const auto before = table.build_gpu_buffer();
+
+        bool threw = false;
+        {
+            ScopedAllocFailure fail(0);
+            try { table.insert_or_update(keys.back().data(), 999); }
+            catch (const std::bad_alloc&) { threw = true; }
+        }
+        EXPECT(threw);
+        EXPECT(table.size() == kDescriptorProbes && !table.contains(keys.back()));
+        EXPECT(table.build_gpu_buffer() == before);
+        const auto c_reloc = table.take_changes();
+        EXPECT(!c_reloc.all && c_reloc.slots.empty());
+    }
+    return 0;
+}
+
 // The entry's last dword is what a `descriptor_table` tagged module reads next to the index: the occupied bit and
 // the arrays the index is bound in (kind_sampled_bit / kind_storage_bit). A plain module never reads it, so a table
 // inserted without a kind must serialize exactly as before (marker, no kind bits).
@@ -591,6 +751,9 @@ int test_kind_word() {
 
 int main() {
     EXPECT(test_unresolvable_hash_collision() == 0);
+    EXPECT(test_unresolvable_collision_does_not_grow_at_load_threshold() == 0);
+    EXPECT(test_all_changed_skips_redundant_slot_tracking() == 0);
+    EXPECT(test_change_tracking_oom_strong_guarantee() == 0);
     EXPECT(test_capacity_overflow() == 0);
     EXPECT(test_fnv1a_hash_matches_contract() == 0);
     EXPECT(test_shared_hash_vectors() == 0);
