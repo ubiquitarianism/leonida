@@ -16,6 +16,7 @@ names; the build lists anything it can't find before it starts.
 | Shader translator, its tests and the GPU test tools (`vk_harness`, `vk_pipeline_check`, ...) | Native, GCC or Clang | CI (`linux-gpu-tools`: GCC, tests on llvmpipe); Clang builds them too, but no CI job uses it yet |
 | `rpf9dump` (asset export) | Native, .NET 8 or newer | CI builds it on Windows only (the `check` job) |
 | `gta6rt`, its shims and their tests | Windows program, under Wine or Proton | Cross-built with clang-cl and xwin; CI runs the Windows build under Wine on pushes to `main` |
+| `scripts/run_game_wine.sh`: one retail run under Wine, headless or visible, counts only ([linux_proton.md](linux_proton.md#running-the-game-under-wine-with-one-command)) | Native (`bash`) around the Windows `gta6rt` | `tests/test_run_game_wine.py` and `tests/test_game_run_summary.py`, without the game |
 
 ## Build the port
 
@@ -83,6 +84,22 @@ Runtime workflow. The stage writes `<out>/gta6rt.sh`, which starts `gta6rt.exe` 
 [testing.md](testing.md#the-windows-runtime-on-linux-under-wine-or-proton) has the test runs under Wine and Proton
 and what fails there.
 
+On Apple Silicon, set `LEONIDA_CX_BOTTLE` to the name of an existing CrossOver bottle to use the same launcher:
+
+```sh
+LEONIDA_CX_BOTTLE=Leonida ./gta6rt.sh --dry-run
+```
+
+Run this from the packaged output directory. The launcher uses CrossOver in `/Applications` by default. Set `WINE`
+to the CrossOver `bin/wine` path if the app is installed elsewhere. It enables Rosetta's AVX advertisement by default
+for this mode and honours an explicit `ROSETTA_ADVERTISE_AVX` value.
+
+For XMA2 audio, `runtime/CMakeLists.txt` builds `runtime/xma_decoder` for `x86_64-pc-windows-msvc` when `cargo` is on
+`PATH`. Distribution Rust packages typically omit the Windows MSVC standard library, which leaves XMA voices silent
+unless you add the `x86_64-pc-windows-msvc` Rust target or pass a prebuilt static library with
+`-DLEONIDA_XMA2_DECODER_LIB=<path>`, built yourself from this checkout's `runtime/xma_decoder` with the command in
+[runtime/xma_decoder/README.md](../runtime/xma_decoder/README.md).
+
 ### Why there is no native Linux `gta6rt`
 
 A native (ELF) loader is not a matter of build flags:
@@ -112,3 +129,36 @@ python3 -I tests/test_<name>.py                                  # one standard-
 
 [testing.md](testing.md) covers the GPU tests (`scripts/run_gpu_tests.py`), running them on llvmpipe, and choosing
 the GPU.
+
+### Without root (micromamba)
+
+If you cannot install distribution packages (no `sudo`), you can install `llvm-tools` and `spirv-tools` into a
+user-owned folder with [micromamba](https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html)
+(x86-64 glibc; for ARM64 use `linux-aarch64` from the micromamba guide; musl/Alpine is not natively supported) and let
+CMake fetch its pinned, hash-checked Vulkan headers if the system does not provide them:
+
+```bash
+LEO=$HOME/leonida-tools
+mkdir -p "$LEO/bin" "$LEO/mamba"
+# Note: `latest` is unpinned and downloaded without signature verification; inspect or pin per the micromamba guide.
+curl -fsSLo "$LEO/micromamba.tar.bz2" https://micro.mamba.pm/api/micromamba/linux-64/latest
+tar -xjf "$LEO/micromamba.tar.bz2" -C "$LEO/bin" --strip-components=1 bin/micromamba
+
+export MAMBA_ROOT_PREFIX="$LEO/mamba"
+"$LEO/bin/micromamba" create -y -n leonida -c conda-forge --override-channels "llvm-tools>=21" spirv-tools
+export PATH="$LEO/mamba/envs/leonida/bin:$PATH"
+
+cmake -S runtime -B runtime/build/linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLEONIDA_VULKAN_HEADERS_FETCH=ON
+cmake --build runtime/build/linux --parallel "$(nproc)"
+LLVM_MC=llvm-mc LEONIDA_VK_DEVICE="<part of your GPU name>" \
+  python3 -I scripts/run_gpu_tests.py --build runtime/build/linux --work "$LEO/run" --require-pass | tee "$LEO/run.log"
+echo "runner exit: ${PIPESTATUS[0]}"
+```
+
+Notes:
+- `LEONIDA_VK_DEVICE` selects the physical GPU by substring so the runner does not fall back to Mesa's `llvmpipe`.
+- Keep `$LEO` on a filesystem without `noexec` (`findmnt -no OPTIONS "$LEO"`).
+- System prerequisites still needed: a working Vulkan driver/loader (`vulkaninfo --summary`), `cmake`, `ninja`, `g++`
+  (or `clang++`), `python3`, `curl`, `tar`, and `bzip2`.
+- Cleanup: delete `$LEO` and `runtime/build/linux`. micromamba also writes `~/.conda/environments.txt` and
+  `~/.mamba/pkgs/urls.txt` (delete only those files if you already use conda).

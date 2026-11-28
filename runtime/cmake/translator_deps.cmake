@@ -29,6 +29,7 @@ set(LEONIDA_TRANSLATOR_DEPS
     ${_leonida_repo}/tools/shader_stage_manifest.py
     ${_leonida_repo}/tools/spirv_asm.py
     ${_leonida_repo}/tools/spirv_asm_tables.py
+    ${_leonida_repo}/tools/spirv_loop_guard.py
     ${_leonida_repo}/tools/spirv_opt.py
     ${_leonida_repo}/tools/spirv_stubs.py
     ${_leonida_repo}/tools/vk_subgroup_info.py

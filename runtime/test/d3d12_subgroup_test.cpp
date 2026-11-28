@@ -3,7 +3,9 @@
 // SHA-256 of its FSSM program, writing eight words through the V# in s[4:7] (four root constants in the console compute layout), read back:
 //   w64 native    cs_w64x_readlane translated natively: v_readlane across both halves of a wave64. Exact only in a
 //                 64-wide subgroup, so the PSO must ask for 64 (and full subgroups) on a device that can give it.
-//                 On a device that cannot (NVIDIA: 32 only) the PSO reports it, and the result is not judged.
+//                 Where the device's subgroup size range does not reach 64 (NVIDIA reports 32..32) the case prints
+//                 SKIP with that range and is not run; where the range reaches 64 but it cannot be required, the PSO
+//                 reports it and the result is not judged.
 //   w64 emulated  the same shader translated with --wave64-emulate: exact on any size, the PSO asks for nothing.
 //   w32 native    cs_wqm_w32, a wave32 shader with whole-quad mode on lane masks; the PSO asks for 32 where the
 //                 device's default or range would otherwise change it.
@@ -18,6 +20,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -185,7 +188,7 @@ Result run(vktest::Device& d, const std::filesystem::path& library, const leonid
     CASE_EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
     Ref<ID3D12Device> device;
     CASE_EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                            reinterpret_cast<void**>(&device.p))));
+                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
     rt::d3d12::set_device_outer(inner, device.p);
 
     // Root signature: [0] four constants (s4..s7 in the console compute layout, D3D-448), the V# the shaders store
@@ -379,7 +382,7 @@ DrawResult draw(vktest::Device& d, const std::filesystem::path& library, const l
     CASE_EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
     Ref<ID3D12Device> device;
     CASE_EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                            reinterpret_cast<void**>(&device.p))));
+                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
     rt::d3d12::set_device_outer(inner, device.p);
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
@@ -529,6 +532,11 @@ const Pixel readlane_expected = {0x40000079u, 0x40000010u, 0x40000064u, 0x400000
 }  // namespace
 
 int main() {
+    // The PSO's subgroup requests are recorded when its Vulkan pipeline is made, and the layer builds compute
+    // pipelines lazily by default: at the first dispatch (or on the warm-up thread), not at
+    // CreateComputePipelineState. `run` reads them straight after creation, so build at creation on this thread.
+    // (A device released with warm-up builds queued no longer outlives its release: d3d12_compile_teardown_test.)
+    _putenv_s("LEONIDA_LAZY_COMPUTE", "0");
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
@@ -541,6 +549,15 @@ int main() {
 
     unsigned judged = 0;
     for (const Shader* shader : {&w64_native, &w64_emulated, &w32_native}) {
+        // A wave64 shader translated natively is exact only in a 64-wide subgroup, so it can be judged only where
+        // the device's subgroup size range (VkPhysicalDeviceSubgroupSizeControlProperties) reaches 64. NVIDIA
+        // reports 32..32: there the native case is skipped for its reason, and the emulated build is the one to use.
+        if (shader == &w64_native && (caps.max_size < 64 || caps.min_size > 64)) {
+            std::printf("SKIP (%s): this device's subgroup sizes are %u..%u (default %u), so a 64-wide subgroup "
+                        "cannot be had and the native wave64 result is not judged\n", shader->label, caps.min_size,
+                        caps.max_size, caps.default_size);
+            continue;
+        }
         const leonida::SubgroupRequest want = expected_request(*shader, caps);
         const Result result = run(d, shader_dir(*shader), caps);
         EXPECT(!result.failure);

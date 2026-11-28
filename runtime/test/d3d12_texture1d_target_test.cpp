@@ -234,6 +234,7 @@ struct Format {
 
 int main() {
     vktest::Device vk;
+    vk.request_buffer_device_address = true;
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
@@ -250,6 +251,9 @@ int main() {
         info.conditional_rendering = vk.conditional_rendering;
         info.storage_buffer_8bit = vk.storage_buffer_8bit;
         info.buffer_device_address = vk.buffer_device_address;
+        info.robust_image_access = vk.robust_image_access;
+        info.bindless = vk.bindless;
+        info.bindless_partially_bound = vk.partially_bound;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         if (hostwine::host_is_wine()) return 77;  // every check is a comparison with Windows D3D12
         Ref<IDXGIFactory4> factory;

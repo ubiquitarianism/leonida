@@ -66,7 +66,7 @@ Portu nie pobiera się gotowego. Buduje się go na Twoim komputerze z Twojej kop
 1. Zainstaluj wymagania powyżej.
 2. Pobierz projekt **razem z submodułem**:
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/ubiquitarianism/leonida
    ```
    „Download ZIP” z GitHuba pomija `third_party/rpf9-explorer`. Build pobierze go sam, jeśli masz `git`, a w
    przeciwnym razie powie, co zrobić.
@@ -95,8 +95,8 @@ python -I make_game.py --wave64-emulate off            # auto (domyślnie), on l
 ```
 
 Etap `check` zawsze wykonuje się pierwszy; następnie, jeśli zostały wybrane, `shaders`, `assets` i `runtime` wykonują się równocześnie (nie zależą od siebie). Etap `pipelines` startuje, gdy przetłumaczone shadery są gotowe. Ten etap
-tworzy każdy przetłumaczony shader na sterowniku Twojej karty graficznej i zapisuje cache potoków, żeby pierwsze
-uruchomienie nie musiało ich kompilować. Tłumaczenie shaderów trwa najdłużej i domyślnie używa połowy wątków
+tworzy każdy przetłumaczony shader na sterowniku Twojej karty graficznej i zapisuje cache potoków
+w `pipeline_cache.bin` (w `--out`). Tłumaczenie shaderów trwa najdłużej i domyślnie używa połowy wątków
 procesora (można to zmienić przez `--jobs`).
 
 - **`--wave64-emulate`**: decyduje, czy shadery compute i mesh wave64 są tłumaczone tak, by były dokładne przy
@@ -169,6 +169,6 @@ albo tłumaczenie z zachowaniem wyodrębnionych wejść shaderów.
 tylko wynikami (liczby, wyniki testów, klasy błędów).
 
 [Przewodnik po testach GPU](../../testing.md) pokazuje, jak uruchomić testy bez plików gry. Wyniki testów GPU
-publikuj w [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
+publikuj jako pull request dodający plik do [gpu-test-results/](../../../gpu-test-results).
 
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+[coord]: https://github.com/ubiquitarianism/leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22

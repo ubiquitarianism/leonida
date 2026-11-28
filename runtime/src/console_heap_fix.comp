@@ -1,0 +1,292 @@
+// Console descriptor heap translation on the GPU (LEONIDA_CONSOLE_HEAP_GPU=1, shims/d3d12_console_heap_gpu.h).
+// The title writes 32-byte RDNA2 records into its console descriptor heap; shaders read a copy in which every buffer
+// V# whose base is the title's own memory names the GPU copy of that memory instead (DeviceState::fix_vsharp). This
+// pass makes that copy: for each listed slot it reads the title's bytes (a host mirror of the heap's pages), rewrites
+// the V# halves, and writes the record where shaders read it. T#s and other words are copied as they are (T#s are
+// found by their exact words in the bindless table; the CPU registers them).
+// console_heap_fix_spv.h is this file compiled with `glslc --target-env=vulkan1.2 -O -mfmt=c` (see the header);
+// keep them together. runtime/test/vk_console_heap_gpu_test.cpp checks it against the CPU reference
+// (console_heap_gpu_reference in d3d12_console_heap_gpu.h).
+//
+// A V# half (dwords 0-3, and 4-7 when dword 3 says the slot is a buffer pair) is translated like fix_vsharp:
+//   - skipped when its TYPE bits (dword 3, bits 30-31) are set or it has no records (dword 2 zero);
+//   - base 0: written with no records;
+//   - base inside a range of the range table (the alias table: slot-133 buffers, title windows, pool extents), sorted
+//     by title VA: rebased to the range's shader VA when the range was checked backed on the CPU and holds the V#'s
+//     whole span; written with no records when it does not hold it (vsharp_address answers 0 there too). An
+//     unchecked range falls through;
+//   - the base as a shader VA (sign-extended from bit 47 with FLAG_SIGNED) with its whole span inside a span of the
+//     backed table (live allocations, geometry blocks): left as it is, as vsharp_address's backed() leaves it;
+//   - otherwise its exact 16 bytes are looked up in the key table (an open-addressed table the CPU fills with what
+//     vsharp_address answered for those words: a shader VA, or "no backing"); found: rebased, or written with no
+//     records;
+//   - not found: written with no records; when the base is in the ask table (the title's memory and GPU windows, with
+//     FLAG_ASK), or there is no ask table, the half is recorded in the miss list, which the CPU reads once the
+//     submission is done, resolves (making the copy if it can) and enters in the key table.
+// "No records" is what fix_vsharp writes: dwords 0, 1 and 2 zero, so loads return 0 and stores are dropped, and no
+// shader adds heap_base to a raw title address.
+//
+// MODE_UPDATE writes the key table entries the CPU changed (one thread each) before MODE_TRANSLATE runs, so the
+// table only ever changes in GPU order, between passes.
+//
+// Addresses are 64-bit buffer device addresses passed as uvec2 (GL_EXT_buffer_reference_uvec2): only the
+// bufferDeviceAddress feature is needed, no shaderInt64.
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Slots {
+    uvec4 v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint w[];
+};
+
+const uint MODE_TRANSLATE = 0u;
+const uint MODE_UPDATE = 1u;
+
+const uint RANGE_WORDS = 8u;     // title_va (2), end (2), shader_va (2), flags, pad
+const uint RANGE_CHECKED = 1u;   // the CPU found the whole range backed
+const uint KEY_WORDS = 8u;       // key (4), to.x, to.y | flags << 16, pad (2)
+const uint KEY_USED = 1u;
+const uint KEY_NONE = 2u;        // vsharp_address answered 0: no records
+const uint KEY_PROBES = 16u;
+const uint UPDATE_WORDS = 12u;   // index, pad (3), entry (8)
+const uint MISS_HEADER = 4u;     // count, capacity, overflowed, pad
+const uint SPAN_WORDS = 4u;      // start (2), end (2)
+const uint FLAG_SIGNED = 1u;
+const uint FLAG_ASK = 2u;
+const uint FLAG_RANGE = 4u;      // MODE_TRANSLATE over slots pc.work.x + i, not a list: a rescan, V# pairs only
+const uint FLAG_FILTER = 8u;     // with FLAG_RANGE: only slots whose metadata meets a change span (below)
+
+layout(push_constant) uniform Params {
+    uvec2 input_slots;  // the title's bytes of the heap (its host mirror)
+    uvec2 copy_slots;   // the heap where shaders read it
+    uvec2 work;         // slot indices (MODE_TRANSLATE)
+    uvec2 ranges;       // range table
+    uvec2 keys;         // key table
+    uvec2 misses;       // miss list
+    uvec2 backed;       // backed spans
+    uvec2 ask;          // ask spans
+    uvec2 meta;         // per slot and half, device-local: what the pass last made of it (meta_of); 0: none
+    uvec2 cshader;      // a filtered rescan's change spans in shader VAs (backings and alias copies that went)
+    uvec2 ctitle;       // and in title VAs (alias ranges that went, words answered since)
+    uint count;         // work items or updates
+    uint range_count;
+    uint key_mask;      // key table entries - 1 (a power of two)
+    uint mode;
+    uint heap;          // the heap's index (< 8), kept in each miss
+    uint backed_count;
+    uint ask_count;
+    uint flags;
+    uint cshader_count;
+    uint ctitle_count;
+} pc;
+// MODE_UPDATE reads its records at pc.work (the push constants hold 128 bytes).
+
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    uint lo = uaddCarry(a.x, b.x, carry);
+    return uvec2(lo, a.y + b.y + carry);
+}
+uvec2 sub64(uvec2 a, uvec2 b) {
+    uint borrow;
+    uint lo = usubBorrow(a.x, b.x, borrow);
+    return uvec2(lo, a.y - b.y - borrow);
+}
+bool less64(uvec2 a, uvec2 b) { return a.y < b.y || (a.y == b.y && a.x < b.x); }
+uvec2 offset(uvec2 base, uint word) {
+    uint carry;
+    uint lo = uaddCarry(base.x, word * 4u, carry);
+    return uvec2(lo, base.y + carry);
+}
+uint load(uvec2 base, uint word) { return Words(offset(base, word)).w[0]; }
+uvec2 load2(uvec2 base, uint word) { return uvec2(load(base, word), load(base, word + 1u)); }
+
+// FNV-1a over the four dwords, then MurmurHash3's fmix32: without the finalizer the low bits (the table index) depend
+// only on the low bits of each dword, and V#s whose bases differ only above bit 20 all fell into one probe chain.
+uint key_hash(uvec4 k) {
+    uint h = 2166136261u;
+    h = (h ^ k.x) * 16777619u;
+    h = (h ^ k.y) * 16777619u;
+    h = (h ^ k.z) * 16777619u;
+    h = (h ^ k.w) * 16777619u;
+    h ^= h >> 16;
+    h *= 0x85EBCA6Bu;
+    h ^= h >> 13;
+    h *= 0xC2B2AE35u;
+    h ^= h >> 16;
+    return h;
+}
+
+// [v, v + n) inside one of `count` sorted, disjoint spans at `spans`.
+bool spans_hold(uvec2 spans, uint count, uvec2 v, uvec2 n) {
+    uint lo = 0u, hi = count;
+    while (lo < hi) {
+        const uint mid = (lo + hi) >> 1u;
+        if (less64(v, load2(spans, SPAN_WORDS * mid))) hi = mid;
+        else lo = mid + 1u;
+    }
+    if (lo == 0u) return false;
+    const uvec2 end = load2(spans, SPAN_WORDS * (lo - 1u) + 2u);
+    return less64(v, end) && !less64(sub64(end, v), n);
+}
+
+// Some span of `count` sorted, disjoint spans at `spans` overlaps [v, v + n).
+bool spans_meet(uvec2 spans, uint count, uvec2 v, uvec2 n) {
+    const uvec2 last = add64(v, n);  // spans starting below it
+    uint lo = 0u, hi = count;
+    while (lo < hi) {
+        const uint mid = (lo + hi) >> 1u;
+        if (less64(load2(spans, SPAN_WORDS * mid), last)) lo = mid + 1u;
+        else hi = mid;
+    }
+    if (lo == 0u) return false;
+    return less64(v, load2(spans, SPAN_WORDS * (lo - 1u) + 2u));
+}
+
+// A 48-bit V# base as the shader VA it names: sign-extended from bit 47 with FLAG_SIGNED.
+uvec2 shader_va(uvec2 base48) {
+    uvec2 v = uvec2(base48.x, base48.y & 0xffffu);
+    if ((pc.flags & FLAG_SIGNED) != 0u && (v.y & 0x8000u) != 0u) v.y |= 0xffff0000u;
+    return v;
+}
+
+// Metadata of one V# half: its title base and span before the pass, and the base it got (0: no records).
+// x = title base low, y = title base bits 32-47 | result bits 32-47 << 16, z = result low, w = span (saturated).
+uvec4 meta_of(uvec4 before, uvec4 after) {
+    if ((before.w >> 30) != 0u || before.z == 0u) return uvec4(0u);
+    const uint stride = (before.y >> 16) & 0x3fffu;
+    uvec2 span;
+    umulExtended(before.z, stride == 0u ? 1u : stride, span.y, span.x);
+    const uvec2 to = after.z == 0u ? uvec2(0u) : uvec2(after.x, after.y & 0xffffu);
+    return uvec4(before.x, (before.y & 0xffffu) | (to.y << 16), to.x, span.y != 0u ? 0xffffffffu : span.x);
+}
+
+// The half's metadata meets a change span: its title base in a title span, or its base or result (with its span) in
+// a shader span. What DeviceState's CPU release filter asks of a slot (LEONIDA_CONSOLE_RELEASE_FILTER).
+bool affected(uvec4 m) {
+    if (m.x == 0u && m.y == 0u && m.z == 0u) return false;
+    const uvec2 base = uvec2(m.x, m.y & 0xffffu);
+    const uvec2 span = uvec2(m.w, 0u);
+    if (pc.ctitle_count != 0u && spans_meet(pc.ctitle, pc.ctitle_count, base, uvec2(1u, 0u))) return true;
+    if (pc.cshader_count == 0u) return false;
+    if (spans_meet(pc.cshader, pc.cshader_count, shader_va(base), span)) return true;
+    const uvec2 to = uvec2(m.z, m.y >> 16);
+    return !(to.x == 0u && to.y == 0u) && spans_meet(pc.cshader, pc.cshader_count, shader_va(to), span);
+}
+
+void rebase(inout uvec4 k, uvec2 to) {
+    k.x = to.x;
+    k.y = (k.y & 0xffff0000u) | (to.y & 0xffffu);
+}
+void no_records(inout uvec4 k) {
+    k.x = 0u;
+    k.y = 0u;
+    k.z = 0u;
+}
+
+// 0: left as it is, 1: rebased or written with no records by a table, 2: missed (written with no records).
+uint translate(inout uvec4 k) {
+    if ((k.w >> 30) != 0u || k.z == 0u) return 0u;
+    const uvec2 base = uvec2(k.x, k.y & 0xffffu);
+    if (base.x == 0u && base.y == 0u) {
+        no_records(k);
+        return 1u;
+    }
+    const uint stride = (k.y >> 16) & 0x3fffu;
+    uvec2 span;
+    umulExtended(k.z, stride == 0u ? 1u : stride, span.y, span.x);
+    // The last range that starts at or below base.
+    uint lo = 0u, hi = pc.range_count;
+    while (lo < hi) {
+        const uint mid = (lo + hi) >> 1u;
+        if (less64(base, load2(pc.ranges, RANGE_WORDS * mid))) hi = mid;
+        else lo = mid + 1u;
+    }
+    if (lo > 0u) {
+        const uint e = RANGE_WORDS * (lo - 1u);
+        const uvec2 end = load2(pc.ranges, e + 2u);
+        if (less64(base, end) && (load(pc.ranges, e + 6u) & RANGE_CHECKED) != 0u) {
+            if (less64(sub64(end, base), span)) {
+                no_records(k);
+            } else {
+                const uvec2 start = load2(pc.ranges, e);
+                rebase(k, add64(load2(pc.ranges, e + 4u), sub64(base, start)));
+            }
+            return 1u;
+        }
+    }
+    uvec2 shader = base;
+    if ((pc.flags & FLAG_SIGNED) != 0u && (base.y & 0x8000u) != 0u) shader.y |= 0xffff0000u;
+    if (pc.backed_count != 0u && spans_hold(pc.backed, pc.backed_count, shader, span.x == 0u && span.y == 0u ? uvec2(1u, 0u) : span))
+        return 1u;
+    const uint h = key_hash(k);
+    for (uint p = 0u; p < KEY_PROBES; ++p) {
+        const uint at = KEY_WORDS * ((h + p) & pc.key_mask);
+        const uint flags = load(pc.keys, at + 5u) >> 16;
+        if ((flags & KEY_USED) == 0u) continue;
+        if (load(pc.keys, at) != k.x || load(pc.keys, at + 1u) != k.y || load(pc.keys, at + 2u) != k.z ||
+            load(pc.keys, at + 3u) != k.w)
+            continue;
+        if ((flags & KEY_NONE) != 0u) no_records(k);
+        else rebase(k, uvec2(load(pc.keys, at + 4u), load(pc.keys, at + 5u) & 0xffffu));
+        return 1u;
+    }
+    no_records(k);
+    if ((pc.flags & FLAG_ASK) != 0u && !spans_hold(pc.ask, pc.ask_count, base, uvec2(1u, 0u))) return 1u;
+    return 2u;
+}
+
+void miss(uint code) {
+    Words m = Words(pc.misses);
+    const uint at = atomicAdd(m.w[0], 1u);
+    if (at < m.w[1]) m.w[MISS_HEADER + at] = code;
+    else m.w[2] = 1u;
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    if (pc.mode == MODE_UPDATE) {
+        const uvec2 record = offset(pc.work, UPDATE_WORDS * i);
+        const uint index = Words(record).w[0];
+        Words table = Words(offset(pc.keys, KEY_WORDS * index));
+        for (uint j = 0u; j < KEY_WORDS; ++j) table.w[j] = Words(record).w[4u + j];
+        return;
+    }
+    // A work item is a slot index; bit 31: the CPU found the slot neither a buffer pair nor a T# it can decode, and
+    // dwords 0-3 are written as zeros (fix_console_slot's rule: such words must not reach a shader as a descriptor).
+    const bool range = (pc.flags & FLAG_RANGE) != 0u;
+    const uint item = range ? pc.work.x + i : Words(pc.work).w[i];
+    const uint slot = item & 0x7fffffffu;
+    const bool has_meta = !(pc.meta.x == 0u && pc.meta.y == 0u);
+    // A filtered rescan reads only the device-local metadata of a slot it leaves alone, not the title's bytes.
+    if (range && (pc.flags & FLAG_FILTER) != 0u && has_meta) {
+        Slots m = Slots(pc.meta);
+        if (!affected(m.v[2u * slot]) && !affected(m.v[2u * slot + 1u])) return;
+    }
+    Slots source = Slots(pc.input_slots);
+    uvec4 a = source.v[2u * slot];
+    uvec4 b = source.v[2u * slot + 1u];
+    // A rescan rewrites buffer pairs only: every other slot keeps what its last listed pass wrote.
+    if (range && (a.w >> 30) != 0u) return;
+    if ((item >> 31) != 0u && (a.w >> 30) != 0u) a = uvec4(0u);
+    const uvec4 a0 = a, b0 = b;
+    if ((a.w >> 30) == 0u) {
+        // A miss is (heap << 29) | (slot << 1) | half: up to eight heaps of 2^28 slots.
+        if (translate(a) == 2u) miss((pc.heap << 29) | (slot << 1u));
+        if (translate(b) == 2u) miss((pc.heap << 29) | (slot << 1u) | 1u);
+    }
+    Slots target = Slots(pc.copy_slots);
+    target.v[2u * slot] = a;
+    target.v[2u * slot + 1u] = b;
+    if (has_meta) {
+        Slots m = Slots(pc.meta);
+        const bool pair = (a0.w >> 30) == 0u;
+        m.v[2u * slot] = pair ? meta_of(a0, a) : uvec4(0u);
+        m.v[2u * slot + 1u] = pair ? meta_of(b0, b) : uvec4(0u);
+    }
+}

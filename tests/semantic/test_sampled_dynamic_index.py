@@ -18,19 +18,66 @@ def translate(instruction):
     return support.translate_lines("ps_dynamic_index", [instruction, *EPILOGUE])
 
 
+def uniform_descriptor_predicate(value, definitions):
+    """Trace a storage-view tag check to scalar descriptor words and constants."""
+    pending = [value]
+    visited = set()
+    while pending:
+        value = pending.pop()
+        if value in visited:
+            continue
+        visited.add(value)
+        op = definitions.get(value, "").split()
+        if not op:
+            return False
+        if op[0] == "OpConstant":
+            continue
+        if op[0] == "OpLoad":
+            address = definitions.get(op[2], "").split()
+            if (len(address) != 4 or address[:3] != ["OpAccessChain", "%_ptr_Function_uint", "%sgpr"] or
+                    not definitions.get(address[3], "").startswith("OpConstant %uint ")):
+                return False
+        elif op[0] in {"OpLogicalAnd", "OpLogicalOr", "OpLogicalNot", "OpBitwiseAnd", "OpIEqual", "OpINotEqual"}:
+            pending.extend(op[2:])
+        else:
+            return False
+    return True
+
+
 class SampledDynamicIndex(unittest.TestCase):
     def check_accesses(self, asm, sampled_bindings, storage_bindings=()):
         bindings = {var: int(binding) for var, binding in re.findall(r"OpDecorate (%\w+) Binding (\d+)", asm)}
-        lookups = set(re.findall(r"(%\w+) = OpFunctionCall %uint %desc_lookup_fn ", asm))
+        lookups = set(re.findall(r"(%\w+) = OpFunctionCall %\w+ %desc_lookup_fn ", asm))
         broadcasts = re.findall(r"(%\w+) = OpGroupNonUniformBroadcastFirst %uint %\w+ (%\w+)", asm)
         # a wave32 pixel shader in a 64-lane subgroup takes its own half's first lane with a shuffle (design.md,
         # "Execution model": shuffle sources keep the current half)
         broadcasts += re.findall(r"(%\w+) = OpGroupNonUniformShuffle %uint %\w+ (%\w+) %\w+", asm)
         lookup_indices = lookups | {result for result, source in broadcasts if source in lookups}
+        # The index a chain uses is that value, or the array's fallback chosen by the T# dimension check
+        # (an OpSelect against 0): follow the extracts and selects the probe's result feeds.
+        for _ in range(4):
+            more = {res for res, source in re.findall(
+                r"(%\w+) = Op(?:CompositeExtract %uint|GroupNonUniformBroadcastFirst %uint %\w+|"
+                r"GroupNonUniformShuffle %uint %\w+) (%\w+)", asm) if source in lookup_indices}
+            more |= {res for res, true_value, false_value in re.findall(
+                r"(%\w+) = OpSelect %uint %\w+ (%\w+) (%\w+)", asm)
+                if true_value in lookup_indices and false_value == "%c0"}
+            if more <= lookup_indices:
+                break
+            lookup_indices |= more
+        definitions = dict(re.findall(r"^\s*(%\w+) = (Op[^\n]+)$", asm, re.M))
+        zero = {var for var, op in definitions.items() if op == "OpConstant %uint 0"}
+        # An unsupported tagged storage view selects the null descriptor. Only a uniform
+        # condition and a verified lookup can select the index for this access.
+        storage_indices = set(lookup_indices)
+        for var, cond, null, source in re.findall(r"(%\w+) = OpSelect %uint (%\w+) (%\w+) (%\w+)", asm):
+            if null in zero and source in lookup_indices and uniform_descriptor_predicate(cond, definitions):
+                storage_indices.add(var)
         sampled, storage = set(), set()
         for var, index in re.findall(r"OpAccessChain %_ptr_UC_\w+ (%\w+) (%\w+)$", asm, re.M):
-            self.assertIn(index, lookup_indices)
-            (storage if var.startswith(("%simages", "%stv")) else sampled).add(bindings[var])
+            is_storage = var.startswith(("%simages", "%stv"))
+            self.assertIn(index, storage_indices if is_storage else lookup_indices)
+            (storage if is_storage else sampled).add(bindings[var])
         self.assertEqual(sampled, set(sampled_bindings))
         self.assertEqual(storage, set(storage_bindings))
         meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, asm)
@@ -103,6 +150,15 @@ class SampledDynamicIndex(unittest.TestCase):
                     asm = translate(f"{op} v0, {coords}, s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_{dim} unorm {mods}")
                     self.check_accesses(asm, (), range(first_binding, first_binding + 3))
                     self.assertIn(expected, asm)
+
+    def test_volume_null_selection_rejects_a_varying_tag(self):
+        asm = translate("image_load v0, v[4:6], s[0:7] dmask:0x1 dim:SQ_RSRC_IMG_3D unorm glc dlc d16")
+        self.check_accesses(asm, (), range(14, 17))
+        scalar_word = "OpAccessChain %_ptr_Function_uint %sgpr %c7"
+        self.assertIn(scalar_word, asm)
+        broken = asm.replace(scalar_word, "OpAccessChain %_ptr_Function_uint %vgpr %c7")
+        with self.assertRaises(AssertionError):
+            self.check_accesses(broken, (), range(14, 17))
 
     def test_atomic_texel_pointers_use_storage_indices(self):
         for dim, coords, binding in (("2D", "v[4:5]", 4), ("3D", "v[4:6]", 7)):

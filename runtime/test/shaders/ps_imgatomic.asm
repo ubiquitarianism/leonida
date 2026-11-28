@@ -1,8 +1,8 @@
 ; Image atomics in a pixel shader, the forms the game uses (1,018 of its 1,038 image-atomic shaders are pixel shaders:
 ; image_atomic_or / umin / umax on a 2D image and umax on a 3D one), through the descriptor table and the set-0
 ; r32ui storage arrays (binding 4 for 2D, 7 for 3D). User data s2:s3 is the console VA of a table of four T#s:
-; +0x00 the 2D umax image, +0x20 the 2D umin image, +0x40 the 2D or image, +0x60 the 3D umax image (any 8 dwords:
-; only the key matters). Each of the 64x64 pixels computes px, py from attr0 (vs_ids runs it 0..1 over the target),
+; +0x00 the 2D umax image, +0x20 the 2D umin image, +0x40 the 2D or image, +0x60 the tagged R32_UINT 3D UAV.
+; Each of the 64x64 pixels computes px, py from attr0 (vs_ids runs it 0..1 over the target),
 ; its id = px + 64 * py, and its texel tx = px >> 3, ty = py >> 3, so 64 pixels contend for each texel of the 8x8
 ; images:
 ;   umax2d[ty][tx] = max(id), umin2d[ty][tx] = min(id), or2d[ty][tx] |= 1 << (id & 31),

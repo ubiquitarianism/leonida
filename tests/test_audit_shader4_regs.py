@@ -3,11 +3,13 @@ import contextlib
 import io
 import json
 import os
+import stat
 import struct
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -168,7 +170,27 @@ class AuditShader4RegsTests(unittest.TestCase):
             self.assertEqual(report["rbw_vgpr_counts"], {"v2": 3, "v4": 3})
             self.assertEqual(report["s3_rbw_op_patterns"], {})
 
-    def test_negative_limit_is_rejected_before_output(self):
+    def test_short_form_carry_in_reads_s3_in_the_audit(self) -> None:
+        # The short form v_add_co_ci_u32 vD, src0, src1 has VCC as its carry-out and carry-in: s3 is src0, read
+        # before any write, so it is reported, and the read does not count as a write of s3.
+        with tempfile.TemporaryDirectory() as disasm:
+            for op in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32"):
+                path = os.path.join(disasm, f"cs_{op}_short.s")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(f"\t{op}_e32 v1, s3, v2\n"
+                            "\ts_mov_b32 s9, s3\n\ts_endpgm\n")
+
+            report = audit_mod.audit(disasm)["cs"]
+            self.assertEqual(report["count"], 3)
+            self.assertEqual(report["rbw_sgpr_counts"], {"s3": 3})
+            self.assertEqual(report["rbw_vgpr_counts"], {"v2": 3})
+            # s3 is never written, so the s_mov_b32 after it reads s3 before a write too.
+            self.assertEqual(report["s3_rbw_op_patterns"], {
+                "v_add_co_ci_u32 D, s3, vN": 1, "v_sub_co_ci_u32 D, s3, vN": 1, "v_subrev_co_ci_u32 D, s3, vN": 1,
+                "s_mov_b32 D, s3": 3})
+
+    def test_limit_below_one_is_rejected_before_output(self):
+        # --limit 0 used to audit nothing and still print a full zero report with exit 0.
         with tempfile.TemporaryDirectory() as tmp:
             disasm = os.path.join(tmp, "disasm")
             os.mkdir(disasm)
@@ -179,20 +201,30 @@ class AuditShader4RegsTests(unittest.TestCase):
                 json.dump({"a_cs": {"stage": "cs"}, "b_cs": {"stage": "cs"}}, f)
 
             out_json = os.path.join(tmp, "report.json")
-            stdout, stderr = io.StringIO(), io.StringIO()
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                with self.assertRaises(SystemExit) as ctx:
-                    audit_mod.main([disasm, "--limit", "-1", "--json", out_json])
-            self.assertEqual(ctx.exception.code, 2)
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertEqual(len(stderr.getvalue().splitlines()), 1)
-            self.assertIn("--limit", stderr.getvalue())
-            self.assertFalse(os.path.exists(out_json))
+            for value in ("0", "-1", "x"):
+                with self.subTest(limit=value):
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        with self.assertRaises(SystemExit) as ctx:
+                            audit_mod.main([disasm, "--limit", value, "--json", out_json])
+                    self.assertEqual(ctx.exception.code, 2)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn("error: argument --limit: must be at least 1", stderr.getvalue())
+                    self.assertNotIn("Traceback", stderr.getvalue())
+                    self.assertFalse(os.path.exists(out_json))
 
-            with self.assertRaisesRegex(ValueError, "limit"):
-                audit_mod.audit(disasm, limit=-1)
-            for limit, count in ((None, 2), (0, 0), (1, 1)):
+            for limit in (0, -1):
+                with self.subTest(audit_limit=limit), self.assertRaisesRegex(ValueError, "at least 1"):
+                    audit_mod.audit(disasm, limit=limit)
+            for limit, count in ((None, 2), (1, 1), (2, 2), (3, 2)):
                 self.assertEqual(audit_mod.audit(disasm, limit=limit)["cs"]["count"], count)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(audit_mod.main([disasm, "--limit", "1", "--json", out_json]), 0)
+            self.assertIn("=== CS (1 shaders;", stdout.getvalue())
+            with open(out_json, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["cs"]["count"], 1)
 
     def test_directory_named_like_shader_is_skipped_by_limit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -368,7 +400,8 @@ class AuditShader4RegsTests(unittest.TestCase):
 
     def test_json_refuses_a_listing_even_when_limit_excludes_it(self):
         listing = self.make_temp_listing()
-        self.assert_json_refuses_input(listing.parent, listing, listing, "--limit", "0")
+        (listing.parent / "cs_first.s").write_bytes(b"\ts_endpgm\n")  # sorts first and takes the only --limit slot
+        self.assert_json_refuses_input(listing.parent, listing, listing, "--limit", "1")
 
     def test_synthetic_cs_ms_gs_audit_and_s3_patterns(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -442,6 +475,74 @@ class AuditShader4RegsTests(unittest.TestCase):
         )]
         _s_rbw, v_rbw, _patterns = audit_mod.rbw_registers(insns)
         self.assertEqual(v_rbw, [2, 3, 4, 5])
+
+
+    def test_load_stage_map_bom_malformed_entries_and_deep_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            with open(os.path.join(disasm, "sample.s"), "w", encoding="utf-8") as f:
+                f.write("\ts_endpgm\n")
+            idx = os.path.join(tmp, "index.json")
+
+            # UTF-8 BOM + mixed malformed list rows + unhashable stage values must not crash or drop valid entries.
+            raw_list = [
+                "not-a-dict",
+                {"file": 123, "stage": "cs"},
+                {"file": "bad_stage.dxbc", "stage": ["unhashable"]},
+                {"file": "sample.dxbc", "stage": "cs"},
+            ]
+            with open(idx, "wb") as f:
+                f.write(b"\xef\xbb\xbf" + json.dumps(raw_list).encode("utf-8"))
+            smap = audit_mod.load_stage_map(disasm)
+            self.assertEqual(smap["sample"], "cs")
+            self.assertEqual(smap["bad_stage"], "?")
+            self.assertEqual(audit_mod.audit(disasm)["cs"]["count"], 1)
+
+            # Dict form with unhashable stage must not raise TypeError during audit().
+            with open(idx, "wb") as f:
+                f.write(b"\xef\xbb\xbf" + json.dumps({"sample": {"stage": ["list"]}}).encode("utf-8"))
+            self.assertEqual(audit_mod.audit(disasm)["cs"]["count"], 0)
+
+            # Deeply nested JSON (RecursionError) is caught like other invalid JSON.
+            with mock.patch.object(audit_mod.json, "load", side_effect=RecursionError):
+                self.assertEqual(audit_mod.load_stage_map(disasm), {})
+
+    def test_read_psv0_rejects_truncated_chunk_or_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Truncated PSV0 chunk payload (plen extends past EOF).
+            full = make_dxbc([make_ms_psv0()])
+            trunc_chunk = os.path.join(tmp, "trunc_chunk.dxbc")
+            with open(trunc_chunk, "wb") as f:
+                f.write(full[:-12])
+            self.assertIsNone(audit_mod.read_psv0(trunc_chunk))
+
+            # PSV0 chunk whose inner rsize exceeds chunk payload bytes.
+            bad_rec_dxbc = make_dxbc([(b"PSV0", struct.pack("<I", 56) + bytes(16))])
+            trunc_rec = os.path.join(tmp, "trunc_rec.dxbc")
+            with open(trunc_rec, "wb") as f:
+                f.write(bad_rec_dxbc)
+            self.assertIsNone(audit_mod.read_psv0(trunc_rec))
+
+    def test_write_json_is_atomic_and_preserves_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "report.json")
+            with open(out, "w", encoding="utf-8") as f:
+                f.write("previous\n")
+            if os.name != "nt":
+                os.chmod(out, 0o640)
+            with mock.patch.object(audit_mod, "replace_retry", side_effect=OSError("busy")):
+                with self.assertRaises(OSError):
+                    audit_mod.write_json(out, {"cs": {"count": 1}})
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "previous\n")
+            self.assertEqual(os.listdir(tmp), ["report.json"])
+
+            audit_mod.write_json(out, {"cs": {"count": 1}})
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"cs": {"count": 1}})
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o640)
 
 
 def setUpModule():

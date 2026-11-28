@@ -15,6 +15,10 @@
 // The executable links thunks for IXUserImpl slots 3-5, 7-14, 19-25 and 33-34 and IXUserGamertagImpl slot 3
 // (tools/gdk_runtime_calls.py, from the file alone; docs/runtime_imports.md). None of them is a private or PC-only
 // slot; those still log once when called.
+//
+// Every served slot writes one "[rt] xgameruntime: XUser <name> first call: ..." line with its arguments and answer
+// (XUserGetGamertag one per component), so a boot log shows how far the title got with its user: the player-select
+// prompt needs a signed-in user and its gamertag (docs/re/notes/firstframe.md). Later calls are silent.
 #include <windows.h>
 
 #include <atomic>
@@ -105,40 +109,57 @@ bool valid(XUserHandle h) {
     return g_handles.count(h) != 0;
 }
 
+// The slot's one first-call line (see the top of the file); the format string is a literal.
+#define USER_FIRST_CALL(...)                                                                             \
+    do {                                                                                                 \
+        static std::atomic<bool> s_logged{false};                                                        \
+        if (!s_logged.exchange(true)) std::fprintf(stderr, "[rt] xgameruntime: XUser " __VA_ARGS__);     \
+    } while (0)
+unsigned long hex(HRESULT hr) { return static_cast<unsigned long>(hr); }
+
 // ---- IXUserImpl (slots 3-36) ----
 
 // 3: HRESULT XUserDuplicateHandle(XUserHandle handle, XUserHandle* duplicatedHandle)
 HRESULT STDMETHODCALLTYPE user_duplicate(void*, XUserHandle handle, XUserHandle* dup) {
-    if (!dup) return E_POINTER;
-    *dup = nullptr;
-    if (!valid(handle)) return E_INVALIDARG;
-    *dup = new_handle();
-    return S_OK;
+    const HRESULT hr = [&]() -> HRESULT {
+        if (!dup) return E_POINTER;
+        *dup = nullptr;
+        if (!valid(handle)) return E_INVALIDARG;
+        *dup = new_handle();
+        return S_OK;
+    }();
+    USER_FIRST_CALL("DuplicateHandle first call: handle %p -> 0x%08lx, new handle %p\n", static_cast<void*>(handle),
+                    hex(hr), dup ? static_cast<void*>(*dup) : nullptr);
+    return hr;
 }
 
 // 4: void XUserCloseHandle(XUserHandle user)
 void STDMETHODCALLTYPE user_close(void*, XUserHandle user) {
+    bool ours = false;
     {
         std::lock_guard<std::mutex> lock(g_handles_mutex);
-        if (!user || g_handles.erase(user) == 0) return;   // closed already, or not ours
+        ours = user && g_handles.erase(user) != 0;   // false: closed already, or not ours
     }
-    delete user;
+    USER_FIRST_CALL("CloseHandle first call: handle %p (%s)\n", static_cast<void*>(user),
+                    ours ? "closed" : "not open; ignored");
+    if (ours) delete user;
 }
 
 // 5: int32_t XUserCompare(XUserHandle user1, XUserHandle user2): 0 when both name the same user. Every valid handle
 // names the one local user.
 int32_t STDMETHODCALLTYPE user_compare(void*, XUserHandle a, XUserHandle b) {
     const bool va = valid(a), vb = valid(b);
-    if (va && vb) return 0;
-    if (va != vb) return va ? 1 : -1;
-    return a == b ? 0 : (a < b ? -1 : 1);
+    const int32_t order = va && vb ? 0 : va != vb ? (va ? 1 : -1) : a == b ? 0 : (a < b ? -1 : 1);
+    USER_FIRST_CALL("Compare first call: handles %p, %p -> %d\n", static_cast<void*>(a), static_cast<void*>(b), order);
+    return order;
 }
 
 // 6: HRESULT XUserGetMaxUsers(uint32_t* maxUsers). One local user offline.
 HRESULT STDMETHODCALLTYPE user_get_max_users(void*, uint32_t* max_users) {
-    if (!max_users) return E_POINTER;
-    *max_users = 1;
-    return S_OK;
+    const HRESULT hr = max_users ? S_OK : E_POINTER;
+    if (max_users) *max_users = 1;
+    USER_FIRST_CALL("GetMaxUsers first call: -> 0x%08lx, 1 user\n", hex(hr));
+    return hr;
 }
 
 // XAsync providers. The result of an add is a new handle, created when the title collects it, so a result the
@@ -194,69 +215,91 @@ HRESULT CALLBACK resolve_provider(XAsyncOp op, const XAsyncProviderData* data) {
 // refused, as documented ("A guest cannot be the default user"). Without a silent option the console would show the
 // account picker; offline the one user is the answer either way.
 HRESULT STDMETHODCALLTYPE user_add_async(void*, XUserAddOptions options, XAsyncBlock* async) {
-    if (!async) return E_POINTER;
     const auto bits = static_cast<uint32_t>(options);
-    if ((bits & static_cast<uint32_t>(XUserAddOptions::AddDefaultUserSilently)) &&
-        (bits & static_cast<uint32_t>(XUserAddOptions::AllowGuests)))
-        return E_INVALIDARG;
-    return XAsyncBegin(async, nullptr, &kAddIdentity, "XUserAddAsync", add_provider);
+    const HRESULT hr = [&]() -> HRESULT {
+        if (!async) return E_POINTER;
+        if ((bits & static_cast<uint32_t>(XUserAddOptions::AddDefaultUserSilently)) &&
+            (bits & static_cast<uint32_t>(XUserAddOptions::AllowGuests)))
+            return E_INVALIDARG;
+        return XAsyncBegin(async, nullptr, &kAddIdentity, "XUserAddAsync", add_provider);
+    }();
+    USER_FIRST_CALL("AddAsync first call: options 0x%x, block %p -> 0x%08lx (the offline user \"%s\")\n", bits,
+                    static_cast<void*>(async), hex(hr), gamertag());
+    return hr;
 }
 
 // 8: HRESULT XUserAddResult(XAsyncBlock* async, XUserHandle* newUser)
 HRESULT STDMETHODCALLTYPE user_add_result(void*, XAsyncBlock* async, XUserHandle* user) {
-    if (!user) return E_POINTER;
-    *user = nullptr;
-    return XAsyncGetResult(async, &kAddIdentity, sizeof(*user), user, nullptr);
+    const HRESULT hr = [&]() -> HRESULT {
+        if (!user) return E_POINTER;
+        *user = nullptr;
+        return XAsyncGetResult(async, &kAddIdentity, sizeof(*user), user, nullptr);
+    }();
+    USER_FIRST_CALL("AddResult first call: block %p -> 0x%08lx, handle %p\n", static_cast<void*>(async), hex(hr),
+                    user ? static_cast<void*>(*user) : nullptr);
+    return hr;
 }
 
 // 9: HRESULT XUserGetLocalId(XUserHandle user, XUserLocalId* userLocalId)
 HRESULT STDMETHODCALLTYPE user_get_local_id(void*, XUserHandle user, XUserLocalId* id) {
-    if (!id) return E_POINTER;
-    if (!valid(user)) return E_INVALIDARG;
-    id->value = kOfflineLocalId;
-    return S_OK;
+    const HRESULT hr = !id ? E_POINTER : !valid(user) ? E_INVALIDARG : S_OK;
+    if (hr == S_OK) id->value = kOfflineLocalId;
+    USER_FIRST_CALL("GetLocalId first call: handle %p -> 0x%08lx, local id %llu\n", static_cast<void*>(user), hex(hr),
+                    static_cast<unsigned long long>(hr == S_OK ? kOfflineLocalId : 0));
+    return hr;
 }
 
 // 10: HRESULT XUserFindUserByLocalId(XUserLocalId userLocalId, XUserHandle* handle)
 HRESULT STDMETHODCALLTYPE user_find_by_local_id(void*, XUserLocalId id, XUserHandle* handle) {
-    if (!handle) return E_POINTER;
-    *handle = nullptr;
-    if (id.value != kOfflineLocalId) return E_GAMEUSER_USER_NOT_FOUND;
-    *handle = new_handle();
-    return S_OK;
+    const HRESULT hr = [&]() -> HRESULT {
+        if (!handle) return E_POINTER;
+        *handle = nullptr;
+        if (id.value != kOfflineLocalId) return E_GAMEUSER_USER_NOT_FOUND;
+        *handle = new_handle();
+        return S_OK;
+    }();
+    USER_FIRST_CALL("FindUserByLocalId first call: local id %llu -> 0x%08lx, handle %p\n",
+                    static_cast<unsigned long long>(id.value), hex(hr), handle ? static_cast<void*>(*handle) : nullptr);
+    return hr;
 }
 
 // 11: HRESULT XUserGetId(XUserHandle user, uint64_t* userId)
 HRESULT STDMETHODCALLTYPE user_get_id(void*, XUserHandle user, uint64_t* id) {
-    if (!id) return E_POINTER;
-    if (!valid(user)) return E_INVALIDARG;
-    *id = kOfflineXuid;
-    return S_OK;
+    const HRESULT hr = !id ? E_POINTER : !valid(user) ? E_INVALIDARG : S_OK;
+    if (hr == S_OK) *id = kOfflineXuid;
+    USER_FIRST_CALL("GetId first call: handle %p -> 0x%08lx, user id 0x%016llx\n", static_cast<void*>(user), hex(hr),
+                    static_cast<unsigned long long>(hr == S_OK ? kOfflineXuid : 0));
+    return hr;
 }
 
 // 12: HRESULT XUserFindUserById(uint64_t userId, XUserHandle* handle)
 HRESULT STDMETHODCALLTYPE user_find_by_id(void*, uint64_t id, XUserHandle* handle) {
-    if (!handle) return E_POINTER;
-    *handle = nullptr;
-    if (id != kOfflineXuid) return E_GAMEUSER_USER_NOT_FOUND;
-    *handle = new_handle();
-    return S_OK;
+    const HRESULT hr = [&]() -> HRESULT {
+        if (!handle) return E_POINTER;
+        *handle = nullptr;
+        if (id != kOfflineXuid) return E_GAMEUSER_USER_NOT_FOUND;
+        *handle = new_handle();
+        return S_OK;
+    }();
+    USER_FIRST_CALL("FindUserById first call: user id 0x%016llx -> 0x%08lx, handle %p\n",
+                    static_cast<unsigned long long>(id), hex(hr), handle ? static_cast<void*>(*handle) : nullptr);
+    return hr;
 }
 
 // 13: HRESULT XUserGetIsGuest(XUserHandle user, bool* isGuest)
 HRESULT STDMETHODCALLTYPE user_get_is_guest(void*, XUserHandle user, bool* guest) {
-    if (!guest) return E_POINTER;
-    if (!valid(user)) return E_INVALIDARG;
-    *guest = false;
-    return S_OK;
+    const HRESULT hr = !guest ? E_POINTER : !valid(user) ? E_INVALIDARG : S_OK;
+    if (hr == S_OK) *guest = false;
+    USER_FIRST_CALL("GetIsGuest first call: handle %p -> 0x%08lx, not a guest\n", static_cast<void*>(user), hex(hr));
+    return hr;
 }
 
 // 14: HRESULT XUserGetState(XUserHandle user, XUserState* state)
 HRESULT STDMETHODCALLTYPE user_get_state(void*, XUserHandle user, XUserState* state) {
-    if (!state) return E_POINTER;
-    if (!valid(user)) return E_INVALIDARG;
-    *state = XUserState::SignedIn;
-    return S_OK;
+    const HRESULT hr = !state ? E_POINTER : !valid(user) ? E_INVALIDARG : S_OK;
+    if (hr == S_OK) *state = XUserState::SignedIn;
+    USER_FIRST_CALL("GetState first call: handle %p -> 0x%08lx, SignedIn (0)\n", static_cast<void*>(user), hex(hr));
+    return hr;
 }
 
 // A slot with no public signature, logged once. Slot 15 (the docs' "unknown") answers E_NOTIMPL, so a caller fails
@@ -288,35 +331,45 @@ template <int Slot, HRESULT Error> HRESULT STDMETHODCALLTYPE offline_failure(voi
 
 // 19: HRESULT XUserGetAgeGroup(XUserHandle user, XUserAgeGroup* ageGroup)
 HRESULT STDMETHODCALLTYPE user_get_age_group(void*, XUserHandle user, XUserAgeGroup* group) {
-    if (!group) return E_POINTER;
-    if (!valid(user)) return E_INVALIDARG;
-    *group = XUserAgeGroup::Adult;
-    return S_OK;
+    const HRESULT hr = !group ? E_POINTER : !valid(user) ? E_INVALIDARG : S_OK;
+    if (hr == S_OK) *group = XUserAgeGroup::Adult;
+    USER_FIRST_CALL("GetAgeGroup first call: handle %p -> 0x%08lx, Adult (3)\n", static_cast<void*>(user), hex(hr));
+    return hr;
 }
 
 // 20: HRESULT XUserCheckPrivilege(XUserHandle user, XUserPrivilegeOptions options, XUserPrivilege privilege,
 //                                 bool* hasPrivilege, XUserPrivilegeDenyReason* reason). Everything is allowed offline
 // (multiplayer and the like then fail at the network, as on a console without one).
-HRESULT STDMETHODCALLTYPE user_check_privilege(void*, XUserHandle user, uint32_t, uint32_t, bool* has,
+HRESULT STDMETHODCALLTYPE user_check_privilege(void*, XUserHandle user, uint32_t options, uint32_t privilege, bool* has,
                                                XUserPrivilegeDenyReason* reason) {
-    if (!has) return E_POINTER;
-    if (!valid(user)) return E_INVALIDARG;
-    *has = true;
-    if (reason) *reason = XUserPrivilegeDenyReason::None;
-    return S_OK;
+    const HRESULT hr = !has ? E_POINTER : !valid(user) ? E_INVALIDARG : S_OK;
+    if (hr == S_OK) {
+        *has = true;
+        if (reason) *reason = XUserPrivilegeDenyReason::None;
+    }
+    USER_FIRST_CALL("CheckPrivilege first call: handle %p, options %u, privilege %u -> 0x%08lx, granted\n",
+                    static_cast<void*>(user), options, privilege, hex(hr));
+    return hr;
 }
 
 // 21: HRESULT XUserResolvePrivilegeWithUiAsync(XUserHandle user, XUserPrivilegeOptions options, XUserPrivilege privilege,
 //                                              XAsyncBlock* async)
-HRESULT STDMETHODCALLTYPE user_resolve_privilege_async(void*, XUserHandle user, uint32_t, uint32_t, XAsyncBlock* async) {
-    if (!async) return E_POINTER;
-    if (!valid(user)) return E_INVALIDARG;
-    return XAsyncBegin(async, nullptr, &kResolveIdentity, "XUserResolvePrivilegeWithUiAsync", resolve_provider);
+HRESULT STDMETHODCALLTYPE user_resolve_privilege_async(void*, XUserHandle user, uint32_t, uint32_t privilege,
+                                                       XAsyncBlock* async) {
+    const HRESULT hr = !async        ? E_POINTER
+                       : !valid(user) ? E_INVALIDARG
+                                      : XAsyncBegin(async, nullptr, &kResolveIdentity, "XUserResolvePrivilegeWithUiAsync",
+                                                    resolve_provider);
+    USER_FIRST_CALL("ResolvePrivilegeWithUiAsync first call: handle %p, privilege %u -> 0x%08lx (nothing to resolve)\n",
+                    static_cast<void*>(user), privilege, hex(hr));
+    return hr;
 }
 
 // 22: HRESULT XUserResolvePrivilegeWithUiResult(XAsyncBlock* async)
 HRESULT STDMETHODCALLTYPE user_resolve_privilege_result(void*, XAsyncBlock* async) {
-    return XAsyncGetResult(async, &kResolveIdentity, 0, nullptr, nullptr);
+    const HRESULT hr = XAsyncGetResult(async, &kResolveIdentity, 0, nullptr, nullptr);
+    USER_FIRST_CALL("ResolvePrivilegeWithUiResult first call: block %p -> 0x%08lx\n", static_cast<void*>(async), hex(hr));
+    return hr;
 }
 
 // 33: HRESULT XUserRegisterForChangeEvent(XTaskQueueHandle queue, void* context, XUserChangeEventCallback* callback,
@@ -329,19 +382,27 @@ uint64_t g_next_token = 1;
 
 HRESULT STDMETHODCALLTYPE user_register_change(void*, XTaskQueueHandle, void*, XUserChangeEventCallback callback,
                                                XTaskQueueRegistrationToken* token) {
-    if (!callback || !token) return E_POINTER;
-    std::lock_guard<std::mutex> lock(g_tokens_mutex);
-    token->token = g_next_token++;
-    g_tokens.insert(token->token);
-    return S_OK;
+    const HRESULT hr = callback && token ? S_OK : E_POINTER;
+    if (hr == S_OK) {
+        std::lock_guard<std::mutex> lock(g_tokens_mutex);
+        token->token = g_next_token++;
+        g_tokens.insert(token->token);
+    }
+    USER_FIRST_CALL("RegisterForChangeEvent first call: -> 0x%08lx, token %llu (never called: the user never changes)\n",
+                    hex(hr), static_cast<unsigned long long>(hr == S_OK ? token->token : 0));
+    return hr;
 }
 
 // false means "wait was false and the unregistration is still pending"; nothing is ever pending offline, so it is
 // true for every token, including one already unregistered or never handed out (a title polling with wait = false
 // would otherwise spin).
 bool STDMETHODCALLTYPE user_unregister_change(void*, XTaskQueueRegistrationToken token, bool) {
-    std::lock_guard<std::mutex> lock(g_tokens_mutex);
-    g_tokens.erase(token.token);
+    {
+        std::lock_guard<std::mutex> lock(g_tokens_mutex);
+        g_tokens.erase(token.token);
+    }
+    USER_FIRST_CALL("UnregisterForChangeEvent first call: token %llu -> true\n",
+                    static_cast<unsigned long long>(token.token));
     return true;
 }
 
@@ -349,6 +410,8 @@ bool STDMETHODCALLTYPE user_unregister_change(void*, XTaskQueueRegistrationToken
 // no sign-out to defer (the documented E_GAMEUSER_DEFERRAL_NOT_AVAILABLE).
 HRESULT STDMETHODCALLTYPE user_get_signout_deferral(void*, XUserSignOutDeferralHandle* deferral) {
     if (deferral) *deferral = nullptr;
+    USER_FIRST_CALL("GetSignOutDeferral first call: -> 0x%08lx (nothing signs out offline)\n",
+                    hex(E_GAMEUSER_DEFERRAL_NOT_AVAILABLE));
     return E_GAMEUSER_DEFERRAL_NOT_AVAILABLE;
 }
 
@@ -359,34 +422,45 @@ void STDMETHODCALLTYPE user_close_signout_deferral(void*, XUserSignOutDeferralHa
 
 // 37: HRESULT XUserAddByIdWithUiAsync(uint64_t userId, XAsyncBlock* async)
 HRESULT STDMETHODCALLTYPE user_add_by_id_async(void*, uint64_t id, XAsyncBlock* async) {
-    if (!async) return E_POINTER;
-    return XAsyncBegin(async, reinterpret_cast<void*>(static_cast<uintptr_t>(id)), &kAddByIdIdentity,
-                       "XUserAddByIdWithUiAsync", add_by_id_provider);
+    const HRESULT hr = !async ? E_POINTER
+                              : XAsyncBegin(async, reinterpret_cast<void*>(static_cast<uintptr_t>(id)),
+                                            &kAddByIdIdentity, "XUserAddByIdWithUiAsync", add_by_id_provider);
+    USER_FIRST_CALL("AddByIdWithUiAsync first call: user id 0x%016llx -> 0x%08lx\n", static_cast<unsigned long long>(id),
+                    hex(hr));
+    return hr;
 }
 
 // 38: HRESULT XUserAddByIdWithUiResult(XAsyncBlock* async, XUserHandle* newUser)
 HRESULT STDMETHODCALLTYPE user_add_by_id_result(void*, XAsyncBlock* async, XUserHandle* user) {
-    if (!user) return E_POINTER;
-    *user = nullptr;
-    return XAsyncGetResult(async, &kAddByIdIdentity, sizeof(*user), user, nullptr);
+    const HRESULT hr = [&]() -> HRESULT {
+        if (!user) return E_POINTER;
+        *user = nullptr;
+        return XAsyncGetResult(async, &kAddByIdIdentity, sizeof(*user), user, nullptr);
+    }();
+    USER_FIRST_CALL("AddByIdWithUiResult first call: block %p -> 0x%08lx, handle %p\n", static_cast<void*>(async),
+                    hex(hr), user ? static_cast<void*>(*user) : nullptr);
+    return hr;
 }
 
 // ---- IXUserImpl4 (42) ----
 
 // 42: bool XUserIsStoreUser(XUserHandle user): the handle is _In_opt_, and the GDK reference says the function
 // always returns true on console.
-bool STDMETHODCALLTYPE user_is_store_user(void*, XUserHandle) { return true; }
+bool STDMETHODCALLTYPE user_is_store_user(void*, XUserHandle user) {
+    USER_FIRST_CALL("IsStoreUser first call: handle %p -> true\n", static_cast<void*>(user));
+    return true;
+}
 
 // ---- IXUserGamertagImpl (its slot 3) ----
 
 // HRESULT XUserGetGamertag(XUserHandle user, XUserGamertagComponent component, size_t gamertagSize, char* gamertag,
 //                          size_t* gamertagUsed). The offline user has a classic gamertag: Modern and UniqueModern are
 // the same text (a classic tag has no '#' and no suffix) and ModernSuffix is empty. gamertagUsed counts the
-// terminator.
+// terminator. This is what the title's player-select prompt shows as "<gamertag> (A)"; the first call for each
+// component is logged with its answer.
 HRESULT STDMETHODCALLTYPE user_get_gamertag(void*, XUserHandle user, XUserGamertagComponent component, size_t size,
                                             char* out, size_t* used) {
     if (used) *used = 0;
-    if (!valid(user)) return E_INVALIDARG;
     const char* text = nullptr;
     switch (component) {
     case XUserGamertagComponent::Classic:
@@ -398,13 +472,24 @@ HRESULT STDMETHODCALLTYPE user_get_gamertag(void*, XUserHandle user, XUserGamert
         text = "";
         break;
     default:
-        return E_INVALIDARG;
+        break;
     }
-    const size_t need = std::strlen(text) + 1;
-    if (!out || size < need) return kInsufficientBuffer;
-    std::memcpy(out, text, need);
-    if (used) *used = need;
-    return S_OK;
+    const size_t need = text ? std::strlen(text) + 1 : 0;
+    const HRESULT hr = !valid(user) || !text ? E_INVALIDARG : !out || size < need ? kInsufficientBuffer : S_OK;
+    if (hr == S_OK) {
+        std::memcpy(out, text, need);
+        if (used) *used = need;
+    }
+    static const char* const kNames[] = {"Classic", "Modern", "ModernSuffix", "UniqueModern", "unknown component"};
+    static std::atomic<bool> s_logged[std::size(kNames)];
+    const uint32_t c = static_cast<uint32_t>(component);
+    const size_t index = c < 4 ? c : 4;
+    if (!s_logged[index].exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XUser GetGamertag first call: %s (%u), handle %p, buffer %zu bytes -> "
+                             "0x%08lx, \"%s\" (%zu bytes used)\n",
+                     kNames[index], c, static_cast<void*>(user), size, hex(hr), hr == S_OK ? text : "",
+                     hr == S_OK ? need : 0);
+    return hr;
 }
 
 // ---- The object: one vtable for the IXUserImpl..IXUserImpl6 chain, one for IXUserGamertagImpl ----
@@ -450,6 +535,7 @@ HRESULT query(REFIID iid, void** out) {
 
 // A process-wide singleton, as the other runtime classes: AddRef and Release don't free.
 HRESULT STDMETHODCALLTYPE object_query_interface(void*, REFIID iid, void** out) { return query(iid, out); }
+#undef USER_FIRST_CALL
 ULONG STDMETHODCALLTYPE object_add_ref(void*) { return 2; }
 ULONG STDMETHODCALLTYPE object_release(void*) { return 1; }
 

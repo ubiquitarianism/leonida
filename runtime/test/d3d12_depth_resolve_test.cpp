@@ -1,4 +1,4 @@
-// Compare depth/stencil ResolveSubresourceRegion with Windows D3D12 on the layer's own adapter and on WARP, through
+﻿// Compare depth/stencil ResolveSubresourceRegion with Windows D3D12 on the layer's own adapter and on WARP, through
 // clears, resolves, copies and Map on both sides: MIN and MAX of either plane, named by the depth format or the
 // plane's own format, and AVERAGE of the depth plane by its own format (R32_FLOAT, R24_UNORM_X8_TYPELESS).
 // Clears write whole pixels, so all samples of a pixel are equal and every mode returns that value: these cases
@@ -88,10 +88,9 @@ struct Planes {
     std::vector<unsigned char> depth, stencil;
 };
 
-// Clears a 4x target with three overlapping values and the 1x destination to values none of them have, resolves
-// `c` and reads every plane of the destination back. The resolve is its own list, so a refused one (run only when
-// `run_invalid`) can't take the clears and read-back with it: the layer refuses a failed list's whole batch.
-bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run_invalid,
+// Clear a 4x source and 1x destination, resolve c, then read back every destination plane. For a layer refusal,
+// submit the setup and readback independently: ExecuteCommandLists rejects the entire list that failed Close.
+bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool check_refusal,
                       const EdgeDraw* edge = nullptr) {
     Ref<ID3D12CommandQueue> queue;
     Ref<ID3D12CommandAllocator> allocator;
@@ -104,6 +103,7 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                              IID_PPV_ARGS(&list.p))));
     CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    const auto execute = [&](ID3D12CommandList* commands) { queue->ExecuteCommandLists(1, &commands); };
 
     D3D12_HEAP_PROPERTIES heap_properties{};
     heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -197,24 +197,33 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     barriers[1].Transition.pResource = target.p;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_DEST;
     list->ResourceBarrier(2, barriers);
-    CHECK(SUCCEEDED(list->Close()));
-
-    CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
-                                             IID_PPV_ARGS(&resolve_list.p))));
-    CHECK(SUCCEEDED(resolve_list->QueryInterface(IID_PPV_ARGS(&list1.p))));
+    if (check_refusal) {
+        CHECK(SUCCEEDED(list->Close()));
+        execute(list.p);
+        CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                 IID_PPV_ARGS(&list1.p))));
+    } else {
+        CHECK(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
+    }
     D3D12_RECT rect = source_rect;
     const UINT x = c.dst_x >= 0 ? UINT(c.dst_x) : c.rect ? UINT(rect.left) : 0;
     const UINT y = c.dst_y >= 0 ? UINT(c.dst_y) : c.rect ? UINT(rect.top) : 0;
     list1->ResolveSubresourceRegion(target.p, c.plane, x, y, source.p, c.plane, c.rect ? &rect : nullptr, c.format,
                                     c.mode);
-    out.close = resolve_list->Close();
-    if (FAILED(out.close) && !run_invalid) return true;
-
-    CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
-                                             IID_PPV_ARGS(&copy_list.p))));
+    Ref<ID3D12GraphicsCommandList> readback_list;
+    if (check_refusal) {
+        out.close = list1->Close();
+        if (SUCCEEDED(out.close)) return true;  // The caller will report the unexpected success.
+        execute(list1.p);
+        CHECK(rt::d3d12::last_execute_result(queue.p) != leonida::ReplayResult::success);
+        CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                 IID_PPV_ARGS(&readback_list.p))));
+    }
+    auto* copy = check_refusal ? readback_list.p : list.p;
     barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    copy_list->ResourceBarrier(1, &barriers[1]);
+    copy->ResourceBarrier(1, &barriers[1]);
     for (UINT i = 0; i < planes; ++i) {
         D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
         src.pResource = target.p;
@@ -223,14 +232,17 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
         dst.pResource = readback.p;
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         dst.PlacedFootprint = placed[i];
-        copy_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        copy->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
-    CHECK(SUCCEEDED(copy_list->Close()));
-
-    for (ID3D12CommandList* one : {static_cast<ID3D12CommandList*>(list.p),
-                                   static_cast<ID3D12CommandList*>(resolve_list.p),
-                                   static_cast<ID3D12CommandList*>(copy_list.p)})
-        queue->ExecuteCommandLists(1, &one);
+    const HRESULT close = copy->Close();
+    if (check_refusal) {
+        CHECK(SUCCEEDED(close));
+    } else {
+        out.close = close;
+        if (FAILED(close) || c.host_refuses) return true;
+    }
+    execute(copy);
+    if (check_refusal) CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
     CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
     Event event;
     CHECK(event.handle);
@@ -238,6 +250,7 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     // 30 s, not 5 s: under `ctest -j 6` other GPU tests share the device, and a fence can take longer
     // than this test's idle runtime to signal (TEST-514 flake). Sibling tests already wait 15-60 s.
     CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
+    CHECK(fence->GetCompletedValue() == 1);
     void* mapped = nullptr;
     const D3D12_RANGE range{0, SIZE_T(total)};
     CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
@@ -441,12 +454,11 @@ int main() {
                 ++edge_skipped;
                 continue;
             }
-            if (!resolve_and_read(ours.p, c, results[i], true, &ours_edge)) return 1;
-            // A mode the device lacks is refused like the cases below. An edge case has no CPU model of its
-            // coverage: only its Close is checked here, and its planes against the host below.
+            if (!resolve_and_read(ours.p, c, results[i], !can, &ours_edge)) return 1;
+            // Successful edge resolves have no CPU coverage model and are compared with the host below.
             const Planes expected = expected_planes(c, can);
             if (results[i].close != (can ? S_OK : E_INVALIDARG) ||
-                (!c.edge && !same_planes(results[i], expected, false, c.plane))) {
+                ((!c.edge || !can) && !same_planes(results[i], expected, false, c.plane))) {
                 std::fprintf(stderr, "%s %s rect %d: Close 0x%08lx, destination %s the clears\n", c.name,
                              mode_name(c.mode), int(c.rect), results[i].close,
                              same_planes(results[i], expected, false, c.plane) ? "matches" : "differs from");
@@ -492,14 +504,32 @@ int main() {
             std::fprintf(stderr, "no DXGI factory\n");
             return 1;
         }
+        bool use_warp_for_d24_stencil = false;
         for (const bool warp : {false, true}) {
             if (hostwine::host_is_wine()) break;  // checked against the clears above
             Ref<IDXGIAdapter> adapter;
             Ref<ID3D12Device> host;
             std::string adapter_name;
-            if (!hostadapter::reference(factory.p, vk, warp, &adapter.p, adapter_name)) continue;
-            if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
+            if (!hostadapter::reference(factory.p, vk, warp, &adapter.p, adapter_name) ||
+                FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+                if (warp && use_warp_for_d24_stencil) {
+                    std::fprintf(stderr, "WARP is required for the D24S8 stencil reference on this driver\n");
+                    return 1;
+                }
+                continue;
+            }
             const char* name = adapter_name.c_str();
+            // RTX 4070 Ti (630.20): a D24S8 stencil MIN resolve with either format closes successfully but
+            // hangs the device on submission. Use WARP for this plane, and keep the hardware's other comparisons.
+            DXGI_ADAPTER_DESC adapter_desc{};
+            LARGE_INTEGER driver{};
+            if (!warp && adapter.p && SUCCEEDED(adapter->GetDesc(&adapter_desc)) &&
+                adapter_desc.VendorId == 0x10de && adapter_desc.DeviceId == 0x2782 &&
+                SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver)) &&
+                driver.QuadPart == 0x0020'0000'0010'0bccLL) {  // 32.0.16.3020
+                use_warp_for_d24_stencil = true;
+                std::printf("D24S8 stencil reference on %s (630.20): using WARP\n", name);
+            }
             unsigned same = 0, compared = 0, refused_alike = 0, quirks = 0;
             std::vector<const Case*> quirks_seen;  // cases without the edge where this host differs from the clears
             const auto quirky = [&](const Case& e) {
@@ -509,8 +539,12 @@ int main() {
             };
             for (std::size_t i = 0; i < cases.size(); ++i) {
                 const Case& c = cases[i];
+                const bool warp_stencil = use_warp_for_d24_stencil && c.plane == 1 &&
+                                          (c.format == d24 || c.format == g8);
                 // See the top of the file; D32S8 by its own format is kept off WARP for the same reason.
-                if (results[i].depth.empty() || (warp && (c.format == d32 || c.format == d32s8))) continue;
+                if (results[i].depth.empty() || (warp && (c.format == d32 || c.format == d32s8)) ||
+                    (!warp && warp_stencil))
+                    continue;
                 Planes expected;
                 if (!resolve_and_read(host.p, c, expected, false, &host_edge)) return 1;
                 ++compared;
@@ -518,9 +552,8 @@ int main() {
                 // host quirk, not a layer bug: report, don't fail. Which D24S8 resolves is the driver's: with stencil
                 // MIN/MAX on both, an RTX 3070 (NVIDIA 610.74) adds "stencil as X24_G8" and "depth as R24_X8" AVERAGE,
                 // a Ryzen 7 9700X iGPU (AMD 32.0.21042.62) depth MIN/MAX; whole subresources and rectangles alike.
-                // Edge cases have no clear model: on WARP, or where the host had a quirk on the same case without the
-                // edge, a difference from the layer is only reported.
-                if (c.edge && (warp || quirky(c))) {
+                // Only report edge differences if a clear comparison found a quirk, or if WARP is a second reference.
+                if (c.edge && ((warp && !warp_stencil) || quirky(c))) {
                     if (FAILED(expected.close) || !same_planes(expected, results[i], true, c.plane))
                         std::printf("edge %s %s rect %d: %s differs from the layer (information)\n", c.name,
                                     mode_name(c.mode), int(c.rect), name);

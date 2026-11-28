@@ -283,6 +283,7 @@ class ImageStoreD16Tests(unittest.TestCase):
     def test_all_store_dims_a16_glc_and_wave64_emulate_validate(self):
         cases = [
             ("1D", "v2", "dmask:0x1", "d16"),
+            ("1D_ARRAY", "v[2:3]", "dmask:0xf", "d16"),
             ("2D", "v2", "dmask:0xf", "a16 d16"),
             ("2D", "v[2:3]", "dmask:0x3", "glc d16"),
             ("2D_ARRAY", "v[2:3]", "dmask:0xf", "a16 d16"),
@@ -349,7 +350,7 @@ class ImageStoreD16Tests(unittest.TestCase):
 
     def test_unsupported_dims_and_modifiers_still_refused(self):
         for bad in (
-            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_1D_ARRAY unorm d16",
+            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA unorm d16",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 tfe",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 lwe",
         ):

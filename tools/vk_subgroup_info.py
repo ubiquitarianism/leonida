@@ -28,8 +28,10 @@ driver. Its shader compiler can crash in vkCreateComputePipelines on emulated wa
 (#857, reported on RX 5000, RX 6000 and RDNA2 iGPUs). make_game.py prefers native wave64 when the GPU can run it.
 
 per_vertex_inputs says whether the device can run a pixel shader with PerVertexKHR inputs (16-bit interpolation,
-docs/design.md): the fragmentShaderBarycentric feature, and a driver other than MoltenVK, whose SPIR-V to MSL
-conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
+docs/design.md): the fragmentShaderBarycentric feature with VK_KHR_fragment_shader_barycentric in the device's
+extension list, and a driver other than MoltenVK, whose SPIR-V to MSL conversion rejects the decoration
+("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). The feature alone is not enough: RADV (Mesa
+26.2.6) fills it with a one on a gfx90c iGPU (Vega 8, PCI 1002:15E7) that doesn't list the extension. Where it is
 false, the shaders are translated with --f16-interp-fallback.
 
 barycentric_fallback is true for Intel's open-source Mesa driver (ANV). SHADER-925 found that Mesa ANV 26.2.5
@@ -41,6 +43,9 @@ fragmentShaderBarycentric but returns a wrong third BaryCoordKHR component (abou
 expected) in ps_bary, ps_persp_bary and ps_ij_computed, while the fallback passes and RADV on RDNA 3.5 passes natively.
 The check keys on the PCI device ID and the driver ID, not on the driver version, so a fixed driver would still take
 the fallback (correct, one geometry-shader stage slower); LEONIDA_BARY_FALLBACK=0 turns it off.
+It is also true for a Raphael iGPU (PCI 1002:164E, RDNA 2) under the same driver up to and including driverVersion
+2.0.283 (31.0.22044.1, compiler 23.20.44): there ps_bary reads a wrong third BaryCoordKHR component (0.992 where
+0.0039 is expected). That bound is the one place the driver version matters; newer drivers keep native barycentrics.
 
 max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
@@ -82,6 +87,12 @@ RDNA2_DEVICE_IDS = ((0x73A0, 0x73FF), (0x7420, 0x743F), (0x163F, 0x163F), (0x143
 # Cezanne and Barcelo. #5933's wrong BaryCoordKHR was measured on 0x15E7 (Vega 8 of a Ryzen 7 5825U). Other GCN 5
 # parts (Raven/Picasso gfx902, Vega 10/12/20 cards) are a different GPU and are not tested, so they are not listed.
 GFX90C_DEVICE_IDS = (0x15E7, 0x1636, 0x1638, 0x164C)
+# Raphael (Ryzen 7000 desktop) iGPU: the one PCI ID measured under AMD's proprietary Windows driver 31.0.22044.1 (driver
+# info and compiler 23.20.44, Vulkan driverVersion 2.0.283), where ps_bary reads a wrong third BaryCoordKHR component
+# (0.992 where 0.0039 is expected). Only drivers up to and including that driverVersion take the fallback; a newer
+# driver is not known to be wrong and keeps native barycentrics. 0x164E is also in RDNA2_DEVICE_IDS.
+RAPHAEL_DEVICE_ID = 0x164E
+RAPHAEL_OLD_AMD_DRIVER_VERSION = (2 << 22) | (0 << 12) | 283   # VK_MAKE_VERSION(2, 0, 283)
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
@@ -92,6 +103,7 @@ VK_API_VERSION_1_2 = (1 << 22) | (2 << 12)
 VK_API_VERSION_1_3 = (1 << 22) | (3 << 12)
 VK_INCOMPLETE = 5
 VULKAN_12_REQUIRED_EXTENSIONS = frozenset((b"VK_KHR_dynamic_rendering", b"VK_KHR_synchronization2"))
+FRAGMENT_SHADER_BARYCENTRIC_EXTENSION = b"VK_KHR_fragment_shader_barycentric"
 
 PROPS_SIZE = 824            # sizeof(VkPhysicalDeviceProperties) on 64-bit
 FEATURES2_SIZE = 240        # sizeof(VkPhysicalDeviceFeatures2): 16 + 55 VkBool32, padded to 8
@@ -109,6 +121,7 @@ PROPS_VENDOR_ID = 8
 PROPS_DEVICE_ID = 12
 PROPS_DEVICE_NAME = 20      # char[256]
 PROPS_API_VERSION = 0
+PROPS_DRIVER_VERSION = 4    # uint32 driverVersion, vendor-encoded (Raphael's 2.0.283 is VK_MAKE_VERSION(2, 0, 283))
 PROPS_MAX_PUSH_CONSTANTS_SIZE = 296 + 32  # limits (296) + maxPushConstantsSize (32) on 64-bit
 QUEUE_FAMILY_SIZE = 24      # sizeof(VkQueueFamilyProperties)
 
@@ -185,12 +198,23 @@ def gfx90c_amd_windows(vendor_id: int, device_id: int, driver_id: int) -> bool:
             and device_id in GFX90C_DEVICE_IDS)
 
 
-def barycentric_fallback(vendor_id: int, device_id: int, driver_id: int) -> bool:
+def raphael_old_amd_windows(vendor_id: int, device_id: int, driver_id: int, driver_version: int | None = None) -> bool:
+    """A Raphael iGPU under AMD's proprietary (Windows) driver at or below driverVersion 2.0.283 (31.0.22044.1,
+    compiler 23.20.44), whose native BaryCoordKHR is wrong. None (not reported) and 0 are no match."""
+    return (vendor_id == AMD_VENDOR_ID and driver_id == VK_DRIVER_ID_AMD_PROPRIETARY
+            and device_id == RAPHAEL_DEVICE_ID
+            and driver_version is not None and 0 < driver_version <= RAPHAEL_OLD_AMD_DRIVER_VERSION)
+
+
+def barycentric_fallback(vendor_id: int, device_id: int, driver_id: int, driver_version: int | None = None) -> bool:
     """Drivers that expose native barycentrics but return wrong BaryCoordKHR values for translated pixel shaders:
-    Mesa ANV (BaryCoordKHR.i zero on Intel Arc, SHADER-925) and AMD's Windows driver on gfx90c (wrong third
-    component, #5933)."""
+    Mesa ANV (BaryCoordKHR.i zero on Intel Arc, SHADER-925), AMD's Windows driver on gfx90c (wrong third
+    component, #5933), and the same driver on a Raphael iGPU up to driverVersion 2.0.283 (wrong third component,
+    measured on 31.0.22044.1). driver_version is VkPhysicalDeviceProperties.driverVersion; the default None means
+    unknown, which gives no fallback from the Raphael rule."""
     return (driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA
-            or gfx90c_amd_windows(vendor_id, device_id, driver_id))
+            or gfx90c_amd_windows(vendor_id, device_id, driver_id)
+            or raphael_old_amd_windows(vendor_id, device_id, driver_id, driver_version))
 
 
 def physical_devices(vk, instance):
@@ -264,6 +288,8 @@ def query(*, stage_caps=False) -> dict:
         device_filter = os.environ.get("LEONIDA_VK_DEVICE", "")
         wanted = device_filter.lower()
         chosen = None
+        chosen_d = None
+        chosen_extensions = None
         chosen_rank = -1
         for d in devs:
             d = ctypes.c_void_p(d)
@@ -279,6 +305,7 @@ def query(*, stage_caps=False) -> dict:
             raw = bytes(props)[16:]
             dev_name = raw[PROPS_DEVICE_NAME:PROPS_DEVICE_NAME + 256].split(b"\0")[0].decode("utf-8", "replace")
             version = int.from_bytes(raw[PROPS_API_VERSION:PROPS_API_VERSION + 4], "little")
+            driver_version = int.from_bytes(raw[PROPS_DRIVER_VERSION:PROPS_DRIVER_VERSION + 4], "little")
             if version < VK_API_VERSION_1_2 or (wanted and wanted not in dev_name.lower()):
                 continue
             core13 = version >= VK_API_VERSION_1_3
@@ -327,6 +354,8 @@ def query(*, stage_caps=False) -> dict:
             rank = device_rank(dtype, vendor_id)
             if rank > chosen_rank:
                 chosen_rank = rank
+                chosen_d = d
+                chosen_extensions = None if core13 else extensions
                 chosen = (dev_name,
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, sg.maxComputeWorkgroupSubgroups,
@@ -334,7 +363,8 @@ def query(*, stage_caps=False) -> dict:
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
-                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
+                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16),
+                          driver_version)
         if chosen is None:
             if device_filter:
                 raise RuntimeError(
@@ -343,7 +373,12 @@ def query(*, stage_caps=False) -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
-         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+         sgc, per_vertex, max_push_constants_size, vendor, device, driver, chosen_driver_version) = chosen
+        if per_vertex:
+            # The feature counts only with its extension listed (RADV sets it on gfx90c without one).
+            # Reuse the Vulkan 1.2 extension set already fetched above, and query Vulkan 1.3 devices only once chosen.
+            exts = device_extensions(vk, chosen_d) if chosen_extensions is None else chosen_extensions
+            per_vertex = FRAGMENT_SHADER_BARYCENTRIC_EXTENSION in exts
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -365,7 +400,7 @@ def query(*, stage_caps=False) -> dict:
             "native64_compute": compute64,
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
-            "barycentric_fallback": barycentric_fallback(vendor, device, driver),
+            "barycentric_fallback": barycentric_fallback(vendor, device, driver, chosen_driver_version),
             "max_push_constants_size": max_push_constants_size,
             "vendor_id": vendor,
             "device_id": device,

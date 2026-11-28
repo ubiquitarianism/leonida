@@ -11,8 +11,10 @@
 //                  arguments of the next dispatch into the raw buffer. Barriers (a transition of the argument buffer to
 //                  INDIRECT_ARGUMENT and UAV barriers on the buffer and the image) and ExecuteIndirect with a dispatch
 //                  command signature runs a second PSO whose group count is that buffer's first word: it reads the
-//                  structured buffer and the image back and writes the raw output. Everything then goes to COMMON and
-//                  the queue does Signal(compute fence, 1).
+//                  structured buffer and the image back and writes the raw output. A second ExecuteIndirect runs a
+//                  garbage argument record (billions of groups in every dimension) that the argument clamp pass empties
+//                  on the GPU (runtime/src/vulkan_indirect_clamp.h), so it completes instead of resetting the driver.
+//                  Everything then goes to COMMON and the queue does Signal(compute fence, 1).
 //   COPY queue     Wait(compute fence, 1), a COPY list that copies the five results (four buffers and the image through
 //                  CopyTextureRegion) to a READBACK buffer, Signal(copy fence, 2). The CPU waits for that with
 //                  SetEventOnCompletion and an event.
@@ -23,13 +25,21 @@
 // argument buffer, the image and the indirect dispatch's output (which also shows that exactly the 3 groups the
 // first dispatch asked for ran).
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
+// --async-small-waits: LEONIDA_ASYNC_PIPELINES=1 with LEONIDA_ASYNC_MIN_BYTES over both modules (and the warm-up off), and
+// every job of the compile worker held until the results are read: both pipelines are under the threshold, so the
+// dispatches build them where they are needed, as with asynchronous builds off. The same words must match, and no build
+// may have reached the worker. Without the threshold the held worker would leave both dispatches skipped.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_pipeline_compile.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
+#include "../src/vulkan_indirect_clamp.h"
 
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 
 #ifndef LEONIDA_TEST_M4_DIR
@@ -93,7 +103,15 @@ Reference reference() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool check_journal = argc == 2 && std::strcmp(argv[1], "--check-async-journal") == 0;
+    const bool small_waits = argc == 2 && std::strcmp(argv[1], "--async-small-waits") == 0;
+    if (small_waits) {  // before the first PSO: the runtime reads these once
+        _putenv_s("LEONIDA_ASYNC_PIPELINES", "1");
+        _putenv_s("LEONIDA_STRICT_REPLAY", "0");
+        _putenv_s("LEONIDA_COMPUTE_WARMUP", "0");
+        _putenv_s("LEONIDA_ASYNC_MIN_BYTES", "1073741824");  // 1 GiB: over any module
+    }
     vktest::Device d;
     d.queue_count_wanted = 2;   // the copy queue and the compute queue each get a VkQueue where the family has two
     const auto device_status = d.initialize();
@@ -126,6 +144,7 @@ int main() {
         info.queue_family = d.family;
         if (distinct_queues) info.command_queues = d.queues;
         info.buffer_device_address = true;
+        info.pipeline_cache_control = d.pipeline_cache_control();
         info.bindless = d.bindless;
         info.bindless_partially_bound = d.partially_bound;
         info.image_view_min_lod = d.image_view_min_lod;
@@ -134,9 +153,31 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
         EXPECT(rt::d3d12::bindless_set(device.p) != VK_NULL_HANDLE);
+
+        // --async-small-waits: every compile-worker job is counted and held until `release` (or the end of this scope,
+        // before the device goes, so a failed check does not leave the device's teardown waiting for a held build).
+        std::atomic<unsigned> worker_jobs{0};
+        struct HeldWorker {
+            HANDLE release = nullptr;
+            ~HeldWorker() {
+                if (!release) return;
+                SetEvent(release);
+                rt::d3d12::PipelineCompiler::instance().set_job_probe(nullptr);
+                CloseHandle(release);
+            }
+        } held;
+        if (small_waits) {
+            EXPECT(rt::d3d12::async_replay_compile());
+            held.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            EXPECT(held.release != nullptr);
+            rt::d3d12::PipelineCompiler::instance().set_job_probe([&worker_jobs, release = held.release](const void*) {
+                worker_jobs.fetch_add(1);
+                WaitForSingleObject(release, INFINITE);
+            });
+        }
 
         // [0] four 32-bit constants (s4..s7), [1] a table of five UAVs (s8, its 32-bit VA): the console compute layout
         // (D3D-448). The fixtures are built with LEONIDA_USER_DATA_SHIFT=4 (runtime/CMakeLists.txt).
@@ -164,6 +205,24 @@ int main() {
         pso_desc.CS = {indirect_container.data(), indirect_container.size()};
         EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso_indirect.p))));
 
+        if (check_journal) {
+            // Check publication while the device and both PSOs are still alive. The async policy can
+            // drop a dispatch whose worker has not yet published its handle, so wait for these two.
+            EXPECT(rt::d3d12::async_replay_compile());
+            const auto deadline = GetTickCount64() + 30000;
+            while (rt::d3d12::PipelineCompiler::instance().stats().completed < 2 && GetTickCount64() < deadline)
+                Sleep(1);
+            EXPECT(rt::d3d12::PipelineCompiler::instance().stats().completed >= 2);
+            const auto* cache_dir = _wgetenv(L"LEONIDA_PIPELINE_CACHE_DIR");
+            EXPECT(cache_dir && *cache_dir);
+            unsigned entries = 0;
+            const auto dir = std::filesystem::path(cache_dir) / L"pipeline_cache.d";
+            EXPECT(std::filesystem::is_directory(dir));
+            for (const auto& file : std::filesystem::directory_iterator(dir))
+                if (file.path().extension() == L".bin" && file.file_size() > 32) ++entries;
+            EXPECT(entries == 2);
+        }
+
         D3D12_INDIRECT_ARGUMENT_DESC argument{};
         argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
         D3D12_COMMAND_SIGNATURE_DESC signature_desc{};
@@ -179,7 +238,7 @@ int main() {
         constexpr auto uav_flag = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         constexpr auto uav_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         constexpr auto common = D3D12_RESOURCE_STATE_COMMON;
-        Ref<ID3D12Resource> upload, input, data, args, out2, image, readback;
+        Ref<ID3D12Resource> upload, input, data, args, out2, image, readback, garbage;
         const auto create_buffer = [&](Ref<ID3D12Resource>& out, const D3D12_HEAP_PROPERTIES& heap, UINT64 bytes,
                                        D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state) {
             const auto desc = buffer_desc(bytes, flags);
@@ -191,6 +250,9 @@ int main() {
         EXPECT(create_buffer(data, default_heap, data_bytes, uav_flag, uav_state));
         EXPECT(create_buffer(args, default_heap, 256, uav_flag, uav_state));
         EXPECT(create_buffer(out2, default_heap, out2_bytes, uav_flag, uav_state));
+        // The garbage arguments: what an argument buffer holds when the compute that writes it was skipped. This one
+        // asks for billions of groups in every dimension, and the clamp pass must run it empty (vulkan_indirect_clamp.h).
+        EXPECT(create_buffer(garbage, upload_heap, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ));
         EXPECT(create_buffer(readback, readback_heap, readback_bytes, D3D12_RESOURCE_FLAG_NONE,
                              D3D12_RESOURCE_STATE_COPY_DEST));
         D3D12_RESOURCE_DESC image_desc{};
@@ -208,6 +270,14 @@ int main() {
             EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
             for (UINT g = 0; g < records; ++g) mapped[g] = input_word(g);
             upload->Unmap(0, nullptr);
+        }
+        {
+            D3D12_DISPATCH_ARGUMENTS* mapped = nullptr;
+            EXPECT(SUCCEEDED(garbage->Map(0, nullptr, reinterpret_cast<void**>(&mapped))));
+            mapped->ThreadGroupCountX = 0xFFFFFFF0u;
+            mapped->ThreadGroupCountY = 0xFFFFFFFFu;
+            mapped->ThreadGroupCountZ = 1u;
+            garbage->Unmap(0, nullptr);
         }
 
         // The table: slot 0 structured buffer (stride 16), 1 raw argument buffer, 2 image, 3 raw input, 4 raw output.
@@ -301,6 +371,12 @@ int main() {
         compute_list->ResourceBarrier(3, between);
         compute_list->SetPipelineState(pso_indirect.p);   // the root arguments stay
         compute_list->ExecuteIndirect(signature.p, 1, args.p, 0, nullptr, 0);
+        // The clamp pass (vulkan_indirect_clamp.h) runs this one empty: its record asks for billions of groups, which
+        // would otherwise run until the host resets the display driver. out2's expected words below show it wrote
+        // nothing, which is also what a skipped compute pass leaves for a legitimate record to ask for. With
+        // LEONIDA_INDIRECT_CLAMP=0 the raw argument buffer is read again, so such a record is not recorded at all.
+        if (leonida::indirect_clamp_enabled())
+            compute_list->ExecuteIndirect(signature.p, 1, garbage.p, 0, nullptr, 0);
         D3D12_RESOURCE_BARRIER release[5] = {transition(data.p, uav_state, common),
                                              transition(args.p, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, common),
                                              transition(out2.p, uav_state, common),
@@ -355,13 +431,23 @@ int main() {
         }
         CloseHandle(event);
         EXPECT(copy_fence->GetCompletedValue() >= 2 && compute_fence->GetCompletedValue() >= 1);
+        if (small_waits) {
+            const unsigned jobs = worker_jobs.load();
+            if (jobs) std::fprintf(stderr, "%u build(s) went to the compile worker under LEONIDA_ASYNC_MIN_BYTES\n", jobs);
+            EXPECT(jobs == 0);
+            // Both modules are under the threshold, so neither is asynchronous.
+            EXPECT(!rt::d3d12::async_replay_compile(false,
+                library.spirv_bytes(*library.find("cs", leonida::sha256_hex(fill)))));
+            EXPECT(!rt::d3d12::async_replay_compile(false,
+                library.spirv_bytes(*library.find("cs", leonida::sha256_hex(indirect)))));
+        }
 
         void* mapped = nullptr;
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         got.assign(static_cast<const std::uint8_t*>(mapped), static_cast<const std::uint8_t*>(mapped) + readback_bytes);
         readback->Unmap(0, nullptr);
 
-        for (auto* r : {&upload, &input, &data, &args, &out2, &image, &readback}) r->reset();
+        for (auto* r : {&upload, &input, &data, &args, &out2, &image, &readback, &garbage}) r->reset();
         stream_list.reset(); compute_list.reset(); readback_list.reset();
         stream_alloc.reset(); compute_alloc.reset(); readback_alloc.reset();
         copy_fence.reset(); compute_fence.reset();

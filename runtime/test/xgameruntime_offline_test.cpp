@@ -346,6 +346,16 @@ int main() {
               std::memcmp(wav, "RIFF", 4) == 0 && std::memcmp(wav + 8, "WAVEfmt ", 8) == 0 &&
               std::memcmp(wav + 36, "data", 4) == 0,
           "GetStreamData writes a valid silent 16 kHz mono 16-bit PCM WAVE header");
+    check(wav[40] == 0 && wav[41] == 0 && wav[42] == 0 && wav[43] == 0,
+          "the stream's data chunk is empty: no samples");
+    check(at<SpeechStream>(acc, 13)(acc, synth, "hi", nullptr) == E_POINTER,
+          "a stream call with no output handle: E_POINTER");
+    check(at<StreamSize>(acc, 15)(acc, stream, nullptr) == E_POINTER,
+          "the stream size with no output: E_POINTER");
+    check(at<StreamData>(acc, 16)(acc, stream, 43, wav, &got) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) &&
+              at<StreamData>(acc, 16)(acc, stream, sizeof(wav), nullptr, nullptr) ==
+                  HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
+          "a buffer one byte smaller than the stream, or none: E_NOT_SUFFICIENT_BUFFER");
     check(at<SpeechClose>(acc, 14)(acc, stream) == S_OK, "XSpeechSynthesizerCloseStreamHandle succeeds");
     stream = nullptr;
     check(at<SpeechStream>(acc, 21)(acc, synth, "<speak/>", &stream) == S_OK && stream != nullptr &&
@@ -371,6 +381,10 @@ int main() {
           "XDisplayAcquireTimeoutDeferral rejects null out pointer");
     check(at<AcquireDeferral>(launcher, 4)(launcher, &deferral) == S_OK && deferral != nullptr,
           "XDisplayAcquireTimeoutDeferral acquires a display power request handle");
+    void* second = nullptr;
+    check(at<AcquireDeferral>(launcher, 4)(launcher, &second) == S_OK && second && second != deferral,
+          "concurrent display deferrals have distinct handles");
+    at<CloseDeferral>(launcher, 5)(launcher, second);
     at<CloseDeferral>(launcher, 5)(launcher, deferral);
     at<CloseDeferral>(launcher, 5)(launcher, nullptr);
     check(true, "XDisplayCloseTimeoutDeferralHandle closes handle and ignores null");

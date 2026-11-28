@@ -1,0 +1,44 @@
+GPU:        AMD Radeon RX 6600 (RDNA2 / GFX1032, Navi 23, PCI 1002:73ff), subgroup 32..64
+Driver:     AMD proprietary 26.6.4 (Windows 32.0.21043.19003, driverVersion 2.0.353),
+            Vulkan 1.4.315 (loader 1.4.309)
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; default 64, subgroupSizeControl,
+            requiredSubgroupSizeStages compute only); VK_EXT_mesh_shader and
+            VK_KHR_fragment_shader_barycentric present
+OS:         Windows 10 Pro 22H2, 10.0.19045
+Commit:     3ed8e50b754eb9dcf9e3819eddbbbccd52fc1177 (main, 2026-11-24)
+Tools:      llvm-mingw 20261117 (clang 23.1.6), llvm-mc 23.1.6 (conda-forge llvm-tools),
+            SPIRV-Tools v2026.4 (conda-forge), Vulkan-Headers 1.4.363, CMake 4.1.2 with
+            Ninja 1.13.2, Python 3.12.5
+run_gpu_tests.py: 261 shaders: 261 translated, 261 pass spirv-val
+            native:                 233/252 passed, 17 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  233/252 passed, 17 skipped, 2 failed (same tests)
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (native and emulated alike): exit 1,
+            "r32 sint (sint view): 64 bad, texel(5,3) = 2071", the same signature as #31.
+            With #892 (8afbba1) the fixtures pass on this card: --filter imgload 4/4
+            native and 4/4 with LEONIDA_W64_EMULATE=1, texel(5,3) = 71 in every view,
+            using the same runtime build (#892 only changes the two .asm fixtures).
+            This is the first AMD Windows driver result for #892.
+Skipped:    17 skips, all documented reasons:
+            16 run by d3d12_*_test / w64_graphics.py (buffer_uav 2, m2_formats 1,
+               m2_textured 4, m3_frame 4, m4_compute 2, translated_draw 2,
+               w64_graphics.py 1),
+            1  ps_w64x_readlane: this device cannot require a 64-wide fragment subgroup.
+Other checks on the same build:
+- build.py: 284 shaders: 284 translated, 284 pass spirv-val (6 mesh fixtures not
+  built by build.py, as documented).
+- check.py: 216/222 pass, 4 skipped, 2 failed (the same tfe pair).
+- w64_graphics.py: 29 fixtures: tier A 9 ok, tier B 8 ok, tier C 12 skipped (no
+  fragment-stage subgroup size control on AMD's Windows driver), 0 failed.
+- ctest: 77/77 passed, 0 failed; shader_library_corpus and vk_sync_validation skipped
+  (no game data, no validation layer installed).
+Notes:
+- All six ms_* fixtures pass, including ms_wave_info_s3, which fails every native run
+  on the RX 9070 XT record with AMD 26.11.2.
+- Built with cmake -S runtime -B runtime/build/vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_CXX_COMPILER=clang++ -DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF
+  -DCMAKE_EXE_LINKER_FLAGS=-static and Vulkan_INCLUDE_DIR pointing at Vulkan-Headers.
+- conda-forge's vulkan-headers package (VK_HEADER_VERSION 231) is too old for
+  runtime/test/vk_test_device.h: vk_xdxr_build_test and vk_command_replay_test stop on
+  VK_KHR_vertex_attribute_divisor and VK_EXT_host_image_copy. Vulkan-Headers 1.4.363
+  builds all 81 programs.
+- AI-assisted. Synthetic tests only; no game files.

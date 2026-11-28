@@ -38,6 +38,8 @@ class LegacyMulDenormalTests(unittest.TestCase):
         # give +0 under the legacy DX9 zero-times-anything rule.
         for src0, src1 in [
             (0x00000001, 0x4B800000),
+            (0x7F800000, 0x807FFFFF),
+            (0xFF800000, 0x007FFFFF),
             (0x80000001, 0x4B800000),
             (0x00000001, 0x7F800000),
             (0x80000001, 0xFFC00000),

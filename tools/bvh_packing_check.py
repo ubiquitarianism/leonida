@@ -5,6 +5,9 @@
 stream passes when its bytes form exactly one tree under that reading:
 
 * header: the dehydrated flag is set, and the leaf records and the box groups fit in the declared structure;
+* parent table (not shipped): the bytes from the header end to `offsetToElements` are zero; `offsetToParents` is
+  `0x40 - (((offsetToNodes - offsetToElements) / 16) & ~127)`, and with a box root `offsetToElements` is the end of
+  one entry per box unit (BOX16 one, BOX32 two) from the first box node's entry, rounded up to 128;
 * level table: the last word is the level count; before it, the level ends are in order, a multiple of the node
   size apart, and end before the table;
 * groups: every group's node words, child pointers and stored values fit in the bytes its nodes occupy;
@@ -70,6 +73,24 @@ def _valid_order_table():
 VALID_ORDER = _valid_order_table()
 
 
+def parent_table(offset_to_elements, offset_to_nodes):
+    """(offsetToParents, first box entry) the console builder writes (docs/bvh.md §3.1).
+
+    The entry for unit u is at offsetToParents + 4 * (u - offsetToElements / 64). The element units' entries take
+    4 bytes each, (offsetToNodes - offsetToElements) / 16 in all; their whole 128-byte blocks fall below the header
+    end, so the first box node's entry lands in [0x40, 0xc0). The first value is the u32 the header holds, the
+    second a signed offset from the header.
+    """
+    leaf_bytes = (offset_to_nodes - offset_to_elements) >> 4
+    start = 0x40 - (leaf_bytes & ~127)
+    return start & R.M32, start + leaf_bytes
+
+
+def elements_after_parents(first_box_entry, box_units):
+    """offsetToElements: the end of the box nodes' entries (one per 64-byte box unit) rounded up to 128."""
+    return (first_box_entry + 4 * box_units + 127) & ~127
+
+
 def mapped_bounds(hdr):
     """sceneBounds mapped through the leaf frame, as tools/bvh_geometry_check.py maps it: (lo xyz, hi xyz)."""
     frame = R.LeafFrame(hdr)
@@ -94,7 +115,11 @@ def _inside(value, comp, box, wide):
 
 
 def _root_equal(value, bound, comp, wide):
+    if math.isnan(value) or math.isnan(bound):
+        return False
     if wide:
+        if math.isinf(value) or math.isinf(bound):
+            return False
         return abs(value - bound) <= FLOAT_TOL * max(abs(bound), 1e-30)
     want = R.half_down(bound) if comp < 3 else R.half_up(bound)
     return R.float_to_half(value) == want
@@ -135,6 +160,16 @@ def check_stream(buf, at=0):
         return res
     if n and elements + 64 * n > nodes:
         res.fail("leaves_overlap_nodes")
+    # Parent table (docs/bvh.md §3.1): not shipped, so the bytes from the header end to the elements are zero, and
+    # offsetToParents follows from the element region alone.
+    first_entry = None
+    if nodes >= elements:
+        want, first_entry = parent_table(elements, nodes)
+        if hdr.offset_to_parents != want:
+            res.fail("parent_offset")
+    area = src[64:elements]
+    if area.count(0) != len(area):
+        res.fail("parent_area_nonzero")
     remaining, chunk = n, 0
     while remaining > 0:
         c = min(R.LEAVES_PER_CHUNK, remaining)
@@ -187,6 +222,9 @@ def check_stream(buf, at=0):
             runs.append((level, wide, first, count, nid))
             nid += count
     st["box_nodes"] += nid
+    box_units = sum(count * (2 if wide else 1) for _, wide, _, count, _ in runs)
+    if first_entry is not None and elements != elements_after_parents(first_entry, box_units):
+        res.fail("parent_extent")
     if hdr.root not in node_of:
         res.fail("root_not_a_node")
         return res
@@ -277,8 +315,11 @@ def check_stream(buf, at=0):
             got = comps.get(comp, [])
             if len(got) == kids and kids:
                 vals = [v for _, v in got]
-                union = min(vals) if comp < 3 else max(vals)
                 st["root_components_stored"] += 1
+                if any(math.isnan(v) for v in vals):
+                    res.fail("root_union_not_bounds")
+                    continue
+                union = min(vals) if comp < 3 else max(vals)
                 if _root_equal(union, box[comp], comp, wide):
                     st["root_components_equal"] += 1
                 else:
@@ -408,21 +449,33 @@ def scan_window(args):
                     tally.kinds[kind] += 1
                 if kind == "bvh4-chunk":
                     # Join the continuation streams that follow, up to the declared end.
-                    parts, have, q = [data], len(data), pos
+                    parts, have, prev_end, q, joined, saw_bad = [data], len(data), pos, pos, [], False
                     while have < row["declared_bytes"]:
-                        nxt = I.ZHDR.search(m, q, size)
-                        more = _inflate(m, nxt.start(), size) if nxt else None
+                        search_end = min(prev_end + 18, size) if saw_bad else size
+                        nxt = I.ZHDR.search(m, q, search_end)
+                        if not nxt or (saw_bad and nxt.start() > prev_end + 16):
+                            break
+                        more = _inflate(m, nxt.start(), size)
                         if more is None:
+                            if nxt.start() > prev_end + 16:
+                                break
+                            saw_bad = True
+                            q = nxt.start() + 1
+                            continue
+                        more_kind = I.classify(more[0][:I.HEAD], len(more[0]))["kind"]
+                        if more_kind != "raw":
                             break
                         parts.append(more[0])
                         have += len(more[0])
-                        tally.kinds["continuation"] += 1
-                        tally.consumed.add(nxt.start())
-                        q = nxt.start() + more[1]
+                        joined.append(nxt.start())
+                        prev_end = q = nxt.start() + more[1]
+                        saw_bad = False
                     data = b"".join(parts)
                     if have < row["declared_bytes"]:
                         tally.add(s, _short())
                         continue
+                    tally.kinds["continuation"] += len(joined)
+                    tally.consumed.update(joined)
                     tally.kinds["bvh4-chunk-joined"] += 1
                     pos = q
                     kind = "bvh4"

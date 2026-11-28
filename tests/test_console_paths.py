@@ -25,7 +25,8 @@ class ConsolePathsTests(unittest.TestCase):
             loader = Path(tmp) / "loader.py"
             for name, verdict, expected in cases:
                 with self.subTest(name=name):
-                    output = "console paths: GAME: -> game-Игра, writes -> overlay-保存\n" + verdict
+                    output = ("console paths: GAME: -> game-Игра, writes -> overlay-保存, "
+                              "T: -> overlay-保存\\.gta6rt-temp\\20261123-181502-123-pid42\n" + verdict)
                     loader.write_text(
                         f"import sys\nsys.stdout.buffer.write({output.encode('utf-8')!r})\n",
                         encoding="utf-8", newline="\n",

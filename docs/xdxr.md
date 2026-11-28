@@ -112,6 +112,55 @@ type is one of two checks, and neither reads past the `InfoType` field:
 
 None of the 15 other DLLs in the package names the type or an offline builder.
 
+## 4a. The runtime serves the DLL itself
+
+`runtime/shims/xbox_bvh_builder.cpp` serves the seven exports the executable imports with the layer's own XDXR
+builder (`runtime/src/xdxr_build.*`), so the bundled DLL is not loaded and its 52 console programs are never created.
+Their pipeline compile (31.2 s for one of them on an RTX 4080, 59.5 s for all 52 on an RX 9070 XT, #7231/#7049) runs
+on the title's thread, longer than its ~30 s startup watchdog, so a cold first boot ends at the builder (boot stop 18).
+`LEONIDA_BVH_BUILDER=console` turns the shim off.
+
+The executable's imports and call sites, measured statically on 1.0.2.1. The counts are `call [rip+disp32]`
+through the import table. For `Batched2X`, IDA finds 8 direct calls: 4 in each of two sibling functions with no
+static reference, reached through a table (#7516), so 2 of them are calls of another form.
+
+| Export | Call sites | The shim |
+|---|---:|---|
+| `XboxBvhBuilder(ID3D12Device11*, bool)` | 1 | keeps the device in a table keyed by `this`; writes nothing into the title's object |
+| `~XboxBvhBuilder()` | 1 | releases that entry |
+| `Set64BitMortonCodes(bool)` | 8 | recorded; the layer's builder has no such option |
+| `GetRaytracingAccelerationStructurePrebuildInfo(INPUTS*, XDXR_STREAM_DESC*, PREBUILD_INFO*)` | 3 | the layer's sizes |
+| `BuildRaytracingAccelerationStructureBatched2X(GCL6*, UINT, BATCHED_DESC2*)` | 6 (8) | one layer build per element (§1), with its postbuild descriptions |
+| `CopyRaytracingAccelerationStructure(GCL4*, dest, source, mode)` | 2 | the layer's copy |
+| `RehydrateRaytracingAccelerationStructureBatched2X(GCL8*, UINT, BUILD_DESC*, UINT64*)` | 4 | rebuilds each structure from source geometry; refuses source-only stream without geometry |
+
+**Where it differs from the DLL:**
+- **Stream records (§3):** they tune the console builder's heuristics, so they are ignored (logged once). The result
+  is still a valid BVH of the same geometry, in the node format the traversal shaders read.
+- **Validation errors:** the DLL throws them as C++ exceptions. A shim must not throw into the title, so an element
+  the DLL would refuse is skipped with a log line. The offline-statistics postbuild type (`0x10`, §4) is one of
+  those.
+- **Rehydration (`RehydrateRaytracingAccelerationStructureBatched2X`):** Rebuilds each structure on the GPU from
+  the source geometry its description carries ([bvh.md](bvh.md) §4a). The leaf frame `compressionParams` gives is
+  **not applied yet**: the leaves are built from the geometry as the description has it.
+  What the 4th parameter (`const UINT64* source_data`, mangling `PEB_K`) conveys is a **hypothesis**: it points to
+  the array of source buffer addresses for offline dehydrated console streams (e.g. rehydration inputs).
+  When geometry is provided (`NumDescs > 0`), the shim issues `BuildRaytracingAccelerationStructure` to construct
+  traversable GPU BVH nodes. That is a fresh build: the title sets `SourceAccelerationStructureData` to the
+  dehydrated stream, so the shim clears it and the `PERFORM_UPDATE` flag (logged once), which would otherwise make
+  the layer refit from the stream's bytes. The title passes `ScratchAccelerationStructureData = 0` (measured on the retail
+  title), so the shim supplies scratch, or the layer would reject the build: one new buffer per call, in which each
+  element has its own 256-byte-aligned region sized via `GetRaytracingAccelerationStructurePrebuildInfo`. The
+  layer's XDXR builder leaves the dependency between builds to the caller's barrier and the title puts none between
+  the elements of a batch, so no two builds, in a batch, on one list or on lists recorded in parallel, share scratch
+  bytes. The layer's command list holds the buffer until it is Reset or released, and the layer destroys it after
+  the submission that used it has retired. When `source_data` is supplied without geometry, the shim logs once and
+  refuses with `E_NOTIMPL`: offline console dehydrated streams cannot be directly deserialized by PC Vulkan/D3D12
+  drivers ([bvh.md](bvh.md) §4/§4a). Empty structures (`NumDescs == 0` without source) are logged and skipped.
+
+`xbox_bvh_builder_test` calls every export through the shim registry, the way the title's imports bind, and
+`xdxr_bvh.py check-build` checks the BLAS, TLAS and compacted BLAS it builds (ctest `xbox_bvh_builder_check`).
+
 ## 5. What is still open
 
 - The names of the stream record types and of their values.

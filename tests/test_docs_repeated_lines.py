@@ -18,6 +18,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WINDOW = 3     # lines between the two (1 = neighbours)
 OPENING = 40   # characters, after the indentation, that must match
+INDENTED = 4   # spaces of indentation that make a Markdown code block, without a fence
 LIST_ITEM = re.compile(r"^(?:[-*+]|\d+[.)])\s")
 
 
@@ -28,8 +29,10 @@ def repeated_lines(text):
         if line.lstrip().startswith("```"):
             in_fence = not in_fence
             continue
+        if in_fence or len(line) - len(line.lstrip(" ")) >= INDENTED or line.startswith("\t"):
+            continue        # a code block written by indentation, like the fenced one above: not prose
         s = line.strip()
-        if in_fence or len(s) < OPENING or s[0] in "|#>" or LIST_ITEM.match(s):
+        if len(s) < OPENING or s[0] in "|#>" or LIST_ITEM.match(s):
             continue
         key = s[:OPENING]
         if key in seen and n - seen[key] <= WINDOW:
@@ -61,6 +64,20 @@ class RepeatedLines(unittest.TestCase):
             "short", "short",                                        # shorter than OPENING
         ])
         self.assertEqual(repeated_lines(text), [(1, 2)])
+
+    def test_checker_ignores_indented_code_blocks(self):
+        cmd = "python -I scripts/run_semantic_tests.py tests/semantic"
+        text = "\n".join([
+            "Prose above the block.",
+            "",
+            "    " + cmd,
+            "    " + cmd + " -j 4 -p 'test_image_*.py'",
+            "",
+            "Prose after the block.",
+        ])
+        self.assertEqual(repeated_lines(text), [], "an indented Markdown code block is not prose")
+        tabbed = "\n".join(["Prose.", "", "\t" + cmd, "\t" + cmd])
+        self.assertEqual(repeated_lines(tabbed), [], "a tab-indented code block is not prose either")
 
     def test_docs_have_no_repeated_neighbouring_lines(self):
         found = []

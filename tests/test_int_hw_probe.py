@@ -148,12 +148,96 @@ class IntHwProbeTests(unittest.TestCase):
             jpath = os.path.join(tmp, "out.json")
             out, err = io.StringIO(), io.StringIO()
             with unittest.mock.patch.object(probe, "run_translator", return_value={"s_bfe_i32_past31": [0], "s_bfe_u32_past31": [0], "s_bfe_i32_width0": [0]}), \
-                 unittest.mock.patch("builtins.open", side_effect=OSError("disk full")), \
+                 unittest.mock.patch.object(probe.json, "dump", side_effect=OSError("disk full")), \
                  redirect_stdout(out), redirect_stderr(err):
                 rc = probe.main(["--oracle", "translator", "--group", "salu_bfe_past31", "--json", jpath])
             self.assertEqual(rc, 2)
             self.assertIn("ERROR:", err.getvalue())
             self.assertIn("disk full", err.getvalue())
+
+    def test_json_preflight_rejects_trailing_separators(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for bad in (os.path.join(tmp, "out.json") + os.sep, os.path.join(tmp, "out.json") + "/", "/"):
+                with self.subTest(json_path=bad):
+                    err = io.StringIO()
+                    with unittest.mock.patch.object(probe, "run_translator", side_effect=AssertionError("ran translator")), \
+                         unittest.mock.patch.object(hw_runner, "open_oracle", side_effect=AssertionError("opened oracle")), \
+                         redirect_stderr(err):
+                        rc = probe.main(["--oracle", "both", "--group", "salu_bfe_past31", "--json", bad])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("ERROR:", err.getvalue())
+
+    def test_json_write_failure_preserves_existing_file_and_cleans_staging(self):
+        fake_tr = {"s_bfe_i32_past31": [0], "s_bfe_u32_past31": [0], "s_bfe_i32_width0": [0]}
+        with tempfile.TemporaryDirectory() as tmp:
+            jpath = os.path.join(tmp, "existing.json")
+            Path(jpath).write_text('{"keep": true}\n', encoding="utf-8", newline="\n")
+            out, err = io.StringIO(), io.StringIO()
+            with unittest.mock.patch.object(probe, "run_translator", return_value=fake_tr), \
+                 unittest.mock.patch.object(probe.json, "dump", side_effect=OSError("disk full")), \
+                 redirect_stdout(out), redirect_stderr(err):
+                rc = probe.main(["--oracle", "translator", "--group", "salu_bfe_past31", "--json", jpath])
+            self.assertEqual(rc, 2)
+            self.assertEqual(Path(jpath).read_text(encoding="utf-8"), '{"keep": true}\n')
+            self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".int-hw-probe-")], [])
+
+    def test_json_publish_uses_replace_retry_and_cleans_on_failure(self):
+        fake_tr = {"s_bfe_i32_past31": [0], "s_bfe_u32_past31": [0], "s_bfe_i32_width0": [0]}
+        with tempfile.TemporaryDirectory() as tmp:
+            jpath = os.path.join(tmp, "existing.json")
+            Path(jpath).write_text('{"keep": true}\n', encoding="utf-8", newline="\n")
+            out, err = io.StringIO(), io.StringIO()
+            with unittest.mock.patch.object(probe, "run_translator", return_value=fake_tr), \
+                 unittest.mock.patch.object(probe.replace_retry, "replace", side_effect=PermissionError("locked")), \
+                 redirect_stdout(out), redirect_stderr(err):
+                rc = probe.main(["--oracle", "translator", "--group", "salu_bfe_past31", "--json", jpath])
+            self.assertEqual(rc, 2)
+            self.assertEqual(Path(jpath).read_text(encoding="utf-8"), '{"keep": true}\n')
+            self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".int-hw-probe-")], [])
+
+            out2 = io.StringIO()
+            with unittest.mock.patch.object(probe, "run_translator", return_value=fake_tr), \
+                 unittest.mock.patch.object(probe.replace_retry, "replace", wraps=probe.replace_retry.replace) as spy_replace, \
+                 redirect_stdout(out2):
+                rc2 = probe.main(["--oracle", "translator", "--group", "salu_bfe_past31", "--json", jpath])
+            self.assertEqual(rc2, 0)
+            spy_replace.assert_called_once()
+            raw = Path(jpath).read_text(encoding="utf-8")
+            self.assertTrue(raw.endswith("\n"))
+            self.assertEqual(json.loads(raw)["waves"], [32, 64])
+            self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".int-hw-probe-")], [])
+
+    def test_rejects_hw_arch_with_translator_empty_group_and_realpath_json_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = os.path.join(tmp, "not_a_dir")
+            existing_dir = os.path.join(tmp, "dir_target")
+            os.mkdir(existing_dir)
+            Path(blocker).write_text("x", encoding="utf-8", newline="\n")
+
+            with unittest.mock.patch.object(probe, "run_translator", side_effect=AssertionError("ran translator")):
+                for argv, expected in (
+                    (["--oracle", "translator", "--hw-arch", "gfx1035"], "--hw-arch"),
+                    (["--oracle", "hw", "--hw-arch", ""], "--hw-arch"),
+                    (["--oracle", "translator", "--group", ""], "--group"),
+                    (["--oracle", "translator", "--group", "   "], "--group"),
+                ):
+                    with self.subTest(argv=argv):
+                        err = io.StringIO()
+                        with redirect_stderr(err):
+                            rc = probe.main(argv)
+                        self.assertEqual(rc, 2)
+                        self.assertIn("ERROR:", err.getvalue())
+                        self.assertIn(expected, err.getvalue())
+
+                for resolved in (existing_dir, os.path.join(blocker, "nested", "out.json")):
+                    with self.subTest(resolved=resolved):
+                        err = io.StringIO()
+                        with unittest.mock.patch.object(probe.os.path, "realpath", return_value=resolved), \
+                                redirect_stderr(err):
+                            rc = probe.main(["--oracle", "translator", "--group", "salu_bfe_past31",
+                                             "--json", os.path.join(tmp, "alias.json")])
+                        self.assertEqual(rc, 2)
+                        self.assertIn("ERROR:", err.getvalue())
 
 
 # v_bfe_u32 / v_bfe_i32 words measured natively on an AMD Radeon 610M (gfx1036, RDNA2), wave32 and wave64 identical:

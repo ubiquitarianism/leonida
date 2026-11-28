@@ -1,0 +1,110 @@
+GPU:        AMD Radeon(TM) Graphics, Ryzen 5 7600 integrated (RDNA2 / gfx1036, Raphael,
+            PCI 1002:164e), subgroup 32..64
+Driver:     AMD proprietary 24.10.24 ("AMD proprietary shader compiler"), Vulkan driver
+            2.0.302, Vulkan 1.4.363 instance / device apiVersion 1.3.280
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; default 64); requirable only
+            in stage COMPUTE (0x20), subgroupSizeControl and computeFullSubgroups on
+OS:         Windows 11, build 26200.9974
+CPU:        AMD Ryzen 5 7600
+RAM:        31.1 GiB reported
+Commit:     b4b7756e8c64e7ae8b310288d543db0e428c0796 (main, 2026-11-25)
+Tools:      llvm-mc 21.1.8 (WSL Ubuntu, /usr/lib/llvm-21/bin/llvm-mc), SPIRV-Tools
+            v2026.4 (Vulkan SDK 1.4.363.0), CMake 3.31.6 + Ninja 1.12.1 (VS 2022
+            BuildTools), Windows SDK 10.0.26100.0, Python 3.14.4
+Push constants: the device's maxPushConstantsSize is 128, so the whole run used
+            LEONIDA_PC_TAIL_UBO=1 for both the build-time shader generation
+            (runtime/build/generated/*/spirv/index.json: push_constant_bytes 128 with
+            pc_tail set-1 UBO entries) and scripts/run_gpu_tests.py, per
+            docs/testing.md "GPUs with 128 bytes of push constants".
+
+run_gpu_tests.py: 265 shaders: 265 translated, 265 pass spirv-val
+            native:                 234/256 passed, 20 skipped, 2 failed
+Failed:     ms_clip, ms_wave_info_s3: the harness exits without a result on this
+            AMD Windows driver (LLPC) - the known mesh-shader compile crashes,
+            #802/#808. The other four ms_* fixtures (ms_f16_pack, ms_tri,
+            ms_v5_workgroup, ms_w64x_ballot) pass, and VK_EXT_mesh_shader is enabled.
+Skipped:    20: the 16 "run by d3d12_*_test / w64_graphics.py" cases (cs_buf_counter,
+            cs_buf_typed, cs_m4_fill, cs_m4_indirect, ps_live_width, ps_m15, ps_m2,
+            ps_m2_array, ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post, ps_m3_query,
+            vs_m15, vs_m2, vs_m3), ps_w64x_readlane (this device cannot require a
+            64-wide fragment subgroup: subgroup 32..64, requirable COMPUTE only), and
+            ps_texoff, ps_texoff_forms, ps_texoff_implicit (the driver does not
+            expose VK_KHR_maintenance8).
+
+ctest (RelWithDebInfo, -j 8, LEONIDA_VK_VALIDATION=1, same device env):
+            320 registered: 267 passed, 23 skipped, 28 failed, 2 disabled
+            (gameinput, gameinput_script: no SDL3 installed); 126.6 s.
+            No VK_LAYER_KHRONOS_validation errors or VUIDs in either suite. The
+            only validation-layer messages are xbox_present's 4 documented
+            "known sRGB swapchain STORAGE" checks, which the test itself tolerates.
+
+Runtime failures (28):
+- 24 tests fail at PSO creation on the 128-byte push-constant wall: the layer logs
+  "pipelines need 144 bytes of push constants (uniform-buffer fallback not built
+  yet); maxPushConstantsSize 128" (push_constants_need_fallback in
+  runtime/shims/d3d12_vulkan_device.cpp; the layer's --pc-tail-ubo equivalent is
+  not built yet). d3d12_bindless_churn, d3d12_bindless_churn_validated,
+  d3d12_buffer_uav, d3d12_bundle, d3d12_compute, d3d12_depth24_draw,
+  d3d12_depth_resolve (also "ResolveSubresourceRegion refused"), d3d12_draw,
+  d3d12_execute_indirect_validation, d3d12_f16_halves, d3d12_geometry,
+  d3d12_indirect_dispatch_count, d3d12_m2_formats, d3d12_m2_textured,
+  d3d12_m3_first_pass, d3d12_m3_frame, d3d12_m4_compute, d3d12_mesh,
+  d3d12_multi_viewport, d3d12_pso_validation, d3d12_stores_atomics, d3d12_subgroup,
+  d3d12_translated_draw, d3d12_typeless_families ("typeless 9 view 12 draw: the
+  layer failed"; all 82 clears matched).
+- d3d12_clear: depth clear with NaN, "layer cleared 1, expected nan" on all 15
+  pixels (#787).
+- d3d12_pipeline_library_host: exit 0xc0000409 (fail-fast) about 0.5 s in, after
+  two "QueryInterface: unknown IID" lines; the known environment crash (a fix is
+  in flight on the plh-crash-fix branch).
+- xdxr_build_check, d3d12_xdxr_rt_check: the BLAS box16 self-checks report
+  thousands of "not inside its parent's box" / ray-difference problems (#1210
+  family; d3d12_xdxr_rt_check: 666 of 1000 rays differ, "no ray hit anything").
+
+Runtime skips (23; each rerun alone to read its reason):
+- LEONIDA_GAME_DIR unset: shader_library_corpus, bink_decode, bink_abi,
+  bink_play_headless, bink_audio, fsr_dispatch, bvh_builder.
+- 144-byte push-constant wall: d3d12_set0_compute, d3d12_pipeline_library,
+  d3d12_fspx_compute, d3d12_msaa_draw ("skipped, the PSOs need 144
+  push-constant bytes and this GPU has 128"), d3d12_conservative_raster ("needs
+  bufferDeviceAddress and 144 push-constant bytes"), pipeline_cache_seed
+  ("vk_pipeline_check built no pipeline here"). d3d12_conservative_tier2,
+  d3d12_conservative_tier3, d3d12_inner_coverage_guards and
+  d3d12_inner_coverage_native exit 77 without a message; the sibling
+  conservative_raster names the same wall.
+- d3d12_queue_handover_two_queues: "the queue family has one queue".
+- d3d12_b5g5r5a1_uav / d3d12_b4g4r4a4_target: the GPU has native storage /
+  colour-attachment support for those formats, nothing is emulated.
+- xbox_present: ran its full check list (all ok) then returned SKIP.
+- d3d12_boot_movie: "SKIP (no package/movie)"; d3d12_first_light:
+  "LEONIDA_FIRST_LIGHT_DIR is not set".
+- Disabled, not skipped: gameinput, gameinput_script (no SDL3).
+
+Commands:
+  cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      (via vcvars64 + Vulkan SDK 1.4.363.0 Bin on PATH, LLVM_MC=
+      "wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc", LEONIDA_PC_TAIL_UBO=1)
+  cmake --build runtime/build
+  VK_LOADER_DRIVERS_SELECT=*amd-vulkan* LEONIDA_VK_DEVICE=radeon \
+  VK_LOADER_LAYERS_DISABLE=~implicit~ LEONIDA_VK_VALIDATION=1 \
+  LEONIDA_PC_TAIL_UBO=1 DISABLE_RTSS_LAYER=1 DISABLE_VULKAN_OBS_CAPTURE=1 \
+  ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure -j 8
+  (same env) python -I scripts/run_gpu_tests.py --build runtime/build
+
+Notes:
+- Built with CMake + Ninja RelWithDebInfo on Windows (362 targets). xma_decoder
+  not built (no cargo); GameInput shim not built (no SDL3) - hence the two
+  disabled tests. Upload heaps in system memory (no Resizable BAR).
+- The machine also has an NVIDIA dGPU (nv-vk64.json); VK_LOADER_DRIVERS_SELECT
+  kept every run on the iGPU, which the logs confirm ("device: AMD Radeon(TM)
+  Graphics").
+- run_gpu_tests.py ran the native mode only; this 32..64 device runs wave64
+  natively, so no LEONIDA_W64_EMULATE pass was made.
+- This is the rare Windows RDNA2 iGPU case the gpu-test-results set lacked: the
+  128-byte push-constant device. The generated test shaders were verified to
+  carry the --pc-tail-ubo layout (push_constant_bytes 128, pc_tail blocks), and
+  every Vulkan-level shader test that can run on 128 bytes passed; the D3D12
+  layer's own 144-byte requirement is the single largest failure source and is
+  a documented not-yet-built fallback, not a regression.
+- AI-assisted (Devin): built main and ran ctest and run_gpu_tests.py on the
+  owner's machine under the shared GPU lock. No game files, nothing online.

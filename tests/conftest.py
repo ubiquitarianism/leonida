@@ -142,6 +142,9 @@ MS_CLIP_DXBC = make_dxbc([mesh_psv0_chunk(),
 SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC, "ms_clip": MS_CLIP_DXBC, "ms_wave_info_s3": MS_TRI_DXBC,
                "ms_w64x_ballot": MS_TRI_DXBC, "ms_f16_pack": MS_TRI_DXBC,      # scripts/run_gpu_tests.py, ms_tri's PSV0
                "gs_w64_a_ring": GS_TRI_DXBC, "gs_w64_c_lane_id": GS_TRI_DXBC,  # build.py gives every gs_* gs_tri's
+               # vertex 64 comes from the second wave: 128 output vertices (scripts/run_gpu_tests.py)
+               "ms_w64x_wave_votes": make_dxbc([mesh_psv0_chunk(max_vertices=128)]),
+               "ms_w64x_wave_loops": make_dxbc([mesh_psv0_chunk(max_vertices=128)]),
                "ms_v5_workgroup": make_dxbc([mesh_psv0_chunk(threads=(32, 1, 1), max_vertices=3,
                                                            max_primitives=1, group_shared=128)])}
 
@@ -156,6 +159,10 @@ KNOWN_VAL_ISSUES = {}
 # 0x8088 = 4 user SGPRs, TGID_X, 512 B of LDS; group 64x1x1 (the header the cs_* samples in runtime/test/shaders use).
 DEFAULT_CS_HEADER = (0x8088, (64, 1, 1))
 
+# The comment line a sample carries when llvm-mc cannot assemble it (cs_dpp_cmp.asm: a VOPC compare in DPP form).
+# scripts/run_gpu_tests.py has the same line; tests/test_translate.py checks that the two agree.
+TEXT_ONLY_MARK = "; run_gpu_tests: text only, llvm-mc has no gfx1013 encoding for an instruction here"
+
 
 class Shader:
     def __init__(self, workdir, name, asm, cs_header=DEFAULT_CS_HEADER, dxbc=EMPTY_DXBC):
@@ -167,6 +174,15 @@ class Shader:
             rsrc2, (lx, ly, lz) = cs_header
             (workdir / "fssm").mkdir(exist_ok=True)
             (workdir / "fssm" / f"{name}.fssm").write_bytes(bytes(0x138) + struct.pack("<4I", rsrc2, lx, ly, lz))
+        self.path = disasm / f"{name}.s"
+        self.workdir = workdir
+        if any(ln.strip() == TEXT_ONLY_MARK for ln in asm.splitlines()):
+            # llvm-mc has no gfx1013 encoding for an instruction of this sample, so its text is the listing, as in
+            # assemble_to_s of scripts/run_gpu_tests.py: the translator reads straight-line code from the text alone.
+            lines = [f"; {name}  code 0x0..0x0 (synthetic), gfx1013, 0 invalid words"]
+            lines += ["\t" + ln.strip() for ln in asm.splitlines() if ln.strip() and not ln.lstrip().startswith(";")]
+            self.path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+            return
         cmd = LLVM_MC + ["-triple=amdgcn--amdpal", "-mcpu=gfx1013"]
         for ln in asm.splitlines():
             s = ln.strip()
@@ -181,9 +197,7 @@ class Shader:
         cmd.append("-show-encoding")
         r = subprocess.run(cmd, input=asm, capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
-        self.path = disasm / f"{name}.s"
         self.path.write_text(f"; {name}  synthetic\n{r.stdout}")
-        self.workdir = workdir
 
     def translate(self):
         return rdna2spirv.translate(str(self.path))

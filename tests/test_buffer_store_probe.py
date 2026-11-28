@@ -104,13 +104,47 @@ class BufferStoreProbeTests(unittest.TestCase):
                  unittest.mock.patch.object(hw_asm, "family", return_value="gfx10"), \
                  unittest.mock.patch.object(probe, "probe_norm", return_value=fake_norm), \
                  unittest.mock.patch.object(probe, "probe_two_comp", return_value=fake_two), \
-                 unittest.mock.patch("builtins.open", side_effect=OSError("disk full")), \
+                 unittest.mock.patch.object(probe.tempfile, "NamedTemporaryFile", side_effect=OSError("disk full")), \
                  redirect_stdout(out), redirect_stderr(err):
                 rc = probe.main(["--waves", "32", "--json", out_path])
             self.assertEqual(rc, 1)
             self.assertIn("error:", err.getvalue())
             self.assertIn("disk full", err.getvalue())
             self.assertNotIn("Traceback", err.getvalue())
+
+    def test_oracle_closed_on_success_and_error(self):
+        fake_oracle = unittest.mock.MagicMock(arch="gfx1035")
+        fake_norm = {name: {"inst": {"exact": [0], "inputs": [0]}} for name, *_ in probe.NORM_FORMATS}
+        fake_norm["snorm2_ties"] = {"exact": [0], "inputs": [0]}
+        fake_two = {"formats_ok": 12, "formats_total": 12, "triples_ok": 216, "triples_total": 216}
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=fake_oracle), \
+             unittest.mock.patch.object(hw_asm, "family", return_value="gfx10"), \
+             unittest.mock.patch.object(probe, "probe_norm", return_value=fake_norm), \
+             unittest.mock.patch.object(probe, "probe_two_comp", return_value=fake_two), \
+             redirect_stdout(out), redirect_stderr(err):
+            rc = probe.main(["--waves", "32"])
+        self.assertEqual(rc, 0)
+        fake_oracle.close.assert_called_once()
+
+    def test_oracle_closed_on_non_gfx10_skip(self):
+        fake_oracle = unittest.mock.MagicMock(arch="gfx900")
+        err = io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=fake_oracle), \
+             unittest.mock.patch.object(hw_asm, "family", return_value="gfx9"), \
+             redirect_stderr(err):
+            rc = probe.main(["--waves", "32"])
+        self.assertEqual(rc, 77)
+        fake_oracle.close.assert_called_once()
+
+    def test_oracle_closed_on_probe_exception(self):
+        fake_oracle = unittest.mock.MagicMock(arch="gfx1035")
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=fake_oracle), \
+             unittest.mock.patch.object(hw_asm, "family", return_value="gfx10"), \
+             unittest.mock.patch.object(probe, "probe_norm", side_effect=RuntimeError("probe failed")):
+            with self.assertRaises(RuntimeError):
+                probe.main(["--waves", "32"])
+        fake_oracle.close.assert_called_once()
 
 
 class FakeNormOracle:
@@ -120,6 +154,9 @@ class FakeNormOracle:
 
     def __init__(self, double_round=()):
         self.double_round = set(double_round)
+
+    def close(self):
+        pass
 
     def run(self, programs, words=4):
         out = []
@@ -160,6 +197,20 @@ class SummaryLineTests(unittest.TestCase):
         self.assertIn("exact, first mismatch f32 0x", out)
         self.assertIn("unorm16 tbuffer_store_format_x:", out)
         self.assertNotIn("unorm8 buffer_store_format_x:", out)
+
+    def test_atomic_json_write_and_replace_failure_preserves_existing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "report.json")
+            self.assertIsNone(probe.write_json_report(out, {"ok": True}))
+            self.assertEqual(os.listdir(tmp), ["report.json"])
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": true}\n')
+            with unittest.mock.patch.object(probe.os, "replace", side_effect=OSError("replace denied")):
+                err = probe.write_json_report(out, {"ok": False})
+            self.assertIsNotNone(err)
+            self.assertEqual(os.listdir(tmp), ["report.json"])
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": true}\n')
 
 
 if __name__ == "__main__":
