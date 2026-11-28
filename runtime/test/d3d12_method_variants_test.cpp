@@ -212,6 +212,7 @@ bool same_footprints(ID3D12Device11* device, const D3D12_RESOURCE_DESC* desc, UI
 struct Edge {
     const char* name;
     HRESULT got, want;  // `want` is the PC runtime's answer, measured on an RTX 4090 (driver 621.14)
+    bool casts = false;  // passes a castable-format list, which needs RelaxedFormatCastingSupported
 };
 
 // The edge cases of the newer arguments, run on any ID3D12Device10: ours, or the host's PC runtime to compare
@@ -469,13 +470,13 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
         {"CreateReservedResource2, DS+DENY_SR in SHADER_RESOURCE",
          r2(res_ds_deny, D3D12_BARRIER_LAYOUT_SHADER_RESOURCE), E_INVALIDARG},
         {"CreateReservedResource2, castable format on buffer",
-         r2(res_buf, D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, 1, srgb_cast), E_INVALIDARG},
+         r2(res_buf, D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, 1, srgb_cast), E_INVALIDARG, true},
         {"CreateReservedResource2, unknown castable format on texture",
-         r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, unknown_cast), E_INVALIDARG},
+         r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, unknown_cast), E_INVALIDARG, true},
         {"CreateReservedResource2, mismatched texel-size castable format",
-         r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, wide_cast), E_INVALIDARG},
+         r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, wide_cast), E_INVALIDARG, true},
         {"CreateReservedResource2, valid castable format on texture",
-         r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, srgb_cast), S_OK},
+         r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, srgb_cast), S_OK, true},
         {"CreateReservedResource2, castable count with null list",
          r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 2, nullptr), S_OK},
         {"CreateCommandQueue1, null description", null_queue, E_INVALIDARG},
@@ -547,13 +548,29 @@ int main() {
             return 1;
         }
         if (have_host) {
+            // A host without relaxed format casting refuses every castable-format list with E_INVALIDARG, valid or
+            // not (Intel UHD Graphics, Alder Lake, 32.0.101.7092 reports RelaxedFormatCastingSupported = 0 and
+            // refuses even a list of the resource's own format). The layer reports the feature, so those cases are
+            // checked against their recorded answers only on such a host.
+            D3D12_FEATURE_DATA_D3D12_OPTIONS12 host12{};
+            const bool host_casts = SUCCEEDED(host->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &host12,
+                                                                        sizeof(host12))) &&
+                                    host12.RelaxedFormatCastingSupported;
             const std::vector<Edge> theirs = edge_answers(host.p, host.p, host.p);
+            std::size_t compared = 0;
             for (std::size_t i = 0; i < ours.size(); ++i) {
+                if (ours[i].casts && !host_casts) {
+                    std::printf("%s: not comparable, the host has no relaxed format casting (host %08lx)\n",
+                                ours[i].name, theirs[i].got);
+                    continue;
+                }
+                ++compared;
                 if (ours[i].got == theirs[i].got) continue;
                 std::fprintf(stderr, "%s: ours %08lx, host runtime %08lx\n", ours[i].name, ours[i].got,
                              theirs[i].got);
                 return 1;
             }
+            std::printf("edge cases: %zu of %zu compared with the host runtime\n", compared, ours.size());
         } else {
             std::printf("no host D3D12 device: edge cases checked against their recorded answers only\n");
         }
