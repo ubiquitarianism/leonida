@@ -557,8 +557,7 @@ public:
             if (index < storage_2d.size()) storage_2d[index] = mirror_storage(mirror) ? 1 : 0;
         }
         if (kind_out) {
-            *kind_out = kind_sampled_bit(std::uint32_t(dimension)) |
-                        (stores ? kind_storage_bit(std::uint32_t(dimension)) : 0) |
+            *kind_out = sampled_kind(dimension) | (stores ? kind_storage_bit(std::uint32_t(dimension)) : 0) |
                         (used_2d ? (kind_sampled_bit(std::uint32_t(ImageDimension::dim_2d)) |
                                     (mirror_storage(mirror) ? kind_storage_bit(std::uint32_t(ImageDimension::dim_2d))
                                                             : 0))
@@ -595,15 +594,19 @@ public:
         const bool live = index && index < used.size() && used[index] == in_use;
         if (live) {
             write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
-            const bool stores = storage.as_float || storage.as_uint || storage.as_sint || storage.r32ui;
+            // Storage views are written only inside the storage arrays (write_image): an index add_image gave an
+            // image without them can be past their end, and then has none to mark.
+            const bool stores = (storage.as_float || storage.as_uint || storage.as_sint || storage.r32ui) &&
+                                index < storage_capacity(dimension);
             if (index < storage_used_[std::uint32_t(dimension)].size())
                 storage_used_[std::uint32_t(dimension)][index] = stores ? 1 : 0;
         }
         if (live && mirror && mirror->sampled && mirror_of(dimension, index)) {
             write_image(ImageDimension::dim_2d, index, mirror->sampled, mirror->sampled_layout, mirror->storage, 0);
-            if (index < mirror_storage_used_.size()) mirror_storage_used_[index] = mirror_storage(mirror) ? 1 : 0;
+            const bool stores_2d = mirror_storage(mirror) && index < storage_capacity(ImageDimension::dim_2d);
+            if (index < mirror_storage_used_.size()) mirror_storage_used_[index] = stores_2d ? 1 : 0;
             auto& storage_2d = storage_used_[std::uint32_t(ImageDimension::dim_2d)];
-            if (index < storage_2d.size()) storage_2d[index] = mirror_storage(mirror) ? 1 : 0;
+            if (index < storage_2d.size()) storage_2d[index] = stores_2d ? 1 : 0;
         }
         if (kind_out) *kind_out = image_kind_at(dimension, index);
     }
@@ -649,18 +652,20 @@ public:
         if (table_dirty_) held_samplers_.push_back(index);
     }
 
-    // What an index of `dimension` is bound in, from what add_image wrote: that dimension's sampled bit, its storage
-    // bit when the slot holds storage views, and the 2D bits when this image owns the slot at the same number in the
-    // 2D arrays as its mirror (mirror_of).
+    // What an index of `dimension` is bound in, from what add_image wrote: that dimension's sampled bit (none for a
+    // dimension without a sampled array, the 1D array), its storage bit when the slot holds storage views (only ever
+    // inside the storage arrays), and the 2D bits when this image owns the slot at the same number in the 2D arrays
+    // as its mirror (mirror_of).
     std::uint32_t image_kind_at(ImageDimension dimension, std::uint32_t index) const {
-        const auto set = [&](const std::vector<std::uint8_t>& used) {
-            return index < used.size() && used[index] != 0;
+        const auto set = [&](const std::vector<std::uint8_t>& used, ImageDimension in) {
+            return index < used.size() && used[index] != 0 && index < storage_capacity(in);
         };
         const std::uint32_t d = std::uint32_t(dimension);
-        std::uint32_t kind = kind_sampled_bit(d) | (set(storage_used_[d]) ? kind_storage_bit(d) : 0);
+        std::uint32_t kind = sampled_kind(dimension) | (set(storage_used_[d], dimension) ? kind_storage_bit(d) : 0);
         if (mirror_of(dimension, index)) {
             kind |= kind_sampled_bit(std::uint32_t(ImageDimension::dim_2d));
-            if (set(mirror_storage_used_)) kind |= kind_storage_bit(std::uint32_t(ImageDimension::dim_2d));
+            if (set(mirror_storage_used_, ImageDimension::dim_2d))
+                kind |= kind_storage_bit(std::uint32_t(ImageDimension::dim_2d));
         }
         return kind;
     }
@@ -924,6 +929,13 @@ private:
             return i;
         }
         return 0;
+    }
+
+    // The sampled bit of an image of `dimension`: none where the dimension has no sampled array (the 1D array, whose
+    // images are storage only), so a tagged module never reads a sampled descriptor that is not there.
+    static std::uint32_t sampled_kind(ImageDimension dimension) {
+        return bindless::sampled_binding(dimension) == bindless::no_binding ? 0
+                                                                           : kind_sampled_bit(std::uint32_t(dimension));
     }
 
     // A mirror is worth binding only when it has a view; its storage views make the 2D storage arrays valid too.
