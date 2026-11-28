@@ -147,7 +147,7 @@ PRIMARY.update({
     0xD0: ("grp2", "Eb 1"), 0xD1: ("grp2", "Ev 1"), 0xD2: ("grp2", "Eb c"), 0xD3: ("grp2", "Ev c"),
     0xD4: ("aam", "invalid"), 0xD5: ("aad", "invalid"), 0xD6: ("salc", "invalid"), 0xD7: ("xlat", ""),
     0xE0: ("loopne", "Jb"), 0xE1: ("loope", "Jb"), 0xE2: ("loop", "Jb"), 0xE3: ("jcxz", "Jb"),
-    0xE4: ("in", "sys"), 0xE5: ("in", "sys"), 0xE6: ("out", "sys"), 0xE7: ("out", "sys"),
+    0xE4: ("in", "Ab Ib"), 0xE5: ("in", "Av Ib"), 0xE6: ("out", "Ib Ab"), 0xE7: ("out", "Ib Av"),
     0xE8: ("call", "Jz"), 0xE9: ("jmp", "Jz"), 0xEA: ("jmpf", "invalid"), 0xEB: ("jmp", "Jb"),
     0xEC: ("in", "sys"), 0xED: ("in", "sys"), 0xEE: ("out", "sys"), 0xEF: ("out", "sys"),
     0xF1: ("int1", ""), 0xF4: ("hlt", ""), 0xF5: ("cmc", ""),

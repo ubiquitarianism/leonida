@@ -34,6 +34,16 @@ of the x86-64 → arm64 groundwork.
 | PE census | `tools/recomp_census.py` | walks every `.pdata` function, decodes + translates it, reports coverage %, hazard mnemonics, indirect control flow, unwind-info flags |
 | Tests | `tests/test_x64_recomp.py`, `tests/test_recomp_census.py` | hand-built byte fixtures only; exec tests skip when qemu is absent |
 
+The `E4 ib`, `E5 ib`, `E6 ib` and `E7 ib` entries of the primary table (the immediate-port forms
+of `in` and `out`) declared their operands as `sys`, so no immediate byte was consumed and each
+decoded as one byte. A per-instruction differential against `objdump -d` over the retail image's
+`.text` (26,674,180 instructions) finds the form used twice, at RVAs `0x55f2ed4` and `0x564652c`,
+each one byte short of objdump's two. The fix drops both length mismatches (52,638 to 52,636 over
+`.text`) and adds none; the `EC`-`EF` DX-port forms take no immediate and stay one byte. Confirmed
+with the REA `gnu.objdump` section-header evidence
+`ev_e29cbdffd0dc7c46889b2a1f955011ce9f2795017233c97107ded73f9186dd90`, with `in $0x3d,%al` and
+`in $0x73,%al` read from the file at those offsets.
+
 ### Translator contract (as implemented)
 
 - Guest regs `rax`–`r15` → host `x19`–`x27`, `x9`–`x15` (`GMAP`); `x28` = guest ctx pointer,

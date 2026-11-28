@@ -169,6 +169,23 @@ class DecodeTests(unittest.TestCase):
         ins = self.one(asm("f3 0f 1e fa"))      # endbr64 (decoded, no crash)
         self.assertEqual(ins.size, 4)
 
+    def test_in_out_immediate_port_consumes_imm8(self):
+        # E4 ib / E5 ib and E6 ib / E7 ib are the immediate-port forms of in/out. The port number
+        # is a byte, so the instruction is two bytes, not one.
+        ins = self.one(asm("e4 3d"))            # in $0x3d,al
+        self.assertEqual((ins.mnem, ins.size), ("in", 2))
+        self.assertEqual(ins.ops, (("r", 0, 1), ("i", 0x3D, 1)))
+        ins = self.one(asm("e5 73"))            # in $0x73,eax
+        self.assertEqual((ins.mnem, ins.size), ("in", 2))
+        ins = self.one(asm("e6 40"))            # out $0x40,al
+        self.assertEqual((ins.mnem, ins.size), ("out", 2))
+        ins = self.one(asm("e7 40"))            # out $0x40,eax
+        self.assertEqual((ins.mnem, ins.size), ("out", 2))
+        for code in ("ec", "ed", "ee", "ef"):   # the dx forms have no immediate
+            ins = self.one(asm(code))
+            self.assertEqual(ins.size, 1, code)
+            self.assertIn(ins.mnem, ("in", "out"), code)
+
     def test_group7_0f01_carries_modrm(self):
         # 0F 01 /r is the system-instruction group. Every form has a ModRM byte, so
         # reading only the two opcode bytes stops the walk one byte early.
