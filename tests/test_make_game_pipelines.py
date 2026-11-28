@@ -2,6 +2,7 @@
 
 Standard library only; no GPU, no Vulkan SDK, no game data: the checker is mocked.
 """
+import hashlib
 import io
 import json
 import os
@@ -142,13 +143,13 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.skip = os.path.join(self.out, "pipeline_crashes.txt")
         self.calls = []
 
-    def stage(self, script, supports=True):
+    def stage(self, script, supports=True, *, setup_error=False):
         """script(args, call_number) -> exit code; it may write the in-flight file first."""
         def fake_run(args, hint="", check=True, **kw):
             args = [str(a) for a in args]
             self.calls.append(args)
             code = script(args, len(self.calls))
-            if code in (0, 1) and "--inflight-file" in args:
+            if (code == 0 or (code == 1 and not setup_error)) and "--inflight-file" in args:
                 # A native checker that finishes its shader pass clears this report, even on validation failure.
                 with open(args[args.index("--inflight-file") + 1], "w", encoding="utf-8", newline="\n") as f:
                     f.write("")
@@ -288,6 +289,28 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertEqual(doc, {"modules": [{"name": "b_mod", "spv_sha256":
                                             __import__("hashlib").sha256(blob).hexdigest()}]})
         self.assertIn("pipeline_crashes.json", err.getvalue())
+
+    def test_the_crash_report_survives_a_retry_setup_failure(self):
+        blob = b"synthetic module"
+        with open(os.path.join(self.spirv, "b_mod.spv"), "wb") as f:
+            f.write(blob)
+
+        def script(args, n):
+            if n == 1 or self.is_probe(args):
+                self.inflight_is("b_mod")
+                return ABORT
+            self.assertEqual(self.skipped(args), self.skip)
+            return 1   # setup fails before the checker writes its work report
+
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            failed, _ = self.stage(script, setup_error=True)
+        self.assertIsNotNone(failed)
+        self.assertEqual(len(self.calls), 3)
+        self.assertIn("before writing its work report", err.getvalue())
+        with open(os.path.join(self.out, "pipeline_crashes.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"modules": [{"name": "b_mod",
+                                                        "spv_sha256": hashlib.sha256(blob).hexdigest()}]})
 
     def test_the_crash_report_survives_a_range_that_cannot_name_a_module(self):
         # A module was already named and recorded, then the driver aborts without naming

@@ -2948,6 +2948,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             # Native setup failures also return 1. A finished pass writes/clears this report even when shaders
             # fail validation; setup failures return before writing it. Do not repeat setup for every batch.
             if code == 1 and not os.path.isfile(inflight):
+                if crashed:
+                    record_crashes(out, spirv, crashed)
                 fail("vk_pipeline_check exited with 1 before writing its work report; check Vulkan initialization "
                      "and report-file access in the output above")
             if code in (0, 1, 2) or interrupted(code):
