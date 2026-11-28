@@ -20,6 +20,12 @@ enum class Binding { Shim, Host, Module, Unimplemented };
 // No module TLS index has been assigned (matches TLS_OUT_OF_INDEXES without pulling <windows.h> into this header).
 inline constexpr uint32_t kNoTlsIndex = 0xFFFFFFFFu;
 
+// The bytes of a section that come from the file: its raw data, cut to its virtual size. A virtual size of 0 means the
+// raw size (the PE rule map_image follows), so such a section is not empty.
+inline constexpr uint32_t section_file_bytes(uint32_t virtual_size, uint32_t raw_size) {
+    return raw_size < virtual_size || !virtual_size ? raw_size : virtual_size;
+}
+
 struct ImportRecord {
     std::string dll;
     std::string name;   // "#123" for ordinals
@@ -167,7 +173,9 @@ private:
     // its own, as another compat DLL's dependency), else loaded by Windows when `load`. Null with `error` (a Windows
     // error code) when Windows refused the file, or when it is not loaded and `load` is false. Caller holds mutex_.
     void* compat_handle(const std::filesystem::path& file, bool load, uint32_t& error);
-    void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);
+    // `compat_miss`, when given, is set when a LEONIDA_COMPAT_DIR module owns the forwarded name and lacks the
+    // export: the caller then binds a failure thunk, as for a direct import, instead of looking further.
+    void* resolve_forwarder(const std::string& spec, Binding& binding, int depth, bool* compat_miss = nullptr);
     void parse_exports(Module& m);
     void protect_sections(Module& m);
     void register_unwind(Module& m);

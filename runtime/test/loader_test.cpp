@@ -1493,6 +1493,13 @@ rt::ImportRecord bind_with_compat(const std::filesystem::path& compat, const cha
     return m.imports[0];
 }
 
+// A section's file bytes: its raw data cut to its virtual size, where a virtual size of 0 is the raw size (map_image,
+// and the CLZERO scan in protect_sections, which skipped such a section).
+static_assert(rt::section_file_bytes(0x100, 0x200) == 0x100);
+static_assert(rt::section_file_bytes(0x300, 0x200) == 0x200);
+static_assert(rt::section_file_bytes(0, 0x200) == 0x200);
+static_assert(rt::section_file_bytes(0x100, 0) == 0);
+
 void test_compat_modules() {
     const std::filesystem::path compat = g_dir / "compat";
     std::filesystem::create_directories(compat);
@@ -1522,6 +1529,59 @@ void test_compat_modules() {
             auto r = bind_with_compat(compat, "testshim.dll", "F", bound);
             if (r.binding != rt::Binding::Unimplemented) failed(what, "F was not left unimplemented");
             else if (!bound || bound == reinterpret_cast<void*>(&test_shim_function)) failed(what, "F reached the shim");
+            else pass(what);
+        }
+        {
+            // A bundled module's export forwarded into a compat DLL binds to the drop-in, as a direct import does.
+            const char* what = "LEONIDA_COMPAT_DIR also owns a forwarded export: it binds to the drop-in DLL";
+            write_image_as(make_forwarder_image("testcompat.Answer", 0x1C0000000), "fwd_compat.dll");
+            auto r = bind_with_compat(compat, "fwd_compat.dll", "fwd", bound);
+            HMODULE h = GetModuleHandleW(dll_path.c_str());
+            auto expected = h ? reinterpret_cast<void*>(GetProcAddress(h, "Answer")) : nullptr;
+            if (r.binding != rt::Binding::Host) failed(what, "the forwarded import was not bound as Host");
+            else if (!expected || bound != expected) failed(what, "the IAT does not hold the drop-in's export");
+            else if (reinterpret_cast<int (*)()>(bound)() != 42) failed(what, "the export did not return 42");
+            else pass(what);
+        }
+        {
+            const char* what = "a forwarder into a compat DLL that lacks the symbol is unimplemented, not shimmed";
+            write_image_as(make_forwarder_image("testshim.F", 0x1D0000000), "fwd_shim.dll");
+            auto r = bind_with_compat(compat, "fwd_shim.dll", "fwd", bound);
+            if (r.binding != rt::Binding::Unimplemented) failed(what, "F was not left unimplemented");
+            else if (!bound || bound == reinterpret_cast<void*>(&test_shim_function)) failed(what, "F reached the shim");
+            else pass(what);
+            const char* plain = "without LEONIDA_COMPAT_DIR the same forwarder binds to the shim";
+            r = bind_with_compat({}, "fwd_shim.dll", "fwd", bound);
+            if (r.binding != rt::Binding::Shim || bound != reinterpret_cast<void*>(&test_shim_function))
+                failed(plain, "F did not bind to the test shim");
+            else pass(plain);
+        }
+        {
+            // A forwarding module named like a System32 DLL, whose forwarded export the compat DLL lacks: the import
+            // gets a failure thunk, as a direct import of the compat DLL would, not the System32 namesake's export.
+            const char* what = "a compat DLL's missing forwarded export is not taken from a System32 namesake";
+            auto img = make_forwarder_image("testcompat.Missing", 0x1E0000000);
+            std::memcpy(img.data() + 0x380, "GetFileVersionInfoSizeA", 24);
+            const auto bundled = write_image_as(img, "version.dll");
+            auto r = bind_with_compat(compat, "version.dll", "GetFileVersionInfoSizeA", bound);
+            if (r.binding != rt::Binding::Unimplemented) failed(what, "the import was bound");
+            else if (bound == host_symbol("version.dll", "GetFileVersionInfoSizeA") && bound)
+                failed(what, "the import is the System32 export");
+            else pass(what);
+            std::error_code ec;
+            std::filesystem::remove(bundled, ec);
+        }
+        {
+            // A forwarder naming a module with its own extension: the compat file is that name, not name + ".dll".
+            const char* what = "a forwarder to a compat module with its own extension finds that file";
+            write_image_as(make_os_dll(0x1F0000000), "compat/testcompat.drv");
+            write_image_as(make_forwarder_image("testcompat.drv.Answer", 0x1C8000000), "fwd_drv.dll");
+            auto r = bind_with_compat(compat, "fwd_drv.dll", "fwd", bound);
+            HMODULE h = GetModuleHandleW((compat / "testcompat.drv").c_str());
+            auto expected = h ? reinterpret_cast<void*>(GetProcAddress(h, "Answer")) : nullptr;
+            if (r.binding != rt::Binding::Host) failed(what, "the forwarded import was not bound as Host");
+            else if (!expected || bound != expected) failed(what, "the IAT does not hold testcompat.drv's export");
+            else if (reinterpret_cast<int (*)()>(bound)() != 42) failed(what, "the export did not return 42");
             else pass(what);
         }
         {
@@ -1570,7 +1630,7 @@ void test_compat_modules() {
         failed("LEONIDA_COMPAT_DIR", e.what());
     }
     // Loaders keep compat DLLs for the process lifetime; drop the references so the work folder can be removed.
-    for (const auto& p : {dll_path, compat / "testshim.dll"})
+    for (const auto& p : {dll_path, compat / "testshim.dll", compat / "testcompat.drv"})
         while (HMODULE h = GetModuleHandleW(p.c_str())) FreeLibrary(h);
 }
 
