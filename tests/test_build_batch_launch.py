@@ -37,11 +37,13 @@ def launch_arguments(script):
 
 def start(arguments, bat):
     """Run `$p = Start-Process cmd.exe -ArgumentList <arguments>` with $bat set, as the script does; its exit code."""
+    # -Wait -PassThru returns the Process after it has exited, so ExitCode is read reliably. Holding $p.Handle
+    # after a plain -PassThru start is racy: for a child that exits at once, ExitCode can be null. A null code is
+    # reported as 999, which no folder case expects, so it fails the check instead of reading as success.
     command = ("$ErrorActionPreference = 'Stop'\n"
                "$bat = $env:LEONIDA_LAUNCH_BAT\n"
-               f"$p = Start-Process cmd.exe -ArgumentList {arguments} -NoNewWindow -PassThru\n"
-               "$null = $p.Handle\n"
-               "$p.WaitForExit()\n"
+               f"$p = Start-Process cmd.exe -ArgumentList {arguments} -NoNewWindow -Wait -PassThru\n"
+               "if ($null -eq $p.ExitCode) { exit 999 }\n"
                "exit $p.ExitCode\n")
     encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
     return subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
