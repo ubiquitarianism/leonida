@@ -146,4 +146,5 @@ commit 和 `tools/rpf9dump` 的源码）。其中任何一项改变时，只重�
 ## 参与贡献与运行 GPU 测试
 
 - GPU 测试指南（不需要游戏文件）：[`docs/testing.md`](../../testing.md)。
+- 提交 GPU 测试结果时，请参照现有报告的格式，通过 pull request 向 [gpu-test-results/](../../../gpu-test-results/) 添加一个文件。
 - 贡献规则、零游戏数据政策与任务协调：[`CONTRIBUTING.md`](../../../CONTRIBUTING.md)。
