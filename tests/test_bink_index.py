@@ -47,6 +47,55 @@ def make_stream(revision="n", frames=4, width=320, height=240, audio=0, body=256
     return bytes(header) + extra + audio_blob + bytes(4 * frames) + bytes(body)
 
 
+def indexed_stream(revision="n", frames=3, audio=0):
+    """A synthetic stream with eight bytes per frame and alternating keyframe flags."""
+    data = bytearray(make_stream(revision, frames=frames, audio=audio, body=8 * frames))
+    payload = len(data) - 8 * frames
+    table = payload - 4 * frames
+    for i in range(frames):
+        struct.pack_into("<I", data, table + 4 * i, (payload + 8 * i) | int(i % 2 == 0))
+    return data
+
+
+class TestFrameIndex(unittest.TestCase):
+    def check(self, stream, suffix=b""):
+        prefix = bytes(77)  # embedded at a deliberately unaligned offset
+        data = prefix + stream + suffix
+        row = bink.parse_header(data, len(prefix))
+        self.assertIsNotNone(row)
+        return bink.frame_index_error(data, row)
+
+    def test_layouts_and_keyframe_flags(self):
+        for rev in "adfghijkn":
+            for tracks in (0, 2):
+                for frames in (1, 3):
+                    with self.subTest(revision=rev, tracks=tracks, frames=frames):
+                        self.assertIsNone(self.check(indexed_stream(rev, frames, tracks)))
+
+    def test_masked_offsets_must_increase_and_stay_inside_stream(self):
+        # Three frames, table at 48, first payload byte at 60, stream ends at 84.
+        for frame, entry, reason in [(0, 59, "outside"), (1, 60, "predecessor"),
+                                     (2, 65, "predecessor"), (2, 84, "outside"),
+                                     (2, 100, "outside")]:
+            with self.subTest(frame=frame, entry=entry):
+                stream = indexed_stream()
+                struct.pack_into("<I", stream, 48 + frame * 4, entry)
+                self.assertIn(reason, self.check(stream, bytes(64)))
+
+    def test_truncated_table_cannot_read_into_following_stream(self):
+        stream = indexed_stream()
+        struct.pack_into("<I", stream, 4, 56 - 8)  # third index word lies past this stream
+        self.assertIn("exceeds stored stream size", self.check(stream))
+
+    def test_unknown_revision_is_reported_only_by_validation(self):
+        self.assertIn("unsupported", self.check(indexed_stream("z")))
+
+    def test_first_frame_can_start_after_a_gap(self):
+        stream = indexed_stream(frames=1)
+        struct.pack_into("<I", stream, 48, 56)
+        self.assertIsNone(self.check(stream))
+
+
 class TestHeader(unittest.TestCase):
     def test_fields(self):
         row = bink.parse_header(make_stream(), 0)
@@ -306,6 +355,37 @@ class TestCommandLine(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_validated_stream_produces_same_report(self):
+        with open(self.path, "wb") as fh:
+            fh.write(indexed_stream(audio=2))
+        for fmt in ("json", "csv"):
+            outputs = []
+            for options in ([], ["--validate-frames"]):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertEqual(bink.main([self.path, "--format", fmt] + options), 0)
+                self.assertEqual("Frame offsets validated: 3 (streams: 1)" in err.getvalue(),
+                                 bool(options))
+                outputs.append(out.getvalue())
+            self.assertEqual(outputs[0], outputs[1])
+
+    def test_invalid_index_in_directory_preserves_existing_report(self):
+        # The first stream is valid. The second has an all-zero index.
+        first = indexed_stream()
+        with open(self.path, "wb") as fh:
+            fh.write(first)
+            fh.write(make_stream())
+        report = os.path.join(self.tmp.name, "result.json")
+        with open(report, "wb") as fh:
+            fh.write(b"existing report")
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            self.assertEqual(bink.main([self.tmp.name, "--validate-frames", "--out", report]), 2)
+        self.assertIn(f"one.bk2 at {len(first)}: frame 0", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
+        with open(report, "rb") as fh:
+            self.assertEqual(fh.read(), b"existing report")
 
     def test_csv_on_stdout_has_one_line_end_per_row(self):
         # A text stream that writes "\n" as "\r\n", as Windows' stdout does, on any platform.

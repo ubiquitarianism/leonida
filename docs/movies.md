@@ -90,9 +90,17 @@ The audio flag bits verified against FFmpeg's demuxer are `0x4000` (prefer 16-bi
 All 229 are therefore Bink Audio DCT, stereo, 48 kHz by the header's own description. That does not prove the
 decoder output format or that every track is used by the game.
 
-The frame index is not read by `bink_index.py`: its length depends on the frame count, and the index is not needed
-to inventory the stream. `rpf9_carve.py` advances by the stored size instead, which is why it can carve without
-parsing the index.
+To check the frame index, run `python -I tools/bink_index.py <archive.rpf> --validate-frames`. The indexer skips
+the revision-specific header and the 12 descriptor bytes per audio track, then reads one offset per frame. After
+masking the keyframe bit, each offset must follow the complete table, fall inside the stored stream and increase
+strictly from the preceding offset. The first frame can start immediately after the table. Validation stops at the
+first bad table or unsupported revision and exits with status 2 before writing a report. A successful run reports
+the number of frame offsets checked. This checks frame boundaries without decoding video or audio. The default
+inventory and `rpf9_carve.py` can still advance by stored stream size alone.
+
+On 2026-11-23, all 22 RPF archives matched the 1.0.2.1 manifest by size and SHA-256. Four contained indexed
+Bink 2 streams. The validator checked **683,552 frame offsets across all 797 streams** (787 revision `n`, 10
+revision `j`), with no table failures. This count covers streams the indexer found directly in the archives.
 
 ## 3. How the streams are found
 

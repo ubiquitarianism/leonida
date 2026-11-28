@@ -2,13 +2,15 @@
 
 A Bink 2 stream starts with ``KB2`` and a lowercase revision letter. The first
 44 (0x2C) bytes are the fixed header; audio-track metadata and the frame index
-follow it, and their size depends on the revision and the track count. This
-tool reads only the fixed header plus the audio descriptors, so a malformed
-stream cannot make it read past the stored size.
+follow it, and their size depends on the revision and the track count. By
+default the indexer reads the fixed header and audio descriptors.
 
 Usage:
     python -I bink_index.py <movies.rpf | dir> [--out index.csv|.json]
-                            [--format csv|json] [--probe]
+                            [--format csv|json] [--probe] [--validate-frames]
+
+With --validate-frames, check the frame offset table of each indexed stream
+before producing the report. Invalid tables and unsupported revisions exit 2.
 
 With ``--probe`` each stream is written to a temporary file and passed to
 ``ffprobe``; the extra columns say only whether that ffprobe build can decode
@@ -46,6 +48,7 @@ from replace_retry import replace as replace_retry  # noqa: E402
 
 SIG = re.compile(rb"KB2[a-z]")
 HDR = 0x2C
+EXTRA_WORD_REVISIONS = "ijkn"
 MAX_FRAMES = 1_000_000
 MAX_WIDTH = 7680
 MAX_HEIGHT = 4800
@@ -109,7 +112,7 @@ def parse_header(data, offset):
         # Revisions i/j/k/n have one opaque word at 0x2C before the audio
         # descriptors; older revisions start them at 0x2C. Try the expected
         # layout first, then the other, and accept only plausible descriptors.
-        bases = [offset + 0x30, offset + 0x2C] if revision in "ijkn" else [offset + 0x2C]
+        bases = [offset + 0x30, offset + 0x2C] if revision in EXTRA_WORD_REVISIONS else [offset + 0x2C]
         for base in bases:
             got = _audio_layout(data, base, audio, offset + stored)
             if got:
@@ -149,7 +152,37 @@ def _gap(data, start, end):
     return end - start, 0
 
 
-def scan_file(path, source):
+def frame_index_error(data, row):
+    """Check stored frame starts, relative to this stream even inside an archive."""
+    revision = row["revision"]
+    if revision in EXTRA_WORD_REVISIONS:
+        header = HDR + 4
+    elif revision in "adfgh":
+        header = HDR
+    else:
+        return f"unsupported Bink 2 revision {revision}"
+
+    table = header + 12 * row["audio_tracks"]
+    table_end = table + 4 * row["frames"]
+    if table_end > row["size"]:
+        return "frame index exceeds stored stream size"
+    previous = None
+    for frame in range(row["frames"]):
+        entry = struct.unpack_from("<I", data, row["offset"] + table + 4 * frame)[0]
+        start = entry & ~1  # the low bit marks a keyframe
+        if start < table_end or start >= row["size"]:
+            return f"frame {frame} starts outside the payload"
+        if previous is not None and start <= previous:
+            return f"frame {frame} does not start after its predecessor"
+        previous = start
+    return None
+
+
+class FrameIndexError(ValueError):
+    """An indexed stream failed the requested frame-table check."""
+
+
+def scan_file(path, source, *, validate_frames=False):
     """Index every Bink 2 stream in one file. Returns (rows, stats)."""
     rows = []
     size = os.path.getsize(path)
@@ -178,6 +211,10 @@ def scan_file(path, source):
                 if row is None:
                     pos = match.start() + 1
                     continue
+                if validate_frames:
+                    error = frame_index_error(data, row)
+                    if error:
+                        raise FrameIndexError(f"{source} at {match.start()}: {error}")
                 z, u = _gap(data, last, match.start())
                 zero += z
                 unread += u
@@ -197,7 +234,7 @@ def scan_file(path, source):
     return rows, stats
 
 
-def scan_target(target, skip_report=None):
+def scan_target(target, skip_report=None, *, validate_frames=False):
     """Index a single container or every file below a directory.
 
     ``skip_report``, when given, is one existing file path (the report the
@@ -221,12 +258,12 @@ def scan_target(target, skip_report=None):
                 # "/" in the source and the sort key, so the report is the same on every platform
                 paths.append((os.path.relpath(path, base).replace(os.sep, "/"), path))
         for source, path in sorted(paths):
-            got, stats = scan_file(path, source)
+            got, stats = scan_file(path, source, validate_frames=validate_frames)
             rows.extend(got)
             for key in total:
                 total[key] += stats[key]
     else:
-        rows, total = scan_file(target, os.path.basename(target))
+        rows, total = scan_file(target, os.path.basename(target), validate_frames=validate_frames)
     return rows, total
 
 
@@ -424,6 +461,7 @@ def main(argv=None):
     ap.add_argument("--out", help="index.csv or index.json; default is stdout")
     ap.add_argument("--format", choices=["csv", "json"], help="inferred from --out if omitted")
     ap.add_argument("--probe", action="store_true", help="run ffprobe on each stream")
+    ap.add_argument("--validate-frames", action="store_true", help="check each indexed stream's frame offsets")
     a = ap.parse_args(argv)
     if a.out and same_output_path(a.target, a.out):
         ap.error("--out must not overwrite the source")
@@ -458,7 +496,10 @@ def main(argv=None):
     if a.out and os.path.isfile(a.out):
         skip_report = a.out
     try:
-        rows, summary = scan_target(a.target, skip_report)
+        rows, summary = scan_target(a.target, skip_report, validate_frames=a.validate_frames)
+    except FrameIndexError as error:
+        print(f"bink_index: error: {error}", file=sys.stderr)
+        return 2
     except OSError as error:
         path = error.filename or a.target
         print(f"bink_index: error: cannot read {path}: {error.strerror or error}", file=sys.stderr)
@@ -508,6 +549,10 @@ def main(argv=None):
               f"{summary['unread_bytes']} unread, {summary['zero_padding']} zero padding, "
               f"{summary['rpf_trailer']} RPF trailer",
               file=sys.stderr)
+    if a.validate_frames:
+        frames = sum(row["frames"] for row in rows)
+        print(f"Frame offsets validated: {frames} (streams: {len(rows)})",
+              file=sys.stdout if a.out else sys.stderr)
     return 0
 
 
