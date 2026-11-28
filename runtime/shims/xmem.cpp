@@ -4,7 +4,8 @@
 //   XMemAlloc(size, attributes)
 //   XMemFree(ptr, attributes)
 //   XMemVirtualQuery(process, address, out64)
-//   XMemGetWorkingSetStatistics(kind, out)   (kind 0x20000001 at all seven FSR call sites)
+//   XMemGetWorkingSetStatistics(kind, out)   (kind 0x20000001 at all seven FSR call sites; 0x2000000a in the
+//                                             executable, 120-byte out)
 //
 // ASSUMPTION: the attribute word is not decoded by the measured call sites (one passes 0x5e50000). Until a call
 // site shows the alignment/type fields, every block is 64-byte aligned (covers cache lines and SIMD) and a size of
@@ -229,7 +230,20 @@ SIZE_T __stdcall XMemVirtualQuery(HANDLE process, const void* address, void* out
 // limit interpretation is inferred from other Series implementations (xcl, xbox-emulator) and title engine telemetry
 // sizing memory pools (RT-220). Note that if GlobalMemoryStatusEx reports 0 physical memory, XMem falls back to the
 // 12 GiB title limit, whereas XSystemGetAppMemoryUsageLimit remains 0.
-BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
+//
+// Kind 0x2000000a (RT-XMEM-WORKINGSET-KIND-0A; docs/xmem_exe_calls.md, "The other imports"): two call sites in the
+// executable pass it with a 120-byte buffer they zero first, and read 64-bit values at +16 and +24 and 32-bit values
+// at +72 and +76, from which they size a 2 MiB-aligned XMemTransferMemory delta of at most 16 MiB (finding on #1608).
+// Nothing public or measured says what those four fields hold, so they are written as 0, which is what the callers'
+// own zeroing already gave them: the delta stays 0, and XMemTransferMemory moves nothing on a PC anyway. +0 and +8
+// are filled as for 0x20000001 (same structure, so the same meaning is assumed). The whole 120 bytes are written, so
+// the result does not depend on the caller having zeroed them, and nothing past them. Other kinds keep the 16-byte
+// form: the FSR callers' frames only show 0x80 bytes, and no caller of another kind has been seen.
+constexpr uint32_t kWorkingSetKindExe = 0x2000000a;
+constexpr size_t kWorkingSetKindExeBytes = 120;
+constexpr size_t kWorkingSetDefaultBytes = 16;
+
+BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t kind, void* stats) {
     if (!stats) {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true, std::memory_order_relaxed)) {
@@ -261,7 +275,7 @@ BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
     }
 
     uint8_t* bytes = static_cast<uint8_t*>(stats);
-    std::memset(bytes, 0, 16);
+    std::memset(bytes, 0, kind == kWorkingSetKindExe ? kWorkingSetKindExeBytes : kWorkingSetDefaultBytes);
     std::memcpy(bytes + 0, &total_memory, sizeof(total_memory));
     uint64_t working_set = pmc.WorkingSetSize;
     std::memcpy(bytes + 8, &working_set, sizeof(working_set));

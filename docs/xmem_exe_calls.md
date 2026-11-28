@@ -112,6 +112,13 @@ Observed constants, where the window before the call loads one:
 `runtime/shims/xmem.cpp` says one call site "passes `0x5e50000`" as the attribute word. The two `XMemAlloc` sites here
 whose attribute is a constant pass `0xf0814000`, not that value, so it comes from another image.
 
+The two `XMemGetWorkingSetStatistics` sites with kind `0x2000000a` pass a 120-byte buffer they zero first, and read
+64-bit values at +16 and +24 and 32-bit values at +72 and +76 to size a 2 MiB-aligned `XMemTransferMemory` delta of
+at most 16 MiB (@djrolfes, on #1608). What those four fields hold is not known. The shim (RT-XMEM-WORKINGSET-KIND-0A)
+writes all 120 bytes for that kind: +0 and +8 as for `0x20000001` (total memory and the process working set) and 0
+everywhere else, so the delta stays 0, as it did when only 16 bytes were written. `XMemTransferMemory` moves nothing on
+a PC anyway. Any other kind keeps the 16-byte form.
+
 ## What this does not show
 
 Which of these calls the boot reaches, and in what order, is not measured: nothing ran. A call site is code that can

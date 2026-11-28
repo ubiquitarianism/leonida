@@ -204,6 +204,66 @@ void test_working_set(XMemGetWorkingSetStatisticsFn get_stats) {
           "XMemGetWorkingSetStatistics(kind, nullptr) returns FALSE without crashing");
 }
 
+// RT-XMEM-WORKINGSET-KIND-0A: the executable passes kind 0x2000000a with a 120-byte buffer it zeroes first and reads
+// +16, +24 (64-bit) and +72, +76 (32-bit). Their meaning is unknown, so the shim writes 0 there; +0 and +8 are filled
+// as for 0x20000001; the 120 bytes are written whatever the caller left in them, and nothing past them.
+void test_working_set_kind_0a(XMemGetWorkingSetStatisticsFn get_stats) {
+    constexpr uint32_t kExeKind = 0x2000000a;
+    constexpr size_t kExeBytes = 120;
+    char saved_env[64]{};
+    const DWORD saved_n = GetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", saved_env, sizeof(saved_env));
+    SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", nullptr);
+
+    alignas(64) uint8_t stats[192];
+    std::memset(stats, 0xa5, sizeof(stats));  // not zeroed, unlike the callers: the shim must not rely on that
+    const BOOL ok = get_stats(kExeKind, stats);
+    check(ok != FALSE, "XMemGetWorkingSetStatistics(0x2000000a, 120-byte out) returns TRUE");
+
+    uint64_t total_memory = 0, working_set = 0;
+    std::memcpy(&total_memory, stats + 0, sizeof(total_memory));
+    std::memcpy(&working_set, stats + 8, sizeof(working_set));
+    alignas(64) uint8_t title[64]{};
+    uint64_t title_total = 0;
+    if (get_stats(kMeasuredKind, title)) std::memcpy(&title_total, title, sizeof(title_total));
+    check(ok != FALSE && total_memory != 0 && total_memory == title_total,
+          "kind 0x2000000a: +0 is the same total memory as kind 0x20000001");
+    check(ok != FALSE && working_set != 0 && working_set <= total_memory,
+          "kind 0x2000000a: +8 is a non-zero working set no larger than +0");
+
+    bool rest_zero = true;
+    for (size_t i = 16; i < kExeBytes; ++i) rest_zero = rest_zero && stats[i] == 0;
+    check(ok != FALSE && rest_zero, "kind 0x2000000a: bytes 16..119 (+16, +24, +72, +76 among them) are written as 0");
+    uint64_t at16 = 1, at24 = 1;
+    uint32_t at72 = 1, at76 = 1;
+    std::memcpy(&at16, stats + 16, sizeof(at16));
+    std::memcpy(&at24, stats + 24, sizeof(at24));
+    std::memcpy(&at72, stats + 72, sizeof(at72));
+    std::memcpy(&at76, stats + 76, sizeof(at76));
+    check(at16 == 0 && at24 == 0 && at72 == 0 && at76 == 0,
+          "kind 0x2000000a: the fields the callers size their transfer from are 0, so the delta stays 0");
+
+    bool tail_untouched = true;
+    for (size_t i = kExeBytes; i < sizeof(stats); ++i) tail_untouched = tail_untouched && stats[i] == 0xa5;
+    check(ok != FALSE && tail_untouched, "kind 0x2000000a: nothing past byte 119 is written");
+
+    SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "6144");
+    alignas(64) uint8_t capped[kExeBytes];
+    uint64_t capped_total = 0;
+    if (get_stats(kExeKind, capped)) std::memcpy(&capped_total, capped, sizeof(capped_total));
+    check(capped_total == 6144ULL * 1024ULL * 1024ULL, "kind 0x2000000a honors LEONIDA_TITLE_MEMORY_MB=6144 at +0");
+    SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", (saved_n > 0 && saved_n < sizeof(saved_env)) ? saved_env : nullptr);
+
+    // Any other kind keeps the 16-byte form of 0x20000001.
+    alignas(64) uint8_t other[64];
+    std::memset(other, 0xa5, sizeof(other));
+    const BOOL other_ok = get_stats(0x20000002, other);
+    bool other_tail = true;
+    for (size_t i = 16; i < sizeof(other); ++i) other_tail = other_tail && other[i] == 0xa5;
+    check(other_ok != FALSE && other_tail, "another kind (0x20000002) still writes only bytes 0..15");
+
+    check(get_stats(kExeKind, nullptr) == FALSE, "XMemGetWorkingSetStatistics(0x2000000a, nullptr) returns FALSE");
+}
+
 void test_virtual_query(XMemVirtualQueryFn query) {
     uint8_t local = 0;
     const void* const local_address = &local;
@@ -2678,6 +2738,7 @@ int main(int argc, char** argv) {
 
     test_alloc(alloc, free_mem);
     test_working_set(get_stats);
+    test_working_set_kind_0a(get_stats);
     test_virtual_query(query);
     if (virtual_alloc && get_write_watch && reset_write_watch) {
         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
