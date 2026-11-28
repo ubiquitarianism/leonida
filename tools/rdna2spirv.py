@@ -6951,6 +6951,17 @@ class Gen:
             raise Unsupported(op + " operand")
         return self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
 
+    @staticmethod
+    def imm64_signed(v: int) -> int:
+        """The 64-bit value of an immediate source of a signed 64-bit scalar op (s_ashr_i64, s_bfe_i64,
+        s_flbit_i32_i64). A SALU literal is one 32-bit dword and llvm-mc prints a negative one as 0xffffff9c;
+        the signed ops sign-extend it (LLVM #70274), where the unsigned ops zero-extend it. Inline constants
+        (-16..64) and values the parser already holds as negative sign-extend through the mask."""
+        v &= 0xFFFFFFFFFFFFFFFF
+        if 0x80000000 <= v <= 0xFFFFFFFF:
+            v |= 0xFFFFFFFF00000000
+        return v
+
     def src64_data(self, s, op, *, allow_vgpr: bool = False):
         kind = s["k"]
         if s.get("n") == 2 and (kind == "sgpr" or (allow_vgpr and kind == "vgpr")):
@@ -8904,7 +8915,7 @@ class Gen:
             elif x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
-                v = x["v"] & 0xFFFFFFFFFFFFFFFF
+                v = self.imm64_signed(x["v"]) if op == "s_flbit_i32_i64" else x["v"] & 0xFFFFFFFFFFFFFFFF
                 lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
             else:
                 raise Unsupported(op + " source")
@@ -10781,7 +10792,7 @@ class Gen:
             if x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
-                v = x["v"] & 0xFFFFFFFFFFFFFFFF
+                v = self.imm64_signed(x["v"]) if op == "s_ashr_i64" else x["v"] & 0xFFFFFFFFFFFFFFFF
                 lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
             else:
                 raise Unsupported(op + " source")
@@ -11710,7 +11721,7 @@ class Gen:
             if x["k"] == "sgpr" and x.get("n") == 2:
                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
             elif x["k"] == "imm":
-                v = x["v"] & 0xFFFFFFFFFFFFFFFF
+                v = self.imm64_signed(x["v"]) if op == "s_bfe_i64" else x["v"] & 0xFFFFFFFFFFFFFFFF
                 lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
             else:
                 raise Unsupported(op + " source")
