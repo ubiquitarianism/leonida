@@ -32,6 +32,31 @@ EXTERNAL_LINK = re.compile(
 OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md"}
 # Build output, not tracked.
 BUILD_OUTPUT = ("runtime/build",)
+# Commit 00131bb8 left branch-only runtime files on `port/d3d12-nvidia` when importing these port notes onto `main`.
+# Scope each exception to the exact `(doc, path)` pairs already cited so any other missing path still fails CI.
+PORT_BRANCH_PATHS = {
+    "docs/port_status.md": frozenset({
+        "runtime/src/display_profile.h",
+        "runtime/src/frame_step.h",
+        "runtime/src/pipeline_queue.h",
+    }),
+    "docs/ultrawide.md": frozenset({
+        "runtime/src/aspect_fit.h",
+        "runtime/src/display_mode.h",
+        "runtime/src/display_profile.h",
+        "runtime/test/aspect_fit_test.cpp",
+    }),
+    "docs/victory_gap_gpu.md": frozenset({
+        "runtime/test/d3d12_xs_exports_test.cpp",
+    }),
+    "docs/victory_gap_media.md": frozenset({
+        "runtime/shims/chad_dsp.cpp",
+        "runtime/shims/gameinput_xinput.cpp",
+        "runtime/shims/media_foundation.cpp",
+        "runtime/test/gameinput_xinput_test.cpp",
+        "runtime/test/media_foundation_test.cpp",
+    }),
+}
 
 
 def _update_fence(fence, line):
@@ -62,14 +87,16 @@ def tracked_files():
         return found
 
 
-def missing_paths(pages, files):
+def missing_paths(pages, files, allowed_missing=None):
     """[(page:line, path)] for backticked repository paths in `pages` ({name: text}) that `files` lacks."""
     known = set(files)
     for f in files:
         parts = f.split("/")
         known.update("/".join(parts[:i]) for i in range(1, len(parts)))
+    allowed_missing = allowed_missing or {}
     out = []
     for page, text in sorted(pages.items()):
+        allowed = allowed_missing.get(page, ())
         fence = None
         for n, line in enumerate(text.split("\n"), 1):
             fence, is_fence_line = _update_fence(fence, line)
@@ -78,7 +105,7 @@ def missing_paths(pages, files):
             scan = EXTERNAL_LINK.sub("", line)
             for m in PATH.finditer(scan):
                 path = m.group(1).rstrip("/.")
-                if "*" in path or path.startswith(BUILD_OUTPUT) or path in known:
+                if "*" in path or path.startswith(BUILD_OUTPUT) or path in known or path in allowed:
                     continue
                 out.append((f"{page}:{n}", path))
     return out
@@ -138,6 +165,19 @@ class DocsRepoPaths(unittest.TestCase):
                          [("docs/b.md:1", "docs/gone.md"), ("docs/b.md:1", "viewer/gone.js"),
                           ("docs/b.md:1", "game/gone.json")])
 
+    def test_port_branch_allowlist_stays_scoped_to_named_paths(self):
+        pages = {
+            "docs/ultrawide.md": "Uses `runtime/src/aspect_fit.h` and `runtime/src/missing_elsewhere.h`.",
+            "docs/other.md": "Should still flag `runtime/src/aspect_fit.h` on unrelated pages.",
+        }
+        self.assertEqual(
+            missing_paths(pages, [], allowed_missing=PORT_BRANCH_PATHS),
+            [
+                ("docs/other.md:1", "runtime/src/aspect_fit.h"),
+                ("docs/ultrawide.md:1", "runtime/src/missing_elsewhere.h"),
+            ],
+        )
+
     def test_docs_name_existing_paths(self):
         files = tracked_files()
         pages = {}
@@ -146,7 +186,7 @@ class DocsRepoPaths(unittest.TestCase):
                 with open(os.path.join(ROOT, p), encoding="utf-8") as f:
                     pages[p] = f.read()
         self.assertTrue(pages)
-        missing = missing_paths(pages, files)
+        missing = missing_paths(pages, files, allowed_missing=PORT_BRANCH_PATHS)
         self.assertEqual(missing, [], "backticked paths that name no tracked file: " +
                          "; ".join(f"{where} {path}" for where, path in missing))
 
