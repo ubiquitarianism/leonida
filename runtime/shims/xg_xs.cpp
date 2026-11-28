@@ -747,6 +747,16 @@ HRESULT __stdcall XGCreateTextureComputer(const void* desc, void** out) {
         }
     }
     trace_desc(calls, "create", _ReturnAddress(), desc ? &d : nullptr, out, 0, hr, t.mode, t.layout.size);
+    // A refused computer is not harmless: the title's texture lock reads the layout it would have written
+    // without checking, so say which descriptions are refused (at most 32 lines).
+    static std::atomic<unsigned> refused{0};
+    if (desc && FAILED(hr) && refused.fetch_add(1, std::memory_order_relaxed) < 32)
+        std::fprintf(stderr,
+                     "[rt] xg_xs: XGCreateTextureComputer refuses dim=%u %llux%ux%u mips=%u fmt=%u samples=%u "
+                     "layout=%#x flags=%#x (hr 0x%08x), caller %s\n",
+                     d.dimension, static_cast<unsigned long long>(d.width), d.height, unsigned(d.depth_or_array),
+                     unsigned(d.mips), d.format, d.samples, d.layout, d.flags, uint32_t(hr),
+                     rt::shims::module_offset(reinterpret_cast<uint64_t>(_ReturnAddress())).c_str());
     // LOCAL DIAGNOSTIC: LEONIDA_XG_TRACE_FORMAT=<DXGI format> logs the first 256 computers of that format whatever
     // LEONIDA_XG_TRACE's cap, with the layout the title asked for (which tiling its CPU writes use).
     static const uint32_t only = [] {

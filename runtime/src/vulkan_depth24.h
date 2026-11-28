@@ -22,6 +22,7 @@
 
 #include "depth24.h"
 #include "depth24_convert_spv.h"
+#include "vulkan_aftermath.h"
 
 namespace leonida {
 
@@ -230,7 +231,8 @@ private:
         bool ok = vk_.vkCreateDescriptorSetLayout(device_, &set_info, nullptr, &set_layout_) == VK_SUCCESS;
         layout_info.pSetLayouts = &set_layout_;
         ok = ok && vk_.vkCreatePipelineLayout(device_, &layout_info, nullptr, &pipeline_layout_) == VK_SUCCESS &&
-             vk_.vkCreateShaderModule(device_, &module_info, nullptr, &module) == VK_SUCCESS;
+             (aftermath::ShaderName("(runtime) depth24_convert.comp"),
+              vk_.vkCreateShaderModule(device_, &module_info, nullptr, &module) == VK_SUCCESS);
         if (ok) {
             VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
             info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,

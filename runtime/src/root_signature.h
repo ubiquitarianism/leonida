@@ -114,7 +114,8 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 // Packs root parameters in order. Static samplers consume no dwords.
 // Fails (ok == false) when the signature needs more than 32 user SGPRs
 // (spill layout unknown: refuse, do not guess) or exceeds the 64-dword
-// D3D12 cost limit, or holds more than 64 root parameters.
+// D3D12 cost limit, or holds more than 64 root parameters. A constant
+// parameter of 0 values takes no dwords, as on the host.
 [[nodiscard]] PackResult pack(const RootSignature& sig);
 
 // The console layout of root arguments in a stage's user SGPRs (docs/d3d12_vulkan.md section 3.5, D3D-448).
@@ -129,8 +130,11 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 //     in this layout equals the program's RSRC2 USER_SGPR count in 29 of 29, and the programs read the tables and
 //     root CBVs at exactly these SGPRs (tools/rootsig_census.py --disasm). The game's compute census agrees (lowest
 //     pointer s4, one-dword tables).
-//   - vertex/pixel/geometry s8 and mesh s16: a hypothesis from the corpus census only (lowest pointer SGPR per stage);
-//     no signature confirms them, and visibility is not modelled (every parameter takes its place in every stage).
+//   - vertex/pixel/geometry s8 and mesh s16: from the corpus census (lowest pointer SGPR per stage) and one live
+//     retail frame (a VS and PS reading their tables at s8, s9, s10; issue #14, comment 7131556366); no serialized
+//     signature confirms them yet, and visibility is not modelled (every parameter takes its place in every stage).
+//     The graphics bind point uses Stage::Pixel (s8, as vertex and geometry); a mesh shader reads the same dwords
+//     through its translator-side window (docs/d3d12_vulkan.md section 3.5).
 // A parameter that does not fit goes to the console's spill array behind s[0:1] (compute, section 7) together with
 // every parameter after it. For compute that packed spill array (1 dword per 32-bit constant, 2 per root descriptor,
 // 1 per descriptor table, no alignment padding) is modelled in StagePackResult; non-compute stages still refuse spills
@@ -180,8 +184,9 @@ struct StagePackResult {
 };
 
 // Lays the parameters out for `stage` in the console layout. Fails like pack() on more than 64 parameters, an
-// unknown parameter type, a constant parameter of 0 values, or the 64-dword cost limit. Compute spills any trailing
-// parameters from the first one that does not fit whole into spill_dword; non-compute stages refuse any spill.
+// unknown parameter type or the 64-dword cost limit. Compute spills any trailing parameters from the first one
+// that does not fit whole into spill_dword; non-compute stages refuse any spill. A constant parameter of 0 values
+// takes no SGPRs and no spill dwords.
 [[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
 
 // D3D12 cost of one parameter against the 64-dword limit.

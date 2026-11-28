@@ -8,6 +8,7 @@
 // nothing committed, and one trace event per distinct (type, size). XMemVirtualAlloc accepts attribute words and console
 // graphics protection bits and commits 2 MiB guest pages; the placeholder flags pass through; physical pages keep their
 // contents across unmap and remap, alias when mapped twice, and scatter-map per address.
+#include "xmem_section_state.h"
 #include <windows.h>
 #include <malloc.h>
 #include <psapi.h>
@@ -405,16 +406,19 @@ bool in_view(const void* address) {
     return VirtualQuery(address, &info, sizeof(info)) && info.Type == MEM_MAPPED;
 }
 
-// Physical pages are views of a reserved section and are committed on first touch. Windows then reports the page as
-// MEM_COMMIT with its protection. Wine's VirtualQuery keeps reporting MEM_RESERVE and no protection for a view page
-// that has been written and reads back, so a check of the reported state and protection has nothing to look at
-// there. True for exactly that answer on that host; the caller says what it skips.
-bool touched_view_reported_reserved(const MEMORY_BASIC_INFORMATION& info) {
+bool wine_host() {
     static const bool wine = [] {
         const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         return ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
     }();
-    return wine && info.Type == MEM_MAPPED && info.State == MEM_RESERVE && info.Protect == 0;
+    return wine;
+}
+
+// On Windows, physical pages are views of a reserved section and are committed on first touch; Windows then reports the
+// page as MEM_COMMIT with its protection. Proton/Wine reports a written mapped view as MEM_RESERVE with no protection;
+// this helper recognizes that measured result, and callers validate the data instead of assuming the state.
+bool touched_view_reported_reserved(const MEMORY_BASIC_INFORMATION& info) {
+    return wine_host() && info.Type == MEM_MAPPED && info.State == MEM_RESERVE && info.Protect == 0;
 }
 
 struct PhysicalApi {
@@ -504,10 +508,27 @@ void test_physical_pages(const PhysicalApi& api) {
     check(api.map(window, 1, &pages[0]) == window, "a page already mapped elsewhere maps again");
     static_cast<volatile uint32_t*>(static_cast<void*>(window))[1] = 0xfeedf00d;
     check(read_u32(second + 3 * kPage64k, 4) == 0xfeedf00d, "both mappings of a page see the same memory");
+    {
+        // The D3D12 layer's geometry copies ask for a page's other addresses without xmem's physical-page lock.
+        std::vector<std::uintptr_t> at_window, at_second;
+        rt::xmem::geometry_aliases(reinterpret_cast<std::uintptr_t>(window), at_window);
+        rt::xmem::geometry_aliases(reinterpret_cast<std::uintptr_t>(second + 3 * kPage64k), at_second);
+        check(at_window.size() == 1 && at_window[0] == reinterpret_cast<std::uintptr_t>(second + 3 * kPage64k) &&
+                  at_second.size() == 1 && at_second[0] == reinterpret_cast<std::uintptr_t>(window),
+              "geometry_aliases names each address of a page mapped twice from the other");
+        std::vector<std::uintptr_t> alone;
+        rt::xmem::geometry_aliases(reinterpret_cast<std::uintptr_t>(second), alone);
+        check(alone.empty(), "geometry_aliases names nothing for a page mapped once");
+    }
 
     // Mapping over a mapped page replaces it; a 0 entry unmaps one page.
     const uint64_t replace[2] = {pages[1], 0};
     check(api.map(window, 2, replace) == window, "mapping over mapped pages replaces them");
+    {
+        std::vector<std::uintptr_t> after;
+        rt::xmem::geometry_aliases(reinterpret_cast<std::uintptr_t>(second + 3 * kPage64k), after);
+        check(after.empty(), "a page's other address leaves geometry_aliases once that mapping is replaced");
+    }
     check(page_holds(window, 0x2000u) && reserved_only(window + kPage64k),
           "the first page now shows page 1 and a 0 entry left the second unmapped");
 
@@ -559,6 +580,58 @@ void test_physical_pages(const PhysicalApi& api) {
 // rt::xmem::copy_page_mappings_fn, behind console queue slot 31 (CopyPageMappingsBatchX): a destination page maps the
 // physical page that is mapped at the source page, so both addresses are one memory, as two XMemMapPhysicalPages calls
 // with the same page would make them.
+void test_stream_cpu_twin(const PhysicalApi& api) {
+    constexpr uint32_t n = 3;
+    const auto window = [&] {
+        return static_cast<uint8_t*>(api.virtual_alloc(nullptr, n * kPage64k, MEM_RESERVE | kXmem64kPages,
+                                                      0x23, PAGE_READWRITE));
+    };
+    auto* cpu = window();
+    auto* gpu = window();
+    auto* source = window();
+    uint64_t count = n, frames[n]{};
+    check(cpu && gpu && source && api.allocate(0x280, &count, frames) && count == n, "stream twin setup");
+    if (!cpu || !gpu || !source || !frames[2]) return;
+    check(api.map(source, n, frames) == source, "stream source frames registered");
+    for (uint32_t i = 0; i < n; ++i) fill_page(source + i * kPage64k, 0x4100 + i);
+    char previous[16]{};
+    GetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", previous, sizeof(previous));
+    const auto pair = [&](bool enabled) {
+        SetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", enabled ? "1" : "0");
+        rt::xmem::note_stream_reservation(uintptr_t(cpu), n * kPage64k, 0x1e1d00f);
+        rt::xmem::note_stream_reservation(uintptr_t(gpu), n * kPage64k, 0x1e1d03e);
+    };
+    const auto batch = [&](uint32_t kind) {
+        const rt::xmem::PageRange range{kind, 0, n};
+        const rt::xmem::PageBatch b{uintptr_t(gpu), 1, &range};
+        return rt::xmem::copy_page_mappings(1, &b, uintptr_t(source), n, 0);
+    };
+    pair(false);
+    check(batch(0) && reserved_only(cpu), "switch off leaves the CPU twin empty");
+    pair(true);
+    check(batch(0) && page_holds(cpu, 0x4100) && page_holds(cpu + 2 * kPage64k, 0x4102),
+          "unchanged GPU frames gain matching CPU views");
+    fill_page(cpu, 0x5110);
+    check(page_holds(gpu, 0x5110), "CPU mirror writes reach the GPU alias");
+    void* middle = cpu + kPage64k;
+    check(api.scatter(&middle, 1, frames + 1), "scatter takes ownership even of the same frame");
+    check(batch(1) && page_holds(cpu + kPage64k, 0x4101) && page_holds(cpu + 2 * kPage64k, 0x5110),
+          "repeat remaps only mirror-owned CPU pages");
+    check(batch(2) && reserved_only(cpu) && reserved_only(cpu + 2 * kPage64k) && page_holds(cpu + kPage64k, 0x4101),
+          "GPU unmap removes mirrors and preserves the scatter mapping");
+    check(batch(0) && api.map(source, 1, nullptr) == source && batch(0) && reserved_only(cpu),
+          "a source hole removes its CPU mirror");
+    auto* other_cpu = window();
+    auto* other_gpu = api.virtual_alloc(nullptr, n * kPage64k, MEM_RESERVE | kXmem64kPages, 0x3, 0x801);
+    const rt::xmem::PageRange other_range{0, 1, 1};
+    const rt::xmem::PageBatch other_batch{uintptr_t(other_gpu), 1, &other_range};
+    check(other_gpu && other_cpu && rt::xmem::copy_page_mappings(1, &other_batch, uintptr_t(source), n, 0)
+          && reserved_only(other_cpu), "slot 31 outside the stream pool leaves other CPU reservations empty");
+    rt::xmem::note_stream_reservation(0, 0, 0x1e1d00f);
+    SetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", *previous ? previous : nullptr);
+}
+
+// Ported from CLHelper's RT-QUEUE31 tests, Leonida Continued f2268abea.
 void test_copy_page_mappings(const PhysicalApi& api) {
     const auto copy = rt::xmem::copy_page_mappings_fn;
     check(copy != nullptr, "xmem.cpp sets the copy_page_mappings hook");
@@ -668,7 +741,19 @@ void test_copy_page_mappings_cpu_view(const PhysicalApi& api) {
     check(readable(other) && page_holds(other, 0x7300u),
           "a GPU-only source page unmapped there is looked up at its CPU range");
 
-    // A null source unmaps both ranges.
+    // A CPU page the title mapped itself is the title's: a copy onto its GPU-only page, or an unmap of it, changes the
+    // GPU-only page alone (the console's CopyPageMappingsBatchX edits only that range's page table).
+    check(copy(gpu + 2 * kPage64k, pool + kPage64k, 1, false), "a copy onto a GPU-only page whose CPU page is the title's");
+    check(readable(gpu + 2 * kPage64k) && page_holds(gpu + 2 * kPage64k, 0x7301u),
+          "the GPU-only page shows the copied pool page");
+    check(readable(cpu + 2 * kPage64k) && page_holds(cpu + 2 * kPage64k, 0x7300u),
+          "the title's own mapping at the paired CPU page is kept, not replaced by the copy");
+    check(copy(gpu + 2 * kPage64k, nullptr, 1, false), "a null source unmaps a GPU-only page whose CPU page is the title's");
+    check(!readable(gpu + 2 * kPage64k), "the GPU-only page is unmapped");
+    check(readable(cpu + 2 * kPage64k) && page_holds(cpu + 2 * kPage64k, 0x7300u),
+          "the title's own mapping at the paired CPU page survives the unmap");
+
+    // A null source unmaps both ranges where the CPU pages are the copy's own.
     check(copy(gpu, nullptr, kPool, false), "a null source unmaps the GPU-only range");
     check(!readable(gpu) && !readable(cpu) && !readable(cpu + kPage64k), "the paired CPU range is unmapped with it");
 
@@ -693,9 +778,676 @@ bool access_faults(volatile uint32_t* address, bool write) {
     return false;
 }
 
+struct SectionWriteControl {
+    bool valid = false;
+    bool initial_reserved = false;
+    bool write_faulted = false;
+    bool reserved_after = false;
+    uint32_t readback = 0;
+};
+
+SectionWriteControl g_section_write_control;
+
+// Measure a plain SEC_RESERVE view before XMemAllocatePhysicalPages installs xmem's VEH. Wine and native Windows do
+// not expose the same write/query behavior here, so foreign-section tests must compare the shim's views with this
+// direct host control rather than use a host-name skip.
+SectionWriteControl measure_section_write_control() {
+    SectionWriteControl control;
+    const HANDLE section =
+        CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, kPage64k, nullptr);
+    void* const view = section ? MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, kPage64k) : nullptr;
+    MEMORY_BASIC_INFORMATION before{};
+    control.initial_reserved = view && VirtualQuery(view, &before, sizeof(before)) && before.Type == MEM_MAPPED &&
+                               before.State == MEM_RESERVE;
+    if (control.initial_reserved) {
+        control.write_faulted = access_faults(static_cast<volatile uint32_t*>(view), true);
+        control.reserved_after = reserved_only(view);
+        if (!control.write_faulted) control.readback = read_u32(view, 0);
+        control.valid = true;
+        std::printf("CONTROL SEC_RESERVE view: write %s, state %s, readback 0x%08x\n",
+                    control.write_faulted ? "faulted" : "completed",
+                    control.reserved_after ? "reserved" : "committed", control.readback);
+    } else
+        std::printf("CONTROL SEC_RESERVE view unavailable; foreign writes keep the original fault assertion\n");
+    if (view) UnmapViewOfFile(view);
+    if (section) CloseHandle(section);
+    return control;
+}
+
+void check_section_write_against_control(void* view, const char* label) {
+    const bool initially_reserved = reserved_only(view);
+    const bool faulted = access_faults(static_cast<volatile uint32_t*>(view), true);
+    const bool reserved = reserved_only(view);
+    const uint32_t readback = faulted ? 0 : read_u32(view, 0);
+    if (!g_section_write_control.valid) {
+        check(initially_reserved && faulted && reserved, label);
+        return;
+    }
+    // Native Windows must retain the measured contract: an uncommitted SEC_RESERVE write faults. On other hosts, use
+    // the direct control's result and require the same state and, when writable, the same actual data.
+    const bool expected_fault = !wine_host() ? true : g_section_write_control.write_faulted;
+    bool ok = initially_reserved == g_section_write_control.initial_reserved && faulted == expected_fault &&
+              reserved == g_section_write_control.reserved_after;
+    if (!faulted) ok = ok && readback == g_section_write_control.readback && readback == 1;
+    check(ok, label);
+}
+
 int64_t commit_growth(const PERFORMANCE_INFORMATION& from, const PERFORMANCE_INFORMATION& to) {
     return (static_cast<int64_t>(to.CommitTotal) - static_cast<int64_t>(from.CommitTotal)) *
            static_cast<int64_t>(to.PageSize);
+}
+
+// A title writes a window page it never mapped. Measured at the story load: a 288 KiB clear into a page of a window
+// reserved for physical pages, a page the title never passed to XMemMapPhysicalPages (runs/hrp13, gw2, tw512b, int1).
+// The console's window memory is zeroed and writable; on the host the placeholder there is PAGE_NOACCESS, so the write
+// fault must be answered with a zeroed page rather than left to the title.
+// MapViewOfFile3 / UnmapViewOfFile2 are kernelbase-only: the runtime resolves them at run time, and so does the test.
+using MapViewOfFile3Fn = void*(WINAPI*)(HANDLE, HANDLE, void*, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
+using UnmapViewOfFile2Fn = BOOL(WINAPI*)(HANDLE, const void*, ULONG);
+
+void* map_view_of_file3(HANDLE section, void* at, SIZE_T size) {
+    static MapViewOfFile3Fn fn = [] {
+        const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+        return kernelbase ? reinterpret_cast<MapViewOfFile3Fn>(GetProcAddress(kernelbase, "MapViewOfFile3")) : nullptr;
+    }();
+    return fn ? fn(section, GetCurrentProcess(), at, 0, size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)
+              : nullptr;
+}
+
+bool unmap_view_of_file2(void* view) {
+    static UnmapViewOfFile2Fn fn = [] {
+        const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+        return kernelbase ? reinterpret_cast<UnmapViewOfFile2Fn>(GetProcAddress(kernelbase, "UnmapViewOfFile2"))
+                          : nullptr;
+    }();
+    return fn && fn(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+}
+
+bool clear_faults(void* at, size_t bytes) {
+    __try {
+        std::memset(at, 0, bytes);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                  : EXCEPTION_CONTINUE_SEARCH) {
+        return true;
+    }
+    return false;
+}
+
+// A title clears a grid straight into a physical-page window, across pages it never mapped: the measured story-load
+// memset (0x48000 bytes, VCRUNTIME140) whose write into a placeholder killed the boot. A page the title never mapped
+// is zeroed and writable (the console's window memory), a mapping over such a page replaces it, and the zero pages are
+// reused rather than committed per plant.
+void test_unmapped_window_page(const PhysicalApi& api) {
+    constexpr uint64_t kPages = 6;
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x25, PAGE_READWRITE));
+    check(window != nullptr, "XMemVirtualAlloc reserves a window with pages left unmapped");
+    if (!window) return;
+    uint64_t pages[kPages]{};
+    uint64_t count = kPages;
+    if (api.allocate(0x281, &count, pages) != TRUE || count != kPages) {
+        check(false, "six physical pages for the window");
+        return;
+    }
+    check(api.map(window, 1, pages) == window && api.map(window + 5 * kPage64k, 1, pages + 5) == window + 5 * kPage64k,
+          "the window's first and last pages map");
+    check(reserved_only(window + kPage64k) && reserved_only(window + 2 * kPage64k),
+          "the pages between them stay placeholders");
+
+    // A plant reads as zero everywhere the title did not write.
+    auto* const middle = reinterpret_cast<volatile uint32_t*>(window + kPage64k);
+    check(!clear_faults(window + kPage64k + 4, 4), "clearing a word of the unmapped page is answered");
+    check(middle[0] == 0, "the rest of the planted page reads as zero");
+    check(middle[1] == 0, "and reads back the clear");
+
+    // The measured clear: 0x48000 bytes from page 0, over the mapped page 0 and the unmapped pages 1 to 4.
+    check(!clear_faults(window, 0x48000), "a 288 KiB clear across mapped and unmapped pages takes no fault");
+    bool committed = true;
+    for (uint64_t i = 0; i <= 4; ++i) {
+        MEMORY_BASIC_INFORMATION info{};
+        committed &= VirtualQuery(window + i * kPage64k, &info, sizeof(info)) && info.State == MEM_COMMIT;
+    }
+    check(committed, "every page the clear reached is committed");
+
+    // A mapping over a planted page replaces it: the physical page's contents win, and the mapping succeeds.
+    static_cast<volatile uint32_t*>(static_cast<void*>(window + 2 * kPage64k))[0] = 0x7e570001;
+    check(api.map(window + 2 * kPage64k, 1, pages + 2) == window + 2 * kPage64k,
+          "a mapping over a planted page succeeds");
+    check(read_u32(window + 2 * kPage64k, 0) == 0, "the mapped page shows the physical page, not the plant");
+
+    // Plant and replace in a loop: a replaced plant returns its section page, so no new one is handed out.
+    {
+        constexpr uint64_t kCycles = 32;
+        const uint64_t taken_before = rt::xmem::zero_pages_taken();
+        bool cycled = true;
+        for (uint64_t i = 0; i < kCycles; ++i) {
+            static_cast<volatile uint32_t*>(static_cast<void*>(window + 3 * kPage64k))[0] = 0x5151u + i;
+            cycled &= api.map(window + 3 * kPage64k, 1, pages + 3) == window + 3 * kPage64k;
+            void* const at = window + 3 * kPage64k;
+            cycled &= api.scatter(&at, 1, nullptr) == TRUE;
+        }
+        check(cycled, "32 plant-and-replace cycles map and unmap");
+        check(rt::xmem::zero_pages_taken() == taken_before,
+              "32 plant-and-replace cycles reuse the zero pages (no new section page)");
+    }
+
+    // A mapped section page the view table does not name (a section the title took over): the fault commits it.
+    auto* const lone = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x25, PAGE_READWRITE));
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, kPage64k, nullptr);
+    void* const view = lone && section ? map_view_of_file3(section, lone, kPage64k) : nullptr;
+    check(lone && section && view == lone, "a section view of the title's own maps into a window page");
+    if (lone && section && view == lone) {
+        check(reserved_only(lone), "the section page is reserved, as xmem's own views are before a commit");
+        check(!access_faults(reinterpret_cast<volatile uint32_t*>(static_cast<void*>(lone)), true),
+              "a write into a mapped but uncommitted window page is answered");
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(lone, &info, sizeof(info)) && touched_view_reported_reserved(info)) {
+            check(read_u32(lone, 0) == 1, "the mapped section page reads back the write despite its reported state");
+            std::printf("SKIP the mapped section page's reported state: the host reports a written view as reserved\n");
+        }
+        else
+            check(info.State == MEM_COMMIT, "and the page is committed");
+        unmap_view_of_file2(view);
+    }
+    // The same page outside every window, in a placeholder the title reserved itself (XMemVirtualAlloc with
+    // MEM_RESERVE_PLACEHOLDER): still the title's memory, so the fault still commits it. (A section page outside the
+    // title's reservations is not: test_foreign_section_writes.)
+    auto* const plain = static_cast<uint8_t*>(api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                                                0x25, PAGE_READWRITE));
+    HANDLE plain_section =
+        CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, kPage64k, nullptr);
+    void* const plain_view = plain && plain_section ? map_view_of_file3(plain_section, plain, kPage64k) : nullptr;
+    check(plain && plain_section && plain_view == plain, "a section view maps into a placeholder that is not a window");
+    if (plain && plain_section && plain_view == plain) {
+        check(!access_faults(reinterpret_cast<volatile uint32_t*>(static_cast<void*>(plain)), true),
+              "a write into a mapped, uncommitted page outside every window is answered");
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(plain, &info, sizeof(info)) && touched_view_reported_reserved(info)) {
+            check(read_u32(plain, 0) == 1, "the placeholder section page reads back the write despite its reported state");
+            std::printf("SKIP the placeholder section page's reported state: the host reports a written view as reserved\n");
+        }
+        else
+            check(info.State == MEM_COMMIT, "and that page is committed");
+        unmap_view_of_file2(plain_view);
+    }
+    if (plain_section) CloseHandle(plain_section);
+    if (section) CloseHandle(section);
+
+    check(api.map(window, kPages, nullptr) == window, "the window unmaps");
+    check(api.free_pages(kPages, pages) == TRUE, "the physical pages are freed");
+}
+
+// A write racing a remap of its page is answered, not lost: a thread writes into the page while another maps and
+// unmaps it. No access violation may escape to the next handler, and the last write must land in the final mapping.
+// `reps` remaps per run (xmem_test --remap-reps runs it many times): the writes that went through, the faults the
+// handler answered while they did (the races the run made), and the writes that escaped.
+struct RemapRace {
+    uint64_t writes = 0, faults = 0, escaped = 0;
+};
+
+uint64_t answered_faults() {
+    using rt::xmem::FaultExit;
+    return rt::xmem::fault_exits(FaultExit::answered) + rt::xmem::fault_exits(FaultExit::planted) +
+           rt::xmem::fault_exits(FaultExit::committed);
+}
+
+RemapRace test_write_during_remap(const PhysicalApi& api, int reps = 200) {
+    constexpr uint64_t kPages = 2;
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    uint64_t pages[kPages]{};
+    uint64_t count = kPages;
+    check(window && api.allocate(0x282, &count, pages) == TRUE && count == kPages, "a window and two pages to remap");
+    if (!window || count != kPages) return {};
+    check(api.map(window, 1, pages) == window, "the page starts mapped");
+    const uint64_t left_before = rt::xmem::fault_exits(rt::xmem::FaultExit::left_to_title);
+    const uint64_t answered_before = answered_faults();
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> escaped{0}, writes{0};
+    std::thread writer([&] {
+        for (uint32_t v = 1; !stop.load(std::memory_order_relaxed); ++v) {
+            auto* const word = reinterpret_cast<volatile uint32_t*>(static_cast<void*>(window));
+            if (access_faults(word, true)) {
+                escaped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            *word = v;
+            writes.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    // The writer is writing before the first remap: 300 remaps take about 10 ms, less than a new thread can take to
+    // start, and a race the writer joins late (or not at all) tests nothing.
+    const ULONGLONG started = GetTickCount64();
+    while (writes.load(std::memory_order_relaxed) == 0 && GetTickCount64() - started < 10000) SwitchToThread();
+    bool remapped = true;
+    for (int i = 0; i < reps; ++i) {
+        remapped &= api.map(window, 1, pages + 1) == window;
+        remapped &= api.map(window, 1, nullptr) == window;
+        SwitchToThread();
+    }
+    stop = true;
+    writer.join();
+    const ULONGLONG elapsed = GetTickCount64() - started;
+    check(remapped, "the page maps and unmaps under a writer");
+    const uint64_t left = rt::xmem::fault_exits(rt::xmem::FaultExit::left_to_title) - left_before;
+    const uint64_t faults = answered_faults() - answered_before;
+    check(escaped.load() == 0 && writes.load() > 0, "every write into the remapped page is answered, none escapes");
+    // An escape the handler did not count as left to the title (and note) went out by an exit nothing records.
+    check(left == escaped.load(), "every write that escaped was left to the title by the handler, and noted");
+    if (escaped.load() || left)
+        std::printf("  %llu of %llu writes escaped; the handler left %llu to the title\n",
+                    static_cast<unsigned long long>(escaped.load()), static_cast<unsigned long long>(writes.load()),
+                    static_cast<unsigned long long>(left));
+    check(elapsed < 30000 + static_cast<ULONGLONG>(reps) * 100, "the remap race finishes without hanging");
+    check(api.map(window, 1, pages) == window, "the page is mapped again");
+    *reinterpret_cast<volatile uint32_t*>(static_cast<void*>(window)) = 0x600dcafe;
+    check(read_u32(window, 0) == 0x600dcafe, "a write after the race lands in the mapping");
+    api.map(window, 1, nullptr);
+    check(api.free_pages(kPages, pages) == TRUE, "the remap race pages are freed");
+    return {writes.load(), faults, escaped.load()};
+}
+
+// The fault race seam (rt::xmem::set_fault_race_hook): the thread g_race_thread names is held at stage g_race_stage of
+// its fault, once, until the test has mapped or planted the page it faulted on from another thread.
+std::atomic<DWORD> g_race_thread{0};
+std::atomic<int> g_race_stage{-1};
+HANDLE g_race_reached = nullptr;
+HANDLE g_race_resume = nullptr;
+
+void race_hook(int stage) {
+    if (stage != g_race_stage.load() || GetCurrentThreadId() != g_race_thread.load()) return;
+    g_race_thread = 0;  // once
+    SetEvent(g_race_reached);
+    WaitForSingleObject(g_race_resume, 10000);
+}
+
+enum class Racer { map, map_and_touch, plant };
+
+// One race, made to happen: a writer faults on an unmapped window page and is held after the handler's first look
+// (stage 0) or just before its exclusive lock (stage 1); meanwhile the page is mapped (and maybe committed by a write of
+// this thread's), or another thread's write plants it. The held write must then be answered, not left to the title.
+void run_first_touch_race(const PhysicalApi& api, int stage, Racer racer) {
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    uint64_t page = 0, count = 1;
+    if (!window || api.allocate(0x280, &count, &page) != TRUE || count != 1) {
+        check(false, "a window and a page for a first-touch race");
+        return;
+    }
+    ResetEvent(g_race_reached);
+    ResetEvent(g_race_resume);
+    g_race_stage = stage;
+    std::atomic<bool> escaped{false};
+    std::thread writer([&] {
+        g_race_thread = GetCurrentThreadId();
+        escaped = access_faults(reinterpret_cast<volatile uint32_t*>(static_cast<void*>(window + 0x10)), true);
+    });
+    const bool reached = WaitForSingleObject(g_race_reached, 10000) == WAIT_OBJECT_0;
+    bool raced = reached;
+    if (reached) {
+        if (racer == Racer::plant) {
+            std::thread other([&] {
+                raced &= !access_faults(reinterpret_cast<volatile uint32_t*>(static_cast<void*>(window + 0x20)), true);
+            });
+            other.join();
+        } else {
+            raced &= api.map(window, 1, &page) == window;
+            if (racer == Racer::map_and_touch)
+                raced &= !access_faults(reinterpret_cast<volatile uint32_t*>(static_cast<void*>(window + 0x20)), true);
+        }
+    }
+    SetEvent(g_race_resume);
+    writer.join();
+    g_race_stage = -1;
+    g_race_thread = 0;
+    char what[160];
+    static const char* const names[] = {"a map", "a map and a write", "another thread's plant"};
+    std::snprintf(what, sizeof what, "first-touch race at stage %d against %s: the held write is answered", stage,
+                  names[static_cast<int>(racer)]);
+    const uint32_t racer_wrote = racer == Racer::map ? 0u : 1u;
+    check(reached && raced && !escaped.load() && read_u32(window, 0x10) == 1u && read_u32(window, 0x20) == racer_wrote,
+          what);
+    api.map(window, 1, nullptr);
+    api.free_pages(1, &page);
+}
+
+void test_first_touch_races(const PhysicalApi& api) {
+    g_race_reached = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_race_resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    rt::xmem::set_fault_race_hook(&race_hook);
+    for (int stage = 0; stage <= 1; ++stage)
+        for (const Racer racer : {Racer::map, Racer::map_and_touch, Racer::plant}) run_first_touch_race(api, stage, racer);
+    rt::xmem::set_fault_race_hook(nullptr);
+    CloseHandle(g_race_reached);
+    CloseHandle(g_race_resume);
+
+    // The same races left to the scheduler: two threads first-touch one unmapped page behind a barrier, then a write
+    // races a map of the page. None may escape.
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    uint64_t page = 0, count = 1;
+    if (!window || api.allocate(0x280, &count, &page) != TRUE || count != 1) {
+        check(false, "a window and a page for the barrier races");
+        return;
+    }
+    constexpr uint32_t kRounds = 400;
+    for (int variant = 0; variant < 2; ++variant) {
+        std::atomic<uint32_t> go{0}, done{0};
+        std::atomic<uint64_t> escaped{0};
+        std::atomic<bool> mapped_ok{true};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 2; ++t)
+            threads.emplace_back([&, t] {
+                for (uint32_t round = 1; round <= kRounds; ++round) {
+                    while (go.load(std::memory_order_acquire) < round) YieldProcessor();
+                    if (variant == 1 && t == 1) {
+                        if (api.map(window, 1, &page) != window) mapped_ok = false;
+                    } else {
+                        auto* const word =
+                            reinterpret_cast<volatile uint32_t*>(static_cast<void*>(window + 0x100 + 4 * t));
+                        if (access_faults(word, true)) escaped.fetch_add(1);
+                    }
+                    done.fetch_add(1, std::memory_order_acq_rel);
+                }
+            });
+        bool unmapped = true;
+        for (uint32_t round = 1; round <= kRounds; ++round) {
+            go.store(round, std::memory_order_release);
+            while (done.load(std::memory_order_acquire) < 2 * round) YieldProcessor();
+            unmapped &= api.map(window, 1, nullptr) == window;  // a placeholder again for the next round
+        }
+        for (auto& thread : threads) thread.join();
+        check(unmapped && mapped_ok.load(), variant == 0 ? "the page unmaps after every round of two first touches"
+                                                         : "the page maps and unmaps in every round of a write racing a map");
+        check(escaped.load() == 0, variant == 0 ? "two threads first-touching one unmapped page: no write escapes"
+                                                : "a write racing a map of its page: no write escapes");
+    }
+    api.free_pages(1, &page);
+}
+
+// Two threads held at once (the decision races below): each hold stops the thread it names at its stage, once, until
+// the test resumes it.
+struct Hold {
+    std::atomic<DWORD> thread{0};
+    std::atomic<int> stage{-1};
+    HANDLE reached = nullptr, resume = nullptr;
+};
+Hold g_holds[2];
+
+void holds_hook(int stage) {
+    const DWORD self = GetCurrentThreadId();
+    for (Hold& hold : g_holds) {
+        if (hold.stage.load() != stage || hold.thread.load() != self) continue;
+        hold.thread = 0;  // once
+        SetEvent(hold.reached);
+        WaitForSingleObject(hold.resume, 10000);
+    }
+}
+
+void arm_hold(Hold& hold, int stage) {
+    ResetEvent(hold.reached);
+    ResetEvent(hold.resume);
+    hold.thread = 0;
+    hold.stage = stage;
+}
+
+bool hold_reached(const Hold& hold) { return WaitForSingleObject(hold.reached, 10000) == WAIT_OBJECT_0; }
+
+using VirtualAlloc2Fn = void*(WINAPI*)(HANDLE, void*, SIZE_T, ULONG, ULONG, void*, ULONG);
+
+// A window page that is a placeholder of its own, made free and then reserved again: what the host shows a reader part
+// way through MapViewOfFile3 or UnmapViewOfFile2 (MEM_FREE, seen on Windows 11), made to last as long as the test needs
+// it. Only while xmem holds its fault lock exclusively for a remap of the page.
+bool free_placeholder(void* page) { return VirtualFree(page, 0, MEM_RELEASE) != FALSE; }
+
+bool reserve_placeholder_again(void* page, SIZE_T size) {
+    static VirtualAlloc2Fn fn = [] {
+        const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+        return kernelbase ? reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(kernelbase, "VirtualAlloc2")) : nullptr;
+    }();
+    return fn && fn(GetCurrentProcess(), page, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0) ==
+                     page;
+}
+
+// The handler decides on what it read under its lock. Each race is made to happen with the race seam's stages:
+//  0. a write held inside its shared look, after the query it decides on: a map of its page cannot complete until the
+//     write lets the lock go (with the query outside the lock it could, and the write would act on a page that
+//     changed under it);
+//  1. a write held after its look while the page is mapped, written through, and unmapped again: it is planted;
+//  2. a write held after its look while a remap of its page is part way, the page free on the host (as it reads inside
+//     MapViewOfFile3): it waits for the remap and lands in the mapping, rather than being passed on.
+// None of them may escape, and the handler may leave none to the title.
+void test_decision_races(const PhysicalApi& api) {
+    for (Hold& hold : g_holds) {
+        hold.reached = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        hold.resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    }
+    rt::xmem::set_fault_race_hook(&holds_hook);
+    const uint64_t left_before = rt::xmem::fault_exits(rt::xmem::FaultExit::left_to_title);
+    const auto word_at = [](uint8_t* window, size_t offset) {
+        return reinterpret_cast<volatile uint32_t*>(static_cast<void*>(window + offset));
+    };
+    for (int scenario = 0; scenario < 3; ++scenario) {
+        auto* const window = static_cast<uint8_t*>(
+            api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+        uint64_t page = 0, count = 1;
+        if (!window || api.allocate(0x280, &count, &page) != TRUE || count != 1) {
+            check(false, "a window and a page for a decision race");
+            break;
+        }
+        Hold& writer_hold = g_holds[0];
+        Hold& mapper_hold = g_holds[1];
+        arm_hold(writer_hold, scenario == 0 ? rt::xmem::kFaultDecided : rt::xmem::kFaultAfterLook);
+        arm_hold(mapper_hold, scenario == 2 ? rt::xmem::kRemapBetween : -1);
+        std::atomic<bool> escaped{false}, written{false};
+        std::thread writer([&] {
+            writer_hold.thread = GetCurrentThreadId();
+            escaped = access_faults(word_at(window, 0x10), true);
+            written = true;
+        });
+        const bool writer_held = hold_reached(writer_hold);
+        bool ok = writer_held;
+        if (scenario == 0 && writer_held) {
+            // The writer holds the lock shared: the map waits for it.
+            std::atomic<bool> mapped{false}, map_ok{false};
+            std::thread mapper([&] {
+                map_ok = api.map(window, 1, &page) == window;
+                mapped = true;
+            });
+            Sleep(200);
+            const bool waited = !mapped.load();
+            SetEvent(writer_hold.resume);
+            mapper.join();
+            writer.join();
+            check(waited, "decision race: a map of the page waits while a write decides under the shared lock");
+            ok &= waited && map_ok.load();
+        } else if (scenario == 1 && writer_held) {
+            // The look saw a placeholder. The page is mapped, written through, and unmapped before the write goes on.
+            ok &= api.map(window, 1, &page) == window;
+            ok &= !access_faults(word_at(window, 0x20), true);
+            ok &= api.map(window, 1, nullptr) == window && reserved_only(window);
+            SetEvent(writer_hold.resume);
+            writer.join();
+            ok &= read_u32(window, 0x10) == 1u && read_u32(window, 0x20) == 0u;  // a fresh plant holds the write
+            check(ok, "decision race: a write whose page is mapped and unmapped after its look is planted");
+        } else if (scenario == 2 && writer_held) {
+            // A remap held between its unmap and its map, the exclusive lock held, the page free on the host.
+            std::atomic<bool> map_ok{false};
+            std::thread mapper([&] {
+                mapper_hold.thread = GetCurrentThreadId();
+                map_ok = api.map(window, 1, &page) == window;
+            });
+            const bool mapper_held = hold_reached(mapper_hold);
+            const bool freed = mapper_held && free_placeholder(window);
+            SetEvent(writer_hold.resume);  // the write goes on, to the exclusive lock the remap holds
+            Sleep(200);
+            const bool waited = !written.load() && !escaped.load();
+            const bool reserved = freed && reserve_placeholder_again(window, kPage64k);
+            SetEvent(mapper_hold.resume);
+            mapper.join();
+            writer.join();
+            check(mapper_held && freed && reserved, "decision race: a remap is held part way, its page free on the host");
+            check(waited, "decision race: a write after its look waits for a remap in flight");
+            ok &= mapper_held && reserved && waited && map_ok.load() && read_u32(window, 0x10) == 1u;
+            check(ok, "decision race: the write lands in the mapping the remap made");
+        } else {
+            SetEvent(writer_hold.resume);
+            writer.join();
+        }
+        char what[128];
+        std::snprintf(what, sizeof what, "decision race %d: the held write is answered, none escapes", scenario);
+        check(ok && written.load() && !escaped.load(), what);
+        for (Hold& hold : g_holds) hold.stage = -1;
+        api.map(window, 1, nullptr);
+        api.free_pages(1, &page);
+    }
+    rt::xmem::set_fault_race_hook(nullptr);
+    check(rt::xmem::fault_exits(rt::xmem::FaultExit::left_to_title) == left_before,
+          "decision races: the handler left no write to the title");
+    for (Hold& hold : g_holds) {
+        CloseHandle(hold.reached);
+        CloseHandle(hold.resume);
+        hold.reached = hold.resume = nullptr;
+    }
+}
+
+bool fill_faults(void* page, uint32_t tag) {
+    __try {
+        fill_page(page, tag);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                  : EXCEPTION_CONTINUE_SEARCH) {
+        return true;
+    }
+    return false;
+}
+
+// The zero pool moves on to a new section after 1,024 live plants. A plant of the older section that is released
+// afterwards must not hand its page's offset to the newer section, where another live plant has it: 2,100 plants span
+// at least two sections whatever the pool held before, the first 1,100 (all of the full section among them) are
+// released and planted again, and every page must still be its own.
+void test_zero_pool_rollover(const PhysicalApi& api) {
+    constexpr uint64_t kPages = 2100, kReleased = 1100;
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    check(window != nullptr, "a 2,100-page window nothing is mapped into");
+    if (!window) return;
+    const auto tag = [](uint64_t i, uint32_t round) { return static_cast<uint32_t>((i + 1) << 12) + round * 0x10000000u; };
+    bool answered = true;
+    for (uint64_t i = 0; i < kPages; ++i) answered &= !fill_faults(window + i * kPage64k, tag(i, 1));
+    check(answered, "2,100 writes into unmapped window pages are all answered");
+    check(api.map(window, kReleased, nullptr) == window, "the first 1,100 plants are released");
+    answered = true;
+    bool fresh = true;
+    for (uint64_t i = 0; i < kReleased; ++i) {
+        answered &= !fill_faults(window + i * kPage64k, tag(i, 2));
+        fresh &= read_u32(window + i * kPage64k, 4) == 0;
+    }
+    check(answered && fresh, "they are planted again, zeroed");
+    bool kept = true, own = true;
+    for (uint64_t i = kReleased; i < kPages; ++i) kept &= page_holds(window + i * kPage64k, tag(i, 1));
+    for (uint64_t i = 0; i < kReleased; ++i) own &= page_holds(window + i * kPage64k, tag(i, 2));
+    check(kept, "the plants that stayed keep their contents after older plants are released and planted again");
+    check(own, "every plant made again holds its own contents (no two plants share a page)");
+    check(api.map(window, kPages, nullptr) == window, "the rollover window unmaps");
+}
+
+// Section pages outside the title's reserved memory are not the title's, however a wild write reaches them: a write
+// into a physical page's scratch view (xmem's own mirror of its section), into a section view another component mapped,
+// or into a view mapped where the title released a placeholder of its own, faults and leaves the page uncommitted.
+void test_foreign_section_writes(const PhysicalApi& api) {
+    uint64_t page = 0, count = 1;
+    check(api.allocate(0x280, &count, &page) == TRUE && count == 1, "a physical page for the scratch-view write");
+    if (count == 1) {
+        auto* const scratch = reinterpret_cast<uint8_t*>(rt::xmem::physical_page_scratch(page));
+        MEMORY_BASIC_INFORMATION info{};
+        check(scratch && VirtualQuery(scratch, &info, sizeof(info)) && info.State == expected_xmem_section_state(),
+              "the scratch view has the initial state of its physical section");
+        if (scratch) {
+            if (expected_xmem_section_state() == MEM_RESERVE)
+                check_section_write_against_control(
+                    scratch, "a write into a reserved section's scratch view matches the host control");
+            else {
+                const bool faulted = access_faults(reinterpret_cast<volatile uint32_t*>(static_cast<void*>(scratch)), true);
+                const bool reserved = reserved_only(scratch);
+                const uint32_t readback = faulted ? 0 : read_u32(scratch, 0);
+                check(!faulted && !reserved && readback == 1,
+                      "a write into a committed section's scratch view completes and reads back");
+            }
+        }
+        api.free_pages(1, &page);
+    }
+
+    const HANDLE section =
+        CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, kPage64k, nullptr);
+    void* const view = section ? MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, kPage64k) : nullptr;
+    check(view != nullptr && reserved_only(view), "a SEC_RESERVE view the host places");
+    if (view) {
+        check_section_write_against_control(
+            view, "a write into a SEC_RESERVE view outside the title's reservations matches the host control");
+        UnmapViewOfFile(view);
+    }
+
+    const auto title_free = reinterpret_cast<BOOL(WINAPI*)(void*, SIZE_T, DWORD)>(rt::shims::find("kernel32.dll", "VirtualFree"));
+    auto* const placeholder = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x25, PAGE_READWRITE));
+    check(placeholder && title_free && title_free(placeholder, 0, MEM_RELEASE),
+          "the title reserves a placeholder and releases it");
+    void* const reused = section && placeholder
+                             ? MapViewOfFileEx(section, FILE_MAP_WRITE, 0, 0, kPage64k, placeholder)
+                             : nullptr;
+    if (reused == placeholder) {
+        check_section_write_against_control(
+            reused, "a section view mapped where the title released its placeholder matches the host control");
+        UnmapViewOfFile(reused);
+    } else {
+        std::printf("SKIP the released-placeholder write: the host gave its address to something else\n");
+        if (reused) UnmapViewOfFile(reused);
+    }
+    if (section) CloseHandle(section);
+
+    void* const reserve = VirtualAlloc(nullptr, kPage64k, MEM_RESERVE, PAGE_READWRITE);
+    check(reserve && access_faults(static_cast<volatile uint32_t*>(reserve), true) && reserved_only(reserve),
+          "a write into an ordinary reservation is left to the title");
+    if (reserve) VirtualFree(reserve, 0, MEM_RELEASE);
+}
+
+bool mapped_view(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(address, &info, sizeof(info)) && info.Type == MEM_MAPPED;
+}
+
+// A map that fails at a page that is not live leaves the pages before it mapped, and recorded as mapped: their
+// aliases, copy_page_mappings' sources and transfer_physical's pins see them. And a map far larger than any window is
+// refused before its page list is read.
+void test_failed_map_records(const PhysicalApi& api) {
+    auto* const a = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 3 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    auto* const b = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    uint64_t pages[2]{};
+    uint64_t count = 2;
+    if (!a || !b || api.allocate(0x280, &count, pages) != TRUE || count != 2) {
+        check(false, "two windows and two pages for the failed map");
+        return;
+    }
+    constexpr uint64_t kNotLive = ((uint64_t{1} << 21) - 1) * 16;
+    const uint64_t list[3] = {pages[0], pages[1], kNotLive};
+    check(api.map(a, 3, list) == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "a map with a page that is not live fails");
+    check(mapped_view(a) && mapped_view(a + kPage64k) && !mapped_view(a + 2 * kPage64k),
+          "the pages before it are mapped, the rest of the range is not");
+    check(api.map(b, 1, pages) == b, "the first page maps at a second address too");
+    std::vector<std::uintptr_t> peers;
+    rt::xmem::geometry_aliases(reinterpret_cast<std::uintptr_t>(b), peers);
+    check(peers.size() == 1 && peers[0] == reinterpret_cast<std::uintptr_t>(a),
+          "the failed call's mapping is recorded: the first page is aliased at both addresses");
+    SetLastError(ERROR_SUCCESS);
+    check(api.map(a, uint64_t{1} << 30, list) == nullptr && GetLastError() == ERROR_INVALID_ADDRESS,
+          "a map of 2^30 pages is refused for its window before the page list is read");
+    api.map(a, 3, nullptr);
+    api.map(b, 1, nullptr);
+    check(api.free_pages(2, pages) == TRUE, "the failed map's pages are freed");
 }
 
 void test_physical_pages_commit_on_touch(const PhysicalApi& api) {
@@ -804,6 +1556,38 @@ void test_physical_pages_commit_on_touch(const PhysicalApi& api) {
     check(read_ok, "ReadFile fills a page that commit_physical_range committed");
 
     check(api.map(second, 2, nullptr) == second && api.map(window, kMapped, nullptr) == window, "they unmap");
+    {
+        // A host guarded read (outside the title image at 0x140000000) of an unmapped window page exits as
+        // passed_guarded without counting as left_to_title; a title read still counts as left_to_title.
+        void* const stub_page = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        const uint8_t mov_eax_rcx_ret[] = {0x8b, 0x01, 0xc3};
+        DWORD stub_old = 0;
+        bool stub_ready = false;
+        if (stub_page) {
+            std::memcpy(stub_page, mov_eax_rcx_ret, sizeof(mov_eax_rcx_ret));
+            stub_ready = VirtualProtect(stub_page, 4096, PAGE_EXECUTE_READ, &stub_old) != FALSE;
+            FlushInstructionCache(GetCurrentProcess(), stub_page, sizeof(mov_eax_rcx_ret));
+        }
+        const auto host_read_faults = [&](const void* p) {
+            __try {
+                reinterpret_cast<uint32_t (*)(const void*)>(stub_page)(p);
+                return false;
+            } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                          : EXCEPTION_CONTINUE_SEARCH) {
+                return true;
+            }
+        };
+        const uint64_t guarded_before = rt::xmem::fault_exits(rt::xmem::FaultExit::passed_guarded);
+        const uint64_t left_before = rt::xmem::fault_exits(rt::xmem::FaultExit::left_to_title);
+        check(stub_ready && host_read_faults(second) &&
+                  rt::xmem::fault_exits(rt::xmem::FaultExit::passed_guarded) == guarded_before + 1 &&
+                  rt::xmem::fault_exits(rt::xmem::FaultExit::left_to_title) == left_before,
+              "a host guarded read of an unmapped window page exits as passed_guarded");
+        check(access_faults(reinterpret_cast<volatile uint32_t*>(second), false) &&
+                  rt::xmem::fault_exits(rt::xmem::FaultExit::left_to_title) == left_before + 1,
+              "a title read of an unmapped window page still exits as left_to_title");
+        if (stub_page) VirtualFree(stub_page, 0, MEM_RELEASE);
+    }
     check(api.free_pages(count, pages.data()) == TRUE, "XMemFreePhysicalPages frees them");
 }
 
@@ -828,8 +1612,10 @@ void test_commit_physical_pages(const PhysicalApi& api) {
         bool queried = true;
         for (uint64_t i = 0; i < kPages; ++i)
             queried &= VirtualQuery(window + i * kPage64k, &info[i], sizeof(info[i])) == sizeof(info[i]);
-        check(queried && info[0].State == MEM_COMMIT && info[1].State == MEM_COMMIT && info[2].State == MEM_RESERVE,
-              "the two committed by number are committed in the window and the third is not yet");
+        const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+        check(queried && info[0].State == MEM_COMMIT && info[1].State == MEM_COMMIT &&
+                  info[2].State == (wine ? MEM_COMMIT : MEM_RESERVE),
+              "the two committed by number are committed in the window and the third retains its initial state");
         check(read_u32(window, 0) == 0 && read_u32(window + kPage64k, 0) == 0,
               "pages committed by number read as zero");
         api.map(window, kPages, nullptr);
@@ -1028,6 +1814,101 @@ void test_placeholders(const PhysicalApi& api) {
     check(api.map(window, 2, nullptr) == window, "unmap the carved window");
     check(api.free_pages(2, pages) == TRUE, "free the carved window's pages");
     check(reserved_only(base), "the rest of the placeholder is still reserved");
+}
+
+// A window carved out of a bigger window (a reserve-only MEM_REPLACE_PLACEHOLDER inside it) leaves the rest of the bigger
+// window a window: pages still map below and above the carve, and into the carve itself.
+void test_window_carve_keeps_rest(const PhysicalApi& api) {
+    constexpr uint64_t kPages = 8;
+    auto* const window = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    check(window != nullptr, "a 64 KiB-page window to carve");
+    if (!window) return;
+    void* const carved = api.virtual_alloc(window + 3 * kPage64k, 2 * kPage64k,
+                                           MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x23,
+                                           PAGE_READWRITE | PAGE_GRAPHICS_READWRITE);
+    check(carved == window + 3 * kPage64k, "a reserve-only replacement carves two pages out of the window");
+    uint64_t pages[3]{};
+    uint64_t count = 3;
+    check(api.allocate(0x380, &count, pages) == TRUE && count == 3, "allocate three pages");
+    if (count != 3) return;
+    check(api.map(window + kPage64k, 1, &pages[0]) == window + kPage64k, "a page maps below the carve");
+    check(api.map(window + 6 * kPage64k, 1, &pages[1]) == window + 6 * kPage64k, "a page maps above the carve");
+    check(api.map(window + 3 * kPage64k, 1, &pages[2]) == window + 3 * kPage64k, "a page maps into the carve");
+    fill_page(window + 6 * kPage64k, 0x6000000u);
+    check(page_holds(window + 6 * kPage64k, 0x6000000u), "the page above the carve holds data");
+    check(api.map(window + kPage64k, 1, nullptr) == window + kPage64k, "unmap below");
+    check(api.map(window + 6 * kPage64k, 1, nullptr) == window + 6 * kPage64k, "unmap above");
+    check(api.map(window + 3 * kPage64k, 1, nullptr) == window + 3 * kPage64k, "unmap the carve");
+    check(api.free_pages(3, pages) == TRUE, "free the three pages");
+}
+
+// A reserve-only replacement splits an existing physical window without releasing either neighbour.
+void test_nested_window(const PhysicalApi& api) {
+    auto* base = static_cast<uint8_t*>(api.virtual_alloc(nullptr, 3 * kPage64k, MEM_RESERVE | kXmem64kPages,
+                                                         0x21, PAGE_READWRITE));
+    check(base != nullptr, "reserve a parent physical window");
+    if (!base) return;
+    void* child = api.virtual_alloc(base + kPage64k, kPage64k, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages,
+                                    0x23, PAGE_READONLY);
+    check(child == base + kPage64k, "carve a read-only registration window inside the parent");
+    if (!child) return;
+    void* addresses[] = {base, child, base + 2 * kPage64k};
+    check(!access_faults(reinterpret_cast<volatile uint32_t*>(base), true) &&
+          !access_faults(reinterpret_cast<volatile uint32_t*>(base + 2 * kPage64k), true),
+          "faults can still plant writable pages on both sides of the child");
+    uint64_t count = 3, pages[3]{};
+    const bool allocated = api.allocate(0x281, &count, pages) && count == 3;
+    check(allocated, "allocate physical pages for nested-window scatter");
+    if (!allocated) return;
+    const bool mapped = api.scatter(addresses, 3, pages) == TRUE;
+    check(mapped, "scatter reaches both parent fragments and the child");
+    if (mapped) {
+        for (unsigned i = 0; i < 3; ++i) {
+            auto* word = static_cast<volatile uint32_t*>(addresses[i]);
+            check(!access_faults(word, false) && *word == 0 && access_faults(word, true) == (i == 1),
+                  "scattered pages retain the protection of their own window");
+        }
+    }
+    if (mapped) {
+        const auto start = reinterpret_cast<uintptr_t>(base);
+        const rt::xmem::PageRange repeat{1, 0, 3};
+        const rt::xmem::PageBatch batch{start, 1, &repeat};
+        const bool copied = rt::xmem::copy_page_mappings(1, &batch, start, 3, 0);
+        check(copied, "one slot-31 repeat range crosses the child and both parent fragments");
+        if (copied) {
+            auto* first = reinterpret_cast<volatile uint32_t*>(base);
+            *first = 42;
+            std::vector<uintptr_t> peers;
+            rt::xmem::geometry_aliases(start + kPage64k, peers);
+            check(peers == std::vector<uintptr_t>{start, start + 2 * kPage64k} &&
+                      *static_cast<volatile uint32_t*>(child) == 42 &&
+                      access_faults(static_cast<volatile uint32_t*>(child), true),
+                  "slot-31 publishes both aliases and preserves the child protection");
+        }
+        auto* source = static_cast<uint8_t*>(api.virtual_alloc(nullptr, 3 * kPage64k, MEM_RESERVE | kXmem64kPages,
+                                                               0x21, PAGE_READWRITE));
+        const bool source_mapped = source && api.map(source, 3, pages) == source;
+        check(source_mapped, "map three consecutive source frames for the queue run");
+        if (source_mapped) {
+            const rt::xmem::PageRange sequential{0, 0, 3};
+            const rt::xmem::PageBatch run{start, 1, &sequential};
+            check(rt::xmem::copy_page_mappings(1, &run, reinterpret_cast<uintptr_t>(source), 3, 0),
+                  "a sequential queue run crosses both child boundaries");
+            for (unsigned i = 0; i < 3; ++i) {
+                std::vector<uintptr_t> peers;
+                rt::xmem::geometry_aliases(reinterpret_cast<uintptr_t>(source + i * kPage64k), peers);
+                check(peers == std::vector<uintptr_t>{start + i * kPage64k},
+                      "each fragment publishes its corresponding source frame");
+            }
+            api.map(source, 3, nullptr);
+        }
+    }
+    check(api.scatter(addresses, 3, nullptr) == TRUE, "unmap nested-window scatter");
+    std::vector<uintptr_t> peers;
+    rt::xmem::geometry_aliases(reinterpret_cast<uintptr_t>(child), peers);
+    check(peers.empty(), "scatter unmap removes the slot-31 aliases");
+    api.free_pages(3, pages);
 }
 
 // Three of the retail executable's five physical-page windows carry 0x400 next to PAGE_READWRITE. That is
@@ -1570,6 +2451,100 @@ void test_write_watch_rereserve(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWa
     }
 }
 
+// Guards over physical pages (src/title_page_watch.h, kernel_writes). One page mapped at two windows, A and B:
+//   1. a page of A made read-only behind every guard's back (as the geometry watch's race left them) is writable again
+//      after rt::xmem::reopen_unowned, and a page the title protected itself (its VirtualProtect) is left read-only;
+//   2. with reopen_unowned as kernel_writes' unguarder, a host thread's write (kernel_writes::write) and a kernel write
+//      (kernel_writes::read_file) into such a page both land;
+//   3. a DirectStorage page-list write (rt::xmem::transfer_physical) pins and opens every address the page is mapped at
+//      before it writes the page through its section, and ends the pins after.
+std::vector<std::pair<uintptr_t, uintptr_t>> g_opened;
+void record_open(uintptr_t from, uintptr_t to) { g_opened.emplace_back(from, to); }
+
+void test_unowned_guards(const PhysicalApi& api) {
+    if (const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll"); ntdll && GetProcAddress(ntdll, "wine_get_version")) {
+        // Under Wine (Proton) these checks fail at their setup: Wine's placeholder views differ (PAGE_WRITECOMBINE and
+        // PAGE_NOCACHE are dropped, MapViewOfFile3 refuses them), so this safety net is inert there. Harmless today;
+        // the Wine side is an open item.
+        std::printf("SKIP unowned guards under Wine: its placeholder views differ, the safety net is Windows-only\n");
+        return;
+    }
+    namespace kw = leonida::kernel_writes;
+    auto* const a = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 2 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+    auto* const b = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 2 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+    uint64_t pages[2]{};
+    uint64_t count = 2;
+    check(a && b && api.allocate(0x280, &count, pages) == TRUE && count == 2 && api.map(a, 2, pages) == a &&
+              api.map(b, 2, pages) == b, "two windows map the same two physical pages");
+    if (!a || !b || count != 2) return;
+    for (size_t i = 0; i < 2 * kPage64k; i += 0x1000) a[i] = 1;  // committed through A
+    const auto protection = [](const void* at) {
+        MEMORY_BASIC_INFORMATION info{};
+        return VirtualQuery(at, &info, sizeof(info)) ? info.Protect : 0;
+    };
+    const auto va = [](const void* at) { return reinterpret_cast<uintptr_t>(at); };
+
+    // 1. An unowned read-only page, and one the title protected.
+    DWORD old = 0;
+    check(VirtualProtect(a + 0x1000, 0x1000, PAGE_READONLY, &old), "a page of A made read-only by nobody's guard");
+    check(rt::xmem::reopen_unowned(va(a + 0x1000), va(a + 0x1001)) && protection(a + 0x1000) == PAGE_READWRITE &&
+              protection(a + 0x2000) == PAGE_READWRITE, "reopen_unowned makes it writable again, as its window is");
+    const auto title_protect = reinterpret_cast<BOOL(WINAPI*)(void*, SIZE_T, DWORD, PDWORD)>(
+        rt::shims::find("kernel32.dll", "VirtualProtect"));
+    check(title_protect && title_protect(b + kPage64k, 0x1000, PAGE_READONLY, &old), "the title protects a page of B");
+    check(!rt::xmem::reopen_unowned(va(b + kPage64k), va(b + kPage64k + 1)) &&
+              protection(b + kPage64k) == PAGE_READONLY, "reopen_unowned leaves a page the title protected");
+    if (title_protect) title_protect(b + kPage64k, 0x1000, PAGE_READWRITE, &old);
+
+    // 2. Writes into an unowned read-only page through kernel_writes.
+    kw::set_unguarder(&rt::xmem::reopen_unowned);
+    std::vector<uint8_t> source(0x1800);
+    for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<uint8_t>(i * 7 + 3);
+    VirtualProtect(a + 0x3000, 0x2000, PAGE_READONLY, &old);
+    bool wrote = false;
+    std::thread host([&] { wrote = kw::write(a + 0x3400, source.data(), source.size()); });
+    host.join();
+    check(wrote && std::memcmp(b + 0x3400, source.data(), source.size()) == 0,
+          "a host thread's write into it lands (and B shows it: one memory)");
+    wchar_t dir[MAX_PATH]{}, path[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, dir);
+    GetTempFileNameW(dir, L"xug", 0, path);
+    HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    DWORD done = 0;
+    check(file != INVALID_HANDLE_VALUE && WriteFile(file, source.data(), 0x1000, &done, nullptr) && done == 0x1000,
+          "a file to read");
+    // (Into A: the title's VirtualProtect above marked all of B's view, which reopen_unowned now leaves alone.)
+    VirtualProtect(a + 0x6000, 0x1000, PAGE_READONLY, &old);
+    OVERLAPPED at{};
+    done = 0;
+    check(kw::read_file(file, a + 0x6000, 0x1000, &done, &at) && done == 0x1000 &&
+              std::memcmp(b + 0x6000, source.data(), 0x1000) == 0, "a kernel write into it lands, retried once");
+    CloseHandle(file);
+    kw::set_unguarder(nullptr);
+
+    // 3. A page-list write pins every address of the page.
+    kw::set_opener(&record_open);
+    std::vector<uint8_t> staging(0x200, 0x5a);
+    const uint64_t page = pages[1];
+    check(rt::xmem::transfer_physical(std::span<const uint64_t>(&page, 1), 0x100, staging, true),
+          "transfer_physical writes a physical page");
+    const bool both = g_opened.size() == 2 &&
+                      ((g_opened[0].first == va(a + kPage64k + 0x100) && g_opened[1].first == va(b + kPage64k + 0x100)) ||
+                       (g_opened[1].first == va(a + kPage64k + 0x100) && g_opened[0].first == va(b + kPage64k + 0x100)));
+    check(both && g_opened[0].second - g_opened[0].first == 0x200, "both of its addresses were pinned and opened first");
+    check(kw::state().count.load() == 0 && a[kPage64k + 0x100] == 0x5a && b[kPage64k + 0x2ff] == 0x5a,
+          "the pins ended, and both addresses show the bytes");
+    kw::set_opener(nullptr);
+    g_opened.clear();
+
+    api.map(a, 2, nullptr);
+    api.map(b, 2, nullptr);
+    check(api.free_pages(2, pages) == TRUE, "the pages are freed");
+}
+
 void print_result() {
     if (g_failures == 0) {
         std::printf("xmem_test: OK (%d checks)\n", g_checks);
@@ -1626,6 +2601,76 @@ int main(int argc, char** argv) {
     check(physical.map != nullptr, "registry exposes xmem.dll!XMemMapPhysicalPages");
     check(physical.scatter != nullptr, "registry exposes xmem.dll!XMemMapPhysicalPagesScatter");
 
+    if (argc == 2 && std::strcmp(argv[1], "--pool-zero-read") == 0) {
+        // This test executable occupies the title's usual PE base, so its own read exercises the PC filter.
+        SetEnvironmentVariableA("LEONIDA_POOL_ZERO_PAGES", "1");
+        SetEnvironmentVariableA("LEONIDA_SLOT31_CPU_TWIN", "0");
+        uint64_t count = 1, page = 0;
+        const bool allocated = physical.allocate && physical.allocate(0x281, &count, &page) && count == 1;
+        check(allocated, "allocate a physical page to install the fault handler");
+        auto* window = static_cast<volatile uint32_t*>(
+            virtual_alloc(nullptr, 2 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x25, PAGE_READWRITE));
+        check(window != nullptr, "reserve an unmapped physical window");
+        auto* gpu = static_cast<uint8_t*>(virtual_alloc(nullptr, 2 * kPage64k, MEM_RESERVE | kXmem64kPages, 3, 0x801));
+        if (allocated && window && gpu) {
+            rt::xmem::note_stream_reservation(uintptr_t(window), 2 * kPage64k, 0x1e1d00f);
+            rt::xmem::note_stream_reservation(uintptr_t(gpu), 2 * kPage64k, 0x1e1d03e);
+            void* first = gpu;
+            check(physical.scatter(&first, 1, &page), "fault diagnostic has a scatter-backed GPU twin");
+            const rt::xmem::PageRange range{0, 0, 1};
+            const rt::xmem::PageBatch batch{uintptr_t(gpu + kPage64k), 1, &range};
+            check(rt::xmem::copy_page_mappings(1, &batch, uintptr_t(gpu), 1, 0),
+                  "fault diagnostic has a slot-31-backed GPU twin");
+            check(!access_faults(window + kPage64k / sizeof(*window), false), "slot-31 CPU hole reads zero with mirror off");
+        }
+        if (allocated && window) {
+            const bool readable = !access_faults(window, false);
+            check(readable && window[0] == 0 && window[kPage64k / sizeof(*window) - 1] == 0,
+                  "a title read of an unmapped pool page returns zeros");
+            MEMORY_BASIC_INFORMATION info{};
+            check(VirtualQuery(const_cast<uint32_t*>(window), &info, sizeof(info)) && info.Protect == PAGE_READONLY,
+                  "the read first plants a read-only zero page");
+            check(!access_faults(window, true) && window[0] == 1 && window[1] == 0,
+                  "the first write replaces the read plant with writable zero backing");
+        }
+        if (allocated) {
+            check(physical.map(const_cast<uint32_t*>(window), 1, &page) == window,
+                  "a physical mapping replaces the read-planted page");
+            physical.free_pages(1, &page);
+        }
+        print_result();
+        return g_failures ? 1 : 0;
+    }
+
+    // xmem_test --remap-reps N [RUNS]: only the remap race, N remaps per run, RUNS runs (default 1), then the decision
+    // races once: the race a review reproduced, looped.
+    if (argc >= 3 && std::strcmp(argv[1], "--remap-reps") == 0) {
+        const int reps = std::atoi(argv[2]);
+        const int runs = argc >= 4 ? std::atoi(argv[3]) : 1;
+        if (!virtual_alloc || !physical.allocate || !physical.free_pages || !physical.map || !physical.scatter ||
+            reps <= 0 || runs <= 0) {
+            print_result();
+            return 1;
+        }
+        RemapRace total;
+        int failed_runs = 0;
+        for (int run = 0; run < runs; ++run) {
+            const int failures_before = g_failures;
+            const RemapRace race = test_write_during_remap(physical, reps);
+            total.writes += race.writes;
+            total.faults += race.faults;
+            total.escaped += race.escaped;
+            if (g_failures != failures_before) ++failed_runs;
+        }
+        test_decision_races(physical);
+        std::printf("remap race: %d runs of %d remaps, %d failed, %llu writes, %llu faults answered, %llu writes "
+                    "escaped\n",
+                    runs, reps, failed_runs, static_cast<unsigned long long>(total.writes),
+                    static_cast<unsigned long long>(total.faults), static_cast<unsigned long long>(total.escaped));
+        print_result();
+        return g_failures ? 1 : 0;
+    }
+
     if (!alloc || !free_mem || !query || !get_stats) {
         print_result();
         return 1;
@@ -1651,6 +2696,8 @@ int main(int argc, char** argv) {
     if (alloc_default && free_default) test_default_alloc(alloc, free_mem, alloc_default, free_default);
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
+        // Keep the direct SEC_RESERVE control ahead of the first physical allocation, which installs xmem's VEH.
+        g_section_write_control = measure_section_write_control();
         test_physical_pages(physical);
         if (argc == 2 && std::strcmp(argv[1], "--file-pools") == 0) {
             test_placeholders(physical);
@@ -1659,12 +2706,23 @@ int main(int argc, char** argv) {
         }
         test_copy_page_mappings(physical);
         test_copy_page_mappings_cpu_view(physical);
+        test_stream_cpu_twin(physical);
+        test_unowned_guards(physical);
         test_physical_pages_commit_on_touch(physical);
+        test_unmapped_window_page(physical);
+        test_write_during_remap(physical);
+        test_first_touch_races(physical);
+        test_decision_races(physical);
+        test_zero_pool_rollover(physical);
+        test_foreign_section_writes(physical);
+        test_failed_map_records(physical);
         test_commit_physical_pages(physical);
         test_first_touch_during_remap(physical);
         test_long_run(physical);
         test_split_under_reader(physical);
         test_placeholders(physical);
+        test_window_carve_keeps_rest(physical);
+        test_nested_window(physical);
         test_write_combine_window(physical);
         test_heap_lock_faults(physical);
     }

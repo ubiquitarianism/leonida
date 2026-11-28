@@ -77,17 +77,51 @@ static_assert(offsetof(Vertex, wrong_color) == 16);
 
 }  // namespace
 
+// Positive-only offscreen variant, sharing the translated-shader fixture, root signature and PSO description.
+int check_stateful_indirect_pixels(ID3D12Device* device, ID3D12RootSignature* root, D3D12_GRAPHICS_PIPELINE_STATE_DESC desc,
+                                  bool multi, bool counted, bool nonindexed_only);
+
 int main(int argc, char** argv) {
+    const bool nonindexed_only = argc == 3 && std::strcmp(argv[2], "--nonindexed-only") == 0;
+    const bool indirect_mode = argc == 2 || nonindexed_only;
+    const bool multi_pixels = indirect_mode && std::strcmp(argv[1], "--stateful-indirect-multi-pixels") == 0;
+    const bool count_pixels = indirect_mode && std::strcmp(argv[1], "--stateful-indirect-counted-pixels") == 0;
+    const bool indirect_pixels = multi_pixels || count_pixels ||
+                                 (indirect_mode && std::strcmp(argv[1], "--stateful-indirect-pixels") == 0);
+    if (argc > 2 && !(nonindexed_only && indirect_pixels)) return 1;
     const bool title_index = argc == 2 && std::strcmp(argv[1], "--title-index-window") == 0;
     const bool title_vertex = argc == 2 && std::strcmp(argv[1], "--title-vertex-window") == 0;
     const bool title_window = title_index || title_vertex;
     vktest::Device d;
+    d.request_draw_indirect_first_instance = indirect_pixels;
+    d.request_robust_index_view = indirect_pixels && !nonindexed_only;
+    // Only the uncounted multi-record commands require multiDrawIndirect. Keep it disabled in the counted fixture.
+    d.request_multi_draw_indirect = multi_pixels;
+    d.request_draw_indirect_count = count_pixels;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) {
         std::fprintf(stderr, "SKIP: no usable Vulkan 1.3 device\n");
         return 77;
     }
     EXPECT(device_status == vktest::DeviceStatus::ready);
+    if (indirect_pixels && !d.enabled.drawIndirectFirstInstance) {
+        std::fprintf(stderr, "SKIP: drawIndirectFirstInstance is unavailable\n");
+        return 77;
+    }
+
+    if (nonindexed_only) EXPECT(!d.robust_index_view);
+    if (d.request_robust_index_view && !d.robust_index_view) {
+        std::fprintf(stderr, "SKIP: indexed indirect pixels require maintenance5 and compatible robustBufferAccess2\n");
+        return 77;
+    }
+    if (multi_pixels && (!d.enabled.multiDrawIndirect || d.max_draw_indirect_count < 2)) {
+        std::fprintf(stderr, "SKIP: multiDrawIndirect unavailable or maxDrawIndirectCount < 2\n");
+        return 77;
+    }
+    if (count_pixels && (!d.draw_indirect_count_enabled || d.max_draw_indirect_count != UINT32_MAX)) {
+        std::fprintf(stderr, "SKIP: counted replay requires drawIndirectCount and maxDrawIndirectCount == UINT32_MAX\n");
+        return 77;
+    }
 
     // Shader programs and the index that maps their hashes to the compiled test modules.
     const auto vs_program = fssm_program({0x56530001, 0xbf810000});
@@ -163,6 +197,11 @@ int main(int argc, char** argv) {
         info.shader_dir = library.string();
         // Of the PSO features only logicOp is passed on, so the other feature refusals below still apply.
         info.features.logicOp = d.enabled.logicOp;
+        info.draw_indirect_first_instance = d.enabled.drawIndirectFirstInstance == VK_TRUE;
+        info.multi_draw_indirect = d.enabled.multiDrawIndirect == VK_TRUE;
+        info.draw_indirect_count_enabled = d.draw_indirect_count_enabled;
+        info.robust_index_view = d.robust_index_view;
+        info.max_draw_indirect_count = d.max_draw_indirect_count;
         info.vertex_attribute_divisor = d.vertex_attribute_divisor;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
@@ -204,6 +243,12 @@ int main(int argc, char** argv) {
         pso_desc.NumRenderTargets = 1;
         pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         pso_desc.SampleDesc.Count = 1;
+        if (indirect_pixels) {
+            const int result = check_stateful_indirect_pixels(device.p, root.p, pso_desc, multi_pixels || count_pixels,
+                                                              count_pixels, nonindexed_only);
+            EXPECT(d.validation_errors() == 0);
+            return result;
+        }
         Ref<ID3D12PipelineState> pso, unfed, mrt, instanced, refused, xor_pso, fullscreen;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
         pso_desc.InputLayout = {elements, 1};  // COLOR missing: D3D12 rejects a layout that leaves an input unfed

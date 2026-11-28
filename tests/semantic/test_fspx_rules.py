@@ -157,7 +157,7 @@ class VccTupleSmemTests(unittest.TestCase):
             f"v_mov_b32_e32 v6, {OUT:#x}",
             "global_store_dword v6, v4, s[0:1]",
         ])
-        self.assertIn("OpFunctionCall %uint %desc_lookup_fn", spv)
+        self.assertRegex(spv, r"OpFunctionCall %\w+ %desc_lookup_fn")
 
     def test_slist_length_mismatch_rejected(self):
         with self.assertRaises(rdna2spirv.Unsupported):

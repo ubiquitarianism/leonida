@@ -395,7 +395,8 @@ int main(int argc, char** argv) {
     };
     const uint32_t nimg = uint32_t(scene.textures.size()) + 1;   // image 0: 1x1 white for untextured draws
     leonida::DescriptorTable table(2 * (nimg + 2));
-    for (uint32_t i = 0; i < nimg; ++i) table.insert(tsharp(i).data(), i);
+    // The module is tagged (build.py), so each T# entry names the array its index is bound in: a sampled 2D image.
+    for (uint32_t i = 0; i < nimg; ++i) table.insert(tsharp(i).data(), i, leonida::kind_sampled_bit(0));
     uint32_t ssharp[8] = {1024, 12582912, 418381824, 0, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};   // the PS's literal S#
     table.insert(ssharp, 0);
     for (uint32_t d = 0; d < ndraw; ++d) {

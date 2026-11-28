@@ -131,6 +131,39 @@ int main() {
         check(!r.ok && r.error.find("64-dword") != std::string::npos,
               "65 constants refused by cost limit");
     }
+    // 64 constants are within the cost limit, as on the host: pack() and the graphics stages refuse them only for
+    // the spill past the user SGPRs, and that is what the error says; compute spills them whole.
+    {
+        RootSignature sig;
+        sig.params = {consts(64)};
+        const PackResult r = pack(sig);
+        check(!r.ok && r.error.find("64-dword") == std::string::npos && r.error.find("spill") != std::string::npos,
+              "64 constants pass the cost limit (refused only as a spill)");
+        const StagePackResult p = pack_stage(sig, Stage::Pixel);
+        check(!p.ok && p.error.find("64-dword") == std::string::npos && p.error.find("spill") != std::string::npos,
+              "pack_stage: 64 constants pass the cost limit for a pixel shader (refused only as a spill)");
+        const StagePackResult c = pack_stage(sig, Stage::Compute);
+        check(c.ok && c.d3d12_cost == 64 && c.spill_dword == std::vector<uint32_t>({0}) && c.spill_dwords == 64,
+              "pack_stage: 64 constants pass the cost limit for compute, spilled whole");
+        sig.params = {consts(32), consts(0), consts(32)};
+        check(pack(sig).error.find("spill") != std::string::npos, "32 + 0 + 32 constants cost 64, not more");
+    }
+    // A constant parameter of 0 values is valid on the host (the serializer warns, CreateRootSignature answers
+    // S_OK). It takes no dwords and no cost: the parameters around it pack as if it were absent.
+    {
+        RootSignature sig;
+        sig.params = {consts(0), consts(2), consts(0), view(), consts(0)};
+        const PackResult r = pack(sig);
+        check(r.ok && r.dword_count == 2 + 2 && r.d3d12_cost == 2 + 2, "zero-value constants pack to no dwords");
+        check(r.provenance.size() == 4 && r.provenance[0].param_index == 1 && r.provenance[1].param_index == 1 &&
+                  r.provenance[2].param_index == 3 && r.provenance[2].sub_index == 0 &&
+                  r.provenance[3].param_index == 3 && r.provenance[3].sub_index == 1,
+              "zero-value constants leave no provenance; their neighbours keep their dwords");
+        RootSignature alone;
+        alone.params = {consts(0)};
+        const PackResult a = pack(alone);
+        check(a.ok && a.dword_count == 0 && a.d3d12_cost == 0, "a lone zero-value constant parameter packs");
+    }
     // A count that wraps a 32-bit sum (1 + 0xFFFFFFFF) is still refused, not packed past dwords[32].
     {
         rt::rootsig::RootSignature sig;
@@ -187,6 +220,19 @@ int main() {
               "RTS0 model matches hand-built blob");
         const PackResult r = pack(d.sig);
         check(r.ok && r.dword_count == 3 + 2, "parsed RTS0 packs to 5 dwords");
+    }
+    // The same blob with 0 values in its constant parameter: parsed and packed, the CBV taking the first dwords.
+    {
+        std::vector<uint8_t> payload = build_payload();
+        payload[56] = 0;  // the constants' value count (payload at 48: register, space, count)
+        const DecodeResult d = parse_rts0(payload.data(), payload.size());
+        check(d.ok && d.sig.params.size() == 2 && d.sig.params[0].num_values == 0,
+              "RTS0 with a zero-value constant parameter parses");
+        const PackResult r = pack(d.sig);
+        check(r.ok && r.dword_count == 2 && r.provenance[0].param_index == 1, "zero-value RTS0 packs the CBV at 0");
+        const StagePackResult c = pack_stage(d.sig, Stage::Compute);
+        check(c.ok && c.first_sgpr.size() == 2 && c.first_sgpr[0] == 4 && c.first_sgpr[1] == 4 && c.end_sgpr == 6,
+              "pack_stage: zero-value RTS0 puts the CBV at s4");
     }
 
     // RTS0 controls: unknown version, wild offsets and truncation fail loudly.
@@ -492,6 +538,48 @@ int main() {
               "pack_stage: non-compute graphics stages still refuse spills");
     }
 
+    // The graphics root window (D3D-448-GRAPHICS): the graphics bind point lays a signature out once with
+    // Stage::Pixel, root dword k at push dword 8 + k. A vertex, pixel or geometry shader reads SGPR i from push
+    // dword i, and a mesh shader its s16 + k from push dword 8 + k (tools/rdna2spirv.py, user_data_dword), so every
+    // stage of a pipeline finds each parameter in the same dword. The mesh window holds 16 dwords, the others 24.
+    {
+        const std::vector<RootSignature> shapes = [] {
+            std::vector<RootSignature> out(4);
+            out[0].params = {consts(2), view()};
+            out[1].params = {table(), table(), consts(1)};
+            out[2].params = {table(), consts(4), view(), table()};
+            out[3].params.assign(16, table());
+            return out;
+        }();
+        for (std::size_t s = 0; s < shapes.size(); ++s) {
+            const StagePackResult vs = pack_stage(shapes[s], Stage::Vertex);
+            const StagePackResult ps = pack_stage(shapes[s], Stage::Pixel);
+            const StagePackResult gs = pack_stage(shapes[s], Stage::Geometry);
+            const StagePackResult ms = pack_stage(shapes[s], Stage::Mesh);
+            check(vs.ok && ps.ok && gs.ok && ms.ok, "graphics window: the shape fits every graphics stage");
+            check(vs.first_sgpr == ps.first_sgpr && vs.first_sgpr == gs.first_sgpr,
+                  "graphics window: VS, PS and GS place every parameter in the same SGPR");
+            bool same_dword = vs.first_sgpr.size() == ms.first_sgpr.size();
+            for (std::size_t i = 0; same_dword && i < vs.first_sgpr.size(); ++i)
+                same_dword = vs.first_sgpr[i] - 8 == ms.first_sgpr[i] - 16;
+            check(same_dword, "graphics window: a mesh shader's s16 + k is the pixel shader's s8 + k");
+        }
+        RootSignature twenty;
+        twenty.params = {consts(20)};
+        check(pack_stage(twenty, Stage::Vertex).ok && !pack_stage(twenty, Stage::Mesh).ok,
+              "graphics window: 20 dwords fit a pixel shader (24 from s8) but not a mesh shader (16 from s16)");
+        RootSignature full;
+        full.params = {consts(24)};
+        check(pack_stage(full, Stage::Pixel).ok, "graphics window: 24 constants fill s8..s31 exactly");
+        full.params = {consts(23), view()};
+        check(!pack_stage(full, Stage::Pixel).ok, "graphics window: a root view past s31 spills");
+        RootSignature tables;
+        tables.params = {table(), table()};
+        const StagePackResult t = pack_stage(tables, Stage::Pixel);
+        check(t.ok && t.first_sgpr == std::vector<uint32_t>({8, 9}) && t.end_sgpr == 10,
+              "graphics window: two tables are s8 and s9, one dword each (pack() gave s[0:1] and s[2:3])");
+    }
+
     // pack_stage keeps pack()'s validation.
     {
         RootSignature invalid_sig;
@@ -499,9 +587,26 @@ int main() {
         bad_param.type = static_cast<ParamType>(0xffffffffu);
         invalid_sig.params = {bad_param};
         check(!pack_stage(invalid_sig, Stage::Compute).ok, "pack_stage: invalid parameter enum rejected");
+        // Zero-value constants are accepted (the host takes them) and take no SGPRs: the next parameter starts where
+        // they would have.
         RootSignature zero;
         zero.params = {consts(0)};
-        check(!pack_stage(zero, Stage::Compute).ok, "pack_stage: zero-value constants rejected");
+        const StagePackResult lone = pack_stage(zero, Stage::Compute);
+        check(lone.ok && lone.first_sgpr.size() == 1 && lone.first_sgpr[0] == 4 && lone.end_sgpr == 4 &&
+                  lone.spill_dwords == 0,
+              "pack_stage: zero-value constants accepted");
+        zero.params = {consts(1), consts(0), table(), consts(0), consts(26)};
+        const StagePackResult mixed = pack_stage(zero, Stage::Compute);
+        check(mixed.ok && mixed.first_sgpr.size() == 5 && mixed.first_sgpr[0] == 4 && mixed.first_sgpr[1] == 5 &&
+                  mixed.first_sgpr[2] == 5 && mixed.first_sgpr[3] == 6 && mixed.first_sgpr[4] == 6 &&
+                  mixed.end_sgpr == 32 && mixed.spill_dwords == 0 && mixed.d3d12_cost == 1 + 1 + 26,
+              "pack_stage: zero-value constants between others fill compute exactly, offsets unchanged");
+        // In the compute spill array a zero-value constant takes no dwords either: the next parameter shares its offset.
+        zero.params = {consts(28), table(), consts(0), consts(1)};
+        const StagePackResult spilled = pack_stage(zero, Stage::Compute);
+        check(spilled.ok && spilled.end_sgpr == 32 &&
+                  spilled.spill_dword == std::vector<uint32_t>({kNoSpill, 0, 1, 1}) && spilled.spill_dwords == 2,
+              "pack_stage: zero-value constants in the compute spill array take no dwords");
         RootSignature costly;
         costly.params = {consts(32), consts(33)};
         const StagePackResult costly_r = pack_stage(costly, Stage::Compute);

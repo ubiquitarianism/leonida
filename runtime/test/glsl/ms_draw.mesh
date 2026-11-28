@@ -2,7 +2,8 @@
 // A mesh shader written to the translator's runtime contract (docs/design.md, "User data" and "Mesh shaders"),
 // standing in for a translated one in d3d12_mesh_test. Each workgroup emits one quad (4 vertices, 2 triangles) on a
 // 4x4 grid of clip-space cells: column = WorkgroupId.x + WorkgroupId.z, row = WorkgroupId.y, so all three
-// DispatchMesh counts reach the shader. s0, s1 (root constants) move the quad in clip space; the colour is red. The
+// DispatchMesh counts reach the shader. Push dwords 8, 9 (the root constants, which a translated mesh shader reads as
+// s16, s17 through the graphics root window) move the quad in clip space; the colour is red. The
 // corners are top-left, top-right, bottom-left, bottom-right and the triangles (0,1,2) and (2,1,3), clockwise in D3D
 // screen space as in d3d12_draw_test, so they are front-facing with the default winding.
 #extension GL_EXT_mesh_shader : require
@@ -22,7 +23,7 @@ void main() {
     SetMeshOutputsEXT(4, 2);
     const uint i = gl_LocalInvocationIndex;
     const float column = float(gl_WorkGroupID.x + gl_WorkGroupID.z), row = float(gl_WorkGroupID.y);
-    const vec2 offset = vec2(uintBitsToFloat(pc.s[0]), uintBitsToFloat(pc.s[1]));
+    const vec2 offset = vec2(uintBitsToFloat(pc.s[8]), uintBitsToFloat(pc.s[9]));
     if (i < 4) {
         const vec2 corner = vec2(float(i & 1u), float(i >> 1));
         const vec2 top_left = vec2(-1.0 + 0.5 * column, 1.0 - 0.5 * row);

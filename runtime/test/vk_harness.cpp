@@ -929,7 +929,8 @@ int main(int argc, char** argv) {
         LOADD(vkCreateSampler); LOADD(vkCreateDescriptorPool); LOADD(vkAllocateDescriptorSets);
         LOADD(vkUpdateDescriptorSets);
         leonida::DescriptorTable desc_table(16);
-        desc_table.insert(tsharp, 1);
+        // The translated modules read the entry's kind (descriptor_table.h): this T# is a sampled 2D image.
+        desc_table.insert(tsharp, 1, leonida::kind_sampled_bit(0));
         desc_table.insert(ssharp, 1);
         const auto table = desc_table.build_gpu_buffer(true);
         VkBuffer tb = VK_NULL_HANDLE;

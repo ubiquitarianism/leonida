@@ -738,6 +738,222 @@ int main(int argc, char** argv) {
             return submit() == VK_SUCCESS && ok;
         };
 
+        const float orange_pixel[4] = {1.0f, 128.0f / 255.0f, 0.0f, 1.0f};
+        const float fallback_pixels[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        // The mirror (BindlessSet::MirrorViews): a 2D-array T# read by a 2D op finds its slice 0 bound in the 2D
+        // arrays at the T#'s own index. The index spaces are per dimension and dense, so slot N of one dimension
+        // and a 2D-array image's mirror slot N coincide: the set records which image owns a mirror slot, not just
+        // that it is used.
+        {
+            // A 2D-array image of two layers (layer 0 orange, layer 1 blue) with its own 2D-array and storage views
+            // plus a 2D view of layer 0, which is what a mirror binds. The storage view puts the index in the
+            // storage range, as in the index-space checks below.
+            const auto make_layered = [&](VkImage* image, VkImageView* layers, VkImageView* layer0) {
+                VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+                ii.imageType = VK_IMAGE_TYPE_2D;
+                ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+                ii.extent = {1, 1, 1};
+                ii.mipLevels = 1;
+                ii.arrayLayers = 2;
+                ii.samples = VK_SAMPLE_COUNT_1_BIT;
+                ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+                ii.usage = sampled_usage | VK_IMAGE_USAGE_STORAGE_BIT;
+                VkResult r = vkCreateImage(dev, &ii, nullptr, image);
+                if (r) return r;
+                VkMemoryRequirements mr;
+                vkGetImageMemoryRequirements(dev, *image, &mr);
+                VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                ai.allocationSize = mr.size;
+                ai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                VkDeviceMemory m = VK_NULL_HANDLE;
+                if ((r = vkAllocateMemory(dev, &ai, nullptr, &m))) return r;
+                allocations.push_back(m);
+                if ((r = vkBindImageMemory(dev, *image, m, 0))) return r;
+                VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                vi.image = *image;
+                vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+                vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+                vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+                if ((r = vkCreateImageView(dev, &vi, nullptr, layers))) return r;
+                vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                return vkCreateImageView(dev, &vi, nullptr, layer0);
+            };
+            const auto upload_layered = [&](VkImage image) {
+                constexpr std::uint32_t blue = 0xffff0000u;   // r = 0, g = 0, b = 255, a = 255
+                std::memcpy(static_cast<char*>(upload_map) + 1028, &blue, 4);
+                VkResult r = vkResetCommandBuffer(cmd, 0);
+                if (r) return r;
+                if ((r = vkBeginCommandBuffer(cmd, &begin))) return r;
+                VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                b.image = image;
+                b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+                b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                     nullptr, 0, nullptr, 1, &b);
+                for (std::uint32_t layer = 0; layer < 2; ++layer) {
+                    VkBufferImageCopy c{};
+                    c.bufferOffset = 1024 + layer * 4;
+                    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
+                    c.imageExtent = {1, 1, 1};
+                    vkCmdCopyBufferToImage(cmd, upload, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+                }
+                b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                b.newLayout = VK_IMAGE_LAYOUT_GENERAL;   // sampled and storage
+                b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                                     nullptr, 0, nullptr, 1, &b);
+                return submit();
+            };
+            // A 3D image with a storage view: its own index space, whose slot numbers are the 2D arrays' too.
+            const auto make_volume = [&](VkImage* image, VkImageView* view) {
+                VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+                ii.imageType = VK_IMAGE_TYPE_3D;
+                ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+                ii.extent = {1, 1, 1};
+                ii.mipLevels = 1;
+                ii.arrayLayers = 1;
+                ii.samples = VK_SAMPLE_COUNT_1_BIT;
+                ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+                ii.usage = sampled_usage | VK_IMAGE_USAGE_STORAGE_BIT;
+                VkResult r = vkCreateImage(dev, &ii, nullptr, image);
+                if (r) return r;
+                VkMemoryRequirements mr;
+                vkGetImageMemoryRequirements(dev, *image, &mr);
+                VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                ai.allocationSize = mr.size;
+                ai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                VkDeviceMemory m = VK_NULL_HANDLE;
+                if ((r = vkAllocateMemory(dev, &ai, nullptr, &m))) return r;
+                allocations.push_back(m);
+                if ((r = vkBindImageMemory(dev, *image, m, 0))) return r;
+                VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                vi.image = *image;
+                vi.viewType = VK_IMAGE_VIEW_TYPE_3D;
+                vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+                vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                return vkCreateImageView(dev, &vi, nullptr, view);
+            };
+            const auto add_mirrored = [&](VkImageView layers, VkImageView layer0, std::uint32_t* index,
+                                          std::uint32_t* kind) {
+                StorageViews storage;
+                storage.as_float = layers;
+                BindlessSet::MirrorViews mirror{};
+                mirror.sampled = layer0;
+                mirror.sampled_layout = VK_IMAGE_LAYOUT_GENERAL;
+                mirror.storage.as_float = layer0;
+                *index = set.add_image(ImageDimension::dim_2d_array, layers, VK_IMAGE_LAYOUT_GENERAL, storage, 0,
+                                       &mirror, kind);
+                return *index != 0;
+            };
+            const auto draw_with = [&](const DescriptorKey& key) {
+                std::memcpy(static_cast<char*>(heap_map) + table_va, key.data(), 32);
+                return draw();
+            };
+
+            const std::uint32_t free_2d = set.free_images(ImageDimension::dim_2d);
+            const std::uint32_t free_array = set.free_images(ImageDimension::dim_2d_array);
+            VkImage layered = VK_NULL_HANDLE;
+            VkImageView layered_view = VK_NULL_HANDLE, layer0 = VK_NULL_HANDLE;
+            CHECK(make_layered(&layered, &layered_view, &layer0));
+            CHECK(upload_layered(layered));
+
+            std::uint32_t index = 0, kind = 0;
+            EXPECT(add_mirrored(layered_view, layer0, &index, &kind));
+            // The allocation is in both index spaces: the T#'s dimension and the 2D arrays (the mirror's slot).
+            EXPECT(set.free_images(ImageDimension::dim_2d) == free_2d - 1);
+            EXPECT(set.free_images(ImageDimension::dim_2d_array) == free_array - 1);
+            // The entry names the 2D-array arrays and their storage arrays, and the 2D ones the mirror is bound in.
+            EXPECT(kind == (kind_sampled_bit(1) | kind_storage_bit(1) | kind_sampled_bit(0) | kind_storage_bit(0)));
+            EXPECT(set.image_kind_at(ImageDimension::dim_2d_array, index) == kind);
+            EXPECT(set.image_kind_at(ImageDimension::dim_2d, index) ==
+                   (kind_sampled_bit(0) | kind_storage_bit(0)));
+            EXPECT(set.insert_key(tsharp, index, kind));
+            EXPECT(flush());
+            CHECK(draw());
+            compare("mirror: a 2D-array T# read by a 2D op", orange_pixel);
+            // Removing the image puts the 2D slot back to its fallback. Its entry still names 2D (the kind it had),
+            // so a 2D op reads that slot: it must hold zeros, not the removed mirror.
+            EXPECT(set.erase_key(tsharp));
+            set.remove_image(ImageDimension::dim_2d_array, index);
+            EXPECT(flush());
+            EXPECT((set.image_kind_at(ImageDimension::dim_2d_array, index) & kind_sampled_bit(0)) == 0);
+            EXPECT(set.free_images(ImageDimension::dim_2d) == free_2d);
+            EXPECT(set.free_images(ImageDimension::dim_2d_array) == free_array);
+            EXPECT(set.insert_key(tsharp, index, kind));
+            EXPECT(flush());
+            CHECK(draw());
+            compare("mirror: removed, the 2D slot holds the fallback", fallback_pixels);
+            EXPECT(set.erase_key(tsharp));
+
+            // The aliasing scenario the owner records: a 2D-array image with its mirror at slot N and a 3D image at
+            // its own index N (both index spaces are dense, so both take the lowest storage slot). Neither may claim
+            // the other's slot, and removing either must leave the other's binding alone.
+            VkImage layered2 = VK_NULL_HANDLE;
+            VkImageView layered2_view = VK_NULL_HANDLE, layer0_2 = VK_NULL_HANDLE;
+            CHECK(make_layered(&layered2, &layered2_view, &layer0_2));
+            CHECK(upload_layered(layered2));
+            std::uint32_t array_index = 0, array_kind = 0;
+            EXPECT(add_mirrored(layered2_view, layer0_2, &array_index, &array_kind));
+            VkImage volume = VK_NULL_HANDLE;
+            VkImageView volume_view = VK_NULL_HANDLE;
+            CHECK(make_volume(&volume, &volume_view));
+            StorageViews volume_storage;
+            volume_storage.as_float = volume_view;
+            const std::uint32_t volume_index = set.add_image(ImageDimension::dim_3d, volume_view,
+                                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, volume_storage);
+            EXPECT(volume_index != 0 && volume_index == array_index);   // the same slot number, two index spaces
+            const std::uint32_t volume_kind = set.image_kind_at(ImageDimension::dim_3d, volume_index);
+            // The 3D image does not own the 2D mirror: a 2D op reading its T# takes the 2D fallback.
+            EXPECT(volume_kind == (kind_sampled_bit(2) | kind_storage_bit(2)));
+            EXPECT((volume_kind & kind_sampled_bit(0)) == 0);
+            EXPECT(set.image_kind_at(ImageDimension::dim_2d_array, array_index) == array_kind);
+            DescriptorKey volume_key = tsharp;   // the same FORMAT (word 1), a different key
+            volume_key[7] ^= 0x10u;
+            EXPECT(set.insert_key(tsharp, array_index, array_kind));
+            EXPECT(set.insert_key(volume_key, volume_index, volume_kind));
+            EXPECT(flush());
+            CHECK(draw_with(volume_key));
+            compare("alias: a 3D T# at another image's mirror slot", fallback_pixels);
+            CHECK(draw_with(tsharp));
+            compare("alias: the mirror, with the 3D image at the same slot", orange_pixel);
+            // Removing the 3D image must not take the 2D-array image's mirror with it.
+            EXPECT(set.erase_key(volume_key));
+            set.remove_image(ImageDimension::dim_3d, volume_index);
+            EXPECT(flush());
+            EXPECT(set.image_kind_at(ImageDimension::dim_2d_array, array_index) == array_kind);
+            CHECK(draw_with(tsharp));
+            compare("alias: the mirror survives the 3D image's removal", orange_pixel);
+            // And removing the 2D-array image frees the 2D slot: a 3D image at that slot number names no mirror.
+            const std::uint32_t volume_again = set.add_image(ImageDimension::dim_3d, volume_view,
+                                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, volume_storage);
+            EXPECT(volume_again == volume_index);
+            EXPECT(set.insert_key(volume_key, volume_again, set.image_kind_at(ImageDimension::dim_3d, volume_again)));
+            EXPECT(set.erase_key(tsharp));
+            set.remove_image(ImageDimension::dim_2d_array, array_index);
+            EXPECT(flush());
+            EXPECT((set.image_kind_at(ImageDimension::dim_3d, volume_again) & kind_sampled_bit(0)) == 0);
+            EXPECT(set.free_images(ImageDimension::dim_2d) == free_2d);
+            CHECK(draw_with(volume_key));
+            compare("alias: no mirror once the 2D-array image is gone", fallback_pixels);
+            EXPECT(set.erase_key(volume_key));
+            set.remove_image(ImageDimension::dim_3d, volume_again);
+            EXPECT(flush());
+            // The steps below expect tsharp at the heap's T# again.
+            std::memcpy(static_cast<char*>(heap_map) + table_va, tsharp.data(), 32);
+            vkDestroyImageView(dev, volume_view, nullptr);
+            vkDestroyImage(dev, volume, nullptr);
+            for (const VkImageView view : {layered_view, layer0, layered2_view, layer0_2})
+                vkDestroyImageView(dev, view, nullptr);
+            vkDestroyImage(dev, layered, nullptr);
+            vkDestroyImage(dev, layered2, nullptr);
+        }
+
         // Index spaces. An image with storage views gets an index the storage arrays hold; one without goes above
         // them where the dimension has room. A dimension that is full gives 0, and removed indices come back.
         StorageViews as_storage;
@@ -751,7 +967,14 @@ int main(int argc, char** argv) {
         std::vector<std::uint32_t> filled;
         for (std::uint32_t i = 1; i < set.image_capacity(ImageDimension::dim_1d); ++i)
             filled.push_back(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL));
-        EXPECT(filled.front() == 1 && filled.back() == set.image_capacity(ImageDimension::dim_1d) - 1);
+        // Images without storage views take the indices above the storage arrays first, then the ones below: every
+        // index but the fallback's, once each.
+        std::vector<std::uint32_t> sorted = filled;
+        std::sort(sorted.begin(), sorted.end());
+        EXPECT(sorted.front() == 1 && sorted.back() == set.image_capacity(ImageDimension::dim_1d) - 1 &&
+               std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end());
+        const std::uint32_t storage_end = set.storage_capacity(ImageDimension::dim_1d);
+        EXPECT(filled.front() == (storage_end < set.image_capacity(ImageDimension::dim_1d) ? storage_end : 1u));
         EXPECT(set.free_images(ImageDimension::dim_1d) == 0);
         EXPECT(set.add_image(ImageDimension::dim_1d, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL) == 0);
         set.remove_image(ImageDimension::dim_1d, 7);
@@ -762,6 +985,61 @@ int main(int argc, char** argv) {
         const std::uint32_t decoy_sampler = set.add_sampler(nearest);
         const std::uint32_t sampler_index = set.add_sampler(nearest);
         EXPECT(decoy_sampler == 1 && sampler_index == 2 && set.free_samplers() == set.sampler_capacity() - 3);
+
+        // The T#'s own type is the truth. This shader samples in 2D; the 3D image's index is 1 in the 3D arrays,
+        // and index 1 of the 2D arrays is `stored_view` (its own image, a red texel). The entry says the index is
+        // bound in the 3D arrays only, so the 2D read must use the 2D array's fallback and read zeros - not
+        // `stored_view`, which is what indexing the instruction's array with the other dimension's index would do.
+        {
+            EXPECT(stored_index == 1);
+            VkImage volume = VK_NULL_HANDLE;
+            VkImageView volume_view = VK_NULL_HANDLE;
+            {
+                const VkImageUsageFlags usage =
+                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+                VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+                ii.imageType = VK_IMAGE_TYPE_3D;
+                ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+                ii.extent = {2, 2, 2};
+                ii.mipLevels = 1;
+                ii.arrayLayers = 1;
+                ii.samples = VK_SAMPLE_COUNT_1_BIT;
+                ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+                ii.usage = usage;
+                CHECK(vkCreateImage(dev, &ii, nullptr, &volume));
+                VkMemoryRequirements mr;
+                vkGetImageMemoryRequirements(dev, volume, &mr);
+                VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                ai.allocationSize = mr.size;
+                ai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                VkDeviceMemory memory = VK_NULL_HANDLE;
+                CHECK(vkAllocateMemory(dev, &ai, nullptr, &memory));
+                allocations.push_back(memory);
+                CHECK(vkBindImageMemory(dev, volume, memory, 0));
+                VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                vi.image = volume;
+                vi.viewType = VK_IMAGE_VIEW_TYPE_3D;
+                vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+                vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                CHECK(vkCreateImageView(dev, &vi, nullptr, &volume_view));
+            }
+            // A storage view puts it in the low index region, so its index is 1: the same slot number as
+            // `stored_view` in the 2D arrays, which a dimension-blind read would pick up.
+            StorageViews volume_storage;
+            volume_storage.as_float = volume_view;
+            const std::uint32_t volume_index = set.add_image(ImageDimension::dim_3d, volume_view,
+                                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, volume_storage);
+            EXPECT(volume_index == stored_index);       // the same slot number, a different index space
+            EXPECT(set.insert_key(tsharp, volume_index, ImageDimension::dim_3d));
+            EXPECT(flush());
+            EXPECT(draw() == VK_SUCCESS);
+            const float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            compare("a 3D T# read by a 2D op", zeros);
+            EXPECT(set.erase_key(tsharp));
+            set.remove_image(ImageDimension::dim_3d, volume_index);
+            vkDestroyImageView(dev, volume_view, nullptr);
+            vkDestroyImage(dev, volume, nullptr);
+        }
 
         if (atomic_mode) {
             // ps_imgatomic.asm: image_atomic_umax/umin/or on three 8x8 r32ui images and umax on a 4x4x4 one, from
@@ -815,7 +1093,8 @@ int main(int argc, char** argv) {
                 indices[k] = set.add_image(k == 3 ? ImageDimension::dim_3d : ImageDimension::dim_2d, views[k],
                                            VK_IMAGE_LAYOUT_GENERAL, storage);
                 EXPECT(indices[k] != 0);
-                EXPECT(set.insert_key(keys[k], indices[k]));
+                EXPECT(set.insert_key(keys[k], indices[k],
+                                      k == 3 ? ImageDimension::dim_3d : ImageDimension::dim_2d));
             }
             EXPECT(flush());
 
@@ -963,9 +1242,10 @@ int main(int argc, char** argv) {
                 const auto target = (slots - 4 + i % kDescriptorProbes) & (slots - 1);
                 while ((hash_descriptor_key(key) & (slots - 1)) != target) ++key[7];
             }
-            for (std::uint32_t i = 0; i < kDescriptorProbes; ++i) set.insert_key(keys[i], decoy_index);
+            for (std::uint32_t i = 0; i < kDescriptorProbes; ++i)
+                set.insert_key(keys[i], decoy_index, ImageDimension::dim_2d);
             EXPECT(!set.flush_replaces_table() && flush());
-            EXPECT(set.insert_key(keys.back(), gradient_index));
+            EXPECT(set.insert_key(keys.back(), gradient_index, ImageDimension::dim_2d));
             EXPECT(slot_count() == slots && set.flush_replaces_table());
             EXPECT(flush() && !set.flush_replaces_table());
             for (const auto& key : keys) {
@@ -979,12 +1259,13 @@ int main(int argc, char** argv) {
         std::uint32_t ahead = 0;
         for (std::uint32_t k = 1; ahead < 3; ++k) {
             if ((hash_descriptor_key(numbered(k)) & (slots - 1)) != home) continue;
-            set.insert_key(numbered(k), decoy_index);
+            set.insert_key(numbered(k), decoy_index, ImageDimension::dim_2d);
             ++ahead;
         }
-        set.insert_key(tsharp, gradient_index);
+        set.insert_key(tsharp, gradient_index, ImageDimension::dim_2d);
         set.insert_key(make_ssharp_key(ssharp.data()), sampler_index);
-        for (std::uint32_t k = 100000; k < 100006; ++k) set.insert_key(numbered(k), decoy_index);
+        for (std::uint32_t k = 100000; k < 100006; ++k)
+            set.insert_key(numbered(k), decoy_index, ImageDimension::dim_2d);
         const std::uint32_t depth = probe_depth(table.build_gpu_buffer(), tsharp);
         EXPECT(slot_count() == slots && depth == 3 && !set.flush_replaces_table());
         EXPECT(flush());
@@ -1000,9 +1281,10 @@ int main(int argc, char** argv) {
         compare("2 miss", zeros);
 
         // 3. The table grows: a new, larger buffer behind binding 2.
-        set.insert_key(tsharp, gradient_index);
+        set.insert_key(tsharp, gradient_index, ImageDimension::dim_2d);
         EXPECT(!set.flush_replaces_table());  // one more entry, in place
-        for (std::uint32_t k = 200000; k < 200200; ++k) set.insert_key(numbered(k), decoy_index);
+        for (std::uint32_t k = 200000; k < 200200; ++k)
+            set.insert_key(numbered(k), decoy_index, ImageDimension::dim_2d);
         EXPECT(slot_count() > slots && table.lookup(tsharp) == gradient_index && set.flush_replaces_table());
         const VkDescriptorSet before_growth = set.set();
         const std::uint64_t made_before = set.generations_made();
@@ -1020,12 +1302,13 @@ int main(int argc, char** argv) {
         const float orange_colour[4] = {1.0f, 128.0f / 255.0f, 0.0f, 1.0f};
         // Rewriting the same mapping is a no-op. Changing it makes a new generation even with no table growth.
         const std::uint32_t grown_slots = slot_count();
-        EXPECT(set.insert_key(tsharp, gradient_index) && !set.flush_replaces_table());
-        EXPECT(set.insert_key(tsharp, decoy_index) && slot_count() == grown_slots && set.flush_replaces_table());
+        EXPECT(set.insert_key(tsharp, gradient_index, ImageDimension::dim_2d) && !set.flush_replaces_table());
+        EXPECT(set.insert_key(tsharp, decoy_index, ImageDimension::dim_2d) && slot_count() == grown_slots &&
+               set.flush_replaces_table());
         EXPECT(flush() && !set.flush_replaces_table());
         CHECK(draw());
         compare("4 rebound", orange_colour);
-        EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_replaces_table());
+        EXPECT(set.insert_key(tsharp, gradient_index, ImageDimension::dim_2d) && set.flush_replaces_table());
         EXPECT(flush());
         CHECK(draw());
         compare("5 restored", nullptr);
@@ -1033,7 +1316,7 @@ int main(int argc, char** argv) {
         // A submit that never reached the queue must keep the table upload pending: the retry has to see the new
         // mapping instead of the fallback or the old index (a recovered submit failure, the case a device reports
         // through table_upload_result(false)).
-        EXPECT(set.insert_key(tsharp, decoy_index) && set.flush_replaces_table());
+        EXPECT(set.insert_key(tsharp, decoy_index, ImageDimension::dim_2d) && set.flush_replaces_table());
         vkResetCommandBuffer(cmd, 0);
         CHECK(vkBeginCommandBuffer(cmd, &begin));
         EXPECT(set.flush(cmd, 1));  // recorded in a command buffer that is never submitted
@@ -1043,7 +1326,7 @@ int main(int argc, char** argv) {
         EXPECT(flush());
         CHECK(draw());
         compare("6 rebound after a failed submit", orange_colour);
-        EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_replaces_table());
+        EXPECT(set.insert_key(tsharp, gradient_index, ImageDimension::dim_2d) && set.flush_replaces_table());
         EXPECT(flush());
 
         // Another view at the same index, then removal of the index.
@@ -1066,7 +1349,7 @@ int main(int argc, char** argv) {
             far_image = set.add_image(ImageDimension::dim_2d, gradient_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             for (std::uint32_t i = 0; i < 2100; ++i) far_sampler = set.add_sampler(nearest);
             EXPECT(far_image > 5000 && far_sampler > 2100);
-            set.insert_key(tsharp, far_image);
+            set.insert_key(tsharp, far_image, ImageDimension::dim_2d);
             set.insert_key(make_ssharp_key(ssharp.data()), far_sampler);
             EXPECT(flush());
             CHECK(draw());
@@ -1087,7 +1370,7 @@ int main(int argc, char** argv) {
             const float blue[4] = {0, 0, 128.0f / 255.0f, 1};  // stored image uses the first gradient texel
             compare("11 reused high slot", blue);
 
-            EXPECT(set.insert_key(tsharp, neighbour));
+            EXPECT(set.insert_key(tsharp, neighbour, ImageDimension::dim_2d));
             EXPECT(flush());
             CHECK(draw());
             compare("12 live neighbour", orange_colour);

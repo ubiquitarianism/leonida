@@ -381,6 +381,10 @@ int main() {
           "XDisplayAcquireTimeoutDeferral rejects null out pointer");
     check(at<AcquireDeferral>(launcher, 4)(launcher, &deferral) == S_OK && deferral != nullptr,
           "XDisplayAcquireTimeoutDeferral acquires a display power request handle");
+    void* second = nullptr;
+    check(at<AcquireDeferral>(launcher, 4)(launcher, &second) == S_OK && second && second != deferral,
+          "concurrent display deferrals have distinct handles");
+    at<CloseDeferral>(launcher, 5)(launcher, second);
     at<CloseDeferral>(launcher, 5)(launcher, deferral);
     at<CloseDeferral>(launcher, 5)(launcher, nullptr);
     check(true, "XDisplayCloseTimeoutDeferralHandle closes handle and ignores null");

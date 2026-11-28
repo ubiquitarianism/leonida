@@ -10,6 +10,7 @@
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
 #include "test_temp_dir.h"
+#include "d3d12_test_shaders.h"
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
@@ -42,7 +43,6 @@ using XboxComputePipelineFn = HRESULT(WINAPI*)(void* device, const D3D12_COMPUTE
                                                std::uint64_t, const IID*, void**);
 // Device slot 67 as amd_fidelityfx_upscaler_xbox.dll calls it: (desc, riid, out).
 using XboxNativeComputePipelineFn = HRESULT(WINAPI*)(void* device, const void*, const IID*, void**);
-using SerializeFn = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
 
 template<class T>
 struct Ref {
@@ -103,19 +103,9 @@ std::vector<std::uint8_t> shader_container(const std::vector<std::uint8_t>& fssm
     return out;
 }
 
+// The shared helper: Windows 10's in-box d3d12.dll refuses the heap-directly-indexed flags at every version.
 std::vector<std::uint8_t> serialize(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc) {
-    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    const auto fn = d3d12 ? reinterpret_cast<SerializeFn>(
-                                reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12SerializeVersionedRootSignature")))
-                          : nullptr;
-    std::vector<std::uint8_t> out;
-    ID3DBlob* blob = nullptr;
-    if (fn && SUCCEEDED(fn(&desc, &blob, nullptr)) && blob) {
-        const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
-        out.assign(p, p + blob->GetBufferSize());
-        blob->Release();
-    }
-    return out;
+    return d3d12test::serialize_root_signature(desc);
 }
 
 D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes, D3D12_RESOURCE_FLAGS flags) {
@@ -495,6 +485,14 @@ int main() {
                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                             IID_PPV_ARGS(&inside.p))));
             EXPECT(inside->GetGPUVirtualAddress() + (1u << 20) <= capped_arena);
+            // The existing buffer and the reserved range prevent a contiguous arena-sized allocation.
+            // A valid default buffer can still use a dedicated allocation and report a usable relative VA.
+            const auto no_slice = buffer_desc(capped_arena, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            Ref<ID3D12Resource> dedicated;
+            EXPECT(SUCCEEDED(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &no_slice,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&dedicated.p))));
+            EXPECT(dedicated->GetGPUVirtualAddress() >= capped_arena);
             EXPECT(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &too_large, D3D12_RESOURCE_STATE_COMMON,
                                                   nullptr, IID_PPV_ARGS(&past.p)) == E_OUTOFMEMORY && !past.p);
             std::printf("arena: %llu MiB (device limits: maxBufferSize %llu MiB, maxMemoryAllocationSize %llu MiB); "
@@ -588,15 +586,53 @@ int main() {
             list->SetDescriptorHeaps(2, both);
             list->SetComputeRootDescriptorTable(2, {gpu + 32});
             list->Dispatch(1, 1, 1);
+            Ref<ID3D12CommandAllocator> bundle_allocator;
+            Ref<ID3D12GraphicsCommandList> bundle;
+            EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle_allocator.p))));
+            EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.p, nullptr,
+                                                       IID_PPV_ARGS(&bundle.p))));
+            bundle->Dispatch(1, 1, 1);
+            EXPECT(SUCCEEDED(bundle->Close()));
+            list->ExecuteBundle(bundle.p);
             list->SetDescriptorHeaps(1, &heap.p);
             list->ExecuteIndirect(signature.p, 1, out_a.p, 0, nullptr, 0);
+            list->SetDescriptorHeaps(1, &sampler.p);
+            list->ExecuteIndirect(signature.p, 1, out_a.p, 0, nullptr, 0);
+            // 27 constants starting at s4 leave room for one heap. At 28, s31 is explicit too.
+            for (UINT count : {27u, 28u}) {
+                auto constants_param = params[0];
+                constants_param.Constants.Num32BitValues = count;
+                auto full_desc = direct_desc;
+                full_desc.Desc_1_0.NumParameters = 1;
+                full_desc.Desc_1_0.pParameters = &constants_param;
+                const auto blob = serialize(full_desc);
+                Ref<ID3D12RootSignature> full;
+                EXPECT(SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&full.p))));
+                pipeline_desc.pRootSignature = full.p;
+                Ref<ID3D12PipelineState> full_pso;
+                EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&full_pso.p))));
+                list->SetPipelineState(full_pso.p);
+                list->SetComputeRootSignature(full.p);
+                list->SetComputeRoot32BitConstant(0, 123, count - 1);
+                list->SetDescriptorHeaps(2, both);
+                list->Dispatch(1, 1, 1);
+            }
             EXPECT(SUCCEEDED(list->Close()));
             std::vector<leonida::Command> commands;
-            EXPECT(rt::d3d12::recorded_commands(list.p, commands) && commands.size() == 2);
+            EXPECT(rt::d3d12::recorded_commands(list.p, commands) && commands.size() == 6);
             const auto& before = std::get<leonida::Dispatch>(commands[0]).user_data;
-            const auto& after = std::get<leonida::ExecuteIndirect>(commands[1]).user_data;
-            EXPECT(before[8] == gpu + 32 && before[9] == gpu && before[10] == smp);
-            EXPECT(after[8] == gpu + 32 && after[9] == gpu && after[10] == 0);
+            const auto& after = std::get<leonida::ExecuteIndirect>(commands[2]).user_data;
+            char setting[2]{};
+            const bool enabled = GetEnvironmentVariableA("LEONIDA_COMPUTE_DIRECT_HEAPS", setting, 2) != 1 ||
+                                 setting[0] != '0';
+            EXPECT(before[8] == gpu + 32 && before[9] == (enabled ? gpu : 0) && before[10] == (enabled ? smp : 0));
+            EXPECT(after[8] == gpu + 32 && after[9] == (enabled ? gpu : 0) && after[10] == 0);
+            EXPECT(std::get<leonida::Dispatch>(commands[1]).user_data == before);
+            const auto& sampler_only = std::get<leonida::ExecuteIndirect>(commands[3]).user_data;
+            EXPECT(sampler_only[9] == 0 && sampler_only[10] == (enabled ? smp : 0));
+            const auto& one_slot = std::get<leonida::Dispatch>(commands[4]).user_data;
+            EXPECT(one_slot[30] == 123 && one_slot[31] == (enabled ? gpu : 0));
+            EXPECT(std::get<leonida::Dispatch>(commands[5]).user_data[31] == 123);
             EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
             // The shader follows the V# at the heap index in s4. Slot 1 and the unrelated explicit table are null.
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -635,10 +671,11 @@ int main() {
             const auto* values = static_cast<const UINT*>(results);
             for (UINT i = 0; i < elements; ++i) {
                 EXPECT(values[i] == 0);
-                EXPECT(values[elements + i] == table_values[i % 4]);
+                EXPECT(values[elements + i] == (enabled ? table_values[i % 4] : 0));
             }
             readback->Unmap(0, nullptr);
-            std::puts("directly indexed compute heap: 64 buffer reads and 64 null controls matched");
+            std::puts(enabled ? "directly indexed compute heap: 64 buffer reads and 64 null controls matched"
+                              : "directly indexed compute heap disabled: 128 zero controls matched");
             EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
         }
 

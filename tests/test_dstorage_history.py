@@ -85,6 +85,58 @@ class RuntimeHistoryTest(unittest.TestCase):
             self.assertEqual(bc7["historyEndpointConfirmedBits"][255][field], 0)
             self.assertLessEqual(abs(bc7["historyEndpoints"][255][field] - 128), 4)
 
+    def test_packed_tail_fits_against_decoded_bcpack_sibling(self):
+        # Mip 0 is zlib, mip 1 a self-contained BCPack stream and the packed tail (mips 2-4) starts its
+        # chains at history entry 255, whose alpha no raw or zlib sibling of the tail can show.
+        solid = bytes([0x40]) + bytes(15)
+        secret = (0, 0, 0, 128) * 6
+        tail = _encode_bc7_mode6_tiled(solid * 256, secret_entry=255, secret_ep=secret, ref_count=255)
+        with tempfile.TemporaryDirectory() as name:
+            pool = Path(name)/"bcpack-parent.ttpf"
+            record = _pack_etpf(128, 128, 4, 1, 98, 4096)
+            _write_custom_rds5_pool(pool, [record], [(7, 4096, tail), (7, 4096, _encode_bc7_mode6_tiled(solid * 256)),
+                                                     (8, 16384, zlib.compress(solid * 1024))])
+            fits = {6: history.calib.Bc6hCalibrator(), 7: history.calib.Bc7Calibrator()}
+            history.calib.calibrate_from_pools([str(pool)], fits)
+            docs = {history.calib.CODEC_KEYS[c]: f.build_document()[0] for c, f in fits.items()}
+            history.extend_missing(docs, history.fit_slices([pool]))
+            bcpack = history.calib.bcpack
+            with self.assertRaises(bcpack.BcpackProvisionalError):
+                bcpack.decode(tail, 7, 4096, allow_provisional=True, history=docs)
+            history.fit_decoded_neighbors([pool], docs)
+        bc7 = docs["bc7"]
+        for field in (3, 7):
+            self.assertGreaterEqual(bc7["historyEndpointBits"][255][field], 4)
+            self.assertEqual(bc7["historyEndpointConfirmedBits"][255][field], 0)
+            self.assertLessEqual(abs(bc7["historyEndpoints"][255][field] - 128), 4)
+        self.assertEqual(bcpack.decode(tail, 7, 4096, allow_provisional=True, history=docs), solid * 256)
+
+    def test_packed_tail_fits_against_its_own_refused_stream(self):
+        # One BCPack stream holds the packed tail (blocks 0-255) and mip 1 (blocks 256-511). Chains from history
+        # entry 255 stay inside the tail, so the stream is refused and no fit reaches the entry, but mip 1 is
+        # determined and is the reference.
+        solid = bytes([0x40]) + bytes(15)
+        secret = (0, 0, 0, 128) * 6
+        stream = _encode_bc7_mode6_tiled(solid * 512, secret_entry=255, secret_ep=secret, ref_count=200)
+        with tempfile.TemporaryDirectory() as name:
+            pool = Path(name)/"one-stream.ttpf"
+            record = _pack_etpf(128, 128, 4, 1, 98, 4096)
+            _write_custom_rds5_pool(pool, [record], [(7, 8192, stream), (8, 16384, zlib.compress(solid * 1024))])
+            fits = {6: history.calib.Bc6hCalibrator(), 7: history.calib.Bc7Calibrator()}
+            history.calib.calibrate_from_pools([str(pool)], fits)
+            docs = {history.calib.CODEC_KEYS[c]: f.build_document()[0] for c, f in fits.items()}
+            history.extend_missing(docs, history.fit_slices([pool]))
+            bcpack = history.calib.bcpack
+            with self.assertRaises(bcpack.BcpackProvisionalError):
+                bcpack.decode(stream, 7, 8192, allow_provisional=True, history=docs)
+            history.fit_decoded_neighbors([pool], docs)
+        bc7 = docs["bc7"]
+        for field in (3, 7):
+            self.assertGreaterEqual(bc7["historyEndpointBits"][255][field], 4)
+            self.assertEqual(bc7["historyEndpointConfirmedBits"][255][field], 0)
+            self.assertLessEqual(abs(bc7["historyEndpoints"][255][field] - 128), 4)
+        self.assertEqual(bcpack.decode(stream, 7, 8192, allow_provisional=True, history=docs), solid * 512)
+
     def test_build_resume_and_repair(self):
         trainer = os.environ.get("LEONIDA_TEST_BCPACK_TRAINER")
         if not trainer and not shutil.which("cl" if os.name == "nt" else "c++"):

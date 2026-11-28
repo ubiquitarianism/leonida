@@ -79,11 +79,19 @@ public:
                 // an aliasing barrier and reinitialization. The API promises data inheritance only for
                 // identical descriptions and optimized clears. Keep that matching backing alive even
                 // when another shape is also registered at this address.
+                // A range's end is the PC allocation's size, which can run past the title's own footprint (on
+                // RADV a large D16 target is sized above the block the title placed it in, and the title's next
+                // block starts inside it). A placement that starts inside another range therefore shares nothing
+                // with it: between two opaque layouts it gets a backing of its own, since D3D12 leaves an alias's
+                // contents undefined until it is reinitialized. Only a non-opaque layout is refused there.
                 const auto limit = ranges_.lower_bound(end);
                 for (auto it = ranges_.begin(); it != limit; ++it) {
                     const auto& range = it->second;
                     if (range.end <= address) continue;
-                    if (it->first != address) return E_NOTIMPL;
+                    if (it->first != address) {
+                        if (!opaque_layout || !range.opaque_layout) return E_NOTIMPL;
+                        continue;
+                    }
                     const bool same_shape = compatible(desc, range.desc);
                     if (range.end == end && same_shape && range.optimized == optimized) {
                         if (auto live = range.backing.lock()) owner = std::move(live);

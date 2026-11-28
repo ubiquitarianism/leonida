@@ -243,15 +243,93 @@ bool flush_descriptors(ID3D12Device* device) {
     return rt::d3d12::last_execute_result(queue.Get()) == leonida::ReplayResult::success;
 }
 
-bool rejects_partial_clear(ID3D12Device* device, ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE view) {
+bool check_partial_clear(ID3D12Device* device, ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE whole,
+                         D3D12_CPU_DESCRIPTOR_HANDLE partial, const D3D12_RESOURCE_DESC& shape,
+                         UINT mip, UINT first, UINT writable) {
+    ComPtr<ID3D12CommandQueue> queue;
+    const D3D12_COMMAND_QUEUE_DESC qdesc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&queue))));
+    ComPtr<ID3D12Fence> fence;
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))));
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))));
     EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
                                                IID_PPV_ARGS(&list))));
-    const UINT colors[4] = {42, 0, 0, 0};
-    list->ClearUnorderedAccessViewUint({}, view, resource, colors, 0, nullptr);
-    return list->Close() == E_INVALIDARG;
+    const UINT clear_value[4] = {42, 0, 0, 0};
+    ID3D12CommandList* lists[] = {list.Get()};
+    if (shape.Format == DXGI_FORMAT_R32_TYPELESS) {
+        // The view is UINT and the backing is SFLOAT. 3D clear format reinterpretation is still unsupported.
+        list->ClearUnorderedAccessViewUint({}, partial, resource, clear_value, 0, nullptr);
+        EXPECT(SUCCEEDED(list->Close()));
+        queue->ExecuteCommandLists(1, lists);
+        return rt::d3d12::last_execute_result(queue.Get()) == leonida::ReplayResult::unsupported;
+    }
+    const UINT w = std::max(1u, UINT(shape.Width) >> mip);
+    const UINT h = std::max(1u, shape.Height >> mip);
+    const UINT d = std::max(1u, UINT(shape.DepthOrArraySize) >> mip);
+    const UINT pitch = (w * 4 + 255) / 256 * 256;
+    const UINT64 total = UINT64(pitch) * h * d;
+    D3D12_HEAP_PROPERTIES rb_heap{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC rb_desc{};
+    rb_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rb_desc.Width = total;
+    rb_desc.Height = rb_desc.DepthOrArraySize = rb_desc.MipLevels = 1;
+    rb_desc.SampleDesc.Count = 1;
+    rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> readback;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&rb_heap, D3D12_HEAP_FLAG_NONE, &rb_desc,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&readback))));
+    // A known, nonzero sentinel makes loss of a neighboring slice observable even on a newly allocated image.
+    constexpr UINT sentinel = std::bit_cast<UINT>(1.0f);
+    const UINT seed[4] = {sentinel, 0, 0, 0};
+    list->ClearUnorderedAccessViewUint({}, whole, resource, seed, 0, nullptr);
+    D3D12_RESOURCE_BARRIER order{};
+    order.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    order.UAV.pResource = resource;
+    list->ResourceBarrier(1, &order);
+    const bool floating = shape.Format == DXGI_FORMAT_R32_FLOAT;
+    if (floating) {
+        const FLOAT float_value[4] = {42.0f, 0, 0, 0};
+        list->ClearUnorderedAccessViewFloat({}, partial, resource, float_value, 0, nullptr);
+    } else {
+        list->ClearUnorderedAccessViewUint({}, partial, resource, clear_value, 0, nullptr);
+    }
+    D3D12_RESOURCE_BARRIER to_src{};
+    to_src.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_src.Transition = {resource, mip, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    list->ResourceBarrier(1, &to_src);
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = readback.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = {0, {shape.Format, w, h, d, pitch}};
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = resource;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = mip;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    D3D12_RESOURCE_BARRIER to_uav = to_src;
+    std::swap(to_uav.Transition.StateBefore, to_uav.Transition.StateAfter);
+    list->ResourceBarrier(1, &to_uav);
+    EXPECT(list->Close() == S_OK);
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(queue.Get()) == leonida::ReplayResult::success);
+    EXPECT(SUCCEEDED(queue->Signal(fence.Get(), 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+    void* mapped = nullptr;
+    EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+    const auto* bytes = static_cast<const std::uint8_t*>(mapped);
+    const UINT cleared = floating ? std::bit_cast<UINT>(42.0f) : clear_value[0];
+    for (UINT z = 0; z < d; ++z) {
+        const UINT want = (z >= first && z < first + writable) ? cleared : sentinel;
+        for (UINT y = 0; y < h; ++y) {
+            const auto* row = reinterpret_cast<const UINT*>(bytes + (UINT64(z) * h + y) * pitch);
+            for (UINT x = 0; x < w; ++x)
+                EXPECT(row[x] == want);
+        }
+    }
+    readback->Unmap(0, nullptr);
+    return true;
 }
 
 bool check_case(ID3D12Device* device, Compute* compute, Kind kind, const D3D12_RESOURCE_DESC& shape,
@@ -282,7 +360,14 @@ bool check_case(ID3D12Device* device, Compute* compute, Kind kind, const D3D12_R
            (decoded.first_layer == first && decoded.layer_count == writable));
     device->CopyDescriptorsSimple(1, copy, source, uav_heap);
     EXPECT(read_slot(copy) == key);
-    if (partial) EXPECT(rejects_partial_clear(device, resource.Get(), copy));
+    if (partial) {
+        // Reuse the original slot for the whole-mip seed; the copied descriptor must still select its W range.
+        auto whole = desc;
+        whole.Texture3D.FirstWSlice = 0;
+        whole.Texture3D.WSize = ~0u;
+        device->CreateUnorderedAccessView(resource.Get(), nullptr, &whole, source);
+        EXPECT(check_partial_clear(device, resource.Get(), source, copy, shape, mip, first, writable));
+    }
     if (partial && first > 0) {
         // A second view of the same volume and mip must not collide with the copied T#.
         auto other = desc;

@@ -341,7 +341,7 @@ def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
     elif _is_int(raw_base):
         base = raw_base
     else:
-        raise SkinError("vertex buffer gfx_off must be an integer")
+        raise SkinError("vertex buffer offset is not an integer")
     if base < 0 or base > len(blob):
         raise SkinError("vertex buffer offset is outside its buffer")
 
@@ -372,7 +372,7 @@ def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
 
     vertex_count = mesh.get("vertex_count", model.get("vertex_count"))
     if not _is_int(vertex_count) or vertex_count <= 0:
-        raise SkinError("mesh has no positive vertex_count")
+        raise SkinError("mesh has no positive integer vertex_count")
 
     rows = {}
     for slot in (6, 7, 8, 9):

@@ -4,6 +4,8 @@ spirv_mini_interp.run_workgroup.
 RDNA2 ISA, SOP1:
   - s_bitreplicate_b64_b32: D[2i+1] = D[2i] = S0[i], i in 0..31; SCC is not written. Into VCC, lane L's bit is S0 bit
     L // 2.
+    Of a 32-bit lane-mask source (exec_lo/exec_hi, vcc_lo/vcc_hi) into scalar data, S0 is that half of the wave's
+    mask, read as data (Gen.wave_mask), then replicated as any scalar.
   - s_flbit_i32_b64: the zeros above the first 1 from bit 63, -1 when S0 is 0. Of EXEC that is 63 minus the wave's
     last active lane.
 Synthetic programs only.
@@ -59,6 +61,36 @@ class LaneMaskBitreplicateFlbit(unittest.TestCase):
                                           f"v_mov_b32_e32 v21, {OUT_AT}", "buffer_store_dword v20, v21, s[0:3], 0 offen",
                                           "s_endpgm"])
                 self.assertEqual(mem[OUT_AT], flbit_model((1 << n) - 1))
+
+    def bitreplicate_of(self, setup, src):
+        mem = run(lane_index() + setup + [f"s_bitreplicate_b64_b32 s[10:11], {src}", "s_mov_b64 exec, -1",
+                                          "v_cmpx_eq_u32_e32 0, v1", "v_mov_b32_e32 v20, s10",
+                                          "v_mov_b32_e32 v22, s11", f"v_mov_b32_e32 v21, {OUT_AT}",
+                                          "buffer_store_dword v20, v21, s[0:3], 0 offen",
+                                          "buffer_store_dword v22, v21, s[0:3], 0 offen offset:4", "s_endpgm"])
+        return mem[OUT_AT] | mem[OUT_AT + 4] << 32
+
+    def test_bitreplicate_of_exec_half_into_data(self):
+        # Every lane that runs the instruction reads the same 32 mask bits; each becomes two bits of s[10:11].
+        for mask in (h.ALL64, 0x00000000FFFFFFFF, 0xFFFFFFFF00000000, 0x8000000180000001, 0x0F0F0F0F12345678):
+            for half, src in ((0, "exec_lo"), (1, "exec_hi")):
+                with self.subTest(exec=hex(mask), src=src):
+                    word = (mask >> (32 * half)) & 0xFFFFFFFF
+                    got = self.bitreplicate_of([f"s_mov_b32 exec_lo, {mask & 0xFFFFFFFF:#x}",
+                                                f"s_mov_b32 exec_hi, {mask >> 32:#x}"], src)
+                    self.assertEqual(got, bitreplicate_model(word))
+
+    def test_bitreplicate_of_a_compare_into_data(self):
+        # VCC from a compare: lanes l < n. Its low and high halves replicated as data.
+        for n in (0, 1, 17, 32, 45, 64):
+            for half, src in ((0, "vcc_lo"), (1, "vcc_hi")):
+                with self.subTest(n=n, src=src):
+                    got = self.bitreplicate_of([f"v_cmp_gt_u32_e32 vcc, {n}, v1"], src)
+                    self.assertEqual(got, bitreplicate_model((((1 << n) - 1) >> (32 * half)) & 0xFFFFFFFF))
+
+
+def bitreplicate_model(word):
+    return sum(3 << (2 * i) for i in range(32) if (word >> i) & 1)
 
 
 if __name__ == "__main__":

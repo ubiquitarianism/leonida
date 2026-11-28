@@ -22,14 +22,17 @@ import json
 import os
 import struct
 import sys
+import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing sibling helpers.
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
+from file_mode import published_mode  # noqa: E402
 import gamedata_index as gi  # noqa: E402
 import gamedata_maps as gm  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 HEADER_BYTES = 40
@@ -480,12 +483,11 @@ class _BinFolderSource:
             if not os.path.isfile(full):
                 continue
             sz = os.path.getsize(full)
-            try:
-                off = int(os.path.splitext(name)[0], 16)
-            except ValueError:
-                other_rows.append((name, sz))
+            stem = os.path.splitext(name)[0]
+            if stem and all(c in "0123456789abcdefABCDEF" for c in stem):
+                hex_rows.append((int(stem, 16), name, sz))
             else:
-                hex_rows.append((off, name, sz))
+                other_rows.append((name, sz))
         hex_rows.sort(key=lambda item: (item[0], item[1]))
         next_off = (hex_rows[-1][0] + 0x10000) if hex_rows else 0
         self.rows = [{"off": off, "stored": sz, "size": sz, "_name": name} for off, name, sz in hex_rows]
@@ -534,6 +536,10 @@ def load_qtable_payload(target: str) -> tuple[bytes, dict]:
 
 def check_report_path(out_path: str, target: str, rows: list[dict] | None = None) -> None:
     """Refuse a --json destination that is a directory or collides with any input."""
+    if not out_path.strip():
+        raise UsageError("--json path must not be empty")
+    if out_path.endswith(("/", "\\")) or (os.sep and out_path.endswith(os.sep)):
+        raise UsageError(f"--json is a directory path: {out_path}")
     if os.path.isdir(out_path):
         raise UsageError(f"--json is a directory: {out_path}")
     if os.path.isdir(target):
@@ -589,6 +595,36 @@ def _print_summary(report: dict) -> None:
         )
 
 
+def _write_json_atomic(path: str, payload: dict) -> None:
+    dest = os.path.realpath(path)
+    parent = os.path.dirname(dest) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".tmp-", suffix=".json")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f, indent=1)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, published_mode(dest))
+        replace_retry(tmp, dest)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="carved script directory, script.rpf archive, or joined .bin file")
@@ -600,7 +636,7 @@ def main(argv=None) -> int:
     try:
         root_h = _parse_hex_u32(a.root_hash) if a.root_hash is not None else None
         type_h = _parse_hex_u32(a.type_hash) if a.type_hash is not None else None
-        if a.json:
+        if a.json is not None:
             rows = gm._read_index_rows(a.target) if os.path.isdir(a.target) and os.path.isfile(os.path.join(a.target, "index.json")) else None
             check_report_path(a.json, a.target, rows=rows)
         blob, meta = load_qtable_payload(a.target)
@@ -621,11 +657,9 @@ def main(argv=None) -> int:
     out = {"location": meta, **report}
     _print_summary(out)
 
-    if a.json:
+    if a.json is not None:
         try:
-            gm._make_parent(a.json)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(out, f, indent=1)
+            _write_json_atomic(a.json, out)
         except OSError as e:
             print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2

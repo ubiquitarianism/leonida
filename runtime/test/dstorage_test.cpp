@@ -18,7 +18,10 @@
 #include <span>
 #include "../src/bcpack.h"
 #include "../src/bcpack_stream.h"
+#include "../src/dstorage_hold.h"
+#include "../src/title_geometry_watch.h"
 #include "../src/title_page_watch.h"
+#include "xmem.h"
 #include "dstorage_xs_abi.h"
 #include "dstorage_staging.h"
 #include "file_system.h"
@@ -232,6 +235,29 @@ void test_staging_budget() {
     check(entered, "waiting publisher wakes when exclusive buffers are released");
     StagingPool::Lease reclaimed(pool);
     check(reclaimed.try_pair(limit), "pool is entirely reusable after the last publisher");
+    check(!reclaimed.try_pair(1), "a held lease refuses duplicate try_pair without leaking helper count");
+    reclaimed.acquire(0);  // releases prior try_pair cleanly
+    check(reclaimed.try_pair(limit), "acquire(0) released prior reservation back to pool");
+    reclaimed.acquire(limit / 2);  // re-acquire replaces prior reservation without leaking used_
+    {
+        StagingPool::Lease companion(pool);
+        check(companion.try_pair(limit / 2), "re-acquired lease kept exact remaining pool budget");
+    }
+    reclaimed.release();
+    check(reclaimed.try_pair(limit), "explicit release returns full pool budget");
+
+    // Overflow-safe staging_bytes saturation for huge page-backed or combined transform sizes.
+    DSTORAGE_REQUEST big_pages{};
+    big_pages.Options.AsUINT64 = options::kSourceMemory | options::kSourcePages;
+    big_pages.SourceSize = UINT32_MAX;
+    big_pages.SourcePageOffset = 65535;
+    check(staging_bytes(big_pages) > big_pages.SourceSize, "large page-backed source does not wrap");
+
+    DSTORAGE_REQUEST big_pair{};
+    big_pair.Options.AsUINT64 = options::kZlib;
+    big_pair.SourceSize = UINT32_MAX;
+    big_pair.DestinationSize = UINT32_MAX;
+    check(staging_bytes(big_pair) == uint64_t(UINT32_MAX) * 2, "large transform sum stays in 64-bit range");
 }
 
 void test_layout_and_options() {
@@ -1356,6 +1382,106 @@ leonida::bcpack::Calibration test_profile() {
     return history;
 }
 
+// Requests whose destination the runtime's own guards keep read-only, written from the queue's worker threads (each
+// through kernel_writes: src/title_page_watch.h):
+//   1. a geometry tile the geometry watch armed (src/title_geometry_watch.h), with the D3D12 layer's opener as far as
+//      that watch goes: a file read, a memory copy and a decompressed (BCPack) publish into it all succeed, and the
+//      tile counts as written (its GPU copy is refilled);
+//   2. an xmem physical page (the stream pool's CPU view) left read-only with no guard to reopen it, with
+//      rt::xmem::reopen_unowned as the unguarder (as gta6rt sets it): the same three requests succeed.
+void test_guarded_destinations(Env& env) {
+    namespace gw = leonida::geometry_writes;
+    namespace kw = leonida::kernel_writes;
+    auto* file = open(env, L"game:/data/b.bin");
+    auto* files = make_queue(env, 0x80, false);
+    auto* memory = make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+    auto* status = make_status(env, 3);
+    const std::vector<uint8_t> source = pattern(4096, 21);
+    const auto& packed = vectors[0];
+    // Each request into `at` (file range, memory copy, BCPack), each of the three after `guard` made the pages
+    // read-only again; the bytes are checked after each.
+    const auto run = [&](uint8_t* at, const std::function<void()>& guard, const char* where) {
+        guard();
+        auto read = file_request(file, 300, at, 4096);
+        files->EnqueueRequest(&read);
+        files->EnqueueStatus(status, 0);
+        files->Submit();
+        check(wait_complete(status, 0), where);
+        check_hr(status->GetHResult(0), S_OK, where);
+        check(std::memcmp(at, env.b.data() + 300, 4096) == 0, where);
+        guard();
+        DSTORAGE_REQUEST copy{};
+        copy.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+        copy.Source = source.data();
+        copy.Destination = at + 0x1000;
+        copy.SourceSize = copy.DestinationSize = 4096;
+        memory->EnqueueRequest(&copy);
+        memory->EnqueueStatus(status, 1);
+        memory->Submit();
+        check(wait_complete(status, 1), where);
+        check_hr(status->GetHResult(1), S_OK, where);
+        check(std::memcmp(at + 0x1000, source.data(), 4096) == 0, where);
+        guard();
+        DSTORAGE_REQUEST bc{};
+        bc.Options.AsUINT64 = options::kSourceMemory | (packed.codec << options::kBcpackShift);
+        bc.Source = packed.raw.data();
+        bc.SourceSize = static_cast<uint32_t>(packed.raw.size());
+        bc.Destination = at + 0x2000;
+        bc.DestinationSize = static_cast<uint32_t>(packed.plain.size());
+        memory->EnqueueRequest(&bc);
+        memory->EnqueueStatus(status, 2);
+        memory->Submit();
+        check(wait_complete(status, 2), where);
+        check_hr(status->GetHResult(2), S_OK, where);
+        check(std::equal(packed.plain.begin(), packed.plain.end(), at + 0x2000), where);
+    };
+
+    // 1. A geometry tile.
+    auto* tile = static_cast<uint8_t*>(VirtualAlloc(nullptr, gw::tile_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    check(tile != nullptr && packed.plain.size() <= gw::tile_size - 0x2000, "a geometry tile for the destinations");
+    if (tile) {
+        const auto va = reinterpret_cast<uintptr_t>(tile);
+        gw::Cell* cell = gw::acquire(va);
+        kw::set_opener([](uintptr_t from, uintptr_t to) { gw::notify(from, to, gw::Event::open); });
+        const auto version = cell->version.load();
+        run(tile, [&] { gw::arm(va, *cell); }, "a request into an armed geometry tile");
+        check(cell->version.load() != version, "the geometry tile counts as written");
+        kw::set_opener(nullptr);
+        gw::release(va);
+        VirtualFree(tile, 0, MEM_RELEASE);
+    }
+
+    // 2. An xmem physical page read-only with no guard to answer for it.
+    using Reserve = void*(WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
+    using Allocate = BOOL(WINAPI*)(uint64_t, uint64_t*, uint64_t*);
+    using Free = BOOL(WINAPI*)(uint64_t, const uint64_t*);
+    using Map = void*(WINAPI*)(void*, uint64_t, const uint64_t*);
+    const auto reserve = reinterpret_cast<Reserve>(rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    const auto allocate = reinterpret_cast<Allocate>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    const auto free_pages = reinterpret_cast<Free>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    const auto map = reinterpret_cast<Map>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    auto* window = reserve ? static_cast<uint8_t*>(reserve(nullptr, 0x10000, MEM_RESERVE | 0x20400000, 0x23,
+                                                           PAGE_READWRITE)) : nullptr;
+    uint64_t page = 0, count = 1;
+    check(window && allocate && allocate(0x280, &count, &page) && map && map(window, 1, &page) == window,
+          "an xmem physical page for the destinations");
+    if (window && count == 1) {
+        for (size_t i = 0; i < 0x10000; i += 0x1000) window[i] = 0;  // committed
+        kw::set_unguarder(&rt::xmem::reopen_unowned);
+        run(window, [&] {
+            DWORD old = 0;
+            VirtualProtect(window, 0x10000, PAGE_READONLY, &old);
+        }, "a request into an xmem page left read-only");
+        kw::set_unguarder(nullptr);
+        map(window, 1, nullptr);
+        free_pages(1, &page);
+    }
+    status->Release();
+    memory->Release();
+    files->Release();
+    file->Release();
+}
+
 void test_extended(Env& env) {
     auto* q = make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
     auto* status = make_status(env, 1);
@@ -1421,6 +1547,24 @@ void test_extended(Env& env) {
             check(leonida::bcpack::decode(codec, raw, result, false, &history) == leonida::bcpack::Quality::failed &&
                   leonida::bcpack::decode(codec, raw, result, true, &history) == leonida::bcpack::Quality::fitted,
                   "partially confirmed BPTC profile requires fitted mode");
+            // A history entry the profile does not know (no bits at all): every block whose predictor chain starts
+            // there is lost. The reference limit (1 in 1,024, at least 2) refuses the request; a lower divisor
+            // rebuilds it and reports how many blocks were approximated. Strict mode still refuses it.
+            auto unknown = history;
+            if (codec == 6) unknown.bc6[255].ep_class = 0;
+            else unknown.bc7[255].ep_bits.fill(0);
+            const char* why = nullptr;
+            leonida::bcpack::Report report;
+            check(leonida::bcpack::decode(codec, raw, result, true, &unknown, &why) == leonida::bcpack::Quality::failed &&
+                      why && std::string(why) == "missing-endpoint",
+                  "an unknown BPTC predictor past the reference limit fails as missing-endpoint");
+            check(leonida::bcpack::decode(codec, raw, result, true, &unknown, &why, true, 1, &report) ==
+                          leonida::bcpack::Quality::fitted &&
+                      report.blocks == result.size() / 16 && report.lost > 2 && report.lost <= report.blocks,
+                  "a lower lost-block divisor rebuilds the request and reports the approximated blocks");
+            check(leonida::bcpack::decode(codec, raw, result, false, &unknown, &why, true, 1, &report) ==
+                      leonida::bcpack::Quality::failed,
+                  "strict decoding still refuses an unknown BPTC predictor");
         }
     }
     std::vector<uint8_t> fitted(512);
@@ -1511,6 +1655,259 @@ void test_extended(Env& env) {
     q->Release();
 }
 
+// A queue half full submits itself, but a read into physical pages and everything behind it wait for Submit: the
+// title may fill the page list right before its own Submit. Until then the list names no page (the read would
+// fail) or the page its slot named before (the data would land in a page that belongs to something else). The two
+// cases of Marvisak/VIctory eddde73, then the ways a hold ends without Submit.
+void test_page_reads_wait_for_submit(Env& env) {
+    const auto alloc = reinterpret_cast<BOOL(WINAPI*)(uint64_t,uint64_t*,uint64_t*)>(
+        rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages"));
+    const auto reserve = reinterpret_cast<void*(WINAPI*)(void*,SIZE_T,DWORD,uint64_t,DWORD)>(
+        rt::shims::find("xmem.dll", "XMemVirtualAlloc"));
+    const auto map = reinterpret_cast<void*(WINAPI*)(void*,uint64_t,const uint64_t*)>(
+        rt::shims::find("xmem.dll", "XMemMapPhysicalPages"));
+    const auto free_pages = reinterpret_cast<BOOL(WINAPI*)(uint64_t,const uint64_t*)>(
+        rt::shims::find("xmem.dll", "XMemFreePhysicalPages"));
+    uint64_t pages[2]{}, count = 2;
+    constexpr size_t page = 65536, bytes = 4096;
+    auto* window = static_cast<uint8_t*>(reserve(nullptr, 2*page, MEM_RESERVE | 0x20400000, 0x21, PAGE_READWRITE));
+    const bool allocated = window && alloc(0x280, &count, pages);
+    const bool mapped = allocated && map(window, 2, pages) == window;
+    check(mapped, "two physical pages mapped for the held reads");
+    if (!mapped) {
+        if (allocated) free_pages(count, pages);
+        if (window) VirtualFree(window, 0, MEM_RELEASE);
+        return;
+    }
+    auto& h = leonida::dstorage::hold_stats();
+    const auto plain = pattern(bytes, 9);
+    const auto into_pages = [&](ULONG_PTR* list) {
+        DSTORAGE_REQUEST r{};
+        r.Options.AsUINT64 = options::kSourceMemory | options::kDestinationPages;
+        r.DestinationPageArray = list;
+        r.DestinationPageOffset = 0;
+        r.Source = plain.data();
+        r.SourceSize = r.DestinationSize = static_cast<uint32_t>(bytes);
+        return r;
+    };
+    const auto into_buffer = [&](uint8_t* out) {
+        DSTORAGE_REQUEST r{};
+        r.Options.AsUINT64 = options::kSourceMemory;
+        r.Destination = out;
+        r.Source = plain.data();
+        r.SourceSize = r.DestinationSize = 16;
+        return r;
+    };
+    const auto zero = [&](const uint8_t* at, size_t n) { return std::all_of(at, at + n, [](uint8_t b) { return b == 0; }); };
+    const auto holds_plain = [&](const uint8_t* at, size_t n) { return std::memcmp(at, plain.data(), n) == 0; };
+    const auto errors = [&] {
+        DSTORAGE_STATS stats{};
+        env.factory->GetStats(&stats);
+        return stats.ErrorCount;
+    };
+    constexpr int kHalf = 0x40;  // of a capacity of 0x80
+    std::vector<uint8_t> outs(kHalf * 16);
+    const auto reset = [&] {
+        std::memset(window, 0, 2*page);
+        std::fill(outs.begin(), outs.end(), uint8_t{0});
+    };
+
+    // The list still names the slot's previous page when the queue submits itself, the right one by Submit.
+    {
+        reset();
+        auto* q = make_queue(env, 0x80, true, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+        auto* status = make_status(env, 1);
+        const uint64_t self = h.self_submits.load(), held = h.held_reads.load(), failed = errors();
+        ULONG_PTR list[] = {static_cast<ULONG_PTR>(pages[0])};
+        DSTORAGE_REQUEST r = into_buffer(outs.data());
+        q->EnqueueRequest(&r);
+        r = into_pages(list);
+        q->EnqueueRequest(&r);
+        for (int i = 2; i < kHalf; ++i) {
+            r = into_buffer(outs.data() + i * 16);
+            q->EnqueueRequest(&r);  // the last one makes half the capacity
+        }
+        check(wait_until([&] { return holds_plain(outs.data(), 16); }),
+              "the entry ahead of a read into pages starts when the queue submits itself");
+        Sleep(50);  // time for an early read to land in the old page
+        check(zero(window, bytes), "a self-submit does not write the page the list named before the title's Submit");
+        check(zero(outs.data() + 2 * 16, 16), "entries behind a held read keep their place");
+        check(h.self_submits.load() == self + 1 && h.held_reads.load() == held + 1,
+              "one self-submit and one held read are counted");
+        DSTORAGE_QUEUE_INFO info{};
+        q->Query(&info);
+        check(info.EmptySlotCount == 0x7f - (kHalf - 1),
+              "held entries still take their slots");
+        list[0] = static_cast<ULONG_PTR>(pages[1]);  // the title fills its page table, then submits
+        q->EnqueueStatus(status, 0);
+        check_hr(status->GetHResult(0), E_PENDING, "a status behind a held read is pending");
+        q->Submit();
+        check(wait_complete(status, 0), "the held entries run at Submit");
+        check_hr(status->GetHResult(0), S_OK, "a read held for Submit succeeds");
+        check(holds_plain(window + page, bytes), "the read lands in the page its list names at Submit");
+        check(zero(window, bytes), "the page the list named before stays untouched");
+        bool all = true;
+        for (int i = 2; i < kHalf; ++i) all = all && holds_plain(outs.data() + i * 16, 16);
+        check(all, "every entry behind the held read ran");
+        check(errors() == failed, "no entry failed");
+        status->Release();
+        q->Release();
+    }
+
+    // The list is still empty when the queue submits itself: no failure, the read waits.
+    {
+        reset();
+        auto* q = make_queue(env, 0x80, true, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+        auto* status = make_status(env, 1);
+        const uint64_t page0 = h.page0_entries.load(), failed = errors();
+        ULONG_PTR list[] = {0};
+        DSTORAGE_REQUEST r = into_pages(list);
+        q->EnqueueRequest(&r);
+        for (int i = 1; i < kHalf; ++i) {
+            r = into_buffer(outs.data() + i * 16);
+            q->EnqueueRequest(&r);
+        }
+        Sleep(50);
+        check(h.page0_entries.load() == page0 && errors() == failed, "an empty page list is not read before Submit");
+        list[0] = static_cast<ULONG_PTR>(pages[0]);
+        q->EnqueueStatus(status, 0);
+        q->Submit();
+        check(wait_complete(status, 0), "the read with a late page list completes");
+        check_hr(status->GetHResult(0), S_OK, "a page list filled before Submit is written");
+        check(holds_plain(window, bytes) && errors() == failed, "its bytes are in the page");
+        status->Release();
+        q->Release();
+    }
+
+    // A full queue: the title waits in an enqueue and cannot call Submit, so the held entries go.
+    {
+        reset();
+        auto* q = make_queue(env, 0x80, true, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+        auto* status = make_status(env, 1);
+        const uint64_t full = h.full_releases.load();
+        ULONG_PTR list[] = {static_cast<ULONG_PTR>(pages[1])};
+        constexpr int kMany = 200;
+        std::vector<uint8_t> sink(kMany * 16);
+        std::atomic<bool> done{false};
+        std::thread producer([&] {
+            DSTORAGE_REQUEST r = into_pages(list);
+            q->EnqueueRequest(&r);
+            for (int i = 0; i < kMany; ++i) {
+                r = into_buffer(sink.data() + i * 16);
+                q->EnqueueRequest(&r);
+            }
+            q->EnqueueStatus(status, 0);
+            done.store(true);
+        });
+        check(wait_until([&] { return done.load(); }), "a full queue with held entries does not wait for Submit");
+        producer.join();
+        check(h.full_releases.load() == full + 1, "the full queue's release is counted");
+        q->Submit();
+        check(wait_complete(status, 0), "the full queue's entries complete");
+        check_hr(status->GetHResult(0), S_OK, "they succeed");
+        bool all = holds_plain(window + page, bytes);
+        for (int i = 0; i < kMany; ++i) all = all && holds_plain(sink.data() + i * 16, 16);
+        check(all, "every entry of the full queue has its bytes");
+        status->Release();
+        q->Release();
+    }
+
+    // A hold has a time limit: held entries go after LEONIDA_DSTORAGE_HOLD_MS without Submit, 2000 ms unless set.
+    for (const wchar_t* limit : {static_cast<const wchar_t*>(nullptr), L"200"}) {
+        reset();
+        SetEnvironmentVariableW(L"LEONIDA_DSTORAGE_HOLD_MS", limit);
+        auto* q = make_queue(env, 0x80, true, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+        SetEnvironmentVariableW(L"LEONIDA_DSTORAGE_HOLD_MS", nullptr);
+        const uint64_t timed = h.timed_releases.load();
+        ULONG_PTR list[] = {static_cast<ULONG_PTR>(pages[0])};
+        const auto begin = std::chrono::steady_clock::now();
+        DSTORAGE_REQUEST r = into_pages(list);
+        q->EnqueueRequest(&r);
+        for (int i = 1; i < kHalf; ++i) {
+            r = into_buffer(outs.data() + i * 16);
+            q->EnqueueRequest(&r);
+        }
+        check(zero(window, bytes), "a hold with a time limit starts as a hold");
+        if (!limit) {
+            Sleep(1000);
+            check(zero(window, bytes), "the default limit is not over after a second");
+        }
+        check(wait_until([&] { return holds_plain(window, bytes); }),
+              limit ? "LEONIDA_DSTORAGE_HOLD_MS ends a hold" : "a hold ends by itself without the variable");
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - begin).count();
+        check(waited >= (limit ? 150 : 1900) && waited < (limit ? 2000 : 6000),
+              limit ? "after about the 200 ms asked for" : "after about the default 2000 ms");
+        check(h.timed_releases.load() == timed + 1, "the timed release is counted");
+        q->Release();
+    }
+
+    // LEONIDA_DSTORAGE_HOLD_MS=0: no time limit, the entries wait for Submit.
+    {
+        reset();
+        SetEnvironmentVariableW(L"LEONIDA_DSTORAGE_HOLD_MS", L"0");
+        auto* q = make_queue(env, 0x80, true, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+        SetEnvironmentVariableW(L"LEONIDA_DSTORAGE_HOLD_MS", nullptr);
+        auto* status = make_status(env, 1);
+        const uint64_t timed = h.timed_releases.load();
+        ULONG_PTR list[] = {static_cast<ULONG_PTR>(pages[0])};
+        DSTORAGE_REQUEST r = into_pages(list);
+        q->EnqueueRequest(&r);
+        for (int i = 1; i < kHalf; ++i) {
+            r = into_buffer(outs.data() + i * 16);
+            q->EnqueueRequest(&r);
+        }
+        Sleep(2300);  // past the default limit
+        check(zero(window, bytes) && h.timed_releases.load() == timed, "with 0 a hold outlasts the default limit");
+        q->EnqueueStatus(status, 0);
+        q->Submit();
+        check(wait_complete(status, 0) && holds_plain(window, bytes), "and ends at Submit");
+        status->Release();
+        q->Release();
+    }
+
+    // LEONIDA_DSTORAGE_HOLD_PAGES=0: the self-submit takes everything, as before.
+    {
+        reset();
+        SetEnvironmentVariableW(L"LEONIDA_DSTORAGE_HOLD_PAGES", L"0");
+        auto* q = make_queue(env, 0x80, true, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+        SetEnvironmentVariableW(L"LEONIDA_DSTORAGE_HOLD_PAGES", nullptr);
+        const uint64_t held = h.held_reads.load();
+        ULONG_PTR list[] = {static_cast<ULONG_PTR>(pages[1])};
+        DSTORAGE_REQUEST r = into_pages(list);
+        q->EnqueueRequest(&r);
+        for (int i = 1; i < kHalf; ++i) {
+            r = into_buffer(outs.data() + i * 16);
+            q->EnqueueRequest(&r);
+        }
+        check(wait_until([&] { return holds_plain(window + page, bytes); }),
+              "LEONIDA_DSTORAGE_HOLD_PAGES=0 submits a read into pages with the rest");
+        check(h.held_reads.load() == held, "and holds nothing");
+        q->Release();
+    }
+
+    // A list that names page 0 when its data is written fails the entry and is counted.
+    {
+        auto* q = make_queue(env, 0x80, false, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
+        auto* status = make_status(env, 1);
+        const uint64_t page0 = h.page0_entries.load();
+        ULONG_PTR list[] = {0};
+        DSTORAGE_REQUEST r = into_pages(list);
+        q->EnqueueRequest(&r);
+        q->EnqueueStatus(status, 0);
+        q->Submit();
+        check(wait_complete(status, 0), "the read with an empty page list completes");
+        check_hr(status->GetHResult(0), E_INVALIDARG, "a page list naming page 0 at Submit fails its entry");
+        check(h.page0_entries.load() == page0 + 1, "the entry with page 0 in its list is counted");
+        status->Release();
+        q->Release();
+    }
+
+    map(window, 2, nullptr);
+    free_pages(count, pages);
+    VirtualFree(window, 0, MEM_RELEASE);
+}
+
 }  // namespace
 
 int main() {
@@ -1566,6 +1963,8 @@ int main() {
     test_stats_timing(env);
     test_stats(env);
     test_extended(env);
+    test_page_reads_wait_for_submit(env);
+    test_guarded_destinations(env);
     test_zlib(env);  // after test_stats, whose request totals it would change
 
     fs::remove_all(env.root, ec);

@@ -1,6 +1,7 @@
 // Slot-133 aliases share GPU contents and retain individual COM identities.
 #pragma once
 #include "d3d12_copy_compare.h"
+#include "../shims/d3d12_xs_device.h"
 
 namespace placeddepthtest {
 
@@ -33,6 +34,19 @@ inline bool check_alias_lifetime(ID3D12Device* device, ID3D12Device* xbox, bool 
                            const D3D12_CLEAR_VALUE* clear = nullptr) {
         return create(xbox, va, &shape, UINT_MAX, clear, IID_PPV_ARGS(&result.p));
     };
+    if (opaque) {
+        auto packed = xbox_desc;
+        packed.Format = static_cast<DXGI_FORMAT>(118);
+        packed.Width = 1280;
+        packed.Height = 720;
+        Ptr<ID3D12Resource> target;
+        // The image is privately backed; reserve a full placement for its title VA.
+        Pages packed_pages{VirtualAlloc(nullptr, 8u << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)};
+        const auto packed_va = reinterpret_cast<UINT64>(packed_pages.ptr);
+        if (!packed_va || FAILED(place(packed_va, packed, target)) ||
+            target->GetGPUVirtualAddress() != packed_va) return false;
+        target.reset();
+    }
     Ptr<ID3D12Resource> first, alias, next, invalid;
     if (FAILED(place(address, xbox_desc, first)) || FAILED(place(address, xbox_desc, alias)) ||
         FAILED(place(address + allocation.SizeInBytes, xbox_desc, next))) return false;
@@ -54,8 +68,28 @@ inline bool check_alias_lifetime(ID3D12Device* device, ID3D12Device* xbox, bool 
     optimized.DepthStencil = {1.0f, 0};
     if (place(address, xbox_desc, invalid, &optimized) != E_NOTIMPL || invalid.p) return false;
     if ((!opaque && (place(address, smaller, invalid) != E_NOTIMPL || invalid.p)) ||
-        place(address + allocation.Alignment, xbox_desc, invalid) != E_NOTIMPL || invalid.p ||
         place(address + 1, xbox_desc, invalid) != E_INVALIDARG || invalid.p) return false;
+    // A placement that starts inside another one's PC allocation: the title's own blocks can be smaller than the
+    // PC sizes them (a D16 target on RADV), so the next block starts inside the range. Opaque layouts get a backing
+    // of their own there; a layout whose bytes would have to be shared is still refused.
+    if (!opaque) {
+        if (place(address + allocation.Alignment, xbox_desc, invalid) != E_NOTIMPL || invalid.p) return false;
+    } else {
+        Ptr<ID3D12Resource> inside;
+        if (FAILED(place(address + allocation.Alignment, xbox_desc, inside)) ||
+            inside->GetGPUVirtualAddress() != address + allocation.Alignment ||
+            rt::d3d12_xs::texture_backing(inside.p) == rt::d3d12_xs::texture_backing(first.p)) {
+            std::fprintf(stderr, "slot-133 alias: a placement inside another range was refused or shared\n");
+            return false;
+        }
+        // Placing the first shape again still finds its own backing, with the inner range registered.
+        Ptr<ID3D12Resource> again;
+        if (FAILED(place(address, xbox_desc, again)) ||
+            rt::d3d12_xs::texture_backing(again.p) != rt::d3d12_xs::texture_backing(first.p)) {
+            std::fprintf(stderr, "slot-133 alias: the outer range lost its backing to the inner one\n");
+            return false;
+        }
+    }
 
     Ptr<ID3D12DescriptorHeap> heap;
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2};

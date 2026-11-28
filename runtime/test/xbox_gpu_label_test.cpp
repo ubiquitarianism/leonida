@@ -34,6 +34,10 @@ using Create = HRESULT(WINAPI *)(void *, const void *, ID3D12CommandAllocator *,
 using Label = void(WINAPI *)(void *, std::uintptr_t, std::uint64_t, std::uint32_t, std::uint32_t);
 int main() {
     _putenv_s("LEONIDA_GPU_LABELS", "1");
+    // First the label path alone: these lists are not tracked by the list values, which own slots 71 to 74 of the
+    // lists they track (the last section). The real list is submitted straight to the queue below.
+    xs::set_list_values_enabled(false);
+    xs::reset_list_value_stats();
     vktest::Device gpu;
     auto status = gpu.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;
@@ -105,7 +109,43 @@ int main() {
         CHECK(t0 > 0 && t1 >= t0);
         CHECK(*retired == 7);
     }
-    CHECK(gpu.validation_errors() == 0);
+    CHECK(xs::list_value_stats().labels_handed == 5 && xs::list_value_stats().writes_recorded == 0);
     std::puts("GPU completion values, two real timestamp samples, resubmission and stale allocation guard passed");
+
+    // With LEONIDA_GPU_LABELS=1 and the list values on (their default), a tracked list's slot 71/72 writes have one
+    // owner: the list values land each exactly once, and nothing goes to the label path, which would store the same
+    // address again from its own completion and clock.
+    xs::set_list_values_enabled(true);
+    xs::reset_list_value_stats();
+    {
+        Ref<ID3D12CommandQueue> proxy_queue;
+        CHECK(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&proxy_queue.p))));
+        Ref<ID3D12GraphicsCommandList> tracked;
+        CHECK(SUCCEEDED(reinterpret_cast<Create>(slot(device.p, 73))(device.p, desc, allocator.p, nullptr,
+                                                                     &__uuidof(ID3D12GraphicsCommandList),
+                                                                     reinterpret_cast<void **>(&tracked.p))));
+        CHECK(xs::is_list_proxy(tracked.p));
+        const auto put32 = reinterpret_cast<Label>(slot(tracked.p, 71)),
+                   put64 = reinterpret_cast<Label>(slot(tracked.p, 72));
+        InterlockedExchange64(values + 4, 0);
+        InterlockedExchange64(values + 5, 0);
+        put32(tracked.p, base + 32, 41, 0, 0);
+        put64(tracked.p, base + 40, 0x300000004ull, 0, 0);
+        CHECK(SUCCEEDED(tracked->Close()));
+        auto stats = xs::list_value_stats();
+        CHECK(stats.labels_handed == 0 && stats.writes_recorded == 2);
+        ID3D12CommandList *submitted[1] = {tracked.p};
+        proxy_queue->ExecuteCommandLists(1, submitted);
+        Ref<ID3D12Fence> done;
+        CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done.p))));
+        CHECK(SUCCEEDED(proxy_queue->Signal(done.p, 1)) && SUCCEEDED(done->SetEventOnCompletion(1, nullptr)));
+        CHECK(xs::list_values_idle(4000));
+        stats = xs::list_value_stats();
+        CHECK(stats.labels_handed == 0 && stats.writes_landed == 2 && stats.writes_failed == 0);
+        CHECK(InterlockedCompareExchange64(values + 4, 0, 0) == 41 &&
+              InterlockedCompareExchange64(values + 5, 0, 0) == 0x300000004ll);
+    }
+    CHECK(gpu.validation_errors() == 0);
+    std::puts("with GPU labels and list values both on, slot 71/72 writes landed once, through the list values");
     return 0;
 }

@@ -1,0 +1,33 @@
+GPU:        AMD Radeon(TM) Graphics, Ryzen 5 7600X integrated (RDNA2 / gfx1036, Raphael, PCI 1002:164e),
+            subgroup 32..64
+Driver:     AMD proprietary 26.11.2 (AMD proprietary shader compiler), driver version 32.0.21045.29003,
+            Vulkan 1.4.315
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; default 64)
+OS:         Windows 11, 10.0.26200.9974
+Commit:     d0da7dade8b688f2e0f7f23f4155d6cbb438809e (main, 2026-11-24)
+Tools:      llvm-mc 21.1.8 (AMDGPU only, built by scripts/build_llvm_mc.ps1), SPIRV-Tools v2026.4
+            (Vulkan SDK 1.4.363.0), CMake 4.4.4, Visual Studio 17 2022 generator,
+            MSVC 19.44.35230, Python 3.13.17
+run_gpu_tests.py: 258 shaders: 258 translated, 258 pass spirv-val
+            native:                 224/249 passed, 23 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  224/249 passed, 23 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (native and emulated alike): "r32 sint (sint view): 64 bad,
+            texel(5,3) = 2071". The fixtures' expectation, not the translator: the review on #98 measured on
+            native gfx1036 that a resident image_load ... tfe keeps the seeded status VGPR, which main's
+            translator already does (SHADER-1266 released in #14; same two failures in Raphael-610M.txt, the
+            same silicon under RADV).
+Skipped:    23. The 16 documented "run by d3d12_*_test / w64_graphics.py" cases (as in RX9070.txt), plus 7 for
+            what this device lacks:
+            - ms_clip, ms_f16_pack, ms_tri, ms_w64x_ballot, ms_wave_info_s3: no VK_EXT_mesh_shader;
+              ms_v5_workgroup: mesh shading unavailable;
+            - ps_w64x_readlane: this device cannot require a 64-wide fragment subgroup.
+Notes:
+- This is gfx1036 under AMD's Windows compiler; Raphael-610M.txt is the same gfx1036 under RADV on Linux.
+  Both fail only the two tfe fixtures.
+- Built with cmake -S runtime -B runtime/build -DLLVM_MC=<llvm-mc.exe> (default Visual Studio 17 2022
+  generator, VULKAN_SDK set, the SDK's Bin on PATH) and cmake --build runtime/build --config RelWithDebInfo.
+- The same machine has an RX 9070 (RX9070.txt); LEONIDA_VK_DEVICE="Radeon(TM) Graphics" selected the iGPU,
+  and the suite printed "device: AMD Radeon(TM) Graphics".
+- No implicit Vulkan layer beyond the SDK's.
+- build.py and check.py were not run on their own; the counts here come from run_gpu_tests.py, which builds and
+  translates the same fixtures.

@@ -136,6 +136,15 @@ program whose kind 0 is too short for word 4 keeps the code heuristic.
     SGPRs (`s[0:1]`, `s4`..`s15`), `M0`, `VCC`, `EXEC` (including inactive lanes across 64 threads) and `SCC` (both 0
     and 1) unchanged, and execution resumes cleanly at `+36` bytes. So they are hardware no-ops on RDNA2.
   - `tools/fspx_unpack.py` disassembles from the end of the prologue.
+  - **A 24-byte variant**: some programs of the pipeline library in `shaders.rpf` (`tools/shader_library.py`) carry
+    only the first two of those words, at words 0 and 3, and their code starts at word 6 (`s_inst_prefetch` in all of
+    them). `code_range` takes that form only when both words are literal-bearing VOP3 opcode-0x180 words of the shape
+    `tools/fspx_prologue_probe.py` checks (second dword `& 0xFFFE0100 == 0x03FE0100`); a program whose words 0, 3 and
+    6 are all prologue words keeps the 36-byte form. Counted on the 1.0.2.1 library with an opcode-only check (#583):
+    50 of 2,684 programs; read from word 0 they never decode (the prologue words are invalid encodings and the rest
+    desyncs), and with the 24-byte start all 50 disassemble with 0 invalid words and 49 translate and pass
+    `spirv-val` (the other stops at `s_sethalt`). `tests/test_fspx_unpack.py` (`test_short_prologue`) covers the form
+    and the stricter check.
 - **Target.** The programs use `v_dot4_i32_i8` (1,458 times) and `v_dot4c_i32_i8` (25,813 times), which fits the
   provider's name (`FSR4_Int8`). `llvm-mc` (LLVM 23.1.5) decodes them for `gfx1011`, `gfx1012`, `gfx1030`, `gfx1031`,
   `gfx1033`, `gfx1034` and `gfx1036`, but not for `gfx1010`, `gfx1013` (the target `shader_disasm.py` uses for the
@@ -148,11 +157,23 @@ program whose kind 0 is too short for word 4 keeps the code heuristic.
   - Measured on RDNA2 hardware (gfx1036, through `tools/hw_oracle`, the instruction given as two raw words): with
     `op_sel` 2 and `op_sel_hi` 5 the result is the dot product with the two 16-bit halves of the second source
     exchanged, in all 5 operand sets (4 of them give another word under the plain rule). So `op_sel` selects halves
-    here as it does for the packed 16-bit ops. On a gap in LLVM’s listing, the translator decodes this exact
-    unclamped, unnegated form from the original bytes, including its source registers and literal. Other
-    undecodable words retain the reachable-code check. LLVM can also print the default high-half selector for
-    an inline integer second source. If that selector is the only changed bit, the translator preserves the
-    stored low-half replication. The hardware measurements are in `tests/semantic/test_alu_dot4_i8.py`.
+    here as it does for the packed 16-bit ops. The words are in `tests/semantic/test_alu_dot4_i8.py`.
+  - `tools/shader_disasm.py` (so `fspx_unpack.py --disasm` and `make_game.py`) prints such a word as
+    `v_dot4_i32_i8 vD, a, b, c op_sel:[0,1,0] op_sel_hi:[1,0,1]` with its real encoding. A dword pair that llvm-mc
+    rejected, with exactly opcode 0x16, `op_sel` 2, `op_sel_hi` 5, no `clamp` and no `neg`, is decoded with the two
+    fields at their defaults and then given the fields and the encoding back, so the translator reads it and its
+    encoding check against the blob passes. Any other `op_sel`/`op_sel_hi` value, `clamp` or `neg` is still
+    undecodable (only this one was measured). A pair llvm-mc accepted, such as a literal followed by an instruction,
+    is never touched. `tests/semantic/test_fspx_dot4_op_sel_disasm.py` checks it with llvm-mc (the 5 measured
+    operand sets, and the forms that stay refused); the 89 words of the real programs are not re-run here, because
+    that needs the package's DLL.
+    When a listing lacks that pass, the translator decodes the same exact form from the original bytes on a gap
+    in the listing (`rdna2spirv.skipped_form`); other undecodable words keep the reachable-code check. LLVM can
+    also print the default high-half selector for an inline integer second source. If that selector is the only
+    changed bit, the translator preserves the stored low-half replication (`rdna2spirv.restore_dot4_inline_sel`).
+    Any other `v_dot4_i32_i8` that llvm-mc decodes but prints with different `op_sel`/`op_sel_hi` fields (for
+    example `op_sel_hi` 5 with a VGPR second source) is not measured and stays refused as a dropped field
+    (docs/design.md, "Signed-byte dot products").
 
 ## Kind 7: records
 
@@ -234,7 +255,7 @@ with a blob holding the dword 0, so the DLL creates no compute scratch buffer; w
 Not done here: using kind 0 at run time beyond what the translated module already carries (its thread-group size
 and `RSRC2`).
 
-**Slot 57 (`DeserializeGraphicsPipelineStateX`, graphics FSPX).** At `game_scarlett_master.exe+0x2477578`, the retail
+**Slot 57 (`DeserializeGraphicsPipelineStateX`, graphics FSPX).** At one call site (measured locally), the retail
 title calls device slot 57 (`+0x1c8`) with `IID_ID3D12PipelineState` (`{765a30f3-f624-4c6f-a828-ace948622445}`) and a
 104-byte description (`+0x00..+0x60`) populated from the zlib-compressed pipeline library in `shaders.rpf`
 ([shader_library.md](shader_library.md): 25,471 graphics records + 2,693 compute records):
@@ -276,11 +297,91 @@ title calls device slot 57 (`+0x1c8`) with `IID_ID3D12PipelineState` (`{765a30f3
   - `state blob`: `+0x000` version tag (`0x4005d800` in 15,632 records, `0x4005d808` in 9,159, `0x4005d810` in 6),
     `+0x004` family (`4` in 12,735 or `6` in 12,062), `+0x02c = 2`, `+0x07c` (`0xcc0010` / `0` / `0xcc0011`),
     `+0x0f4 = 5`, `+0x0f8 = 1`, `+0x0fc = 0x33333333` (`0.1f`), `+0x100..+0x11c` (`0x00060006` x8), `+0x150 = 0x40`,
-    `+0x158 = 0xffffffff`, `+0x17c = 0x10000a00`. Unidentified offsets are logged once per offset while safe default
-    raster/depth/blend state is used.
+    `+0x158 = 0xffffffff`, `+0x17c = 0x10000a00`. The colour-target, depth, stencil and raster registers are decoded
+    (next paragraphs); depth bias is not.
   - `stage blob`: `+0x00 = 2` (graphics stage blob), `+0x04` payload size (`196` in 208 B blobs), `+0x08 = 0x66`,
     `+0x0c = 0x40 | flags`, followed by records `0x41` (32 B input/output signature), `0x42` (32 B output signature)
     and `0x43` (20 B: tag + 16 B opaque digest).
+
+**State blob A: the colour-target registers (RT-SLOT57-BLEND-STATE).** Blob A is the console driver's serialized
+pipeline state, and its shared block holds context register values in the RDNA2 layout (Mesa's gfx10 register
+headers). Measured on 1.0.2.1 over all 5,680 distinct blobs, which the 25,471 graphics records reference:
+
+- **Shape:** 380 + 8k bytes (k = 0..5) for vertex-shader pipelines, and 464 + 8k (k = 0..7) for mesh pipelines. The
+  mesh pipelines' stage block is 84 bytes longer, so every offset after `+0x28` moves by 84 there; the offsets below
+  are the vertex ones. Word 0 is `0x4005d800` with bits 3 and 4 free in all 25,471 records.
+- **`+0x78` `CB_TARGET_MASK`:** four component bits (R, G, B, A, as in `D3D12_COLOR_WRITE_ENABLE`) per target:
+  `0xf` in 16,650 records, `0xff` in 2,805, `0xffffff` in 2,561. In 17,626 records the targets it enables are exactly
+  `0..rt_count-1` of blob B. In 1,937 it also enables target 1 of a one-target pipeline: those are the dual-source
+  pipelines below. The others leave a target with a format unwritten.
+- **`+0x7c` `CB_COLOR_CONTROL`:** ROP3 `0xcc` (copy) in every record, so no logic op.
+- **`+0xd0..+0xec` `CB_BLEND0..7_CONTROL`:** one word per target. There are 34 distinct values, every one an
+  in-range RDNA2 blend: factors 0 to 20 with neither `BOTH_*` value, `COMB_FCN` 0 to 4, `SEPARATE_ALPHA_BLEND` set
+  wherever `ENABLE` is, and `DISABLE_ROP3` set in all. By target 0: `0x80000000` (blending off) in 15,373 records,
+  `0xe5010504` (colour `SRC_ALPHA`/`INV_SRC_ALPHA`, alpha `ONE`/`INV_SRC_ALPHA`) in 3,456, `0xf1010f01` (colour
+  `ONE`/`SRC1_COLOR`, alpha `ONE`/`SRC1_ALPHA`) in 1,931, and `0xe5040504` in 1,387. 10,135 records blend on at least
+  one of their targets.
+- **`+0x100..+0x11c`:** eight more per-target words that follow `CB_BLENDn` (`0x06000600` where blending is off).
+  They fit `SX_MRTn_BLEND_OPT`, whose `COMB_FCN` 6 is "blend disabled". They aren't read.
+
+`runtime/src/native_pso.h` (`decode_state_a_blend`, `d3d12_blend`) maps each target's `CB_BLENDn_CONTROL` and
+`CB_TARGET_MASK` nibble to a `D3D12_RENDER_TARGET_BLEND_DESC`, and `fill_blend_state` in
+`runtime/shims/d3d12_xs_native_pso.h` uses it for every native PSO:
+
+- **Before:** every target had blending off and wrote every component, so the first-run pages after #939 drew glyph
+  quads solid, artwork hard-edged and composited backgrounds black.
+- **With the decoded state:** the pages, the legal screens and the loading slideshow draw as on console (RTX 4070
+  Laptop).
+- **Integer targets:** a target with a `UINT` or `SINT` format never blends, as the colour block bypasses blending
+  there and D3D12 refuses a PSO that asks for it. One library pipeline enables `MAX` on an `R8_UINT` target beside
+  two others.
+- **Stand-in targets:** where `B4G4R4A4_UNORM` is not renderable, the Vulkan layer draws it into an RGBA8 stand-in
+  and refuses blending there (`E_NOTIMPL`, the output is quantized before it). The factory then retries the pipeline
+  with blending off on those targets only (`shims/d3d12_xs_native_pso_fallback.h`), instead of leaving it to the PC
+  description path. On an RTX 4070 Laptop that is the same library pipeline (the first one the title creates). Only a
+  pipeline that blends a `B4G4R4A4` target is retried: `E_NOTIMPL` also stands for refusals unrelated to blending (a
+  rect list without its geometry stage, mesh limits, `FullyCovered`, a dual-source output that does not fit
+  `Location 0, Index 1`), and those keep the blend the title asked for.
+- **Dual-source:** the 1,937 records that blend with `SRC1` factors get them as `D3D12_BLEND_SRC1_*`. The Vulkan
+  layer then moves the pixel shader's `SV_Target1` from `Location 1` to `Location 0, Index 1`
+  (`runtime/src/dual_source_fragment.h`, RT-DUAL-SOURCE-BLEND).
+- **Kept on the defaults:** a blob of another shape, or a target with a factor or function this path does not take,
+  keeps the whole pipeline on the defaults and is logged.
+
+**State blob A: the depth, stencil and raster registers (RT-SLOT57-DEPTH-RASTER).** The same shared block, at the
+same vertex-pipeline offsets (+84 in mesh pipelines). The register layouts and their checks against blob B are below,
+measured over all 25,471 graphics records:
+
+- **`+0x9c` `PA_CL_CLIP_CNTL`:** `DX_CLIP_SPACE_DEF` set in every record. Both z clips are off in 960 records and on
+  in the rest, so the near and far planes always agree.
+- **`+0xa0` `PA_SU_SC_MODE_CNTL`:** no culling in 13,534 records, back faces in 11,873 and front faces in 62.
+  `FACE` (clockwise is front) is clear in all but 2, `POLY_MODE` is 0 in all, and the polygon-offset enables are set
+  in all.
+- **`+0xb8` `DB_DEPTH_CONTROL`:**
+  - with no DSV in blob B, `Z_ENABLE` is clear in 7,040 of 7,079 records;
+  - `STENCIL_ENABLE` is set only with formats that have stencil;
+  - `DEPTH_BOUNDS_ENABLE` and bits 30-31 are clear in all;
+  - `BACKFACE_ENABLE` is set in all;
+  - the test is off (`0x007007f0`) in 9,062 records, otherwise mostly `GEQUAL` (a reversed depth range), with `LESS`,
+    `LEQUAL`, `EQUAL` and `NOTEQUAL` in some.
+- **`+0xbc` `DB_STENCIL_CONTROL`:** nonzero in 5,512 of the 6,213 records with stencil on, and in 2 without. The ops
+  used are `KEEP`, `REPLACE_TEST`, `ADD_WRAP`, `ZERO` and `INVERT`.
+- **`+0xc0`/`+0xc4` `DB_STENCILREFMASK(_BF)`:** the two faces have the same read and write masks in every stencil
+  record, and `STENCILOPVAL` is 1 in all. `STENCILTESTVAL` (bits 7:0, the reference) is 0 in all 6,213 stencil records, front and
+  back, so the reference always comes from the title (`OMSetStencilRef`) and the PSO does not need it. 245 records use a back-face function of their own.
+
+`runtime/src/native_pso.h` (`decode_state_a_depth_raster`, `d3d12_depth_raster`) maps them to
+`D3D12_DEPTH_STENCIL_DESC` and the cull, front-face and depth-clip fields of `D3D12_RASTERIZER_DESC`, and
+`fill_depth_raster_state` in `runtime/shims/d3d12_xs_native_pso.h` uses them for every native PSO:
+
+- **Before:** depth `ALWAYS` with writes wherever there was a DSV, no stencil, no culling and depth clip on.
+- **With the decoded state:** every one of the 25,471 records maps. A pipeline without a DSV keeps depth and stencil
+  off.
+- **Not decoded:** depth bias (`PA_SU_POLY_OFFSET_*`). Its D3D12 units depend on the depth format, so it stays 0.
+  The polygon-offset enables in `PA_SU_SC_MODE_CNTL` are set in all 25,471 records. The values look like the floats at
+  `+0xac`/`+0xb0` (scale and offset), which are both 0 in 23,987 records and nonzero in about 1,480.
+- **Front face:** `FACE` is the only field whose effect can't be seen before a world frame. It maps to
+  `FrontCounterClockwise = !FACE`, as RADV and PAL program it.
 
 ## Translation status
 

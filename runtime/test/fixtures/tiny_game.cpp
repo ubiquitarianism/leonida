@@ -120,6 +120,7 @@ int main(int argc, char** argv) {
         };
         check(configured("LEONIDA_D3D12", "vulkan"), "first-run UI Vulkan backend");
         check(configured("LEONIDA_PIPELINE_COMPILE", "on-demand"), "first-run UI pipeline profile");
+        check(configured("LEONIDA_KEYBOARD_PAD", "1"), "first-run UI keyboard pad reads keys only with focus");
         check(configured("LEONIDA_ARENA_MB", "768"), "first-run UI caller override");
     }
 

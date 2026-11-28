@@ -534,11 +534,9 @@ const Pixel readlane_expected = {0x40000079u, 0x40000010u, 0x40000064u, 0x400000
 int main() {
     // The PSO's subgroup requests are recorded when its Vulkan pipeline is made, and the layer builds compute
     // pipelines lazily by default: at the first dispatch (or on the warm-up thread), not at
-    // CreateComputePipelineState. `run` reads them straight after creation, so build at creation on this thread; and
-    // keep the warm-up thread off so a pipeline it is still compiling cannot outlive the device the test releases
-    // (it crashed the process after a failed check).
+    // CreateComputePipelineState. `run` reads them straight after creation, so build at creation on this thread.
+    // (A device released with warm-up builds queued no longer outlives its release: d3d12_compile_teardown_test.)
     _putenv_s("LEONIDA_LAZY_COMPUTE", "0");
-    _putenv_s("LEONIDA_COMPUTE_WARMUP", "0");
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips

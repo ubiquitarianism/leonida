@@ -82,3 +82,16 @@ captured PSO):
     verified against the lighting pass).
 - The runtime must therefore bind the PSO's declared `RTVFormats[]` rather than inferring `R16G16B16A16_FLOAT` for all
   G-buffer attachments from `OSG1` or `exp ... compr`.
+
+## 4. Reproducing the census (`tools/gbuffer_census.py`)
+
+```powershell
+python -I tools/gbuffer_census.py <work>\shaders\dxbc [--disasm <dir>] [--payload-coverage]
+```
+
+Reads `index.json`, each pixel shader's `OSG1` output signature, and the matching `.s` listing under `--disasm`
+(default `<dxbc>\disasm`), and prints JSON counts for four cohorts (all indexed PS, case-folded `deferred` entry
+names, case-sensitive `Deferred` stems, and `PS_DeferredTextured` stems) with declared target counts, signature
+layouts, and observed `exp mrtN` export modes (`compr` vs `uncompressed`). With `--payload-coverage`, it also counts
+distinct whole FSSM payloads per cohort and histograms how many indexed entries share each payload. Standard library
+only; outputs counts and layouts only (no shader text).

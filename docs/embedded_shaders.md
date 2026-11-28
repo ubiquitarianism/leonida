@@ -294,8 +294,8 @@ The last line also gets `--wave64-emulate` and the fallback flags of the build, 
   emulated modules made at the default cap, `RadixAlloc` is refused (`declares 37084 bytes of workgroup memory`,
   `0x80004001`) after 28 creations.
 
-**Packed pixel shaders.** The executable also holds two native pixel shaders in SGD5 records. Their header file
-offsets are `0x688ecf6` and `0x688f17f`. Both stored lengths include the 12-byte header. Raw deflate yields a
+**Packed pixel shaders.** The executable also holds two native pixel shaders in SGD5 records (their file offsets
+are measured locally and not kept here). Both stored lengths include the 12-byte header. Raw deflate yields a
 complete DXBC of 1,324 or 1,052 bytes. Their FSSM SHA-256 keys are
 `cae1e27820adde6a6cb35e308290164ad8cf7107f0fe147d50a2053d7ceeb4b8` and
 `879cb2e326c5e5333935a0b2b1dd9c3c2adc1b03e546d1f84f993d912b4f66b0`. The first is

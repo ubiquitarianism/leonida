@@ -36,7 +36,7 @@ void main(uint3 group : SV_GroupID) {
 )";
 
 bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count, bool gpu_update,
-         std::array<UINT, 2>& result, bool shim) {
+         std::array<UINT, 2>& result, bool shim, bool fixed = false, bool clamp_fixture = false) {
     Ref<ID3D12RootSignature> root;
     D3D12_ROOT_PARAMETER param{};
     param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -80,6 +80,11 @@ bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count,
         const UINT base = (kArgsOffset + i * kStride) / 4;
         input[base] = i + 1;   // number of groups in the record, 1 then 2 then 3
         input[base + 1] = input[base + 2] = 1;
+        if (clamp_fixture) {
+            // Budget 2: (1,4,4)->(1,2,1), (2,0,1)->empty, (3,1,1)->(2,1,1).
+            if (i == 0) input[base + 1] = input[base + 2] = 4;
+            if (i == 1) input[base + 1] = 0;
+        }
         input[base + 3] = 0xa5a5a5a5;  // padding: must be ignored
         input[base + 4] = 0x5a5a5a5a;
     }
@@ -112,7 +117,7 @@ bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count,
     list->SetComputeRootSignature(root.p);
     list->SetPipelineState(pso.p);
     list->SetComputeRootUnorderedAccessView(0, output->GetGPUVirtualAddress());
-    list->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, counts.p, kCountOffset);
+    list->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, fixed ? nullptr : counts.p, fixed ? 0 : kCountOffset);
     if (gpu_update) {
         auto to_copy = transition(counts.p, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                                   D3D12_RESOURCE_STATE_COPY_DEST);
@@ -122,7 +127,7 @@ bool run(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, UINT count,
                                       D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         list->ResourceBarrier(1, &to_indirect);
         // Repeat with a count produced by a GPU copy after the previous indirect dispatch.
-        list->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, counts.p, kCountOffset);
+        list->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, fixed ? nullptr : counts.p, fixed ? 0 : kCountOffset);
     }
     const auto to_copy = transition(output.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -178,37 +183,38 @@ std::string module_version(const wchar_t* name) {
 }
 }  // namespace
 
-int main() {
-    // Wine has no WARP (its host is vkd3d on the GPU), and its D3DCompile has no RWByteAddressBuffer::InterlockedAdd
-    // (E5005 on wine-staging 11.21), so the reference shader did not build and the test ended before the layer ran.
-    // The host runs are skipped there; the layer is still checked against expected().
-    const bool compare_host = !hostwine::host_is_wine();
-    std::vector<std::uint8_t> native_code;
+int make_host(Ref<ID3D12Device>& host, std::vector<std::uint8_t>& native_code) {
+    using Compile = decltype(&D3DCompile);
+    const HMODULE compiler = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!compiler) return 77;
+    const auto compile = reinterpret_cast<Compile>(GetProcAddress(compiler, "D3DCompile"));
+    if (!compile) return 77;
+    Ref<ID3DBlob> native, errors;
+    if (FAILED(compile(native_shader, std::strlen(native_shader), nullptr, nullptr, nullptr,
+                       "main", "cs_5_0", 0, 0, &native.p, &errors.p)) || !native.p)
+        return 1;
+    const auto* native_bytes = static_cast<const std::uint8_t*>(native->GetBufferPointer());
+    native_code.assign(native_bytes, native_bytes + native->GetBufferSize());
     Ref<IDXGIFactory4> factory;
     Ref<IDXGIAdapter> warp;
-    Ref<ID3D12Device> host;
-    if (compare_host) {
-        using Compile = decltype(&D3DCompile);
-        const HMODULE compiler = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (!compiler) return 77;
-        const auto compile = reinterpret_cast<Compile>(GetProcAddress(compiler, "D3DCompile"));
-        if (!compile) return 77;
-        Ref<ID3DBlob> native, errors;
-        if (FAILED(compile(native_shader, std::strlen(native_shader), nullptr, nullptr, nullptr,
-                           "main", "cs_5_0", 0, 0, &native.p, &errors.p)) || !native.p) {
-            std::fprintf(stderr, "D3DCompile of the reference shader failed%s%.*s\n", errors.p ? ": " : "",
-                         errors.p ? int(errors->GetBufferSize()) : 0,
-                         errors.p ? static_cast<const char*>(errors->GetBufferPointer()) : "");
-            return 1;
-        }
-        const auto* native_bytes = static_cast<const std::uint8_t*>(native->GetBufferPointer());
-        native_code.assign(native_bytes, native_bytes + native->GetBufferSize());
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
-            FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
-            FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
-            return 77;
-    }
 
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
+        FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
+        FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
+    return 77;
+
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    const bool clamp = argc == 2 && !std::strcmp(argv[1], "--clamp");
+    // Wine has no WARP (its host is vkd3d on the GPU); the layer is still checked against expected().
+    const bool compare_host = !hostwine::host_is_wine();
+    Ref<ID3D12Device> host;
+    std::vector<std::uint8_t> native_code;
+    if (!clamp && compare_host) {
+        if (const int status = make_host(host, native_code)) return status;
+    }
     vktest::Device vk;
     vk.request_buffer_device_address = true;
     const auto status = vk.initialize();
@@ -241,6 +247,22 @@ int main() {
     Ref<ID3D12Device> layer;
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&layer.p)))) return 1;
 
+    if (clamp) {
+        for (bool fixed : {false, true}) {
+            for (UINT count : {0u, 1u, 7u}) {
+                const auto want = fixed || count >= 3 ? std::array<UINT, 2>{4, 5} :
+                                  count ? std::array<UINT, 2>{2, 2} : std::array<UINT, 2>{};
+                std::array<UINT, 2> result{};
+                if (!run(layer.p, container, count, false, result, true, fixed, true) || result != want) {
+                    std::fprintf(stderr, "group budget: fixed=%d count=%u got %u/%u expected %u/%u\n",
+                                 int(fixed), count, result[0], result[1], want[0], want[1]);
+                    return 1;
+                }
+            }
+        }
+        std::puts("6 indirect group budget cases passed");
+        return vk.validation_errors() ? 1 : 0;
+    }
     // The layer is checked against expected(), the D3D12 rule that the count is read when the GPU executes the
     // command. WARP must match it too, with one measured exception: in-box WARP 10.0.22621.5415 (Windows 11 23H2)
     // reuses the first count for the second ExecuteIndirect after the GPU copy overwrites it (0 -> 3 gives 0/0,

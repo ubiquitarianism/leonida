@@ -13,8 +13,8 @@ from pathlib import Path
 import pytest
 
 import rdna2spirv
-from conftest import (EMPTY_DXBC, KNOWN_VAL_ISSUES, ROOT, SAMPLE_DXBC, Shader, make_dxbc, mesh_psv0_chunk,
-                      requires_tools, signature_chunk)
+from conftest import (EMPTY_DXBC, KNOWN_VAL_ISSUES, ROOT, SAMPLE_DXBC, TEXT_ONLY_MARK, Shader, make_dxbc,
+                      mesh_psv0_chunk, requires_tools, signature_chunk)
 
 pytestmark = requires_tools
 
@@ -62,6 +62,24 @@ def test_gpu_samples_translate_and_validate(path, make_shader):
     with open(path, encoding="utf-8") as f:
         shader = make_shader(f.read(), name, dxbc=SAMPLE_DXBC.get(stem, EMPTY_DXBC))
     shader.validate(shader.translate(), KNOWN_VAL_ISSUES.get(stem))
+
+
+def test_text_only_mark_is_spelled_as_in_the_gpu_runner():
+    """conftest.Shader and scripts/run_gpu_tests.py have to agree on the comment line that marks a sample llvm-mc
+    cannot assemble: with two spellings, a marked sample is handed to llvm-mc here and fails."""
+    runner = Path(ROOT, "scripts", "run_gpu_tests.py").read_text(encoding="utf-8")
+    assert f'\nTEXT_ONLY_MARK = "{TEXT_ONLY_MARK}"\n' in runner
+
+
+def test_only_a_marked_sample_skips_llvm_mc(make_shader):
+    """A sample with the text-only line becomes its own listing, comment lines dropped, whatever llvm-mc makes of
+    its instructions; the same lines without it still go to llvm-mc and fail there."""
+    body = "v_mov_b32 v1, 1.0\n  v_no_such_instruction v0, v1\n\ns_endpgm\n"
+    shader = make_shader(f"; a sample llvm-mc cannot assemble\n{TEXT_ONLY_MARK}\n{body}", "cs_text_only")
+    assert shader.path.read_text(encoding="utf-8").splitlines()[1:] == [
+        "\tv_mov_b32 v1, 1.0", "\tv_no_such_instruction v0, v1", "\ts_endpgm"]
+    with pytest.raises(AssertionError, match="v_no_such_instruction"):
+        make_shader(body, "cs_not_marked")
 
 
 @pytest.mark.parametrize("case", sorted(SUPPORTED))
@@ -124,7 +142,7 @@ def test_translation_is_deterministic(make_shader):
 
 def test_unsupported_instruction_is_reported_not_guessed(make_shader):
     """Anything outside the supported set must raise Unsupported rather than emit a wrong program."""
-    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_sat_pk_u8_i16 v0, v1"))
+    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_mullit_f32 v0, v1, v1, v1"))
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
 
@@ -437,6 +455,17 @@ def test_mesh_cull_primitive_is_block_bool(make_shader):
     assert re.search(r"OpAccessChain %_ptr_Out_bool_ms %ms_cull %\w+ %c0", spvasm)
 
 
+def test_mesh_cull_precedes_clip_vertex_block_in_entrypoint(make_shader):
+    """%ms_cull must precede %ms_out_vtx in OpEntryPoint MeshEXT: AMD Windows LLPC crashes (0xC0000005) otherwise."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ms_clip.asm"), encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ms_clip", dxbc=SAMPLE_DXBC["ms_clip"])
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    ep = next(ln for ln in spvasm.splitlines() if "OpEntryPoint MeshEXT" in ln)
+    assert "%ms_cull" in ep and "%ms_out_vtx" in ep
+    assert ep.index("%ms_cull") < ep.index("%ms_out_vtx"), ep
+
+
 # ---- pos1..pos3: ClipDistance / CullDistance / misc exports (VS & MS) ----
 
 def _vgpr_to_index_map(spvasm, array_var, ptr_type):
@@ -661,6 +690,58 @@ def test_ms_clip_and_cull_distances_across_pos1_pos2(make_shader):
     assert "shaderCullDistance" in meta["features"]
     assert not ({1, 2} & set(meta.get("outputs", [])))
     assert not ({1, 2} & set(meta.get("params", [])))
+
+
+def test_ms_compressed_pos1_clip_export_unpacks_f16_pairs(make_shader):
+    """'exp pos1 v20, v20, v21, v21 compr' in a mesh shader (a clip distance vector, v20/v21 packed f16 pairs) is
+    translated like the VS export: each register is UnpackHalf2x16'd and its two halves are clip[0..1] / clip[2..3]."""
+    import re
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0xF)])])
+    asm = _ms_header_asm("v_mov_b32 v20, 0x3c003800\nv_mov_b32 v21, 0x40004400\n"
+                         "exp pos1 v20, v20, v21, v21 done compr")
+    shader = make_shader(asm, name="ms_compr_pos1", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert len(re.findall(r"OpExtInst %v2float %glsl UnpackHalf2x16", spvasm)) == 2
+    chains = re.findall(r"OpAccessChain %_ptr_Function_float %ms_clip %c(\d+)", spvasm)
+    assert [int(x) for x in chains] == [0, 1, 2, 3] * 2      # the four stores, then the copy to the output
+    assert "OpCapability ClipDistance" in spvasm
+
+
+def test_ms_compressed_pos1_clip_export_off_register_writes_nothing(make_shader):
+    """A compressed export whose second register is off exports only clip[0..1]."""
+    import re
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0xF)])])
+    asm = _ms_header_asm("v_mov_b32 v20, 0x3c003800\nexp pos1 v20, v20, off, off done compr")
+    shader = make_shader(asm, name="ms_compr_pos1_off", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert len(re.findall(r"OpExtInst %v2float %glsl UnpackHalf2x16", spvasm)) == 1
+    chains = re.findall(r"OpAccessChain %_ptr_Function_float %ms_clip %c(\d+)", spvasm)
+    assert [int(x) for x in chains] == [0, 1] + [0, 1, 2, 3]     # two stores, then the copy to the output
+
+
+def test_ms_compressed_param_export_unpacks_f16_pairs(make_shader):
+    """'exp param0 ... compr' in a mesh shader stages (x,y,z,w) from the two unpacked f16 registers."""
+    import re
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF)])])
+    asm = _ms_header_asm("v_mov_b32 v20, 0x3c003800\nv_mov_b32 v21, 0x40004400\n"
+                         "exp param0 v20, v20, v21, v21 done compr")
+    shader = make_shader(asm, name="ms_compr_param", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert len(re.findall(r"OpExtInst %v2float %glsl UnpackHalf2x16", spvasm)) == 2
+    assert "OpStore %ms_param0" in spvasm
+
+
+def test_ms_uncompressed_exports_do_not_unpack_halves(make_shader):
+    """Negative control: the same exports without 'compr' read the registers as f32."""
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0xF)])])
+    asm = _ms_header_asm("exp param0 v10, v11, v12, v13\nexp pos1 v10, v11, v12, v13 done")
+    shader = make_shader(asm, name="ms_plain_exports", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert "UnpackHalf2x16" not in spvasm
 
 
 def test_wave64_detected_from_mask_ops_without_exec_markers(make_shader):
@@ -1023,9 +1104,9 @@ def test_gather4_l_literal_lod_bounds_feed_mip_selection(make_shader):
     clamp = defs[_gather_rounded_lod(defs)].split()
     assert clamp[:4] == ["OpExtInst", "%float", "%glsl", "FClamp"]
     for limit, bits in zip(clamp[-2:], (0x3e800000, 0x3f400000)):
-        cast, scalar, value = defs[limit].split()
-        assert (cast, scalar) == ("OpBitcast", "%float")
-        assert defs[value] == f"OpConstant %uint {bits}"
+        # Gen.fconst: the float constant with those bits, not a bitcast of the uint constant
+        assert limit == f"%fc{bits:x}"
+        assert defs[limit] == f"OpConstant %float {struct.unpack('<f', struct.pack('<I', bits))[0]!r}"
 
 
 def test_gather4_l_run_time_lod_bounds_clamp_without_fclamp(make_shader):
@@ -1392,6 +1473,11 @@ def test_mesh_s3_wave_id_emits_local_index_shift_and_bfe(make_shader):
     asm = shader.translate()
     shader.validate(asm)
     assert "%wave = OpShiftRightLogical %uint %lidx %c6" in asm
+    # SHADER-STRUCTURED-PC-UNWRAP: blk2 post-dominates blk0/blk1 and carries s_barrier, so its tautological
+    # pc == 2 guard must be unwrapped (keeping OpControlBarrier in uniform top-level control flow for AMD LLPC).
+    blk2_pos = asm.index("%blk2 = OpLabel")
+    before_blk2 = asm[asm.index("%blk1 = OpLabel"):blk2_pos]
+    assert "OpBranchConditional" not in before_blk2, before_blk2
     assert "%mwi = OpShiftLeftLogical %uint %wave %c18" in asm
     assert "OpStore %s3p %mwi" in asm
     assert "OpBitFieldUExtract %uint" in asm
@@ -1910,3 +1996,51 @@ def test_wave64_scmp_mask_halves_and_scalars_validate(emulate, make_shader, monk
         assert "OpGroupNonUniform" not in spv
     else:
         assert "OpGroupNonUniformBitwiseOr" in spv
+
+
+def test_ms_misc_pos1_exports_layer_and_viewport_per_primitive(make_shader):
+    """A mesh shader whose OSG1 declares SV_RenderTargetArrayIndex and SV_ViewportArrayIndex writes z of the pos1 misc
+    vector (z[10:0] = Layer, z[19:16] = ViewportIndex) to the per-primitive Layer / ViewportIndex outputs."""
+    import re
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 4, 0x1), (2, 5, 0x1)])])
+    asm = _ms_header_asm("exp pos1 off, off, v14, off done")
+    shader = make_shader(asm, name="ms_misc_pos1", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert "OpCapability ShaderLayer" in spvasm
+    assert "OpCapability ShaderViewportIndex" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 1 BuiltIn Layer" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 1 PerPrimitiveEXT" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 2 BuiltIn ViewportIndex" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 2 PerPrimitiveEXT" in spvasm
+    assert "%ms_cull_blk = OpTypeStruct %bool %int %int" in spvasm
+    # decode: Layer = z & 0x7FF, ViewportIndex = (z >> 16) & 0xF
+    assert re.search(r"OpBitwiseAnd %uint %\w+ %c7ff", spvasm)
+    assert re.search(r"OpShiftRightLogical %uint %\w+ %c10", spvasm)
+    # written to the primitive output at the local index
+    assert "OpAccessChain %_ptr_Out_int_ms %ms_cull %mli %c1" in spvasm
+    assert "OpAccessChain %_ptr_Out_int_ms %ms_cull %mli %c2" in spvasm
+    meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
+    assert "shaderOutputLayer" in meta["features"]
+    assert "shaderOutputViewportIndex" in meta["features"]
+
+
+def test_ms_misc_pos1_layer_only_has_no_viewport_member(make_shader):
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 4, 0x1)])])
+    shader = make_shader(_ms_header_asm("exp pos1 off, off, v14, off done"), name="ms_misc_layer", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert "%ms_cull_blk = OpTypeStruct %bool %int\n" in spvasm
+    assert "BuiltIn ViewportIndex" not in spvasm
+    assert "OpCapability ShaderViewportIndex" not in spvasm
+
+
+def test_ms_without_misc_outputs_keeps_plain_primitive_block(make_shader):
+    """Negative control: no SV_RenderTargetArrayIndex / SV_ViewportArrayIndex in OSG1, so no Layer / ViewportIndex."""
+    dxbc = make_dxbc([mesh_psv0_chunk(), signature_chunk(b"OSG1", [(0, 1, 0xF)])])
+    shader = make_shader(_ms_header_asm("exp pos1 off, off, v14, off done"), name="ms_no_misc", dxbc=dxbc)
+    spvasm = shader.translate()
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+    assert "%ms_cull_blk = OpTypeStruct %bool\n" in spvasm
+    assert "BuiltIn Layer" not in spvasm and "BuiltIn ViewportIndex" not in spvasm
+    assert "OpCapability ShaderLayer" not in spvasm

@@ -13,6 +13,21 @@ start ..\leonida_progress\progress.html
 The page is one self-contained HTML file: no network, no packages, it opens from disk. The project logo
 (`assets/logo.png`) is embedded in it, and the page follows the system theme until you pick one with its theme button.
 
+Use a CTest JUnit report when the run includes tests configured with `SKIP_RETURN_CODE`. CTest can log those
+skips as `Test Passed.` in `LastTest.log`. `--ctest-junit` replaces the local log with the report, which preserves
+the skipped status. Use `--junit` to add independent runs. A new file name for each run keeps an aborted CTest run
+from reusing an older report.
+
+```powershell
+$report = Join-Path $env:TEMP ("leonida-ctest-{0}.xml" -f [guid]::NewGuid())
+ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure --output-junit $report
+if (Test-Path -LiteralPath $report -PathType Leaf) {
+    python -I tools/progress_dashboard.py --out ..\leonida_progress --ctest-junit $report
+} else {
+    throw "CTest did not produce a JUnit report (exit $LASTEXITCODE)."
+}
+```
+
 ## Sources
 
 Each source is optional. A missing one is listed under "Sources" on the page; it is never counted as zero or as a failure.

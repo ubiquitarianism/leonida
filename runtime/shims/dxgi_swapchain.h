@@ -45,6 +45,7 @@ struct SwapchainFunctions {
     PFN_vkResetFences reset_fences = nullptr;
     PFN_vkDeviceWaitIdle device_wait_idle = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties mem_props = nullptr;
+    PFN_vkGetPhysicalDeviceFormatProperties format_props = nullptr;  // optional: without it, blits never filter
     PFN_vkCreateImage create_image = nullptr;
     PFN_vkDestroyImage destroy_image = nullptr;
     PFN_vkGetImageMemoryRequirements image_mem_req = nullptr;
@@ -71,6 +72,7 @@ struct SwapchainFunctions {
         LOAD_I(surface_formats, vkGetPhysicalDeviceSurfaceFormatsKHR);
         LOAD_I(surface_present_modes, vkGetPhysicalDeviceSurfacePresentModesKHR);
         LOAD_I(mem_props, vkGetPhysicalDeviceMemoryProperties);
+        LOAD_I(format_props, vkGetPhysicalDeviceFormatProperties);
         LOAD_D(create_swapchain, vkCreateSwapchainKHR);
         LOAD_D(destroy_swapchain, vkDestroySwapchainKHR);
         LOAD_D(get_images, vkGetSwapchainImagesKHR);
@@ -111,7 +113,7 @@ class VulkanSwapchain {
 public:
     VulkanSwapchain(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
                     PFN_vkGetDeviceProcAddr gdpa, VkDevice device, VkQueue queue, std::uint32_t queue_family,
-                    std::mutex& submit_mutex, DeviceFaultDiagnostics* diagnostics)
+                    SubmitMutex& submit_mutex, DeviceFaultDiagnostics* diagnostics)
         : instance_(instance), physical_(physical), device_(device), queue_(queue), queue_family_(queue_family),
           submit_mutex_(submit_mutex), diagnostics_(diagnostics) {
         loaded_ = fn_.load(gipa, instance, gdpa, device);
@@ -156,8 +158,11 @@ public:
             sci.hwnd = hwnd;
             if (fn_.create_win32_surface(instance_, &sci, nullptr, &surface_) != VK_SUCCESS) return false;
             VkBool32 supported = VK_FALSE;
-            if (fn_.surface_support(physical_, queue_family_, surface_, &supported) != VK_SUCCESS || !supported)
+            if (fn_.surface_support(physical_, queue_family_, surface_, &supported) != VK_SUCCESS || !supported) {
+                // Not kept: a later create() would skip this check and build a swapchain on it.
+                fn_.destroy_surface(instance_, std::exchange(surface_, VK_NULL_HANDLE), nullptr);
                 return false;
+            }
         }
         allow_tearing_ = allow_tearing;
         return rebuild(width, height, preferred_format, buffer_count);
@@ -172,7 +177,9 @@ public:
         }
         allow_tearing_ = allow_tearing;
         const VkFormat fmt = (preferred_format != VK_FORMAT_UNDEFINED) ? preferred_format : format_;
-        const std::uint32_t count = buffer_count ? buffer_count : exposed_count_;
+        // The last BufferCount that was built: after a failed ResizeBuffers nothing is exposed, but count 0 still
+        // keeps the swap chain's count.
+        const std::uint32_t count = buffer_count ? buffer_count : buffer_count_;
         return rebuild(width, height, fmt, count ? count : 2u);
     }
 
@@ -220,6 +227,7 @@ public:
         pi.pSwapchains = &swapchain_;
         pi.pImageIndices = &image_index;
         std::lock_guard lock(submit_mutex_);
+        const SubmitMutex::SubmitTurn turn(submit_mutex_, false);  // a queue operation: the compile gate
         const VkResult r = observe(fn_.queue_present(queue_, &pi), "vkQueuePresentKHR (DXGI)");
         return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
     }
@@ -400,8 +408,12 @@ private:
             VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
             si.commandBufferCount = 1;
             si.pCommandBuffers = &blit_cmd_;
-            if (fn_.queue_submit(queue_, 1, &si, blit_fence_) != VK_SUCCESS ||
-                fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+            bool submitted = false;
+            {
+                const SubmitMutex::SubmitTurn turn(submit_mutex_);  // a queue operation: the compile gate
+                submitted = fn_.queue_submit(queue_, 1, &si, blit_fence_) == VK_SUCCESS;
+            }
+            if (!submitted || fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
                 destroy_offscreen();
                 return false;
             }
@@ -452,7 +464,7 @@ private:
         region.dstOffsets[1] = {static_cast<std::int32_t>(surface_extent_.width),
                                 static_cast<std::int32_t>(surface_extent_.height), 1};
         fn_.cmd_blit(blit_cmd_, offscreen_images_[image_index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+                     dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, blit_filter_);
 
         VkImageMemoryBarrier post[2]{};
         post[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -486,7 +498,12 @@ private:
     }
 
     bool submit_blit_and_wait(const VkSubmitInfo& submit) {
-        return observe(fn_.queue_submit(queue_, 1, &submit, blit_fence_), "vkQueueSubmit (DXGI)") == VK_SUCCESS &&
+        VkResult submitted;
+        {
+            const SubmitMutex::SubmitTurn turn(submit_mutex_);  // the compile gate (VulkanContext::queue_submit)
+            submitted = fn_.queue_submit(queue_, 1, &submit, blit_fence_);
+        }
+        return observe(submitted, "vkQueueSubmit (DXGI)") == VK_SUCCESS &&
                observe(fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX),
                        "vkWaitForFences (DXGI blit)") == VK_SUCCESS;
     }
@@ -550,21 +567,47 @@ private:
             ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ci.preTransform = caps.currentTransform;
+        // The first mode the surface offers, opaque first (VUID-VkSwapchainCreateInfoKHR-compositeAlpha-01280).
         ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        for (const VkCompositeAlphaFlagBitsKHR mode :
+             {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+              VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR}) {
+            if (caps.supportedCompositeAlpha & mode) {
+                ci.compositeAlpha = mode;
+                break;
+            }
+        }
         ci.presentMode = chosen_present_mode;
         ci.clipped = VK_TRUE;
         ci.oldSwapchain = swapchain_;
 
         VkSwapchainKHR next = VK_NULL_HANDLE;
-        if (observe(fn_.create_swapchain(device_, &ci, nullptr, &next), "vkCreateSwapchainKHR (DXGI)") != VK_SUCCESS)
+        if (observe(fn_.create_swapchain(device_, &ci, nullptr, &next), "vkCreateSwapchainKHR (DXGI)") != VK_SUCCESS) {
+            // oldSwapchain is retired even when the call fails: it can neither present nor be passed as
+            // oldSwapchain again (VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933). Drop it and its buffers, as a
+            // failed ResizeBuffers leaves the host's swap chain with none.
+            destroy_swapchain();
             return false;
+        }
         if (swapchain_) fn_.destroy_swapchain(device_, swapchain_, nullptr);
         destroy_offscreen();
+        // Nothing is exposed until the new buffers exist: image()/resource_binding() index the native images when
+        // there is no offscreen ring, and there may be fewer of those than the old BufferCount.
+        exposed_count_ = 0;
         swapchain_ = next;
         present_mode_ = chosen_present_mode;
         format_ = (preferred_format != VK_FORMAT_UNDEFINED) ? preferred_format : chosen.format;
         surface_extent_ = ext;
         extent_ = (width > 0 && height > 0) ? VkExtent2D{width, height} : ext;
+        // A 1:1 blit takes texels as they are; a scaling one filters only when the source format allows it
+        // (VUID-vkCmdBlitImage-filter-02001).
+        blit_filter_ = VK_FILTER_NEAREST;
+        if ((extent_.width != surface_extent_.width || extent_.height != surface_extent_.height) && fn_.format_props) {
+            VkFormatProperties properties{};
+            fn_.format_props(physical_, format_, &properties);
+            if (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
+                blit_filter_ = VK_FILTER_LINEAR;
+        }
 
         std::uint32_t img_count = 0;
         fn_.get_images(device_, swapchain_, &img_count, nullptr);
@@ -582,6 +625,7 @@ private:
         // image instead.
         if (!create_offscreen_backbuffers(requested)) return false;
         exposed_count_ = requested;
+        buffer_count_ = requested;
         current_index_ = 0;
         next_back_buffer_ = 0;
         acquired_index_ = 0;
@@ -595,7 +639,7 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
     std::uint32_t queue_family_ = 0;
-    std::mutex& submit_mutex_;
+    SubmitMutex& submit_mutex_;
     DeviceFaultDiagnostics* diagnostics_;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
@@ -605,6 +649,7 @@ private:
     VkCommandBuffer blit_cmd_ = VK_NULL_HANDLE;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkPresentModeKHR present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
+    VkFilter blit_filter_ = VK_FILTER_NEAREST;
     bool allow_tearing_ = false;
     VkExtent2D surface_extent_{0, 0};
     VkExtent2D extent_{0, 0};
@@ -613,6 +658,7 @@ private:
     std::vector<VkImage> offscreen_images_;
     std::vector<VkDeviceMemory> offscreen_memory_;
     std::uint32_t exposed_count_ = 0;
+    std::uint32_t buffer_count_ = 0;  // the BufferCount of the last successful rebuild
     std::uint32_t current_index_ = 0;
     std::uint32_t acquired_index_ = 0;
     std::uint32_t next_back_buffer_ = 0;

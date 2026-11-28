@@ -3,7 +3,7 @@
 // d3d12_draw_test. The tests' signatures are two root constants then a root CBV, so in the console's graphics layout
 // (from s8, two dwords per root view: docs/d3d12_vulkan.md, D3D-448) s10:s11 is the CBV: the console VA of three
 // floats (a tint), read at heap base + VA. The output is (red * tint.x, tint.y, blue * tint.z, 1).
-// d3d12_mesh_test pads its signature onto the runtime's s0 fallback layout and builds this with -DROOT_BASE=0 (s2:s3).
+// d3d12_mesh_test uses it as is: its mesh shader reads the same block through the root window (push dword 8 = s16).
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 

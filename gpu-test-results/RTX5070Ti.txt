@@ -1,0 +1,53 @@
+GPU:        NVIDIA GeForce RTX 5070 Ti (Blackwell, PCI 10de:2c05)
+Driver:     NVIDIA 617.42 (proprietary), Vulkan 1.4.351
+Subgroup:   32..32 (default 32)
+OS:         Windows 11 Pro, build 26300
+Commit:     21625bca8c675c62f9dbffc318ce6a59d57faf31
+Tools:      llvm-mc 23.1.5 (Windows, built with MSVC from the llvm-project
+            23.1.5 source release with LLVM_TARGETS_TO_BUILD=AMDGPU; the
+            release's Windows binaries carry no AMDGPU target), SPIRV-Tools v2026.4,
+            Vulkan SDK 1.4.363.0, CMake 4.4.4,
+            MSVC 19.50.35721.0 (Visual Studio 2026 Build Tools), Python 3.13.13
+CPU:        AMD Ryzen 9 7900X
+RAM:        31.14 GiB reported
+
+run_gpu_tests.py:
+            257/257 shaders translated and passed spirv-val in both modes.
+            Native: 197/248 passed, 49 skipped, 2 failed.
+            LEONIDA_W64_EMULATE=1: 229/248 passed, 17 skipped, 2 failed.
+
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (both modes, known #31):
+            r32 sint (sint view): 64 bad, texel(5,3) = 2071.
+
+Skipped:    Native: 49 skipped, 31 of them "no 64-wide compute subgroup on
+            this device" and 1 "no 64-wide subgroup"; the rest run by
+            d3d12_*_test or w64_graphics.py, or ps_w64x_readlane (this
+            device cannot require a 64-wide fragment subgroup).
+            Emulated: 17 skipped, the "run by d3d12_*_test /
+            w64_graphics.py" cases and ps_w64x_readlane.
+
+Runtime:    RelWithDebInfo, Windows native build.
+            294 registered, 281 passed, 11 skipped,
+            1 failed, 1 disabled (gameinput: no SDL3 installed).
+
+Failed:     d3d12_execute_indirect_validation:
+            49 parity cases, positive GPU dispatch OK,
+            0 validation errors, 5 parity failures.
+            The argument-range discrepancy discussed in #337 and #306.
+
+Notes:
+- ms_wave_info_s3: 4096/4096 pixels exact in both modes, in the full run
+  and in three more isolated runs per mode (run_gpu_tests.py --filter
+  ms_wave_info_s3, scripts at 21625bca8; vk_harness reports "NVIDIA GeForce
+  RTX 5070 Ti (subgroup 32..32)"): 4 of 4 native, 4 of 4 emulated. The old
+  original-repository issue 8369 ("fails consistently on RTX 5070 Ti") did
+  not reproduce in these runs; this test is flaky on some AMD hosts
+  (docs/gpu_test_results.md), so 4 runs do not rule out a rare failure.
+- cs_signed_zero_nan: PASS in both modes.
+- The same runtime build with LEONIDA_VK_VALIDATION=1: vk_queue reports
+  10 synchronization-validation WRITE_AFTER_WRITE hazards between
+  back-to-back submissions (#470 removes them); d3d12_clear and
+  d3d12_mesh report the errors #516 and #540 address.
+- Single baseline run performed on 2026-11-24.
+- AI-assisted test automation and report preparation.
+- Synthetic tests only; no game files used.
