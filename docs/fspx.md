@@ -136,6 +136,15 @@ program whose kind 0 is too short for word 4 keeps the code heuristic.
     SGPRs (`s[0:1]`, `s4`..`s15`), `M0`, `VCC`, `EXEC` (including inactive lanes across 64 threads) and `SCC` (both 0
     and 1) unchanged, and execution resumes cleanly at `+36` bytes. So they are hardware no-ops on RDNA2.
   - `tools/fspx_unpack.py` disassembles from the end of the prologue.
+  - **A 24-byte variant**: some programs of the pipeline library in `shaders.rpf` (`tools/shader_library.py`) carry
+    only the first two of those words, at words 0 and 3, and their code starts at word 6 (`s_inst_prefetch` in all of
+    them). `code_range` takes that form only when both words are literal-bearing VOP3 opcode-0x180 words of the shape
+    `tools/fspx_prologue_probe.py` checks (second dword `& 0xFFFE0100 == 0x03FE0100`); a program whose words 0, 3 and
+    6 are all prologue words keeps the 36-byte form. Counted on the 1.0.2.1 library with an opcode-only check (#583):
+    50 of 2,684 programs; read from word 0 they never decode (the prologue words are invalid encodings and the rest
+    desyncs), and with the 24-byte start all 50 disassemble with 0 invalid words and 49 translate and pass
+    `spirv-val` (the other stops at `s_sethalt`). `tests/test_fspx_unpack.py` (`test_short_prologue`) covers the form
+    and the stricter check.
 - **Target.** The programs use `v_dot4_i32_i8` (1,458 times) and `v_dot4c_i32_i8` (25,813 times), which fits the
   provider's name (`FSR4_Int8`). `llvm-mc` (LLVM 23.1.5) decodes them for `gfx1011`, `gfx1012`, `gfx1030`, `gfx1031`,
   `gfx1033`, `gfx1034` and `gfx1036`, but not for `gfx1010`, `gfx1013` (the target `shader_disasm.py` uses for the
@@ -148,11 +157,23 @@ program whose kind 0 is too short for word 4 keeps the code heuristic.
   - Measured on RDNA2 hardware (gfx1036, through `tools/hw_oracle`, the instruction given as two raw words): with
     `op_sel` 2 and `op_sel_hi` 5 the result is the dot product with the two 16-bit halves of the second source
     exchanged, in all 5 operand sets (4 of them give another word under the plain rule). So `op_sel` selects halves
-    here as it does for the packed 16-bit ops. On a gap in LLVM’s listing, the translator decodes this exact
-    unclamped, unnegated form from the original bytes, including its source registers and literal. Other
-    undecodable words retain the reachable-code check. LLVM can also print the default high-half selector for
-    an inline integer second source. If that selector is the only changed bit, the translator preserves the
-    stored low-half replication. The hardware measurements are in `tests/semantic/test_alu_dot4_i8.py`.
+    here as it does for the packed 16-bit ops. The words are in `tests/semantic/test_alu_dot4_i8.py`.
+  - `tools/shader_disasm.py` (so `fspx_unpack.py --disasm` and `make_game.py`) prints such a word as
+    `v_dot4_i32_i8 vD, a, b, c op_sel:[0,1,0] op_sel_hi:[1,0,1]` with its real encoding. A dword pair that llvm-mc
+    rejected, with exactly opcode 0x16, `op_sel` 2, `op_sel_hi` 5, no `clamp` and no `neg`, is decoded with the two
+    fields at their defaults and then given the fields and the encoding back, so the translator reads it and its
+    encoding check against the blob passes. Any other `op_sel`/`op_sel_hi` value, `clamp` or `neg` is still
+    undecodable (only this one was measured). A pair llvm-mc accepted, such as a literal followed by an instruction,
+    is never touched. `tests/semantic/test_fspx_dot4_op_sel_disasm.py` checks it with llvm-mc (the 5 measured
+    operand sets, and the forms that stay refused); the 89 words of the real programs are not re-run here, because
+    that needs the package's DLL.
+    When a listing lacks that pass, the translator decodes the same exact form from the original bytes on a gap
+    in the listing (`rdna2spirv.skipped_form`); other undecodable words keep the reachable-code check. LLVM can
+    also print the default high-half selector for an inline integer second source. If that selector is the only
+    changed bit, the translator preserves the stored low-half replication (`rdna2spirv.restore_dot4_inline_sel`).
+    Any other `v_dot4_i32_i8` that llvm-mc decodes but prints with different `op_sel`/`op_sel_hi` fields (for
+    example `op_sel_hi` 5 with a VGPR second source) is not measured and stays refused as a dropped field
+    (docs/design.md, "Signed-byte dot products").
 
 ## Kind 7: records
 
@@ -234,7 +255,7 @@ with a blob holding the dword 0, so the DLL creates no compute scratch buffer; w
 Not done here: using kind 0 at run time beyond what the translated module already carries (its thread-group size
 and `RSRC2`).
 
-**Slot 57 (`DeserializeGraphicsPipelineStateX`, graphics FSPX).** At `game_scarlett_master.exe+0x2477578`, the retail
+**Slot 57 (`DeserializeGraphicsPipelineStateX`, graphics FSPX).** At one call site (measured locally), the retail
 title calls device slot 57 (`+0x1c8`) with `IID_ID3D12PipelineState` (`{765a30f3-f624-4c6f-a828-ace948622445}`) and a
 104-byte description (`+0x00..+0x60`) populated from the zlib-compressed pipeline library in `shaders.rpf`
 ([shader_library.md](shader_library.md): 25,471 graphics records + 2,693 compute records):

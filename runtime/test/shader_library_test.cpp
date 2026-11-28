@@ -820,6 +820,80 @@ int main() {
         std::filesystem::remove_all(dir);
     }
 
+    // The descriptor-table layout marker (`descriptor_table` in each module's meta, descriptor_table.h): absent is
+    // the old plain layout. The kind word is additive - a tagged module reads it, a plain one ignores it and reads
+    // the index at the same place - so one tagged module needs the tagged layout however many plain ones a merged or
+    // partial index holds; counting entries would let a plain majority hand every tagged module an all-zero kind, and
+    // every image read through another dimension's array would fall back. LEONIDA_DESCRIPTOR_TABLE overrides in the
+    // device, through descriptor_table_layout_from_env.
+    {
+        const auto root = dir / "table_layouts";
+        const auto write_index = [](const std::filesystem::path& folder, const std::string& modules) {
+            std::filesystem::create_directories(folder);
+            std::ofstream index(folder / "index.json", std::ios::binary);
+            index << "{" << modules << "}";
+        };
+        const auto module = [](const char* name, const char* marker) {
+            std::string out = "{\"stage\": \"vs\", \"fssm_sha256\": \"" + std::string(name) + "\"";
+            if (marker) out += ", \"descriptor_table\": \"" + std::string(marker) + "\"";
+            return out + "}";
+        };
+        const auto census = [](const ShaderLibrary& library, std::size_t tagged, std::size_t plain) {
+            return library.descriptor_table_census().tagged == tagged &&
+                   library.descriptor_table_census().plain == plain;
+        };
+
+        // A library translated before the kind word (or with --descriptor-table plain) is plain.
+        write_index(root, "\"a\": " + module("aa", nullptr) + ", \"b\": " + module("bb", nullptr));
+        ShaderLibrary all_plain;
+        CHECK(all_plain.load(root.string(), &error));
+        CHECK(census(all_plain, 0, 2) &&
+              all_plain.descriptor_table_layout() == DescriptorTableLayout::plain);
+
+        write_index(root, "\"a\": " + module("aa", "tagged") + ", \"b\": " + module("bb", "tagged"));
+        ShaderLibrary all_tagged;
+        CHECK(all_tagged.load(root.string(), &error));
+        CHECK(census(all_tagged, 2, 0) &&
+              all_tagged.descriptor_table_layout() == DescriptorTableLayout::tagged);
+
+        // One tagged module among plain ones: the tagged layout (the old vote gave the plain majority's choice and
+        // every image of another dimension fell back).
+        write_index(root, "\"a\": " + module("aa", "tagged") + ", \"b\": " + module("bb", nullptr) + ", \"c\": " +
+                              module("cc", "plain") + ", \"d\": " + module("dd", nullptr));
+        ShaderLibrary tagged_minority;
+        CHECK(tagged_minority.load(root.string(), &error));
+        CHECK(census(tagged_minority, 1, 3) &&
+              tagged_minority.descriptor_table_layout() == DescriptorTableLayout::tagged);
+
+        write_index(root, "\"a\": " + module("aa", nullptr) + ", \"b\": " + module("bb", "tagged"));
+        ShaderLibrary tied;
+        CHECK(tied.load(root.string(), &error));
+        CHECK(census(tied, 1, 1) && tied.descriptor_table_layout() == DescriptorTableLayout::tagged);
+
+        // A sub-index's marker counts too, and loading a folder replaces the census rather than adding to it.
+        write_index(root, "\"a\": " + module("aa", nullptr) + ", \"b\": " + module("bb", nullptr));
+        write_index(root / "fspx", "\"upscaler\": " + module("cc", "tagged"));
+        ShaderLibrary sub_index;
+        CHECK(sub_index.load(root.string(), &error));
+        CHECK(census(sub_index, 1, 2) && sub_index.descriptor_table_layout() == DescriptorTableLayout::tagged);
+        CHECK(sub_index.load(root.string(), &error) && census(sub_index, 1, 2));  // reload, not accumulate
+        std::filesystem::remove_all(root / "fspx");
+        CHECK(sub_index.load(root.string(), &error) && census(sub_index, 0, 2) &&
+              sub_index.descriptor_table_layout() == DescriptorTableLayout::plain);
+
+        // LEONIDA_DESCRIPTOR_TABLE: an exact layout name wins over the vote; anything else is ignored, and a refused
+        // value leaves the caller's layout alone.
+        DescriptorTableLayout chosen = DescriptorTableLayout::tagged;
+        CHECK(descriptor_table_layout_from_env("plain", &chosen) && chosen == DescriptorTableLayout::plain);
+        CHECK(descriptor_table_layout_from_env("tagged", &chosen) && chosen == DescriptorTableLayout::tagged);
+        CHECK(!descriptor_table_layout_from_env(nullptr, &chosen));
+        CHECK(!descriptor_table_layout_from_env("", &chosen));
+        CHECK(!descriptor_table_layout_from_env("Plain", &chosen));
+        CHECK(!descriptor_table_layout_from_env("other", &chosen));
+        CHECK(chosen == DescriptorTableLayout::tagged);
+        std::filesystem::remove_all(dir);
+    }
+
     if (const int line = fspx_checks()) return line;
 
     // FSPX entries: found by fspx_code_sha256, in the main index or in <dir>/fspx/index.json (named "fspx/<name>").

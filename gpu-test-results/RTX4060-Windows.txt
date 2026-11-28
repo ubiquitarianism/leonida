@@ -1,0 +1,21 @@
+GPU:        NVIDIA GeForce RTX 4060 (Ada / AD107), subgroup 32..32
+Driver:     NVIDIA 617.42 (proprietary, Windows; Vulkan API 1.4.351), Vulkan SDK 1.4.363.0
+Subgroup:   32..32 (no 64-wide compute subgroup; the wave64 compute fixtures skip natively)
+OS:         Windows 11 Pro 10.0.26200
+Commit:     6293c1c4f88c7ea2088ec595fea51362f1759996 (main, 2026-11-24)
+Tools:      SPIRV-Tools v2026.4 (Vulkan SDK 1.4.363.0), CMake 3.31.6 + Ninja (Visual Studio 2022
+            Build Tools, MSVC 19.44.35229), Python 3.12.10. No llvm-mc: the run used the
+            pre-disassembled subset (--disasm-dir tests/semantic/fixtures/disasm).
+run_gpu_tests.py: 100 shaders: 100 translated, 100 pass spirv-val
+            native:                 81/97 passed, 16 skipped, 0 failed
+            LEONIDA_W64_EMULATE=1:  97/97 passed
+Failed:     none.
+Skipped:    native: 16 "no 64-wide compute subgroup on this device" (the wave64 compute fixtures);
+            all 16 pass in the emulated run.
+Notes:
+- Built with scripts\build_runtime.ps1 (Ninja, RelWithDebInfo, MSVC) at the commit above; the tests ran
+  with --build runtime\build --disasm-dir tests/semantic/fixtures/disasm.
+- This is the disassembly subset, not the full llvm-mc-assembled suite; complements
+  RTX4060-Nobara-three-tests.txt (Linux, three tests).
+- AI-assisted (Claude Code ran the build and tests and wrote this file from the run output).
+  No game files.

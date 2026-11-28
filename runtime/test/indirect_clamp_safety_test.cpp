@@ -320,12 +320,14 @@ int main() {
             area_buf = job1.stats_buffer;
             slot_off = job1.stats_offset;
             std::uint8_t* host = state.buffer_host.at(reinterpret_cast<std::uintptr_t>(area_buf));
-            const std::uint32_t gpu_written[4] = {5u, 1u, 2u, 3u};
+            const std::uint32_t gpu_written[12] = {5u, 1u, 2u, 3u, 0u, 0u, 0u, 0u, 7u, 4u, 3u, 2u};
             std::memcpy(host + slot_off, gpu_written, sizeof(gpu_written));
         }
         const auto after1 = clamp.counters();
         CHECK(after1.records_clamped == 5 && after1.counts_clamped == 1 && after1.over_budget == 2 &&
               after1.zeroed == 3);
+        CHECK(after1.mesh_records == 7 && after1.mesh_yz_records == 4 &&
+              after1.mesh_max_y == 3 && after1.mesh_max_z == 2);
 
         // Batch 2 reuses the exact same slot (LIFO free_slots_) and is destroyed without GPU submission.
         {
@@ -337,6 +339,8 @@ int main() {
         const auto after2 = clamp.counters();
         CHECK(after2.records_clamped == 5 && after2.counts_clamped == 1 && after2.over_budget == 2 &&
               after2.zeroed == 3);
+        CHECK(after2.mesh_records == 7 && after2.mesh_yz_records == 4 &&
+              after2.mesh_max_y == 3 && after2.mesh_max_z == 2);
     }
 
     // 4. Non-4-byte-aligned argument_offset or count_offset is rejected before allocating scratch.

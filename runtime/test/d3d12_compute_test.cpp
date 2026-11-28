@@ -10,6 +10,7 @@
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
 #include "test_temp_dir.h"
+#include "d3d12_test_shaders.h"
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
@@ -42,7 +43,6 @@ using XboxComputePipelineFn = HRESULT(WINAPI*)(void* device, const D3D12_COMPUTE
                                                std::uint64_t, const IID*, void**);
 // Device slot 67 as amd_fidelityfx_upscaler_xbox.dll calls it: (desc, riid, out).
 using XboxNativeComputePipelineFn = HRESULT(WINAPI*)(void* device, const void*, const IID*, void**);
-using SerializeFn = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
 
 template<class T>
 struct Ref {
@@ -103,19 +103,9 @@ std::vector<std::uint8_t> shader_container(const std::vector<std::uint8_t>& fssm
     return out;
 }
 
+// The shared helper: Windows 10's in-box d3d12.dll refuses the heap-directly-indexed flags at every version.
 std::vector<std::uint8_t> serialize(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc) {
-    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    const auto fn = d3d12 ? reinterpret_cast<SerializeFn>(
-                                reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12SerializeVersionedRootSignature")))
-                          : nullptr;
-    std::vector<std::uint8_t> out;
-    ID3DBlob* blob = nullptr;
-    if (fn && SUCCEEDED(fn(&desc, &blob, nullptr)) && blob) {
-        const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
-        out.assign(p, p + blob->GetBufferSize());
-        blob->Release();
-    }
-    return out;
+    return d3d12test::serialize_root_signature(desc);
 }
 
 D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes, D3D12_RESOURCE_FLAGS flags) {
@@ -495,6 +485,14 @@ int main() {
                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                             IID_PPV_ARGS(&inside.p))));
             EXPECT(inside->GetGPUVirtualAddress() + (1u << 20) <= capped_arena);
+            // The existing buffer and the reserved range prevent a contiguous arena-sized allocation.
+            // A valid default buffer can still use a dedicated allocation and report a usable relative VA.
+            const auto no_slice = buffer_desc(capped_arena, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            Ref<ID3D12Resource> dedicated;
+            EXPECT(SUCCEEDED(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &no_slice,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&dedicated.p))));
+            EXPECT(dedicated->GetGPUVirtualAddress() >= capped_arena);
             EXPECT(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &too_large, D3D12_RESOURCE_STATE_COMMON,
                                                   nullptr, IID_PPV_ARGS(&past.p)) == E_OUTOFMEMORY && !past.p);
             std::printf("arena: %llu MiB (device limits: maxBufferSize %llu MiB, maxMemoryAllocationSize %llu MiB); "

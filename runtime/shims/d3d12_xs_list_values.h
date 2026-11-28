@@ -31,8 +31,10 @@
 // - The thread that signals a gate runs the work the layer held behind it (QueueHolds: the held lists' submission,
 //   the shadow refresh, a deferred Present). That is the releaser, a second thread: the pump only decides, so
 //   writes keep landing and other gates keep timing out while held work runs.
-// Bounded: a gate is signalled after LEONIDA_VALUE_WAIT_TIMEOUT_MS (default 200 ms) whatever memory holds, counted
-// from when the gates before it on its queue opened, and logged once per address. Short timeouts (4 ms) go to an
+// Bounded: a gate is signalled after LEONIDA_VALUE_WAIT_TIMEOUT_MS (default 200 ms) of idle wait time, counted from
+// when the gates before it on its queue opened and paused (up to a finite cap scaled with the gate's own budget) while
+// the releaser is running held work, while an acyclic matching producer write is in flight, or while unrelated
+// unblocked GPU work is running (src/list_value_wait_budget.h); logged once per address. Short timeouts (4 ms) go to an
 // address that timed out three times in a row, and, once four gates in a row timed out (the title waits for values
 // no modelled write stores, a new address each frame), to every wait whose address was never met: a frame then pays
 // a few milliseconds, not the full timeout, per such wait. A wait cut short is watched for the rest of the full
@@ -56,10 +58,12 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <span>
 #include <utility>
 #include <vector>
 
 #include "d3d12_xs_device.h"          // console_value_met, ListValueStats
+#include "../src/list_value_wait_budget.h"  // leonida::list_value_wait: work-aware timeout clock & producer graph
 #include "../src/title_page_watch.h"  // leonida::kernel_writes::store
 #include "../src/value_write_sink.h"  // leonida::value_sink: the arena and xmem's PAGE_NOACCESS pages
 
@@ -362,7 +366,8 @@ public:
         if (writes.empty() || exiting_.load(std::memory_order_relaxed)) return;  // stop(): see there
         {
             std::lock_guard lock(mutex_);
-            writes_.push_back({std::move(queue), value, std::move(writes)});
+            const std::uint64_t after_gate = max_pending_gate_locked(queue.get());
+            writes_.push_back({std::move(queue), value, std::move(writes), after_gate});
         }
         start_or_settle();
     }
@@ -396,7 +401,7 @@ public:
             gate.value = value;
             gate.started = true;
             gate.since = Clock::now();
-            gate.deadline = Clock::time_point::max();
+            gate.last_tick = gate.since;
             gate.after = after;
             gate.action = std::move(action);
             gates_.push_back(std::move(gate));
@@ -502,13 +507,15 @@ private:
         std::shared_ptr<QueueValues> queue;
         std::uint64_t value;
         std::vector<Write> writes;
+        std::uint64_t after_gate = 0;  // highest pending gate value on `queue` ahead of this write group
     };
     struct Gate {
         std::shared_ptr<QueueValues> queue;
         std::uint64_t value = 0;
         std::vector<Wait> waits;
-        Clock::time_point deadline;    // set by start_gate
-        Clock::time_point since;
+        leonida::list_value_wait::GateTimeoutState timeout{};  // work-aware timeout clock (set by start_gate)
+        Clock::time_point last_tick{};
+        Clock::time_point since{};
         bool started = false;          // the gates before it on its queue have opened: its time runs
         bool cut_short = false;        // given the short timeout
         std::uint64_t after = 0;       // action gates: the queue's `written` value the action runs behind
@@ -602,7 +609,9 @@ private:
             stall_logged_ = false;
             return;
         }
-        const std::uint64_t ms = GetTickCount64() - since;
+        // `since` is the start tick with its low bit set (never 0 while inside), so it can be one past now.
+        const std::uint64_t now = GetTickCount64();
+        const std::uint64_t ms = now > since ? now - since : 0;
         if (ms < kStallMs || stall_logged_) return;
         stall_logged_ = true;
         bump(counters().release_stalls);
@@ -630,12 +639,21 @@ private:
                 releasing_ = true;
             }
             SetEvent(wake_);  // the pump may be in an untimed wait: it watches the Signals from here on
+            struct PendingReleaseGuard {
+                std::atomic<std::size_t>* count;
+                std::size_t remaining;
+                ~PendingReleaseGuard() {
+                    if (remaining) count->fetch_sub(remaining, std::memory_order_release);
+                }
+            } pending_guard{&pending_releases_, batch.size()};
             for (Release& release : batch) {
                 if (stop_.load(std::memory_order_relaxed)) break;
                 signal_value_.store(release.value, std::memory_order_relaxed);
                 signal_since_ms_.store(GetTickCount64() | 1, std::memory_order_relaxed);  // never 0 while inside
                 signal(release);
                 signal_since_ms_.store(0, std::memory_order_relaxed);
+                pending_releases_.fetch_sub(1, std::memory_order_release);
+                --pending_guard.remaining;
             }
             std::lock_guard lock(release_mutex_);
             releasing_ = false;
@@ -719,35 +737,113 @@ private:
         writes_.swap(rest);
     }
 
-    // The gates whose waits are met, whose time is up or whose action's turn has come, taken off the list in each
+    // Highest pending gate value currently in `gates_` for `queue` (0 if none). Called with mutex_ held.
+    std::uint64_t max_pending_gate_locked(const QueueValues* queue) const {
+        std::uint64_t highest = 0;
+        for (const Gate& g : gates_)
+            if (g.queue.get() == queue && g.value > highest) highest = g.value;
+        return highest;
+    }
+
+    // The gates whose waits are met, whose idle time is up or whose action's turn has come, taken off the list in each
     // queue's order (a queue's gate values rise in submission order, so a later one must not be signalled first: it
-    // would open the earlier one too). `force` (no threads): every gate, now. Called with mutex_ held.
-    void take_open(bool force, std::vector<Release>& opening) {
-        std::vector<const QueueValues*> blocked;
+    // would open the earlier one too). A memory gate's timeout clock pauses while held work is being released, while
+    // an acyclic matching producer write is in flight, or (up to a cap) while unrelated unblocked GPU work is running
+    // (src/list_value_wait_budget.h). `force` (no threads): every gate, now. Called with mutex_ held.
+    void take_open(bool force, bool landed_any, std::vector<Release>& opening) {
+        if (gates_.empty()) return;
         const auto now = Clock::now();
-        for (auto it = gates_.begin(); it != gates_.end();) {
-            const QueueValues* queue = it->queue.get();
-            if (std::find(blocked.begin(), blocked.end(), queue) != blocked.end()) {
-                ++it;
-                continue;
+        namespace lvw = leonida::list_value_wait;
+
+        // Build the lightweight producer/gate dependency view lazily only if a started memory gate is still unmet.
+        bool graph_built = false;
+        std::vector<lvw::PendingWrite> flat_writes;
+        std::vector<lvw::PendingWriteGroup> view_writes;
+        std::vector<lvw::WaitPredicate> flat_waits;
+        std::vector<lvw::PendingGate> view_gates;
+        std::vector<std::pair<std::size_t, std::size_t>> gate_wait_ranges;  // (offset, count) into flat_waits
+        const auto ensure_graph = [&] {
+            if (graph_built) return;
+            graph_built = true;
+            std::size_t total_writes = 0;
+            for (const WriteGroup& wg : writes_) total_writes += wg.writes.size();
+            flat_writes.reserve(total_writes);
+            view_writes.reserve(writes_.size());
+            for (const WriteGroup& wg : writes_) {
+                const std::size_t start = flat_writes.size();
+                for (const Write& w : wg.writes)
+                    flat_writes.push_back({w.address, w.value, w.bytes, w.kind != WriteKind::value});
+                view_writes.push_back({wg.queue.get(), wg.after_gate,
+                                       std::span<const lvw::PendingWrite>(flat_writes).subspan(start, wg.writes.size())});
             }
+            std::size_t total_waits = 0;
+            for (const Gate& g : gates_)
+                if (!g.action) total_waits += g.waits.size();
+            flat_waits.reserve(total_waits);
+            gate_wait_ranges.reserve(gates_.size());
+            for (const Gate& g : gates_) {
+                const std::size_t start = flat_waits.size();
+                if (!g.action) {
+                    for (const Wait& w : g.waits)
+                        if (!met_now(w)) flat_waits.push_back({w.address, w.reference, w.comparison, w.wide});
+                }
+                gate_wait_ranges.emplace_back(start, flat_waits.size() - start);
+            }
+            view_gates.reserve(gates_.size());
+            for (std::size_t i = 0; i < gates_.size(); ++i) {
+                const auto [off, cnt] = gate_wait_ranges[i];
+                view_gates.push_back({gates_[i].queue.get(), gates_[i].value, static_cast<bool>(gates_[i].action),
+                                      std::span<const lvw::WaitPredicate>(flat_waits).subspan(off, cnt)});
+            }
+        };
+
+        std::vector<const QueueValues*> blocked;
+        std::vector<bool> opened(gates_.size(), false);
+        for (std::size_t idx = 0; idx < gates_.size(); ++idx) {
+            Gate& gate = gates_[idx];
+            const QueueValues* queue = gate.queue.get();
+            if (std::find(blocked.begin(), blocked.end(), queue) != blocked.end()) continue;
             bool open = force;
-            if (it->action) {
-                open = open || queue->written->GetCompletedValue() >= it->after;
+            if (gate.action) {
+                open = open || queue->written->GetCompletedValue() >= gate.after;
             } else {
-                if (!it->started) start_gate(*it, now);
+                if (!gate.started) start_gate(gate, now);
                 bool met = true;
-                for (const Wait& wait : it->waits) met = met && met_now(wait);
-                open = open || met || now >= it->deadline;
-                if (open) note_outcome(*it, met || force);
+                for (const Wait& wait : gate.waits) met = met && met_now(wait);
+                bool timed_out = false;
+                if (!open && !met) {
+                    const std::uint64_t dt_us =
+                        now > gate.last_tick
+                            ? static_cast<std::uint64_t>(
+                                  std::chrono::duration_cast<std::chrono::microseconds>(now - gate.last_tick).count())
+                            : 0u;
+                    gate.last_tick = now;
+                    const bool releaser_busy =
+                        landed_any || !opening.empty() || pending_releases_.load(std::memory_order_acquire) != 0;
+                    lvw::PauseReason reason = lvw::PauseReason::releaser_busy;
+                    if (!releaser_busy) {
+                        ensure_graph();
+                        reason = lvw::pause_reason(false, view_writes, view_gates, idx, console_value_met);
+                    }
+                    timed_out = gate.timeout.advance(dt_us, reason);
+                } else {
+                    gate.last_tick = now;
+                }
+                open = open || met || timed_out;
+                if (open) note_outcome(gate, met || force, now);
             }
             if (open) {
-                opening.push_back({std::move(it->queue), it->value, std::move(it->action)});
-                it = gates_.erase(it);
+                opening.push_back({std::move(gate.queue), gate.value, std::move(gate.action)});
+                opened[idx] = true;
             } else {
                 blocked.push_back(queue);
-                ++it;
             }
+        }
+        if (!opening.empty()) {
+            std::deque<Gate> rest;
+            for (std::size_t idx = 0; idx < gates_.size(); ++idx)
+                if (!opened[idx]) rest.push_back(std::move(gates_[idx]));
+            gates_.swap(rest);
         }
     }
 
@@ -761,12 +857,15 @@ private:
             busy_ = true;
             take_landed(force, landing);
         }
+        const bool landed_any = !landing.empty();
         for (const WriteGroup& group : landing) land(group);
         std::vector<Release> opening;
         {
             std::lock_guard lock(mutex_);
             watch_late();
-            take_open(force, opening);
+            take_open(force, landed_any, opening);
+            if (!force && !opening.empty())
+                pending_releases_.fetch_add(opening.size(), std::memory_order_release);
         }
         if (!opening.empty()) {
             if (force) {
@@ -917,7 +1016,10 @@ private:
         gate.started = true;
         gate.cut_short = cut_short;
         gate.since = now;
-        gate.deadline = now + std::chrono::milliseconds(cut_short ? kDemotedTimeoutMs : full);
+        gate.last_tick = now;
+        const unsigned gate_ms = cut_short ? kDemotedTimeoutMs : full;
+        const auto caps = leonida::list_value_wait::default_pause_caps(gate_ms, cut_short);
+        gate.timeout.reset(static_cast<std::uint64_t>(gate_ms) * 1000u, caps.active_us, caps.max_us);
     }
 
     // A wait for `address` was met (in time, or late): the address has met history and its timeouts in a row end.
@@ -959,15 +1061,15 @@ private:
     }
 
     // Called with mutex_ held.
-    void note_outcome(const Gate& gate, bool met) {
+    void note_outcome(const Gate& gate, bool met, Clock::time_point now) {
         if (met) {
             bump(counters().gates_met);
             timeouts_in_a_row_ = 0;
             for (const Wait& wait : gate.waits) note_met(wait.address);
             if (gate.cut_short && !gate.waits.empty()) lift_demotion(gate.waits.front().address);
-            if (logged_met_ < 4) {  // the first few, to show the model at work in a boot log
+            if (logged_met_ < 4 && !gate.waits.empty()) {  // the first few, to show the model at work in a boot log
                 ++logged_met_;
-                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - gate.since).count();
+                const double ms = std::chrono::duration<double, std::milli>(now - gate.since).count();
                 std::fprintf(stderr, "[rt] d3d12_xs: a queue's wait for 0x%llx was met after %.2f ms\n",
                              static_cast<unsigned long long>(gate.waits.front().address), ms);
             }
@@ -988,14 +1090,14 @@ private:
         for (const Wait& wait : gate.waits) {
             if (met_now(wait)) continue;
             if (gate.cut_short && !watched && late_.size() < kMaxLate) {
-                late_.push_back({wait, gate.since + std::chrono::milliseconds(full)});
+                late_.push_back({wait, now + std::chrono::milliseconds(full)});
                 watched = true;
             }
             Streak* streak = find_streak(wait.address);
             if (!streak) streak = add_streak(wait.address);
             ++streak->timeouts;
-            std::uint64_t now = 0;
-            read_value(wait.address, wait.wide, now);
+            std::uint64_t current = 0;
+            read_value(wait.address, wait.wide, current);
             if (!streak->logged) {
                 streak->logged = true;
                 static std::atomic<unsigned> addresses{0};
@@ -1006,7 +1108,7 @@ private:
                                  gate.cut_short ? kDemotedTimeoutMs : full,
                                  static_cast<unsigned long long>(wait.address), wait.wide ? 64u : 32u,
                                  wait.comparison, static_cast<unsigned long long>(wait.reference),
-                                 static_cast<unsigned long long>(now));
+                                 static_cast<unsigned long long>(current));
             }
             if (streak->timeouts == kDemoteAfter) {
                 static std::atomic<unsigned> demoted{0};
@@ -1039,6 +1141,7 @@ private:
     std::condition_variable release_ready_;
     std::deque<Release> releases_;
     bool releasing_ = false;
+    std::atomic<std::size_t> pending_releases_{0};  // queued + active releases, read lock-free in take_open()
     std::atomic<std::uint64_t> signal_since_ms_{0};  // GetTickCount64 when the releaser's current Signal began, or 0
     std::atomic<std::uint64_t> signal_value_{0};
     std::atomic<DWORD> releaser_tid_{0};

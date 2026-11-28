@@ -9,11 +9,17 @@
 //                         other PE private memory (runtime + title heaps), PE images, PE sections, memory the Vulkan
 //                         driver mapped for us, /dev/nvidia* mappings, other native (Unix-side) anonymous memory
 //                         (driver heaps, glibc arenas), and files.
+//   [rt] mem-probe breakdown: the same allocations by consumer (src/memory_breakdown.h): the arena with its reserved,
+//                         bound and in-use bytes, geometry copies, title windows and shadows, upload heaps, staging,
+//                         texture blocks, sampled textures, render targets and depth, and other, which add up to the
+//                         allocated bytes of the t= line.
 // The Vulkan counts come from wrapping the runtime's own function table (install()); helpers that load their own
 // pointers (depth24, predicate, xdxr, swapchain) are not counted: they create a handful of objects.
 
 #include <windows.h>
 #include <vulkan/vulkan.h>
+
+#include "memory_breakdown.h"
 
 #include <algorithm>
 #include <atomic>
@@ -40,6 +46,8 @@ struct Allocation {
     bool imported = false;
     std::uintptr_t mapped = 0;
     std::uint64_t mapped_bytes = 0;
+    // Who asked for it (an Owner scope at the allocation), or what was bound to it later (bind_image_memory).
+    memory_breakdown::Consumer consumer = memory_breakdown::Consumer::other;
 };
 
 struct State {
@@ -52,11 +60,15 @@ struct State {
     PFN_vkCreateGraphicsPipelines create_graphics = nullptr;
     PFN_vkCreateComputePipelines create_compute = nullptr;
     PFN_vkDestroyPipeline destroy_pipeline = nullptr;
+    PFN_vkCreateImage create_image = nullptr;
+    PFN_vkDestroyImage destroy_image = nullptr;
+    PFN_vkBindImageMemory bind_image = nullptr;
 
     std::mutex mutex;
     std::unordered_map<VkDeviceMemory, Allocation> allocations;
     std::unordered_map<VkShaderModule, std::uint64_t> modules;
     std::unordered_map<VkPipeline, std::uint8_t> pipelines;  // 0 graphics, 1 compute
+    std::unordered_map<VkImage, std::uint32_t> image_usage;   // VkImageUsageFlags of each live image
     std::uint64_t module_bytes = 0, modules_made = 0, module_bytes_made = 0;
     std::uint64_t graphics_live = 0, compute_live = 0, graphics_made = 0, compute_made = 0;
     std::uint64_t graphics_ns = 0, compute_ns = 0;  // time inside vkCreate*Pipelines
@@ -94,7 +106,8 @@ inline VKAPI_ATTR VkResult VKAPI_CALL allocate_memory(VkDevice device, const VkM
     const VkResult result = s.allocate(device, info, callbacks, out);
     if (result == VK_SUCCESS && out && *out) {
         std::lock_guard lock(s.mutex);
-        s.allocations[*out] = {info->memoryTypeIndex, info->allocationSize, imported_memory(info), 0, 0};
+        s.allocations[*out] = {info->memoryTypeIndex, info->allocationSize, imported_memory(info), 0, 0,
+                               memory_breakdown::current_owner()};
     }
     return result;
 }
@@ -130,6 +143,43 @@ inline VKAPI_ATTR void VKAPI_CALL unmap_memory(VkDevice device, VkDeviceMemory m
         if (auto it = s.allocations.find(memory); it != s.allocations.end()) it->second.mapped = 0;
     }
     s.unmap(device, memory);
+}
+
+inline VKAPI_ATTR VkResult VKAPI_CALL create_image(VkDevice device, const VkImageCreateInfo* info,
+                                                   const VkAllocationCallbacks* callbacks, VkImage* out) {
+    State& s = state();
+    const VkResult result = s.create_image(device, info, callbacks, out);
+    if (result == VK_SUCCESS && out && *out) {
+        std::lock_guard lock(s.mutex);
+        s.image_usage[*out] = info->usage;
+    }
+    return result;
+}
+
+inline VKAPI_ATTR void VKAPI_CALL destroy_image(VkDevice device, VkImage image, const VkAllocationCallbacks* callbacks) {
+    State& s = state();
+    if (image) {
+        std::lock_guard lock(s.mutex);
+        s.image_usage.erase(image);
+    }
+    s.destroy_image(device, image, callbacks);
+}
+
+// Memory nobody named that an image is bound to is that image's: a render target or depth buffer, or a sampled
+// texture. A named block (the texture blocks) keeps its name, whatever is bound into it.
+inline VKAPI_ATTR VkResult VKAPI_CALL bind_image_memory(VkDevice device, VkImage image, VkDeviceMemory memory,
+                                                        VkDeviceSize offset) {
+    State& s = state();
+    const VkResult result = s.bind_image(device, image, memory, offset);
+    if (result == VK_SUCCESS) {
+        std::lock_guard lock(s.mutex);
+        const auto a = s.allocations.find(memory);
+        const auto u = s.image_usage.find(image);
+        if (a != s.allocations.end() && u != s.image_usage.end() &&
+            a->second.consumer == memory_breakdown::Consumer::other)
+            a->second.consumer = memory_breakdown::image_consumer(u->second);
+    }
+    return result;
 }
 
 inline VKAPI_ATTR VkResult VKAPI_CALL create_shader_module(VkDevice device, const VkShaderModuleCreateInfo* info,
@@ -246,7 +296,8 @@ void install(Functions& vk) {
     if (s.installed++) return;
     if (!vk.vkAllocateMemory || !vk.vkFreeMemory || !vk.vkMapMemory || !vk.vkUnmapMemory ||
         !vk.vkCreateShaderModule || !vk.vkDestroyShaderModule || !vk.vkCreateGraphicsPipelines ||
-        !vk.vkCreateComputePipelines || !vk.vkDestroyPipeline)
+        !vk.vkCreateComputePipelines || !vk.vkDestroyPipeline || !vk.vkCreateImage || !vk.vkDestroyImage ||
+        !vk.vkBindImageMemory)
         return;
     s.started = GetTickCount64();
     s.allocate = vk.vkAllocateMemory, vk.vkAllocateMemory = allocate_memory;
@@ -258,6 +309,9 @@ void install(Functions& vk) {
     s.create_graphics = vk.vkCreateGraphicsPipelines, vk.vkCreateGraphicsPipelines = create_graphics_pipelines;
     s.create_compute = vk.vkCreateComputePipelines, vk.vkCreateComputePipelines = create_compute_pipelines;
     s.destroy_pipeline = vk.vkDestroyPipeline, vk.vkDestroyPipeline = destroy_pipeline;
+    s.create_image = vk.vkCreateImage, vk.vkCreateImage = create_image;
+    s.destroy_image = vk.vkDestroyImage, vk.vkDestroyImage = destroy_image;
+    s.bind_image = vk.vkBindImageMemory, vk.vkBindImageMemory = bind_image_memory;
     std::fprintf(stderr, "[rt] mem-probe: installed, every %u s\n", interval_seconds());
 }
 
@@ -451,6 +505,7 @@ inline std::string read_rollup() {
 struct DeviceFacts {
     std::function<std::string()> describe;  // one text fragment
     std::function<Ranges()> title_ranges;   // the title's memory
+    std::function<memory_breakdown::DeviceShare()> share;  // the arena and the bindless tables, for the breakdown
     VkPhysicalDeviceMemoryProperties memory{};
 };
 
@@ -477,6 +532,7 @@ inline void sample(const DeviceFacts& facts) {
     std::uint64_t type_count[VK_MAX_MEMORY_TYPES] = {}, type_bytes[VK_MAX_MEMORY_TYPES] = {};
     std::uint64_t import_count[VK_MAX_MEMORY_TYPES] = {}, import_bytes[VK_MAX_MEMORY_TYPES] = {};
     Ranges vk_mapped;
+    memory_breakdown::Tally tally;
     std::uint64_t modules = 0, module_bytes = 0, modules_made = 0, module_bytes_made = 0;
     std::uint64_t graphics = 0, compute = 0, graphics_made = 0, compute_made = 0, graphics_ns = 0, compute_ns = 0;
     {
@@ -491,6 +547,7 @@ inline void sample(const DeviceFacts& facts) {
                 type_bytes[i] += a.bytes;
             }
             if (a.mapped && !a.imported) vk_mapped.push_back({a.mapped, a.mapped + a.mapped_bytes});
+            tally.add(a.consumer, a.bytes, a.imported);
         }
         modules = s.modules.size();
         module_bytes = s.module_bytes;
@@ -527,6 +584,10 @@ inline void sample(const DeviceFacts& facts) {
                  (unsigned long long)compute_made, double(graphics_ns) / 1e9, double(compute_ns) / 1e9,
                  (unsigned long long)modules, mib(module_bytes), (unsigned long long)modules_made,
                  mib(module_bytes_made), memory_text.c_str(), facts.describe ? facts.describe().c_str() : "");
+    std::fprintf(stderr, "[rt] mem-probe breakdown t=%.0fs: %s\n", t,
+                 memory_breakdown::format(tally, facts.share ? facts.share() : memory_breakdown::DeviceShare{},
+                                          module_bytes)
+                     .c_str());
     Ranges title = facts.title_ranges ? facts.title_ranges() : Ranges{};
     std::sort(title.begin(), title.end());
     Usage usage[b_count];

@@ -30,6 +30,7 @@ import rdna2_decode  # noqa: E402
 
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
+DOT4_I8_OPCODE = 0x16         # VOP3P v_dot4_i32_i8
 PROBE = "0x00 0x00 0x81 0xbf"  # s_endpgm: the one instruction every shader ends with
 FAILED = []                    # (path, first stderr line) for shaders that produced no disassembly
 
@@ -88,13 +89,36 @@ def probe(mcpu: str) -> None:
              f"{install_hint()}")
 
 
-def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):
+def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True, compute: bool = False):
+    """`compute`: a pipeline-library or FSPX compute program. llvm-mc 21 does not decode SMEM loads whose SOFFSET is
+    SGPR_NULL (0x7D, e.g. s_load_dwordx8 ... 0xd60 with soffset null): it reports the first dword invalid, then reads
+    the second (0xFA......) as an 8-byte EXP and the rest of the listing goes out of step (gfx1013 and gfx1030 alike).
+    In 749 of the 2,684 library programs of 1.0.2.1 that refused 945 programs ('fall-through into undecodable
+    words'). tools/rdna2_decode.py decodes them; such a program takes its listing when it has fewer invalid words."""
+    if backend == "auto":
+        asm, bad, err = disasm(code, mcpu, backend="llvm-mc", wave32=wave32)
+        if bad == 0 and asm.strip():
+            return asm, bad, err
+        py_asm, py_bad, _ = disasm(code, mcpu, backend="python", wave32=wave32)
+        if py_asm.strip() and (not asm.strip() or py_bad < bad):
+            return py_asm, py_bad, ""
+        return asm, bad, err
+    if compute and backend != "python":
+        asm, bad, err = disasm(code, mcpu, backend=backend, wave32=wave32)
+        if bad:
+            py_asm, py_bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
+            if py_bad < bad:
+                return py_asm, py_bad, ""
+        return asm, bad, err
     if backend == "python":
         asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
         return asm, bad, ""
     asm, bad, err = run_mc(code, mcpu, wave32)
     if bad and asm.strip():
         fixed = with_vopc_dpp(code, mcpu, err, wave32)
+        if fixed:
+            return fixed
+        fixed = with_dot4_op_sel(code, mcpu, bad, err, wave32)
         if fixed:
             return fixed
     return asm, bad, err
@@ -188,6 +212,60 @@ def with_vopc_dpp(code: bytes, mcpu: str, err: str, wave32: bool = True):
     return None
 
 
+def dot4_op_sel_words(code: bytes, offsets) -> dict:
+    """{offset: (word0, word1)} of the dword pairs at `offsets` that are v_dot4_i32_i8 with op_sel 2 and op_sel_hi 5,
+    no clamp and no neg: the form 89 words of the FidelityFX upscaler's programs take (docs/fspx.md). llvm-mc has no
+    decoding for it, and a plain v_dot4_i32_i8 has op_sel 0 and op_sel_hi 7. Only this combination is recognised:
+    its result was measured on hardware (tests/semantic/test_alu_dot4_i8.py), the other op_sel values were not."""
+    found = {}
+    for at in sorted(offsets):
+        if at % 4 or at + 8 > len(code):
+            continue
+        w0, w1 = struct.unpack_from("<2I", code, at)
+        if (w0 >> 23 == 0x198 and (w0 >> 16) & 0x7F == DOT4_I8_OPCODE and (w0 >> 8) & 7 == 0     # VOP3P, neg_hi
+                and (w0 >> 11) & 7 == 2 and (w0 >> 14) & 1 == 1 and (w0 >> 15) & 1 == 0          # op_sel, hi[2], clamp
+                and (w1 >> 27) & 3 == 1 and (w1 >> 29) & 7 == 0):                                # op_sel_hi[1:0], neg_lo
+            found[at] = (w0, w1)
+    return found
+
+
+def with_dot4_op_sel(code: bytes, mcpu: str, bad: int, err: str, wave32: bool = True):
+    """The listing of `code` with each rejected v_dot4_i32_i8 op_sel 2 / op_sel_hi 5 word printed as the instruction
+    it is, or None when there is none. llvm-mc rejects the pair, so it is decoded with the two fields at their
+    defaults (op_sel 0, op_sel_hi 7), and each such line gets the real fields and the real encoding back: the
+    translator then reads the instruction and checks its encoding against the blob. A word that is not printed as
+    v_dot4_i32_i8 at an instruction boundary was not an instruction (it sits in a literal or in data), so it is
+    left as it was and the pass runs again without it."""
+    words = dot4_op_sel_words(code, invalid_offsets(err))
+    while words and bad:
+        patched = bytearray(code)
+        for at, (w0, w1) in words.items():
+            struct.pack_into("<2I", patched, at, w0 & ~(7 << 11), w1 | (2 << 27))
+        asm, bad2, err2 = run_mc(bytes(patched), mcpu, wave32)
+        if not asm.strip():
+            return None
+        invalid, pos, hit, lines = invalid_offsets(err2), 0, set(), []
+        for line in asm.split("\n"):
+            enc = ENCODING.search(line)
+            if not enc:
+                lines.append(line)
+                continue
+            while pos in invalid:
+                pos += 4
+            if pos in words and line.lstrip("\t").startswith("v_dot4_i32_i8 "):
+                hit.add(pos)
+                w0, w1 = words[pos]
+                original = ",".join(f"0x{b:02x}" for b in struct.pack("<2I", w0, w1))
+                line = line[:enc.start()].rstrip() + " op_sel:[0,1,0] op_sel_hi:[1,0,1]"
+                line = f"{line:<40}; encoding: [{original}]"
+            lines.append(line)
+            pos += len(enc.group(1).split(","))
+        if hit == set(words):
+            return "\n".join(lines), bad2, err2
+        words = {at: w for at, w in words.items() if at in hit}
+    return None
+
+
 MAX_DATA_DWORDS = 1 << 16
 
 
@@ -276,8 +354,8 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--skip-existing", action="store_true", help="reuse complete listings from a matching run")
     ap.add_argument("--mcpu", default="gfx1013")
-    ap.add_argument("--backend", choices=("llvm-mc", "python"), default="llvm-mc",
-                    help="disassembler backend: llvm-mc (default) or pure-Python RDNA2 decoder (#1901)")
+    ap.add_argument("--backend", choices=("llvm-mc", "python", "auto"), default="llvm-mc",
+                    help="disassembler backend: llvm-mc (default), pure-Python RDNA2 decoder (#1901), or auto")
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
@@ -329,6 +407,11 @@ def main():
     if files:
         if a.backend == "llvm-mc":
             probe(a.mcpu)
+        elif a.backend == "auto":
+            try:
+                probe(a.mcpu)
+            except SystemExit:
+                a.backend = "python"
         with ThreadPoolExecutor(a.jobs) as ex:
             res.update(ex.map(lambda p: one(p, out, a.mcpu, backend=a.backend), files))
     print(f"{total} shaders -> {os.path.abspath(out)}: {dict(res)}")

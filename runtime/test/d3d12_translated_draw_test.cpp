@@ -193,6 +193,7 @@ int main(int argc, char** argv) {
         rt::d3d12::VulkanDeviceInfo info{};
         info.prepare_on_bind=d.prepare_on_bind;
         info.cold_graphics_compile=d.cold_graphics_compile;
+        info.heavy_pipeline_cache=d.heavy_pipeline_cache;
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
         info.physical = d.physical;

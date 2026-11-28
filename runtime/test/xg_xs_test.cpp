@@ -81,6 +81,51 @@ void check_addresses(const Texture& t) {
     check(true, "every mip/array element has a distinct aligned address inside the resource");
 }
 
+// A fill of the smaller mips only (d3d12_vulkan_device.cpp, partial_mips) reads mip_chain_bytes(t, first) bytes from the
+// base: those hold every element of the mips from `first` on, and the next larger mip is not among them.
+void check_mip_prefix(uint32_t format, uint32_t layout, uint64_t width, uint32_t height, uint16_t mips) {
+    ResourceDesc d{};
+    d.dimension = kTexture2D;
+    d.width = width;
+    d.height = height;
+    d.depth_or_array = 1;
+    d.mips = mips;
+    d.format = format;
+    d.samples = 1;
+    d.layout = layout;
+    Texture t;
+    check(build_texture(d, t), "mip prefix case lays out");
+    const auto& plane = t.layout.plane[0];
+    std::vector<uint8_t> whole(size_t(t.layout.size));
+    for (size_t i = 0; i < whole.size(); ++i) whole[i] = uint8_t(i * 31 + (i >> 8) * 7);
+    std::vector<uint64_t> columns;
+    bool same = true, ordered = true, found = true;
+    for (unsigned first = 0; first < t.layout.mips; ++first) {
+        const uint64_t bytes = mip_chain_bytes(t, first);
+        // Exactly the prefix, so that a read past it is a heap error under a checked allocator and a difference here.
+        std::vector<uint8_t> part(whole.size(), 0xee);
+        std::copy_n(whole.begin(), size_t(bytes), part.begin());
+        for (unsigned level = first; level < t.layout.mips; ++level) {
+            const auto& mip = plane.mips[level];
+            const uint32_t pitch = mip.width_elements * t.format.bytes;
+            std::vector<uint8_t> a(size_t(pitch) * mip.height_elements), b(a.size());
+            copy_elements<false>(t, level, 0, whole.data(), a.data(), pitch, pitch * mip.height_elements, columns);
+            copy_elements<false>(t, level, 0, part.data(), b.data(), pitch, pitch * mip.height_elements, columns);
+            same &= a == b;
+        }
+        const bool in_tail = first > plane.standard_mips;
+        found &= first_mip_within(t, bytes) == (in_tail ? plane.standard_mips : first);
+        found &= first_mip_within(t, bytes - 1) == (first >= plane.standard_mips ? t.layout.mips
+                                                    : first + 1 < t.layout.mips  ? first + 1
+                                                                                 : t.layout.mips);
+        if (first && first <= plane.standard_mips) ordered &= bytes < mip_chain_bytes(t, first - 1);
+    }
+    check(same, "the prefix of a mip holds it and every smaller one");
+    check(ordered && mip_chain_bytes(t, 0) == t.layout.size, "a larger mip needs a longer prefix, mip 0 the whole texture");
+    check(found, "the first mip within a readable prefix is the largest one it holds");
+    check(first_mip_within(t, 0) == t.layout.mips, "nothing readable: no mip");
+}
+
 // copy_elements (row + column addressing) reads every element where offset() says it is.
 void check_detile(const Texture& t) {
     const ElementAddress address(t);
@@ -389,6 +434,19 @@ void test_models_agree() {
 }  // namespace
 
 int main() {
+    check_mip_prefix(DXGI_FORMAT_BC7_UNORM, 0x109, 1024, 1024, 11);   // 64 KiB blocks and a tail
+    check_mip_prefix(DXGI_FORMAT_BC1_UNORM, 0x105, 512, 256, 10);     // 4 KiB blocks and a tail
+    check_mip_prefix(DXGI_FORMAT_BC7_UNORM, 0x109, 300, 700, 10);     // extents that are no power of two
+    check_mip_prefix(DXGI_FORMAT_R8G8B8A8_UNORM, 0x10a, 256, 256, 1);  // one mip
+    check_mip_prefix(DXGI_FORMAT_R8G8B8A8_UNORM, 0x105, 512, 512, 2);  // a chain too short for a tail
+    check_mip_prefix(DXGI_FORMAT_R8G8B8A8_UNORM, 1, 256, 128, 9);     // linear
+    {
+        ResourceDesc d{kTexture2D, 0, 256, 256, 6, 9, DXGI_FORMAT_BC7_UNORM, 1, 0, 0x109, 0};
+        Texture cube;
+        check(build_texture(d, cube) && mip_chain_bytes(cube, 4) == cube.layout.size &&
+                  first_mip_within(cube, cube.layout.size - 1) == cube.layout.mips,
+              "an array is readable as a whole or not at all");
+    }
     {
         struct Entry { bool mapped, stale; int id; };
         Entry first{false, false, 1}, mapped{true, false, 2}, stale{false, true, 3};
@@ -415,6 +473,62 @@ int main() {
         for (unsigned pass = 0; pass < 3; ++pass) poll([] { return true; });
         check(polled == std::vector<int>{4}, "an expired wall budget advances past priority entries to the next texture");
 
+        // LEONIDA_TITLE_EVERY_BUDGET_US: the marked textures (mapped or stale) are visited from a cursor of their own
+        // until the budget runs out; the unmarked ones are the round robin's and are skipped here.
+        {
+            Entry m1{true, false, 11}, u1{false, false, 12}, s1{false, true, 13}, m2{true, false, 14};
+            Entry u2{false, false, 15}, s2{false, true, 16};
+            std::map<std::uint64_t, Entry*> marked{{100, &m1}, {200, &u1}, {300, &s1}, {400, &m2}, {500, &u2}};
+            std::uint64_t every = 0;
+            std::vector<int> seen;
+            std::vector<int> urgent_ids;  // stands for "mapped and never filled"
+            const auto is_urgent = [&](const Entry& t) {
+                return std::find(urgent_ids.begin(), urgent_ids.end(), t.id) != urgent_ids.end();
+            };
+            const auto visit_marked = [&](auto exhausted) {
+                const auto snapshot = leonida::title_texture_snapshot(marked);
+                leonida::visit_marked_title_textures(
+                    snapshot, every,
+                    [&](Entry& t) {
+                        seen.push_back(t.id);
+                        urgent_ids.erase(std::remove(urgent_ids.begin(), urgent_ids.end(), t.id), urgent_ids.end());
+                    },
+                    is_urgent, exhausted);
+            };
+            visit_marked([] { return false; });
+            check(seen == std::vector<int>{11, 13, 14}, "without a limit every marked texture is visited once, in order");
+            seen.clear();
+            for (unsigned pass = 0; pass < 4; ++pass) visit_marked([] { return true; });
+            check(seen == std::vector<int>{11, 13, 14, 11},
+                  "a budget spent after each visit moves one marked texture a pass and wraps");
+            seen.clear();
+            marked.erase(300);
+            marked[350] = &s2;
+            visit_marked([&] { return seen.size() == 2; });
+            check(seen == std::vector<int>{16, 14}, "the cursor survives an erased entry and reaches a new stale one");
+            seen.clear();
+            visit_marked([] { return true; });
+            check(seen == std::vector<int>{11}, "the pass after resumes past the last visited entry");
+            // The cursor now points past 100 (m1). Mark m2 (at 400) urgent, as a mapped texture never filled: it is
+            // visited first whatever the budget, and once filled (no longer urgent) it is not visited a second time
+            // in the same pass's rotation.
+            seen.clear();
+            urgent_ids = {14};
+            visit_marked([] { return true; });
+            check(seen == std::vector<int>{14, 16}, "an urgent texture is visited first, then one rotation step");
+            seen.clear();
+            urgent_ids = {14};
+            visit_marked([] { return false; });
+            check(seen == std::vector<int>{14, 11, 16},
+                  "with no limit an urgent texture is still visited once, not again in the rotation");
+            seen.clear();
+            const std::vector<std::pair<std::uint64_t, Entry*>> none;
+            leonida::visit_marked_title_textures(
+                none, every, [&](Entry& t) { seen.push_back(t.id); }, [](const Entry&) { return true; },
+                [] { return false; });
+            check(seen.empty(), "an empty registry visits nothing");
+        }
+
         // A fill made during a pass submits, and that submission destroys a retired image whose destructor erases its
         // registry entry; the registry mutex is recursive for its owner on Windows, so the erase lands inside the pass.
         // A walk over a snapshot keeps every entry of the pass alive and in order, which a walk over the registry
@@ -433,6 +547,42 @@ int main() {
         for (int i = 0; i < 32; ++i) every[i] = i + 1;
         check(walked == every, "a pass walks every entry once even when a visit erases and re-registers");
         check(registry.size() == 32, "the registry kept the re-registrations made during the pass");
+    }
+
+    {
+        leonida::TitleTextureRangeIndex index;
+        std::map<std::uint64_t, std::pair<unsigned, unsigned>> ranges;
+        for (unsigned id = 1; id <= 60; ++id) {
+            const auto begin = (id * 17) % 31;
+            ranges[id] = {begin, begin + id};
+            index.set(id, begin, id);
+        }
+        index.erase(12);
+        ranges.erase(12);
+        index.set(13, 5, 9);
+        ranges[13] = {5, 14};
+        index.set(2, 0, 0);
+        ranges.erase(2);
+        bool same = true;
+        for (unsigned from = 0; from < 100; ++from) {
+            for (unsigned to = from; to <= 100; ++to) {
+                std::vector<std::uint64_t> got, want;
+                index.overlapping(from, to, [&](auto key) { got.push_back(key); });
+                std::sort(got.begin(), got.end());
+                for (const auto& [key, range] : ranges)
+                    if (from < to && range.first < to && from < range.second) want.push_back(key);
+                same &= got == want;
+            }
+        }
+        check(same, "indexed invalidation matches all CPU overlaps after alias, replacement and removal");
+        index.set(99, (UINT64_MAX >> 1) - 2, 16);
+        unsigned hits = 0;
+        index.overlapping(UINT64_MAX >> 1, (UINT64_MAX >> 1) + 1, [&](auto id) { hits += id == 99; });
+        check(hits == 1, "an interval across bit 63 is indexed without a word-width shift");
+        const auto slice = leonida::title_texture_snapshot(ranges, 12, 4);
+        check(slice.size() == 4 && slice.front().first == 13 && slice.back().first == 16,
+              "bounded refresh resumes at the next live address");
+        check(leonida::title_texture_snapshot(ranges, 61, 4).empty(), "end of sweep permits wrap");
     }
 
     {
@@ -502,6 +652,7 @@ int main() {
     DWORD previous = 0;
     if (!VirtualProtect(reservation, page, PAGE_READWRITE | PAGE_GUARD, &previous)) return 1;
     check(!leonida::texture_memory_readable(address, 2 * page), "guarded texture page remains untouched");
+    check(leonida::texture_memory_readable_bytes(address, 2 * page) == 0, "the readable prefix ends at a guarded first page");
     VirtualFree(reservation, page, MEM_DECOMMIT);
     check(!leonida::texture_memory_readable(address, page), "previously readable page is rechecked after decommit");
     VirtualFree(reservation, 0, MEM_RELEASE);
@@ -699,6 +850,58 @@ int main() {
     check(create(&d, &computer) == E_NOTIMPL && computer, "unsupported texture keeps a safe fallback object");
     check(slot<LayoutFn>(computer, 2)(computer, &l) == E_NOTIMPL && l.size == 8192 &&
           slot<RefFn>(computer, 1)(computer) == 1, "fallback leaves caller outputs untouched and is safe to release");
+
+    // A linear 3D texture (layout 0x100) is thin (addrlib HwlComputeSurfaceInfoLinear): rows of 256 bytes, every
+    // depth slice a whole mip chain. The title's texture lock reads mip 0's offset and size from this
+    // computer and, when creation fails, its own uninitialised stack instead: measured with the 32x32x36 R32_UINT
+    // 3D texture it clears 0x48000 bytes at that pointer, which is this layout's size exactly.
+    d = {4, 0, 32, 32, 36, 1, DXGI_FORMAT_R32_UINT, 1, 0, 0x100, 0x300004};
+    if (!make(create, d, computer, "create linear 3D computer")) return 1;
+    std::memset(&l, 0xa5, sizeof(l));
+    check(slot<LayoutFn>(computer, 2)(computer, &l) == S_OK && l.size == 0x48000 && l.alignment == 256 &&
+              l.mips == 1 && l.dimension == 4 && l.plane[0].slice_bytes == 8192 &&
+              l.plane[0].mips[0].offset == 0 && l.plane[0].mips[0].size == 0x48000 &&
+              l.plane[0].mips[0].slice_bytes == 8192 && l.plane[0].mips[0].pitch_bytes == 256,
+          "linear 3D 32x32x36 R32 is 36 slices of 32 rows of 256 bytes");
+    check(slot<SizeFn>(computer, 3)(computer) == 0x48000 && slot<SizeFn>(computer, 4)(computer) == 256,
+          "linear 3D size and alignment agree with slot 2");
+    check(slot<OffsetFn>(computer, 6)(computer, 0, 0, 3, 2, 5, 0, nullptr) == 5 * 8192 + 2 * 256 + 3 * 4,
+          "linear 3D element offset is slice, row, column");
+    {
+        // A mip-0 copy through slots 8 and 9: padded source rows and slices land at 256-byte rows, 8 KiB slices.
+        constexpr unsigned row = 32 * 4 + 12, slice = row * 32 + 20;
+        std::vector<uint8_t> source(slice * 36), read_back(source.size(), 0), memory(l.size, 0);
+        for (size_t i = 0; i < source.size(); ++i) source[i] = uint8_t(i * 7 + 3);
+        check(slot<IntoFn>(computer, 8)(computer, memory.data(), 0, 0, source.data(), row, slice) == S_OK &&
+                  std::memcmp(&memory[35 * 8192 + 31 * 256], &source[35 * slice + 31 * row], 32 * 4) == 0 &&
+                  slot<FromFn>(computer, 9)(computer, read_back.data(), 0, 0, 0, memory.data(), row, slice) == S_OK &&
+                  std::memcmp(&read_back[35 * slice + 31 * row], &source[35 * slice + 31 * row], 32 * 4) == 0,
+              "slots 8 and 9 copy a linear 3D mip slice by slice");
+        check(slot<IntoFn>(computer, 8)(computer, memory.data(), 0, 1, source.data(), row, slice) == E_INVALIDARG,
+              "a 3D texture has no second subresource");
+    }
+    slot<RefFn>(computer, 1)(computer);
+
+    // A linear 3D texture with more than one mip: its chain layout (slice-major or mip-major) is not measured, so the
+    // description is refused rather than given offsets that may be wrong for mips 1+.
+    d = {4, 0, 32, 16, 8, 3, DXGI_FORMAT_R8_UNORM, 1, 0, 0x100, 0};
+    check(!build_texture(d, texture), "linear 3D with mips is refused until a title texture measures it");
+
+    // A render-target or depth flag with an explicit mode takes that mode's layout (measured: 1x1 RGBA32F
+    // descriptions with layout 0x100 and the render-target bit reach the title's CPU upload).
+    d = {3, 0, 1, 1, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0, 0x100, 0x300001};
+    if (!make(create, d, computer, "create linear render-target computer")) return 1;
+    check(slot<LayoutFn>(computer, 2)(computer, &l) == S_OK && l.size == 256 && l.alignment == 256,
+          "explicit linear render target is one 256-byte row");
+    slot<RefFn>(computer, 1)(computer);
+    // Without a mode, the render target is not this model's (it leaves the mode to XG's Z/R choice): the general layout
+    // model lays it out, as it does the other render targets above.
+    void* general = nullptr;
+    d.layout = 0;
+    Texture own{};
+    check(!build_texture(d, own), "a render target without a mode is not the explicit-mode model's");
+    check(create(&d, &general) == S_OK && general, "a render target without a mode uses the general layout model");
+    if (general) slot<RefFn>(general, 1)(general);
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

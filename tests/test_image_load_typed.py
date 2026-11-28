@@ -112,6 +112,11 @@ class Module:
         if op == "OpConstantTrue":
             return True
         if op == "OpFunctionCall" and a[1] == "%desc_lookup_fn":
+            if a[0] == "%desc_hit":
+                # The tagged descriptor probe returns (index, kind). These tests model a sampled-only hit:
+                # every sampled-dimension bit set (bits 0..5), no storage-array bit. That keeps the hit in the
+                # sampled array being tested without pretending that it is also bound as a storage image.
+                return (index, 0x3F if index else 0)
             return index
         if op == "OpLoad":
             ptr_op, p = self.defs[a[1]]

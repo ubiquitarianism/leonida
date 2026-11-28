@@ -1,0 +1,29 @@
+GPU:        NVIDIA GB10 (Grace Blackwell superchip, DGX Spark), unified memory, subgroup 32..32
+Driver:     NVIDIA 615.71.09 (proprietary), Vulkan 1.4.351 (loader 1.4.328)
+Subgroup:   32..32
+OS:         Ubuntu 24.04.5 LTS, Linux 7.0.0-1019-nvidia, aarch64
+Commit:     9e7720c (main, 2026-11-25)
+Tools:      llvm-mc 21.1.8 (apt.llvm.org llvm-21, AMDGPU target), SPIRV-Tools v2025.4 (Ubuntu),
+            glslang 16.0.0, CMake 3.28.3, Ninja 1.11.1, GCC 13.3.0, Python 3.12.3
+CPU:        Cortex-X925 + Cortex-A725 cores (arm64)
+RAM:        121 GiB reported (shared with the GPU)
+
+run_gpu_tests.py: 274 shaders: 274 translated, 274 pass spirv-val (both modes)
+            native:                 208/264 passed, 55 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1:  242/264 passed, 21 skipped, 1 failed
+Failed:     cs_imgatomic_ext (both modes): 6 of 64 sint words differ, first word 32: got 0x0badf00d,
+            expected 0x00000101, the six 3D-volume glc returns. Not this GPU: the fixture's volume T# lacks
+            the synthetic-UAV tag the translator gates 3D atomics on, and it fails the same on an RTX 5090,
+            RADV, llvmpipe and MoltenVK; #1518 fixes the fixture.
+Skipped:    native: 33 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this
+            device" and 1 "cannot require a 64-wide fragment subgroup" (the wave64 fixtures, which the
+            emulated run covers), 19 documented "run by d3d12_*_test / w64_graphics.py" cases and 1 "needs
+            the Windows D3D12 runtime". Emulated: the same 19 and 1, plus the 64-wide fragment one.
+Notes:
+- The first arm64 Linux record on real hardware (llvmpipe-arm64-Linux.txt is the CPU rasterizer). Same
+  pass/skip/fail counts as the RTX 5090 on x86-64 Linux at this commit.
+- Built with cmake -S runtime -B runtime/build/linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo and
+  cmake --build runtime/build/linux; run with LLVM_MC=/usr/lib/llvm-21/bin/llvm-mc. Ubuntu 24.04's own
+  llvm-18 is too old (docs/testing.md), so llvm-21 came from apt.llvm.org.
+- The GPU was also serving an unrelated inference job during these runs (they took about 8 minutes each).
+- No game files were used; only the synthetic fixtures in runtime/test/shaders.

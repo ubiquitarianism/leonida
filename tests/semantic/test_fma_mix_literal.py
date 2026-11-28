@@ -77,6 +77,20 @@ class FmaMixLiteralTest(unittest.TestCase):
     def test_reanchored_listing_takes_it_too(self):
         self.assertEqual(self.run_ps(listing(PRINTED, invalid=True), blob(STORED)), [f2u(8.0)] * 4)
 
+    def test_text_cut_but_printed_encoding_whole(self):
+        # llvm-mc 21.1.8 can also print the literal cut to its low half in the text alone, with all 32 bits in the
+        # printed encoding: same_encoding then passes, and before the change the high half read +0.0 (6.0).
+        self.assertEqual(self.run_ps(listing(STORED), blob(STORED)), [f2u(8.0)] * 4)
+        self.assertEqual(self.run_ps(listing(STORED, invalid=True), blob(STORED)), [f2u(8.0)] * 4)
+        # The printed encoding is all it needs: no blob next to the listing.
+        self.assertEqual(self.run_ps(listing(STORED), None), [f2u(8.0)] * 4)
+
+    def test_text_immediate_other_than_the_low_half_is_left_alone(self):
+        # The text shows 0x4000 (2.0), not the encoded literal's low half 0x4200: the text is taken as it reads,
+        # fma(2.0, 2.0, +0.0) = 4.0, not the encoding's fma(3.0, 2.0, 2.0) = 8.0.
+        text = MIX_TEXT.replace("0x4200", "0x4000")
+        self.assertEqual(self.run_ps(listing(program(0x40004200, text=text)), None), [f2u(4.0)] * 4)
+
     def test_without_the_blob_the_printed_literal_is_all_there_is(self):
         # LLVM's text alone: the high half reads +0.0, fma(3.0, 2.0, 0.0) = 6.0 (what the listing says).
         self.assertEqual(self.run_ps(listing(PRINTED), None), [f2u(6.0)] * 4)

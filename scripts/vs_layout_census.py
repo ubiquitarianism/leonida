@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import fssm_unpack  # noqa: E402
 import pal_stages  # noqa: E402
 import shader_disasm  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 import shader_ir  # noqa: E402
 from vs_input_survey import (FETCH_CALL, MBCNT, PARAM_EXPORT, POS0_EXPORT, PRIM_EXPORT, SENDMSG,  # noqa: E402
                              read_before_write)
@@ -87,10 +88,9 @@ def payloads_of(dxbc_path):
             for i, blob in enumerate(blobs)]
 
 
-def survey(dxbc_dir, disasm_fn=None, limit=None):
-    """The census over <dxbc>: counts by stage, hardware id, markers and VS entry VGPRs."""
-    index_path = os.path.join(dxbc_dir, "index.json")
-    with open(index_path, encoding="utf-8") as f:
+def load_index(dxbc_dir):
+    """(stage by stem, stems in index order) from <dxbc>/index.json."""
+    with open(os.path.join(dxbc_dir, "index.json"), encoding="utf-8") as f:
         index = json.load(f)
     if not isinstance(index, list) or not all(isinstance(e, dict) for e in index):
         raise ValueError("index.json is not a list of shader entries")
@@ -102,6 +102,26 @@ def survey(dxbc_dir, disasm_fn=None, limit=None):
             if stem not in stages:
                 names.append(stem)
             stages[stem] = e.get("stage")
+    return stages, names
+
+
+def input_paths(dxbc_dir):
+    """Every file the census may read: index.json, then each indexed container and its disasm/<stem>.s listing.
+    An index that cannot be read names no more; survey() reports it."""
+    paths = [os.path.join(dxbc_dir, "index.json")]
+    try:
+        _stages, names = load_index(dxbc_dir)
+    except (OSError, ValueError):
+        return paths
+    for name in names:
+        paths.append(os.path.join(dxbc_dir, name + ".dxbc"))
+        paths.append(os.path.join(dxbc_dir, "disasm", name + ".s"))
+    return paths
+
+
+def survey(dxbc_dir, disasm_fn=None, limit=None):
+    """The census over <dxbc>: counts by stage, hardware id, markers and VS entry VGPRs."""
+    stages, names = load_index(dxbc_dir)
     if limit is not None:
         names = names[:limit]
 
@@ -186,9 +206,15 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, help="stop after this many containers (index order)")
     a = ap.parse_args(argv)
     index_path = os.path.join(a.dxbc, "index.json")
-    if a.json and os.path.exists(a.json) and os.path.exists(index_path) and os.path.samefile(a.json, index_path):
-        print(f"vs_layout_census: error: --json would overwrite the input {index_path}", file=sys.stderr)
-        return 2
+    if a.json:
+        # Refuse before survey(): it reads the whole corpus and runs llvm-mc for every unlisted payload.
+        if os.path.isdir(a.json):
+            print(f"vs_layout_census: error: --json {a.json} is a directory, not a JSON file", file=sys.stderr)
+            return 2
+        for path in input_paths(a.dxbc):
+            if same_report_path(a.json, path):
+                print(f"vs_layout_census: error: --json would overwrite the input {path}", file=sys.stderr)
+                return 2
     try:
         r = survey(a.dxbc, disasm_fn=default_disasm, limit=a.limit)
     except (OSError, ValueError) as e:

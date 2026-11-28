@@ -163,6 +163,14 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(T.parse(b"\0" * 0x100), ([], []))
 
 
+class PointerTest(unittest.TestCase):
+    def test_array_block_number_is_20_bits(self):
+        # 4097 blocks: block 1 at 0x100, block 4097 at 0x200. A 12-bit block field would read 4097 as block 1.
+        blocks = [(1, 0x40, 0x100)] * 4096 + [(4097, 0x40, 0x200)]
+        b = struct.pack("<QH", 4097 | (0x10 << 20), 2).ljust(0x300, b"\0")
+        self.assertEqual(T._array(b, blocks, 0, (0, 0x52)), (4097, 0x210, 2))
+
+
 class ResolveTest(unittest.TestCase):
     def resolve(self):
         found = {0: T.parse(interiors()), 1: T.parse(placements())}

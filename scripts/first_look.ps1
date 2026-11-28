@@ -105,9 +105,19 @@ $dryRunExitCode = $LASTEXITCODE
 $report = Get-Content -LiteralPath (Join-Path $out "$([IO.Path]::GetFileName($Exe)).json") -Raw | ConvertFrom-Json
 $todo = $report.imports | Where-Object { $_.where -eq "shim" } | Sort-Object { -$_.functions.Count }
 $lines = foreach ($t in $todo) { "{0,-40} {1,5}" -f $t.dll, $t.functions.Count }
+# "unverified" only comes from a host that isn't Windows and has no Wine prefix (pe_inspect.py, classify_dll): most
+# are system DLLs, but a console DLL the shims don't serve yet is among them, so they follow the list, marked.
+$unverified = @($report.imports | Where-Object { $_.where -eq "unverified" } | Sort-Object { -$_.functions.Count })
+if ($unverified.Count -gt 0) {
+    $lines = @(foreach ($t in $todo) { "{0,-40} {1,5}" -f $t.dll, $t.functions.Count }) +
+        @(foreach ($t in $unverified) { "{0,-40} {1,5}  system (unverified)" -f $t.dll, $t.functions.Count })
+}
 Set-Content -LiteralPath (Join-Path $out "shim-todo.txt") -Value $lines
 Write-Host "`n== Shim to-do (DLL, function count)"
 $lines
+if ($unverified.Count -gt 0) {
+    Write-Warning "$($unverified.Count) DLLs could not be checked against system DLLs (no Wine prefix): set WINEPREFIX and run again"
+}
 $enc = $report.sections | Where-Object { $_.looks_encrypted } | ForEach-Object { $_.name }
 if ($enc) { Write-Warning "High-entropy sections (still encrypted or packed): $($enc -join ', ')" }
 Write-Host "`nReports: $out"

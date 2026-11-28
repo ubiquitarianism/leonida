@@ -236,6 +236,16 @@ inline constexpr VkImageViewType vulkan_view_type(ImageType type) {
     }
 }
 
+inline constexpr VkImageSubresourceRange vulkan_subresource_range(const Image& image, VkImageAspectFlags aspects) {
+    const bool volume = image.type == ImageType::image_3d;
+    return {aspects, image.first_mip, image.mip_count, volume ? 0u : image.first_layer,
+            volume ? 1u : image.layer_count};
+}
+
+inline constexpr bool has_hardware_volume_uav_slice_offset(const ImageWords& words, const Image& image) {
+    return image.type == ImageType::image_3d && image.first_layer != 0 && detail::get(words[5], 0, 4) == 1;
+}
+
 // ---- formats ----
 
 // One row for each Vulkan format: its GFX10_FORMAT code, and the DST_SEL that reads its channels as R, G, B, A

@@ -107,14 +107,22 @@ constexpr char kEventName[] = "XGameEventImpl";
 constexpr GUID kEventClass = {0xbbfbdcc7, 0xbfe7, 0x409b, {0xa5, 0xca, 0xed, 0xf0, 0x54, 0x96, 0x0b, 0x4d}};
 std::atomic<long> g_events{0};
 
-bool log_every_event() {
-    static const bool on = [] {
+// "=1" exactly. Read on the first call, which is on a title thread: the answer is kept in a namespace-scope atomic, not
+// a block-scope static, whose guard has been seen to skip the initializer on such a thread under Wine (old upstream
+// 7599).
+bool env_is_one(const char* name, std::atomic<int>& cached) {
+    int on = cached.load(std::memory_order_relaxed);
+    if (on < 0) {
         char value[4] = {};
         size_t length = 0;
-        return getenv_s(&length, value, "LEONIDA_LOG_GAME_EVENTS") == 0 && length == 2 && value[0] == '1';
-    }();
-    return on;
+        on = getenv_s(&length, value, name) == 0 && length == 2 && value[0] == '1';
+        cached.store(on, std::memory_order_relaxed);
+    }
+    return on != 0;
 }
+
+std::atomic<int> g_log_every_event{-1};
+bool log_every_event() { return env_is_one("LEONIDA_LOG_GAME_EVENTS", g_log_every_event); }
 
 // 3: HRESULT XGameEventWrite(XUserHandle user, const char* serviceConfigId, const char* playSessionId,
 //                            const char* eventName, const char* dimensionsJson, const char* measurementsJson)
@@ -399,14 +407,8 @@ struct XDisplayHdrModeInfo {
     float maxFullFrameToneMapLuminance;
 };
 
-bool hdr_requested() {
-    static const bool on = [] {
-        char value[4] = {};
-        size_t length = 0;
-        return getenv_s(&length, value, "LEONIDA_HDR") == 0 && length == 2 && value[0] == '1';
-    }();
-    return on;
-}
+std::atomic<int> g_hdr_requested{-1};
+bool hdr_requested() { return env_is_one("LEONIDA_HDR", g_hdr_requested); }
 
 // 4: XDisplayHdrModeResult XDisplayTryEnableHdrMode(XDisplayHdrModePreference preference, XDisplayHdrModeInfo* info)
 // The host swapchain is SDR, so HDR stays off unless LEONIDA_HDR=1; then it is "enabled" with the documented

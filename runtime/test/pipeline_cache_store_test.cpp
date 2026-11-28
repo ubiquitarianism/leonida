@@ -40,6 +40,14 @@ static int test_limit() {
         CHECK(!limit.valid);
         CHECK(limit.bytes == default_save_limit);
     }
+    // The limit counts what a session adds to an offline seed, not the seed the driver hands back with it.
+    constexpr std::size_t gib = std::size_t{1} << 30;
+    CHECK(!store::over_save_limit(3 * gib, 0, 4 * gib));
+    CHECK(store::over_save_limit(5 * gib, 0, 4 * gib));
+    CHECK(!store::over_save_limit(10 * gib, 9 * gib, 4 * gib));    // a 9 GB seed plus 1 GB of new builds is saved
+    CHECK(store::over_save_limit(14 * gib, 9 * gib, 4 * gib));     // 5 GB added is over 4
+    CHECK(!store::over_save_limit(4 * gib, 9 * gib, 1));           // smaller than the seed: nothing added
+    CHECK(!store::over_save_limit(4 * gib + 1, 1, 4 * gib));       // exactly at the limit once the seed is taken off
     return 0;
 }
 

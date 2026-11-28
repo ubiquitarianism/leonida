@@ -7,7 +7,8 @@
 //   3. a reader further behind than the journal holds is told so (it then looks at everything);
 //   4. a change with no range overlaps every reader;
 //   5. TextureReadability keeps a positive answer, when asked to, until a retry;
-//   6. a pass over 20,000 waiting textures probes only those under the one mapped block.
+//   6. a pass over 20,000 waiting textures probes only those under the one mapped block;
+//   7. between passes, sync_map retries only when a map change overlaps the texture's footprint.
 #include <windows.h>
 
 #include <cstdint>
@@ -140,6 +141,48 @@ int main() {
         check(probes == 4 && readable == 4, "a mapped block probes and finds only the four textures in it");
         probes = 0;
         check(pass() == 4 && probes == 0, "a pass with no change probes nothing");
+    }
+
+    // 7. Synchronous view checks between passes (sync_map): unrelated map changes cost no probe, an overlapping unmap
+    //    defers without reading, and an overlapping map wakes a waiting texture before the next pass.
+    {
+        constexpr std::uintptr_t cpu = kBase + 0x20000000;
+        constexpr std::uint64_t size = 512 * 1024;
+        const std::uint64_t pass_generation = map::generation();
+        bool mapped = true;
+        unsigned probes = 0;
+        leonida::TextureReadability r;
+        const auto probe = [&] {
+            ++probes;
+            return mapped;
+        };
+        check(r.check(0, true, probe, true) && probes == 1 && !r.pending(),
+              "sync_map: initial probe caches a readable answer");
+        for (std::uintptr_t i = 0; i < 32; ++i)
+            map::changed(cpu + size + i * 0x10000, cpu + size + (i + 1) * 0x10000);
+        r.sync_map(pass_generation, cpu, size);
+        check(r.check(0, true, probe, true) && probes == 1,
+              "sync_map: map changes outside the footprint keep the cached answer");
+        r.sync_map(pass_generation, cpu, size);
+        check(r.check(0, true, probe, true) && probes == 1,
+              "sync_map: a second check at the same generation does nothing");
+
+        mapped = false;
+        map::changed(cpu + 0x10000, cpu + 0x20000);
+        r.sync_map(pass_generation, cpu, size);
+        check(!r.check(0, true, probe, true) && r.pending() && probes == 2,
+              "sync_map: an overlapping unmap between passes reprobes and defers");
+
+        map::changed(cpu - 0x10000, cpu);
+        r.sync_map(pass_generation, cpu, size);
+        check(!r.check(0, true, probe, true) && r.pending() && probes == 2,
+              "sync_map: an adjacent non-overlapping change leaves a pending texture waiting");
+
+        mapped = true;
+        map::changed(cpu, cpu + size);
+        r.sync_map(pass_generation, cpu, size);
+        check(r.check(0, true, probe, true) && !r.pending() && probes == 3,
+              "sync_map: an overlapping map between passes wakes a pending texture at once");
     }
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

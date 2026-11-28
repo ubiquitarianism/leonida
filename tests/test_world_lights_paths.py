@@ -25,7 +25,7 @@ PTR = 0x50000000
 
 
 def pool(block, offset=0):
-    """A pool reference: 1-based block number in bits 0..11, byte offset from bit 20."""
+    """A pool reference: 1-based block number in bits 0..19, byte offset from bit 20."""
     return block | (offset << 20)
 
 
@@ -261,6 +261,15 @@ class MetaTest(unittest.TestCase):
         self.assertEqual(v, 0x5000001E)
         self.assertEqual(meta.ref(v), (T.LIGHT, meta.blocks[29][2] + 0x500))
         self.assertEqual(meta.system_shaped, 1)
+
+    def test_pool_block_number_is_20_bits(self):
+        # Block 4097 sets bit 12. A 12-bit block field would refuse it as a pool reference (or read block 1).
+        r = Resource()
+        r.struct(T.LIGHT, 1, [])
+        for _ in range(4097):
+            r.block(T.LIGHT, bytes(0x10))
+        meta = T.Meta(r.build())
+        self.assertEqual(meta.ref(pool(4097, 8)), (T.LIGHT, meta.blocks[4096][2] + 8))
 
     def test_not_a_resource(self):
         with self.assertRaises(ValueError):

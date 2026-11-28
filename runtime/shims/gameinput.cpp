@@ -45,14 +45,17 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <map>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "gameinput.h"
+#include "gameinput_clip.h"
 #include "gameinput_abi.h"
 #include "gameinput_script.h"
+#include "keyboard_pad_connection.h"
 #include "shims.h"
 
 using namespace gi;
@@ -862,10 +865,19 @@ State& g() {
     return *s;
 }
 
+bool matches(const Callback& c, const Event& e);
+
+// Under g().mu. Queues an event only when a registered callback wants it: GameInput dispatches callbacks, and with
+// none listening there is no work. Otherwise every reading (a pad's moving stick, a sensor pad's 125 Hz stream) would
+// queue an item nobody hears, and a title holding a dispatcher that runs one item a frame (Dispatch(0)) would fall
+// further behind every frame: a pad plugged in after start would have its connect event stuck behind that backlog and
+// never reach the title (RT-GAMEINPUT-LATE-PAD).
 void queue_event(const Event& e) {
+    State& s = g();
+    if (std::none_of(s.callbacks.begin(), s.callbacks.end(), [&e](const Callback& c) { return matches(c, e); })) return;
     if (e.device) e.device->AddRef();
     if (e.reading) e.reading->AddRef();
-    g().queue.push_back(e);
+    s.queue.push_back(e);
 }
 
 bool matches(const Callback& c, const Event& e) {
@@ -883,7 +895,19 @@ bool matches(const Callback& c, const Event& e) {
     }
 }
 
+// The token of the callback running on this thread, for kCurrentCallbackToken; 0 outside a callback.
+thread_local GameInputCallbackToken t_running_token = kInvalidCallbackToken;
+
+GameInputCallbackToken resolve_token(GameInputCallbackToken token) {
+    return token == kCurrentCallbackToken ? t_running_token : token;
+}
+
 void call(const Callback& c, const Event& e) {
+    struct Running {  // restored on return, so a callback that drives another delivery keeps its own token
+        GameInputCallbackToken saved = t_running_token;
+        explicit Running(GameInputCallbackToken t) { t_running_token = t; }
+        ~Running() { t_running_token = saved; }
+    } running(c.token);
     switch (c.type) {
         case CbType::Device:
             reinterpret_cast<GameInputDeviceCallback>(c.fn)(c.token, c.context, e.device, e.timestamp, e.current, e.previous);
@@ -1004,6 +1028,9 @@ leonida::InputFamily family_of(SDL_JoystickID jid, SDL_Gamepad* p) {
 // in bits 0-7, forced in bit 8, the generation from bit 16.
 leonida::ActiveInputTracker g_tracker;
 std::atomic<uint64_t> g_active{0};
+// GetCurrentReading calls so far, any device: a scripted press is held until the title has read the pads a few
+// times since it began (update_keyboard_pad).
+std::atomic<uint64_t> g_reading_calls{0};
 
 void publish_active() {
     g_active.store(static_cast<uint64_t>(g_tracker.active()) | (g_tracker.forced() ? 1ull << 8 : 0) |
@@ -1683,10 +1710,10 @@ bool async_key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 //
 // The cursor stops at the edge of the screen, so cursor deltas stop too. Raw input reports what the mouse itself
 // moved, with no edge and no pointer acceleration. A message-only window (never shown) on its own thread receives
-// WM_INPUT and adds each movement to a running total; system_cursor_pos then returns that total as an edgeless
+// WM_INPUT and adds each movement to a running total; raw_cursor_pos then returns that total as an edgeless
 // "cursor", and update_keyboard_pad takes the difference between polls exactly as it did with the real cursor.
 std::atomic<long long> g_raw_x{0}, g_raw_y{0};  // total raw movement since the thread started, mouse counts
-std::atomic<bool> g_raw_ready{false};           // registration worked; system_cursor_pos uses the totals
+std::atomic<bool> g_raw_ready{false};           // registration worked; the pad can use the totals
 std::atomic<bool> g_raw_started{false};         // the thread is started once per process
 
 LRESULT CALLBACK raw_mouse_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1743,12 +1770,13 @@ void start_raw_mouse() {
     if (!g_raw_started.exchange(true)) std::thread(raw_mouse_thread).detach();
 }
 
+bool raw_cursor_pos(int* x, int* y) {
+    *x = static_cast<int>(g_raw_x.load());
+    *y = static_cast<int>(g_raw_y.load());
+    return true;
+}
+
 bool system_cursor_pos(int* x, int* y) {
-    if (g_raw_ready) {  // the edgeless total; it wraps only after ±2^31 counts, and the poll uses differences
-        *x = static_cast<int>(g_raw_x.load());
-        *y = static_cast<int>(g_raw_y.load());
-        return true;
-    }
     POINT p;
     if (!GetCursorPos(&p)) return false;
     *x = p.x;
@@ -1766,33 +1794,42 @@ std::atomic<rt::gameinput::KeyDownFn> g_key_down{async_key_down};
 std::atomic<rt::gameinput::HasFocusFn> g_has_focus{foreground_is_ours};
 std::atomic<rt::gameinput::CursorPosFn> g_cursor_pos{system_cursor_pos};
 
-struct KeyboardPad {
-    SDL_JoystickID id = 0;
-    SDL_Joystick* js = nullptr;
-    bool failed = false;  // attaching failed once; not retried every 2 ms
+struct KeyboardPad : rt::gameinput::detail::KeyboardPadConnection<SDL_JoystickID, SDL_Joystick*> {
     int right_x = 0, right_y = 0;    // the mouse's right stick, SDL axis units (+Y down)
     int cursor_x = 0, cursor_y = 0;  // the cursor at the last poll
+    rt::gameinput::CursorPosFn cursor_source = nullptr;
     bool have_cursor = false;        // cursor_x/y are valid; false after focus loss, so the first poll moves nothing
 };
 KeyboardPad g_keyboard;
 
 bool is_keyboard_pad(SDL_JoystickID jid) { return jid != 0 && jid == g_keyboard.id; }
 
-void detach_keyboard_pad() {
-    if (g_keyboard.js) SDL_CloseJoystick(g_keyboard.js);
-    if (g_keyboard.id) SDL_DetachVirtualJoystick(g_keyboard.id);
-    if (g_keyboard.id) std::fprintf(stderr, "[rt] gameinput: keyboard pad removed\n");
-    g_keyboard = {};
-}
-
 // Keeps the cursor inside the game window while it has focus, so a click cannot land on another window, and releases
 // it on focus loss. Only with raw input (a clipped plain cursor would stop the stick at the window edge) and only for
 // a real foreground window of this process: not KeyboardPadMode::Always over a terminal, nor a test's fake focus.
-// Re-applied every 100 ms, because Windows drops the clip on some focus and resize changes.
+// Re-applied every 100 ms, because Windows drops the clip on some focus and resize changes. Never while the window is
+// dragged or sized, or a press that began on its title bar or border is held (gameinput_clip.h has why).
 bool g_clipped = false;
 uint64_t g_clip_at = 0;
+rt::gameinput::detail::CursorClipGate g_clip_gate;
 
 void clip_cursor(bool want) {
+    const HWND w = want ? GetForegroundWindow() : nullptr;
+    if (w) {
+        GUITHREADINFO gui{};
+        gui.cbSize = sizeof(gui);
+        const bool modal_loop = GetGUIThreadInfo(GetWindowThreadProcessId(w, nullptr), &gui) &&
+                                (gui.flags & (GUI_INMOVESIZE | GUI_INMENUMODE | GUI_SYSTEMMENUMODE));
+        const bool button_down = ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+                                   GetAsyncKeyState(VK_MBUTTON)) & 0x8000) != 0;
+        POINT cursor;
+        RECT client;
+        const bool in_client = GetCursorPos(&cursor) && ScreenToClient(w, &cursor) && GetClientRect(w, &client) &&
+                               PtInRect(&client, cursor);
+        want = g_clip_gate.update(true, modal_loop, button_down, in_client);
+    } else {
+        want = g_clip_gate.update(false, false, false, false);
+    }
     if (!want) {
         if (g_clipped) ClipCursor(nullptr);
         g_clipped = false;
@@ -1800,9 +1837,8 @@ void clip_cursor(bool want) {
     }
     const uint64_t now = now_us();
     if (g_clipped && now - g_clip_at < 100'000) return;
-    const HWND w = GetForegroundWindow();
     RECT r;
-    if (!w || !GetClientRect(w, &r)) return;
+    if (!GetClientRect(w, &r)) return;
     POINT top_left{r.left, r.top}, bottom_right{r.right, r.bottom};
     if (!ClientToScreen(w, &top_left) || !ClientToScreen(w, &bottom_right)) return;
     const RECT screen{top_left.x, top_left.y, bottom_right.x, bottom_right.y};
@@ -1812,29 +1848,34 @@ void clip_cursor(bool want) {
     }
 }
 
-bool attach_keyboard_pad() {
-    SDL_VirtualJoystickDesc d;
-    SDL_INIT_INTERFACE(&d);
-    d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
-    d.naxes = SDL_GAMEPAD_AXIS_COUNT;
-    d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
-    d.button_mask = (1u << SDL_GAMEPAD_BUTTON_COUNT) - 1;
-    d.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
-    d.name = "Keyboard pad (Leonida)";
-    g_keyboard.id = SDL_AttachVirtualJoystick(&d);
-    g_keyboard.js = g_keyboard.id ? SDL_OpenJoystick(g_keyboard.id) : nullptr;
-    if (!g_keyboard.js) {
-        std::fprintf(stderr, "[rt] gameinput: cannot attach the keyboard pad: %s\n", SDL_GetError());
-        detach_keyboard_pad();
-        g_keyboard.failed = true;
-        return false;
+struct KeyboardPadBackend {
+    static uint64_t now() { return now_us(); }
+    static SDL_JoystickID attach() {
+        SDL_VirtualJoystickDesc d;
+        SDL_INIT_INTERFACE(&d);
+        d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        d.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        d.button_mask = (1u << SDL_GAMEPAD_BUTTON_COUNT) - 1;
+        d.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
+        d.name = "Keyboard pad (Leonida)";
+        return SDL_AttachVirtualJoystick(&d);
     }
-    std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
-                         "Q/E shoulders, Esc Menu, Tab View, WASD left stick, mouse right stick, right/left "
-                         "button LT/RT)\n");
-    start_raw_mouse();
-    return true;
-}
+    static SDL_Joystick* open(SDL_JoystickID id) { return SDL_OpenJoystick(id); }
+    static void close(SDL_Joystick* js) { SDL_CloseJoystick(js); }
+    static bool detach(SDL_JoystickID id) { return SDL_DetachVirtualJoystick(id); }
+    static bool is_virtual(SDL_JoystickID id) { return SDL_IsJoystickVirtual(id); }
+    static void removed() { std::fprintf(stderr, "[rt] gameinput: keyboard pad removed\n"); }
+    static void failed() {
+        std::fprintf(stderr, "[rt] gameinput: cannot attach the keyboard pad: %s\n", SDL_GetError());
+    }
+    static void attached() {
+        std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
+                             "Q/E shoulders, Esc Menu, Tab View, WASD left stick, mouse right stick, right/left "
+                             "button LT/RT)\n");
+        start_raw_mouse();
+    }
+};
 
 // Before SDL_UpdateGamepads, so the buttons set here are in this poll's reading.
 void update_keyboard_pad() {
@@ -1845,17 +1886,19 @@ void update_keyboard_pad() {
         mode = g().config.keyboard_pad;
         sens = g().config.mouse_sensitivity;
     }
-    if (mode == rt::gameinput::KeyboardPadMode::Off) {
+    KeyboardPadBackend backend;
+    const bool enabled = mode != rt::gameinput::KeyboardPadMode::Off;
+    if (!enabled) {
         clip_cursor(false);
-        if (g_keyboard.id) detach_keyboard_pad();
-        g_keyboard.failed = false;
-        return;
+        g_keyboard.right_x = g_keyboard.right_y = 0;
+        g_keyboard.have_cursor = false;
     }
-    if (!g_keyboard.js && (g_keyboard.failed || !attach_keyboard_pad())) return;
+    if (!g_keyboard.update(enabled, backend)) return;
 
     bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
     int lx = 0, ly = 0;
     bool aim = false, fire = false;
+    bool raw_mouse = false;
     // Focus gates physical keyboard and mouse input. Read the cursor afresh on return to avoid a jump.
     // Scripted presses still run while the window is unfocused.
     const bool active = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
@@ -1868,25 +1911,39 @@ void update_keyboard_pad() {
         fire = key_down(VK_LBUTTON);
 
         int x = 0, y = 0;
-        const bool have = g_cursor_pos.load()(&x, &y);
+        auto cursor_source = g_cursor_pos.load();
+        raw_mouse = cursor_source == system_cursor_pos && g_raw_ready;
+        if (raw_mouse) cursor_source = raw_cursor_pos;
+        // The first sample from a new coordinate source establishes its baseline.
+        if (cursor_source != g_keyboard.cursor_source) {
+            g_keyboard.cursor_source = cursor_source;
+            g_keyboard.have_cursor = false;
+        }
+        const bool have = cursor_source(&x, &y);
         const bool moved = have && g_keyboard.have_cursor;
+        // Raw input exposes the low bits of a running total. Keep subtraction modular across a wrap.
+        auto delta = [](int current, int previous) {
+            return static_cast<int>(static_cast<unsigned>(current) - static_cast<unsigned>(previous));
+        };
         auto step = [sens](int v, int pixels) {
             const long long n = static_cast<long long>(v) * kMouseDecayNum / kMouseDecayDen +
-                                std::lround(static_cast<long long>(pixels) * kMouseAxisPerPixel * sens);
+                                std::llround(static_cast<long long>(pixels) * kMouseAxisPerPixel * sens);
             return static_cast<int>(std::clamp<long long>(n, -kStickFull, kStickFull));
         };
-        g_keyboard.right_x = step(g_keyboard.right_x, moved ? x - g_keyboard.cursor_x : 0);
-        g_keyboard.right_y = step(g_keyboard.right_y, moved ? y - g_keyboard.cursor_y : 0);
+        g_keyboard.right_x = step(g_keyboard.right_x, moved ? delta(x, g_keyboard.cursor_x) : 0);
+        g_keyboard.right_y = step(g_keyboard.right_y, moved ? delta(y, g_keyboard.cursor_y) : 0);
         if (have) g_keyboard.cursor_x = x, g_keyboard.cursor_y = y;
         g_keyboard.have_cursor = have;
     } else {
         g_keyboard.right_x = g_keyboard.right_y = 0;
         g_keyboard.have_cursor = false;
     }
-    clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
+    clip_cursor(raw_mouse && foreground_is_ours());
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
     // LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120" (with LEONIDA_KEYBOARD_PAD=always): timed presses on the keyboard
-    // pad, in seconds since the pad's first update, each held 300 ms. For unattended boots: the title's first prompt
+    // pad, in seconds since the pad's first update, each held 300 ms or its own button@seconds:hold, and then until the
+    // title has read the pads kReads times since it began (never past kMaxHold seconds, or the hold if it is longer, so
+    // a title that stops reading does not keep the button). For unattended boots: the title's first prompt
     // waits for a button with no timeout (docs/re/notes/firstframe.md, step 5). The parser, the timeline and the
     // button names are gameinput_script.h's, shared with the scripted pad of a build without SDL3.
     namespace script = rt::gameinput::script;
@@ -1898,13 +1955,82 @@ void update_keyboard_pad() {
                          s.presses.size(), s.rejected);
         return s;
     }();
-    if (!scripted.empty()) {
+    // LEONIDA_INPUT_FILE=<path> (local, for headless runs whose display takes no keyboard input): every line appended
+    // to the file names one button of gameinput_script.h's table ("a", "down", ...) and becomes a press at once, held
+    // like a scripted one (300 ms and six readings, at most 5 s). The file is read again at most every 250 ms.
+    struct FilePress {
+        uint32_t bit;
+        double at;
+        uint64_t began;
+        bool started;
+    };
+    static std::vector<FilePress> file_presses;
+    static const std::string input_file = [] {
+        const char* v = std::getenv("LEONIDA_INPUT_FILE");
+        return std::string(v ? v : "");
+    }();
+    if (!scripted.empty() || !input_file.empty()) {
         static const ULONGLONG origin = GetTickCount64();
         const double now = (GetTickCount64() - origin) / 1000.0;
-        const script::Held held = script::held_at(scripted, now);
+        script::Held held{};
+        static constexpr uint64_t kReads = 6;
+        static constexpr double kMaxHold = 5.0;
+        static std::vector<uint64_t> began(scripted.presses.size(), 0);
+        static std::vector<char> started(scripted.presses.size(), 0);
+        const uint64_t calls = g_reading_calls.load(std::memory_order_relaxed);
+        if (!input_file.empty()) {
+            static ULONGLONG last_read = 0;
+            static std::size_t lines_done = 0;
+            const ULONGLONG tick = GetTickCount64();
+            if (tick - last_read >= 250) {
+                last_read = tick;
+                if (FILE* f = std::fopen(input_file.c_str(), "r")) {
+                    char line[64];
+                    std::size_t n = 0;
+                    while (std::fgets(line, sizeof(line), f)) {
+                        if (++n <= lines_done) continue;
+                        lines_done = n;
+                        std::string name(line);
+                        while (!name.empty() && (name.back() == '\n' || name.back() == '\r' || name.back() == ' '))
+                            name.pop_back();
+                        bool known = false;
+                        for (const script::Button& b : script::kButtons)
+                            if (name == b.name) {
+                                file_presses.push_back({b.bit, now, 0, false});
+                                known = true;
+                            }
+                        std::fprintf(stderr, "[rt] gameinput: input file line %zu \"%s\" at %.1f s%s\n", n,
+                                     name.c_str(), now, known ? "" : " (unknown button, ignored)");
+                    }
+                    std::fclose(f);
+                }
+            }
+            for (auto& p : file_presses) {
+                if (now < p.at || now >= p.at + kMaxHold) continue;
+                if (!p.started) {
+                    p.started = true;
+                    p.began = calls;
+                }
+                if (now < p.at + 0.3 || calls - p.began < kReads) held.buttons |= p.bit;
+            }
+        }
+        for (std::size_t i = 0; i < scripted.presses.size(); ++i) {
+            const auto& press = scripted.presses[i];
+            bool active = false;
+            if (now >= press.at && now < press.at + std::max(press.hold, kMaxHold)) {
+                if (!started[i]) {
+                    started[i] = 1;
+                    began[i] = calls;
+                }
+                active = now < press.at + press.hold || calls - began[i] < kReads;
+            }
+            if (!active) continue;
+            if (press.stick) held.stick = press.stick;
+            else held.buttons |= press.button;
+        }
         if (held.stick) right_y = held.stick > 0 ? -kStickFull : kStickFull;  // SDL's +Y is down
         for (const script::Button& b : script::kButtons) {
-            if (!(scripted.named & b.bit)) continue;
+            if (!(scripted.named & b.bit) && input_file.empty()) continue;
             const auto button = static_cast<SDL_GamepadButton>(b.sdl);
             SDL_SetJoystickVirtualButton(g_keyboard.js, button, (held.buttons & b.bit) || down[button]);
         }
@@ -1959,6 +2085,10 @@ void poll_once() {
     SDL_JoystickID* ids = SDL_GetGamepads(&count);
     std::vector<SDL_JoystickID> present(ids, ids + (ids ? count : 0));
     SDL_free(ids);
+    // An unopened virtual device may still be waiting for SDL to finish detaching it.
+    // Do not advertise it to the title until it has a working keyboard handle.
+    if (g_keyboard.id && !g_keyboard.js)
+        present.erase(std::remove(present.begin(), present.end(), g_keyboard.id), present.end());
 
     std::vector<Device*> connected;
     {
@@ -2326,7 +2456,13 @@ public:
         return r;
     }
     // Runs the queued callbacks on the caller's thread within the quota (see deliver_within).
-    bool STDMETHODCALLTYPE Dispatch(uint64_t quotaInMicroseconds) override { return deliver_within(quotaInMicroseconds); }
+    bool STDMETHODCALLTYPE Dispatch(uint64_t quotaInMicroseconds) override {
+        static std::atomic<bool> s_logged{false};
+        if (!s_logged.exchange(true))
+            std::fprintf(stderr, "[rt] gameinput: Dispatch first call (quota %llu us)\n",
+                         static_cast<unsigned long long>(quotaInMicroseconds));
+        return deliver_within(quotaInMicroseconds);
+    }
     HRESULT STDMETHODCALLTYPE OpenWaitHandle(HANDLE* handle) override {
         if (!handle) return E_POINTER;
         *handle = nullptr;
@@ -2411,7 +2547,80 @@ public:
 
     uint64_t STDMETHODCALLTYPE GetCurrentTimestamp() override { return now_us(); }
 
+    // LEONIDA_INPUT_STATS=1 (diagnostic): every 10 s, how the title asked for readings (by method and device
+    // argument) and what it got (by the reading's device, and whether a gamepad button was down in it).
+    static void note_reading(int method, IGameInputDevice* asked, HRESULT hr, IGameInputReading* got) {
+        static const bool on = env("LEONIDA_INPUT_STATS") == "1";
+        if (!on) return;
+        struct Stats {
+            std::mutex mu;
+            uint64_t calls[3][3] = {};  // method x (null, aggregate, a device)
+            uint64_t found[3] = {}, pressed[3] = {}, a_pressed[3] = {};
+            std::map<std::string, std::pair<uint64_t, uint64_t>> by_device;  // name -> (readings, with buttons)
+            uint64_t since = 0;
+        };
+        static Stats st;
+        std::string name;
+        bool buttons = false, a_button = false;
+        if (SUCCEEDED(hr) && got) {
+            IGameInputDevice* d = nullptr;
+            got->GetDevice(&d);
+            if (d) {
+                name = as_device(d)->name;
+                d->Release();
+            }
+            GameInputGamepadState g{};
+            if (got->GetGamepadState(&g)) {
+                buttons = g.buttons != 0;
+                a_button = (g.buttons & GameInputGamepadA) != 0;
+            }
+        }
+        const int arg = !asked ? 0 : as_device(asked)->info.deviceFamily == GameInputFamilyAggregate ? 1 : 2;
+        std::lock_guard lock(st.mu);
+        ++st.calls[method][arg];
+        if (SUCCEEDED(hr) && got) {
+            ++st.found[method];
+            st.pressed[method] += buttons;
+            st.a_pressed[method] += a_button;
+            auto& e = st.by_device[name];
+            ++e.first;
+            e.second += buttons;
+        }
+        const uint64_t now = now_us();
+        if (!st.since) st.since = now;
+        if (now - st.since < 10'000'000) return;
+        static const char* methods[] = {"GetCurrentReading", "GetNextReading", "GetPreviousReading"};
+        std::string line;
+        for (int m = 0; m < 3; ++m) {
+            char t[200];
+            std::snprintf(t, sizeof(t), " %s %llu/%llu/%llu found %llu pressed %llu A %llu;", methods[m],
+                          (unsigned long long)st.calls[m][0], (unsigned long long)st.calls[m][1],
+                          (unsigned long long)st.calls[m][2], (unsigned long long)st.found[m],
+                          (unsigned long long)st.pressed[m], (unsigned long long)st.a_pressed[m]);
+            line += t;
+        }
+        for (const auto& [n, c] : st.by_device) {
+            char t[160];
+            std::snprintf(t, sizeof(t), " [%s: %llu readings, %llu with buttons]", n.c_str(), (unsigned long long)c.first,
+                          (unsigned long long)c.second);
+            line += t;
+        }
+        std::fprintf(stderr, "[rt] gameinput stats (calls null/aggregate/device): %s\n", line.c_str());
+        std::memset(st.calls, 0, sizeof(st.calls));
+        std::memset(st.found, 0, sizeof(st.found));
+        std::memset(st.pressed, 0, sizeof(st.pressed));
+        std::memset(st.a_pressed, 0, sizeof(st.a_pressed));
+        st.by_device.clear();
+        st.since = now;
+    }
+
     HRESULT STDMETHODCALLTYPE GetCurrentReading(uint32_t kind, IGameInputDevice* device, IGameInputReading** out) override {
+        g_reading_calls.fetch_add(1, std::memory_order_relaxed);
+        const HRESULT hr = current_reading(kind, device, out);
+        note_reading(0, device, hr, out ? *out : nullptr);
+        return hr;
+    }
+    HRESULT current_reading(uint32_t kind, IGameInputDevice* device, IGameInputReading** out) {
         if (!out) return E_POINTER;
         *out = nullptr;
         if (kind != GameInputKindUnknown && !(kind & kSupportedKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
@@ -2445,11 +2654,15 @@ public:
 
     HRESULT STDMETHODCALLTYPE GetNextReading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device,
                                              IGameInputReading** out) override {
-        return find_reading(ref, kind, device, out, true);
+        const HRESULT hr = find_reading(ref, kind, device, out, true);
+        note_reading(1, device, hr, out ? *out : nullptr);
+        return hr;
     }
     HRESULT STDMETHODCALLTYPE GetPreviousReading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device,
                                                  IGameInputReading** out) override {
-        return find_reading(ref, kind, device, out, false);
+        const HRESULT hr = find_reading(ref, kind, device, out, false);
+        note_reading(2, device, hr, out ? *out : nullptr);
+        return hr;
     }
     // E_NOTIMPL is GameInput v0's own answer: Microsoft's reference page says the method "was never implemented in
     // v0" and returns E_NOTIMPL, and v1 removed it. A history lookup here would give a title what no GameInput does.
@@ -2473,6 +2686,15 @@ public:
         if (token) *token = kInvalidCallbackToken;
         if (!fn) return E_INVALIDARG;
         if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
+        // How a title learns of its pads decides whether one plugged in later reaches it, so the first few
+        // registrations are logged.
+        static std::atomic<int> s_logged{0};
+        if (s_logged.fetch_add(1) < 8)
+            std::fprintf(stderr, "[rt] gameinput: RegisterDeviceCallback(%s, kind 0x%x, status 0x%x, %s enumeration)\n",
+                         device ? "one device" : "all devices", kind, status_filter,
+                         enumeration == GameInputBlockingEnumeration ? "blocking"
+                         : enumeration == GameInputAsyncEnumeration  ? "async"
+                                                                     : "no");
         State& s = g();
         GameInputCallbackToken t;
         std::vector<Event> now;
@@ -2518,6 +2740,8 @@ public:
     }
 
     void STDMETHODCALLTYPE StopCallback(GameInputCallbackToken token) override {
+        token = resolve_token(token);
+        if (token == kInvalidCallbackToken) return;
         std::lock_guard lock(g().mu);
         for (Callback& c : g().callbacks)
             if (c.token == token) c.active = false;
@@ -2526,6 +2750,8 @@ public:
     // Removes the callback and, unless called from inside a callback, waits for one that is running to return.
     // VERIFY: the timeout is not honoured; the wait is for at most one callback.
     bool STDMETHODCALLTYPE UnregisterCallback(GameInputCallbackToken token, uint64_t) override {
+        token = resolve_token(token);
+        if (token == kInvalidCallbackToken) return false;
         State& s = g();
         bool found = false;
         {
@@ -2542,6 +2768,9 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateDispatcher(IGameInputDispatcher** out) override {
         if (!out) return E_POINTER;
+        static std::atomic<bool> s_logged{false};
+        if (!s_logged.exchange(true))
+            std::fprintf(stderr, "[rt] gameinput: CreateDispatcher first call (callbacks now run in Dispatch)\n");
         *out = new Dispatcher;
         return S_OK;
     }

@@ -9,6 +9,9 @@ own src1), with 0 for src0 when the selected lane is out of its row or inactive.
 writes are translated: all rows and banks enabled and either `bound_ctrl:1` or DPP8. A form that leaves a lane
 unwritten is refused, because what that lane's mask bit becomes is not measured.
 
+`v_cmpx` in DPP form (SHADER-VOPCX-DPP) takes the same forms and writes EXEC instead of VCC. 78 pipeline-library
+pixel shaders of 1.0.2.1 hold it, all as `v_cmpx_gt_f32_dpp vN, -vM quad_perm:[2,3,0,1] ... bound_ctrl:1 fi:1`.
+
 The values come from running the translated module in tests/semantic/spirv_wave_interp.py.
 
 Standard library only; no GPU, no LLVM, no SPIRV-Tools, no game files.
@@ -66,32 +69,38 @@ def compare_vs(op, form, exec_off=None):
 
 def compare_reference(op, form, exec_off=None, wave=32):
     """The VCC bit per lane after compare_vs: an inactive lane's bit is 0, as for a plain compare."""
-    mods = form.split()
-    fi = any(m == "fi:1" for m in mods)
     relation = COMPARES[op][1]
     active = [lane != exec_off for lane in range(wave)]
     out = []
     for lane in range(wave):
-        loc, ok = lane & 15, True
-        if mods[0].startswith("dpp8:"):
-            src = (lane & ~7) | [int(x) for x in mods[0][6:-1].split(",")][lane & 7]
-        elif mods[0].startswith("quad_perm:"):
-            src = (lane & ~3) | [int(x) for x in mods[0][11:-1].split(",")][lane & 3]
-        else:
-            kind, _, n = mods[0].partition(":")
-            n = int(n or 0)
-            if kind == "row_shr":
-                ok, s = loc >= n, loc - n
-            elif kind == "row_shl":
-                ok, s = loc + n < 16, loc + n
-            elif kind == "row_ror":
-                s = (loc - n) & 15
-            else:                                                    # row_mirror
-                s = 15 - loc
-            src = (lane & ~15) | (s & 15)
-        valid = ok and (active[src] or fi)
-        out.append(int(active[lane] and relation(src if valid else 0, lane)))
+        src = source_lane(form, lane, active)
+        out.append(int(active[lane] and relation(src if src is not None else 0, lane)))
     return out
+
+
+def source_lane(form, lane, active):
+    """The lane DPP `form` reads src0 from for `lane`, or None where src0 reads 0 (out of the row, or inactive
+    without fi:1)."""
+    mods = form.split()
+    fi = any(m == "fi:1" for m in mods)
+    loc, ok = lane & 15, True
+    if mods[0].startswith("dpp8:"):
+        src = (lane & ~7) | [int(x) for x in mods[0][6:-1].split(",")][lane & 7]
+    elif mods[0].startswith("quad_perm:"):
+        src = (lane & ~3) | [int(x) for x in mods[0][11:-1].split(",")][lane & 3]
+    else:
+        kind, _, n = mods[0].partition(":")
+        n = int(n or 0)
+        if kind == "row_shr":
+            ok, s = loc >= n, loc - n
+        elif kind == "row_shl":
+            ok, s = loc + n < 16, loc + n
+        elif kind == "row_ror":
+            s = (loc - n) & 15
+        else:                                                    # row_mirror
+            s = 15 - loc
+        src = (lane & ~15) | (s & 15)
+    return src if ok and (active[src] or fi) else None
 
 
 def run(op, form, exec_off=None):
@@ -124,30 +133,105 @@ class DppCompare(unittest.TestCase):
     def test_a_form_that_leaves_a_lane_unwritten_is_refused(self):
         for form in UNWRITTEN_FORMS:
             with self.subTest(form=form):
-                with self.assertRaisesRegex(Unsupported, "DPP compare with lanes that keep their mask bit"):
+                with self.assertRaisesRegex(Unsupported, "DPP compare with lanes DPP leaves unwritten"):
                     compare_vs("v_cmp_gt_f32_dpp", form)
 
-    def test_cmpx_is_refused(self):
-        lines = ["v_mbcnt_lo_u32_b32 v0, -1, 0",
-                 "v_cmpx_gt_u32_dpp v0, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:1",
+
+# v_cmpx in DPP form (SHADER-VOPCX-DPP): the same lane selection, with the result written to EXEC. src0 is the first
+# operand, since v_cmpx prints no destination. f32 compares read v1 = float(lane - 4), so a negated src1 changes the
+# result; integer compares read v0 = lane.
+CMPX = {
+    "v_cmpx_gt_f32_dpp": ("v1", lambda a, b: a > b),
+    "v_cmpx_lt_u32_dpp": ("v0", lambda a, b: a < b),
+    "v_cmpx_eq_u32_dpp": ("v0", lambda a, b: a == b),
+}
+# The form all 113 DPP v_cmpx of the 78 refused pipeline-library pixel shaders of 1.0.2.1 use, with src1 negated.
+GAME_FORM = "quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:1 fi:1"
+
+
+def cmpx_vs(op, form, exec_off=None, neg=False):
+    """A vertex shader: EXEC = `op`(DPP(src), [-]src) over the lanes on (all but `exec_off`); param0.x exports 1
+    where the new EXEC keeps the lane and 0 where it drops it."""
+    src = CMPX[op][0]
+    lines = ["v_mbcnt_lo_u32_b32 v0, -1, 0", "v_add_nc_u32_e32 v7, -4, v0", "v_cvt_f32_i32_e32 v1, v7",
+             "v_mov_b32 v4, 1", "v_mov_b32 v6, 0", "s_mov_b32 s10, exec_lo"]
+    if exec_off is not None:
+        lines.append(f"v_cmpx_ne_u32_e32 {exec_off}, v0")
+    lines += [f"{op} {src}, {'-' if neg else ''}{src} {form}", "v_mov_b32 v6, v4", "s_mov_b32 exec_lo, s10",
+              "v_mov_b32 v5, 0", "exp pos0 v5, v5, v5, v5 done", "exp param0 v6, v5, v5, v5", "s_endpgm"]
+    return support.translate_lines("vs_dpp_cmpx", lines)
+
+
+def cmpx_reference(op, form, exec_off=None, neg=False, wave=32):
+    """The EXEC bit per lane after the v_cmpx of cmpx_vs: 0 for a lane that was off, as for a plain v_cmpx."""
+    src, relation = CMPX[op]
+    value = (lambda lane: float(lane - 4)) if src == "v1" else (lambda lane: lane)
+    active = [lane != exec_off for lane in range(wave)]
+    out = []
+    for lane in range(wave):
+        s = source_lane(form, lane, active)
+        a = value(s) if s is not None else 0
+        b = -value(lane) if neg else value(lane)
+        out.append(int(active[lane] and relation(a, b)))
+    return out
+
+
+def run_cmpx(op, form, exec_off=None, neg=False):
+    res = wi.run_wave(cmpx_vs(op, form, exec_off, neg), wave=32,
+                      builtins={"VertexIndex": lambda lane: lane, "InstanceIndex": lambda lane: 0})
+    return [o["%out_param0"][0] for o in res["outputs"]]
+
+
+class DppCompareExec(unittest.TestCase):
+    def test_values(self):
+        for op in CMPX:
+            for form in WRITTEN_FORMS + [GAME_FORM]:
+                for exec_off in (None, 5, 16):
+                    with self.subTest(op=op, form=form, exec_off=exec_off):
+                        self.assertEqual(run_cmpx(op, form, exec_off), cmpx_reference(op, form, exec_off))
+
+    def test_game_form_with_negated_src1(self):
+        for exec_off in (None, 1, 6):
+            with self.subTest(exec_off=exec_off):
+                want = cmpx_reference("v_cmpx_gt_f32_dpp", GAME_FORM, exec_off, neg=True)
+                self.assertEqual(run_cmpx("v_cmpx_gt_f32_dpp", GAME_FORM, exec_off, neg=True), want)
+                self.assertNotEqual(want, cmpx_reference("v_cmpx_gt_f32_dpp", GAME_FORM, exec_off))
+
+    def test_reference_by_hand(self):
+        # quad_perm:[2,3,0,1] swaps the halves of each quad, and lanes 0-7 hold -4..3: lane 0 compares lane 2's -2
+        # with its own -4, so -2 > -4 keeps it and, src1 negated, -2 > 4 drops it.
+        self.assertEqual(cmpx_reference("v_cmpx_gt_f32_dpp", GAME_FORM)[:8], [1, 1, 0, 0, 1, 1, 0, 0])
+        self.assertEqual(cmpx_reference("v_cmpx_gt_f32_dpp", GAME_FORM, neg=True)[:8], [0, 0, 0, 0, 1, 1, 1, 1])
+        # A lane that was off stays off, whatever its compare gives.
+        self.assertEqual(cmpx_reference("v_cmpx_gt_f32_dpp", GAME_FORM, exec_off=5)[:8], [1, 1, 0, 0, 1, 0, 0, 0])
+
+    def test_a_form_that_leaves_a_lane_unwritten_is_refused(self):
+        for form in UNWRITTEN_FORMS:
+            with self.subTest(form=form):
+                with self.assertRaisesRegex(Unsupported, "DPP compare with lanes DPP leaves unwritten"):
+                    cmpx_vs("v_cmpx_gt_f32_dpp", form)
+
+    def test_a_destination_operand_is_refused(self):
+        # v_cmpx prints no destination: a line with one is not a form the disassembler writes.
+        lines = ["v_mbcnt_lo_u32_b32 v0, -1, 0", f"v_cmpx_gt_u32_dpp vcc_lo, v0, v0 {WRITTEN_FORMS[0]}",
                  "v_mov_b32 v5, 0", "exp pos0 v5, v5, v5, v5 done", "s_endpgm"]
-        with self.assertRaises(Unsupported):
-            support.translate_lines("vs_dpp_cmpx", lines)
+        with self.assertRaisesRegex(Unsupported, "DPP compare operands"):
+            support.translate_lines("vs_dpp_cmpx_dst", lines)
 
 
 def vopc(opcode, src0, vsrc1):
     return 0x3E << 25 | opcode << 17 | vsrc1 << 9 | src0
 
 
-def dpp16_word(src0_reg, ctrl, bound=0, fi=0, bank_mask=0xF, row_mask=0xF):
-    return row_mask << 28 | bank_mask << 24 | bound << 19 | fi << 18 | ctrl << 8 | src0_reg
+def dpp16_word(src0_reg, ctrl, bound=0, fi=0, bank_mask=0xF, row_mask=0xF, src1_neg=0):
+    return row_mask << 28 | bank_mask << 24 | src1_neg << 22 | bound << 19 | fi << 18 | ctrl << 8 | src0_reg
 
 
 def dpp8_word(src0_reg, lanes):
     return sum(lane << (8 + 3 * i) for i, lane in enumerate(lanes)) | src0_reg
 
 
-GT_F32, LT_U32 = 0x04, 0xC1                 # VOPC opcodes (tools/rdna2_tables.py)
+GT_F32, LT_U32, CMPX_GT_F32 = 0x04, 0xC1, 0x14     # VOPC opcodes (tools/rdna2_tables.py)
 S_ENDPGM = 0xBF810000
 # (first word, second word, the line both printers give)
 PAIRS = [
@@ -161,6 +245,9 @@ PAIRS = [
      "v_cmp_gt_f32_dpp vcc_lo, v20, v20 dpp8:[4,5,6,7,0,1,2,3]"),
     (vopc(GT_F32, 234, 6), dpp8_word(5, [7, 6, 5, 4, 3, 2, 1, 0]),
      "v_cmp_gt_f32_dpp vcc_lo, v5, v6 dpp8:[7,6,5,4,3,2,1,0] fi:1"),
+    # The game's v_cmpx form: no destination, src1 negated (bytes fa 02 28 7c 01 4e 4c ff).
+    (vopc(CMPX_GT_F32, 250, 1), dpp16_word(1, 0x4E, bound=1, fi=1, src1_neg=1),
+     "v_cmpx_gt_f32_dpp v1, -v1 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:1 fi:1"),
 ]
 
 
@@ -175,6 +262,7 @@ class DppCompareDecode(unittest.TestCase):
         import rdna2_decode
         self.assertEqual(rdna2_decode.T.VOPC[GT_F32][0], "v_cmp_gt_f32")
         self.assertEqual(rdna2_decode.T.VOPC[LT_U32][0], "v_cmp_lt_u32")
+        self.assertEqual(rdna2_decode.T.VOPC[CMPX_GT_F32][0], "v_cmpx_gt_f32")
 
     def test_python_decoder(self):
         import rdna2_decode
@@ -186,8 +274,8 @@ class DppCompareDecode(unittest.TestCase):
                 self.assertEqual((lines, bad), ([want, "s_endpgm"], 0))
 
     def test_a_decoded_line_translates(self):
-        # What the disassembler prints is what the translator takes: the two forms it accepts, from PAIRS.
-        for _, _, line in (PAIRS[0], PAIRS[3]):
+        # What the disassembler prints is what the translator takes: the forms it accepts, from PAIRS.
+        for _, _, line in (PAIRS[0], PAIRS[3], PAIRS[5]):
             with self.subTest(line=line):
                 lines = ["v_mbcnt_lo_u32_b32 v0, -1, 0", line, "v_mov_b32 v5, 0", "exp pos0 v5, v5, v5, v5 done",
                          "s_endpgm"]

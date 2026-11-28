@@ -137,7 +137,40 @@ class VccTupleFallbackTest(unittest.TestCase):
         ]
         for variant in PROGRAM_VARIANTS:
             with self.subTest(printed_as=variant):
-                self.assertIn("OpFunctionCall %uint %desc_lookup_fn", translate(program, variant))
+                self.assertRegex(translate(program, variant), r"OpFunctionCall %\w+ %desc_lookup_fn")
+
+    def test_load_with_register_offset_into_vcc(self):
+        # The widened scalar load with an SGPR soffset and an immediate offset (the form luizwidmer/palmetto's
+        # docs/boot_frontier.md measured in an FSPX program, built here from the field layout, not copied):
+        # s_buffer_load_dwordx8 [s100..s105,vcc_lo,vcc_hi], s[4:7], s12 offset:0x40 reads BASE + 0x40 + s12.
+        load = "02 19 2c f4 40 00 00 18"
+        program = [SET_SGPR_V[0], SET_SGPR_V[1], ("s_mov_b32 s6, 0x100", "ff 03 86 be 00 01 00 00"), SET_SGPR_V[3],
+                   ("s_mov_b32 s12, 32", "a0 03 8c be"),
+                   (None, load), WAIT,
+                   ("v_mov_b32_e32 v10, s100", "64 02 14 7e"), ("v_mov_b32_e32 v11, s105", "69 02 16 7e"),
+                   ("v_mov_b32_e32 v12, vcc_lo", "6a 02 18 7e"), ("v_mov_b32_e32 v13, vcc_hi", "6b 02 1a 7e"),
+                   ] + STORE_X4
+        words = [0x22220000 + i for i in range(8)]
+        for variant in PROGRAM_VARIANTS:
+            with self.subTest(printed_as=variant):
+                mem = run(translate(program, variant), {BASE + 0x60 + 4 * i: w for i, w in enumerate(words)})
+                self.assertEqual([mem.get(OUT + 4 * i) for i in range(4)], [words[0], words[5], words[6], words[7]])
+
+    def test_buffer_store_with_resource_in_vcc(self):
+        # buffer_store_dword v11, v1, [s104,s105,vcc_lo,vcc_hi], 0 offen: a store through the widened resource too.
+        store = "00 10 70 e0 01 0b 1a 80"
+        program = SET_SGPR_V + [
+            (None, LOAD_X4_VCC), WAIT,
+            ("v_mov_b32_e32 v1, 4", "84 02 02 7e"),
+            ("v_mov_b32_e32 v11, 0x5a5a1234", "ff 02 16 7e 34 12 5a 5a"),
+            (None, store), WAIT_V,
+            ("s_endpgm", "00 00 81 bf"),
+        ]
+        memory = {BASE + 4 * i: w for i, w in enumerate([OUT, 0, 16, 0x30000000])}
+        for variant in PROGRAM_VARIANTS:
+            with self.subTest(printed_as=variant):
+                mem = run(translate(program, variant), memory)
+                self.assertEqual(mem.get(OUT + 4), 0x5A5A1234)
 
     def test_junk_that_swallows_the_next_instructions(self):
         # The junk at the tuple's second word is longer than that word, so it covers the s_mov_b32 after the tuple

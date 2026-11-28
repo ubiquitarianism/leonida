@@ -1,0 +1,54 @@
+GPU:        NVIDIA GeForce RTX 2050 (Laptop, Ampere / GA107, PCI 10de:25ad), 3.87 GiB device-local heap
+Driver:     NVIDIA 621.24 (proprietary, Windows 32.0.16.2124), Vulkan 1.4.357
+Subgroup:   32..32 (default 32)
+OS:         Windows 11 Home Single Language, build 26300
+Commit:     2d73c242fddfe26d57b52ee150704e6c3b23cff4 (main, 2026-11-24)
+Tools:      llvm-mc 21.1.8 (scripts\build_llvm_mc.ps1, AMDGPU target), SPIRV-Tools v2026.4 RC2,
+            Vulkan SDK 1.4.363.0, CMake 4.4.4 + Ninja 1.13.2,
+            MSVC 14.44.35207 (VS Build Tools 2022 17.14), Python 3.14.10 (MSYS2 UCRT64)
+CPU:        AMD Ryzen 7 7435HS
+RAM:        31.82 GiB reported
+
+run_gpu_tests.py:
+            258/258 shaders translated and passed spirv-val in both modes.
+            Native: 198/249 passed, 49 skipped, 2 failed.
+            LEONIDA_W64_EMULATE=1: 230/249 passed, 17 skipped, 2 failed.
+
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (both modes, known #31):
+            r32 sint (sint view): 64 bad, texel(5,3) = 2071.
+            Rerun alone with --filter tfe in both modes: the same two lines.
+
+Skipped:    Native: 33 wave64 fixtures this 32-wide device cannot run natively
+            (31 "no 64-wide compute subgroup", 1 "no 64-wide subgroup",
+            1 "cannot require a 64-wide fragment subgroup"), plus the
+            16 documented "run by d3d12_*_test / w64_graphics.py" cases.
+            Emulated: the same 16, plus the 64-wide fragment one.
+
+Runtime:    RelWithDebInfo, scripts\build_runtime.ps1 -FetchSdl3, VULKAN_SDK set.
+            ctest run serially (no -j).
+            304 registered, 292 passed, 11 skipped, 1 failed.
+
+Failed:     d3d12_execute_indirect_validation:
+            49 parity cases, positive GPU dispatch OK,
+            0 validation errors, 5 parity failures.
+            All five: layer=0 warp=1 hw=1 expected=0.
+            Rerun alone: the same five cases.
+
+Skipped:    8 need the retail package or its outputs (shader_library_corpus,
+            bink_decode, bink_abi, bink_play_headless, bink_audio, fsr_dispatch,
+            bvh_builder, d3d12_boot_movie); d3d12_first_light needs
+            LEONIDA_FIRST_LIGHT_DIR; vk_sync_validation needs
+            LEONIDA_VK_VALIDATION; d3d12_rgb9e5_rtv reports
+            "RGB9E5 render targets unavailable on this adapter".
+
+Notes:
+- The one extra shader and test against the records at d42773d0 is
+  cs_w32_shift64 (#590). It passes in both modes: 640 words exact.
+- wave64 VS/PS/GS on 32-wide subgroups: tier A: 1, tier C: 1.
+- The run_gpu_tests.py counts match the RTX 3070 Ti record on the same
+  driver (621.24), allowing for cs_w32_shift64.
+- ctest has one more pass and no disabled test against the RTX 5070
+  record: gameinput is built here (SDL3 fetched) and passes.
+- Single baseline run performed on 2026-11-24.
+- AI-assisted (Claude Code): tool setup, build, test runs and this record.
+- Synthetic tests only; no game files used.

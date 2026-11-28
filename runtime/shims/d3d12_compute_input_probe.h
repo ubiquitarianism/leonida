@@ -7,6 +7,7 @@
 #include "xmem.h"
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <charconv>
 #include <cstdio>
@@ -251,11 +252,12 @@ void recheck(State& state) {
                 if (heap->copy) scan("console", heap->shader_va, heap->copy, heap->bytes);
     }
     {
-        std::unique_lock lock(state.cbv_heap_mutex, std::try_to_lock);
+        std::unique_lock lock(state.visible_heap_mutex, std::try_to_lock);
         if (!lock.owns_lock()) std::fputs("[rt] compute-input: after loss, arena heaps locked\n", stderr);
         else
-            for (const auto& [offset, end] : state.cbv_heaps)
-                if (end <= state.arena.size) scan("arena", offset, state.arena.mapped + offset, end - offset);
+            for (const auto& [offset, heap] : state.visible_heaps)
+                if (heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && heap.end <= state.arena.size)
+                    scan("arena", offset, state.arena.mapped + offset, heap.end - offset);
     }
 }
 
@@ -526,6 +528,14 @@ void inspect(State& state, std::span<const leonida::CommandList* const> lists, s
             if (!d && (!ind || ind->kind != leonida::IndirectKind::dispatch)) continue;
             const char* name = state.context->diagnostic_compute_name(d ? d->pipeline : ind->pipeline);
             if (!matches(name)) continue;
+            // LEONIDA_COMPUTE_INPUT_LIMIT=<n>: the first n matching dispatches in full, then one in 1,000 (a culling
+            // program runs several times a submission; 0 or unset: every one, as before).
+            static const unsigned limit = [] {
+                const char* v = std::getenv("LEONIDA_COMPUTE_INPUT_LIMIT");
+                return v ? unsigned(std::strtoul(v, nullptr, 10)) : 0u;
+            }();
+            static std::atomic<unsigned> matched{0};
+            if (const unsigned n = ++matched; limit && n > limit && n % 1000) continue;
             const auto& roots = d ? d->user_data : ind->user_data;
             std::fprintf(stderr, "[rt] compute-input: execute=%llu list=%zu cmd=%zu queue=%s name=%s pso=%p %s groups=%u,%u,%u "
                          "heap-base=0x%llx roots=[%s]\n", (unsigned long long)seq, l, i, queue, name, reinterpret_cast<void*>(d ? d->pipeline : ind->pipeline),

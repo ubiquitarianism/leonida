@@ -114,8 +114,9 @@ and then only to a temporary file that is deleted.
 
 On this archive both tools find the same 515 streams, the same 8,831,336,892 bytes, 1,094,744 bytes of zero
 padding and 22,812 bytes after the last stream. Those 22,812 are 3,884 zero bytes and the 18,928-byte RPF trailer
-(counted by reading the tail directly); `bink_index.py` now counts them as zero padding and `rpf_trailer`, which for
-this archive gives `unread_bytes` 0 and zero padding 1,098,628 (derived from the measured tail, not a rerun). Running `bink_index.py` on the 515 carved
+(counted by reading the tail directly). A read-only rerun of `bink_index.py` at `2d53a8055` on 2026-11-23
+confirmed 1,098,628 bytes of zero padding, 18,928 trailer bytes and 0 unread bytes. The archive matched the
+1.0.2.1 manifest by size and SHA-256. Running `bink_index.py` on the 515 carved
 `.bk2` files finds 515 streams with zero unread bytes, which confirms the stored sizes cover each file exactly.
 
 ## 4. Decoding
@@ -322,8 +323,8 @@ The loader-side runs behind these numbers are recorded in [`runtime/test/bink_de
   1-, 2-, and 4-track samples; later frames were not swept and may return 7,680 or 0 bytes). Which language or mix
   role the game assigns to track IDs `0, 1, 2, 3` at run time remains unknown.
 - **Startup playback.** In two boots the title opened the archive twice about 1.2 s after entering the loader.
-  The separately loaded `Bink2Scarlett.dll` opens metadata at title RVA `0x442ebe6`; playback retains the handle
-  at `0x442f056` and registers mapped frame buffers at `0x442f9b8`. The frame wrapper at `0x2ef0e0` has a CPU
+  The separately loaded `Bink2Scarlett.dll` opens the metadata from the title; playback retains the handle
+  and registers mapped frame buffers. The title's frame wrapper has a CPU
   multi-worker decode and wait path and a synchronous fallback. Three rotating sets of linear R8 planes (one
   3840×2160 and two 1920×1080 per set) reach the slot-133 texture uploader. `VS_Bink` / `PS_BinkNoAlpha` bind
   the three plane descriptors at table offsets 0x20, 0x40 and 0x60 and draw to an RGBA8 intermediate. The UI

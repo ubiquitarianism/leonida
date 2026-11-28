@@ -152,8 +152,11 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
 
 * It writes `fspx/<name>.code` and `fspx/<name>.json`, the layout `fspx_unpack.py` writes and `rdna2spirv.py`
   reads (`native_blob`, `cs_dispatch_state`). A compute program also gets `fspx/<name>.state`, its record's state
-  blob (FSPX kind 0) as it is, whose SHA-256 is the index's `fspx_state_sha256`; every compute program has exactly one
-  (2,684 programs, 2,693 records). It also writes `index.json` with each program's stage, and
+  blob (FSPX kind 0) as it is, whose SHA-256 is the index's `fspx_state_sha256`; in the 1.0.2.1 `shaders.rpf` library,
+  every compute program has one distinct state-blob index across `library.json`'s `compute` table (2,684 programs,
+  2,693 records). A program that records use with different state blobs is written once per distinct state, the
+  first under its name and each further one as `<name>_state_<blob index>`, so each pair of keys has an entry
+  (the library measured above has no such program). It also writes `index.json` with each program's stage, and
   `library.json` with the header and both pipeline tables, stage to program name. Programs are named
   `lib_<stage>_<index>`.
 * `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does.
@@ -162,6 +165,11 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
   interface.
 * `--save` writes the reassembled library. A saved file is also accepted as input.
 * `--stages` limits the output to some stages.
+* `--compute-hashes FILE` instead writes only the compute programs whose code has one of the SHA-256 digests listed
+  in `FILE` (`fspx_code_sha256`), with every state they are used with. A digest no compute program has is an error.
+* `tools/pso_code_base_pairs.py` reads the same library, in either form, and joins each graphics record's stage to
+  the translation index through that stage's source digest (§3). It counts whole PSOs by the `uses_code_base` of
+  their stages: counts only, no name or code. §6 and [d3d12_vulkan.md](d3d12_vulkan.md) §5.2 report what it says.
 
 The output is game data and must stay in your work folder. `tests/test_shader_library.py` builds libraries and
 archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest
@@ -178,7 +186,7 @@ them and the state key is the record's state blob. The step is redone as a whole
 `llvm-mc`, the wave64 mode or the flags change (`library_build.json`, written last), and a clash of both keys between
 different modules fails it, as for the FSPX step. Graphics pipelines are not translated by the build.
 
-### Resuming a compute-only batch on Linux
+### Resuming a compute-only batch on Linux or native Windows
 
 Run `tools/shader_library.py` with `--stages cs --disasm --jobs 2` and the carved containers, or select the
 kind-6 hashes with `--compute-hashes`. For an unpacked library with its input `index.json`, use the compute batch.
@@ -187,13 +195,26 @@ kind-6 hashes with `--compute-hashes`. For an unpacked library with its input `i
 python3 -I scripts/translate_pipeline_compute.py /path/to/unpacked --out /path/to/spirv/library --wave64-emulate
 ```
 
-Use a dedicated output folder. The two workers run at nice 19. Each has a 768 MiB address-space limit and uses one
-SPIRV-Tools process at a time (four processes total). `--jobs 1` uses a single worker and `--memory-mib` changes
-the per-process limit. A rerun checks each module against its checksum and the listing, source container, FSPX
+Use a dedicated output folder and a stable, trusted SPIRV-Tools installation on PATH. On Linux the two workers
+run at nice 19. Each has a 768 MiB address-space limit and uses one SPIRV-Tools process at a time (four processes
+total). On native Windows CPython, a BelowNormal coordinator and up to two gated workers run with a 768 MiB
+**committed memory** cap per process (not total virtual address space). Each worker's kill-on-close Job permits
+only itself and one tool process. The parent verifies job membership before sending work; the child rechecks the
+effective limits. A no-share file open keeps the pack exclusive through worker exit. An incompatible outer Job
+or a failed limit/lock check stops the build; there is no unbounded Windows mode. A hard stop can leave temporary
+scratch files, but cannot partially replace the index. `--jobs 1` uses a single translating worker and
+`--memory-mib` changes the per-process limit. A rerun checks each module against its checksum and the listing, source container, FSPX
 sidecars, toolchain and wave mode. It retries failures. Only validated modules enter the runtime index. Its
 atomic replacement follows both workers, so an interrupted run leaves the previous index readable. A partial
 run exits nonzero and writes the reasons to `failures.json`, keyed by kind-6 and kind-0 SHA-256. Old modules
 can still be used by a runtime that already opened the preceding index.
+
+The coordinator and each shard explicitly apply `--wave64-emulate`, `--loop-limit`, `--descriptor-hash` and
+`--compact-spirv`; requesting compaction requires both translator support and `spirv-opt`. The cache key includes
+those settings, compiler sources, builder and tool hashes. `.compute-cache/worker-receipt.json` records the exact
+options and input-name digest for each shard; compare its `index_sha256` with the actual published index before
+using it. This is an audit file, not a completion marker. A pre-upgrade cache key is not reused as evidence for
+a new builder.
 
 Among 2,680 compute programs, 46 start with two 12-byte literal-bearing VOP3 NOP hash carriers. Their body
 starts at byte 24. The three-record form starts at byte 36. The no-op measurements are in `docs/fspx.md`.
@@ -247,7 +268,10 @@ None of the programs has been run on a GPU.
 
 * **Pipeline pairing is in the package.** [d3d12_vulkan.md](d3d12_vulkan.md) question 14 asks whether a PSO pairs
   two code-base stages, and says the pairing is in the executable. The graphics records give it for 25,471
-  pipelines: each names its VS or MS and its PS. Each source can be found through §3.
+  pipelines: each names its VS or MS and its PS, and each source can be found through §3. `tools/pso_code_base_pairs.py`
+  joins that to the FSSM translation index and counts the result: **no PSO in 1.0.2.1 has two code-base stages**.
+  25,027 have none, 444 exactly one (343 MS, 60 PS, 41 VS), and 21 stay unknown because a stage's program is not in
+  the carve output. So the one code base in the 144-byte push-constant block is enough for this package.
 * **A second compiled form of 6,522 shaders.** The pipeline builds differ from the FSSM code. Which form the game
   runs for a pipeline is not measured here (that needs the executable). Either way, a translated pipeline build can
   be compared with the translated FSSM shader of the same pipeline.

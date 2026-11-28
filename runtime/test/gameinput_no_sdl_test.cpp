@@ -98,8 +98,10 @@ Pad read_at(IGameInput* input, IGameInputDevice* device, double seconds) {
 }
 
 int scripted_pad(CreateFn create) {
-    // Four presses (two overlapping A presses, Menu, a right-stick throw) and three rejected entries.
-    SetEnvironmentVariableA("LEONIDA_INPUT_SCRIPT", "a@1, START@2.5 ,a@1.2,rsup@4,bogus@1,a@-1,");
+    // Six presses (two overlapping A presses, Menu, B held 0.8 s, a right-stick throw, a Y press the title never reads
+    // while it is down) and seven rejected entries (four of them holds that are zero, negative, missing or too long).
+    SetEnvironmentVariableA("LEONIDA_INPUT_SCRIPT",
+                            "a@1, START@2.5 ,a@1.2,b@3:0.8 ,rsup@4,y@10,bogus@1,a@-1,,x@3:0,x@3:-1,x@3:,x@3:601");
     rt::gameinput_no_sdl::set_clock(fake_clock);
     at(0);
 
@@ -201,27 +203,48 @@ int scripted_pad(CreateFn create) {
     check(menu.buttons == GameInputGamepadMenu && menu.ui == GameInputUiNavigationMenu,
           "script: START (any case) holds Menu at 2.6 s");
     check(read_at(input, device, 2.85).buttons == 0, "script: Menu is released at 2.85 s");
+    check(read_at(input, device, 3.05).buttons == GameInputGamepadB, "script: b@3:0.8 holds B at 3.05 s");
+    check(read_at(input, device, 3.7).buttons == GameInputGamepadB,
+          "script: B is still held at 3.7 s, past the 0.3 s default");
+    check(read_at(input, device, 3.85).buttons == 0, "script: B is released after its 0.8 s hold");
     const Pad up = read_at(input, device, 4.1);
     check(up.buttons == 0 && up.right_y == 1.0f && up.ui == GameInputUiNavigationScrollUp,
           "script: rsup throws the right stick up at 4.1 s");
     check(read_at(input, device, 4.5).right_y == 0, "script: the stick is back at rest at 4.5 s");
+    // The title reads at 4.5 s and next at 60 s: y@10 starts and ends in between, and is still in the history.
     check(read_at(input, device, 60).buttons == 0, "script: nothing is held after the script ends");
 
-    // The history: the reading before the current one is the stick throw, and the one after that throw is the rest.
+    // The history, newest first: the rest after Y (10.3 s), the Y press (10.0 s), the rest after the stick throw
+    // (4.3 s), the stick throw. Each reading carries the script's time of the change, not the time of the read.
     IGameInputReading* now = nullptr;
-    IGameInputReading* before = nullptr;
-    IGameInputReading* after = nullptr;
     check(input->GetCurrentReading(GameInputKindUnknown, nullptr, &now) == S_OK && now, "script: a current reading");
     if (now) {
+        check(now->GetTimestamp() == 7'000'000 + 10'300'000, "script: the current reading is Y's release at 10.3 s");
+        IGameInputReading* y = nullptr;
+        IGameInputReading* rest = nullptr;
+        IGameInputReading* stick = nullptr;
+        IGameInputReading* after = nullptr;
         GameInputGamepadState s{};
-        check(input->GetPreviousReading(now, GameInputKindGamepad, device, &before) == S_OK && before &&
-                  before->GetGamepadState(&s) && s.rightThumbstickY == 1.0f,
-              "script: GetPreviousReading steps back to the stick throw");
-        if (before) {
-            check(input->GetNextReading(before, GameInputKindGamepad, nullptr, &after) == S_OK && after == now,
-                  "script: GetNextReading steps forward to the current reading");
-            before->Release();
+        check(input->GetPreviousReading(now, GameInputKindGamepad, device, &y) == S_OK && y &&
+                  y->GetGamepadState(&s) && s.buttons == GameInputGamepadY &&
+                  y->GetTimestamp() == 7'000'000 + 10'000'000,
+              "script: a press between two reads of the title is in the history, at its own time");
+        if (y) {
+            check(input->GetPreviousReading(y, GameInputKindGamepad, device, &rest) == S_OK && rest &&
+                      rest->GetGamepadState(&s) && s.buttons == 0 && s.rightThumbstickY == 0 &&
+                      rest->GetTimestamp() == 7'000'000 + 4'300'000,
+                  "script: before Y, the stick's return at 4.3 s");
+            check(input->GetNextReading(y, GameInputKindGamepad, nullptr, &after) == S_OK && after == now,
+                  "script: GetNextReading steps forward from Y to the current reading");
+            y->Release();
         }
+        if (rest) {
+            check(input->GetPreviousReading(rest, GameInputKindGamepad, device, &stick) == S_OK && stick &&
+                      stick->GetGamepadState(&s) && s.rightThumbstickY == 1.0f,
+                  "script: GetPreviousReading steps back to the stick throw");
+            rest->Release();
+        }
+        if (stick) stick->Release();
         if (after) after->Release();
         IGameInputReading* none = nullptr;
         check(input->GetNextReading(now, GameInputKindUnknown, nullptr, &none) == GAMEINPUT_E_READING_NOT_FOUND &&
@@ -242,6 +265,62 @@ int scripted_pad(CreateFn create) {
                   E_NOTIMPL &&
               reading_token == kInvalidCallbackToken,
           "script: reading callbacks still need SDL3");
+    // A blocking enumeration's callback still running on one thread while another unregisters it (kevincommits'
+    // Finding 19 in #1608, item 5): UnregisterCallback must wait for it to return, or the caller frees its context
+    // mid-call. And the callback may unregister itself without waiting on itself.
+    {
+        struct Held {
+            IGameInput* input;
+            HANDLE entered, release;
+            GameInputCallbackToken token;
+            bool self_unregistered;
+        };
+        static Held held{};
+        held = {input, CreateEventW(nullptr, TRUE, FALSE, nullptr), CreateEventW(nullptr, TRUE, FALSE, nullptr), 0, false};
+        HANDLE registrar = CreateThread(
+            nullptr, 0,
+            [](void*) -> DWORD {
+                GameInputCallbackToken t = 0;
+                held.input->RegisterDeviceCallback(
+                    nullptr, GameInputKindGamepad, GameInputDeviceConnected, GameInputBlockingEnumeration, &held,
+                    [](GameInputCallbackToken token, void* ctx, IGameInputDevice*, uint64_t, uint32_t, uint32_t) {
+                        auto* h = static_cast<Held*>(ctx);
+                        h->token = token;
+                        SetEvent(h->entered);
+                        WaitForSingleObject(h->release, 3000);
+                    },
+                    &t);
+                return 0;
+            },
+            nullptr, 0, nullptr);
+        check(WaitForSingleObject(held.entered, 3000) == WAIT_OBJECT_0, "script: the blocking callback is running");
+        HANDLE unregistrar = CreateThread(
+            nullptr, 0, [](void*) -> DWORD { return held.input->UnregisterCallback(held.token, 0) ? 1 : 0; }, nullptr,
+            0, nullptr);
+        check(WaitForSingleObject(unregistrar, 200) == WAIT_TIMEOUT,
+              "script: UnregisterCallback from another thread waits for the running blocking callback");
+        SetEvent(held.release);
+        DWORD unregistered = 0;
+        check(WaitForSingleObject(unregistrar, 3000) == WAIT_OBJECT_0 && GetExitCodeThread(unregistrar, &unregistered) &&
+                  unregistered == 1,
+              "script: and returns true once it has returned");
+        WaitForSingleObject(registrar, 3000);
+        CloseHandle(registrar);
+        CloseHandle(unregistrar);
+
+        GameInputCallbackToken self = 0;
+        check(input->RegisterDeviceCallback(
+                  nullptr, GameInputKindGamepad, GameInputDeviceConnected, GameInputBlockingEnumeration, &held,
+                  [](GameInputCallbackToken token, void* ctx, IGameInputDevice*, uint64_t, uint32_t, uint32_t) {
+                      auto* h = static_cast<Held*>(ctx);
+                      h->self_unregistered = h->input->UnregisterCallback(token, 0);
+                  },
+                  &self) == S_OK &&
+                  held.self_unregistered,
+              "script: a blocking callback can unregister itself");
+        CloseHandle(held.entered);
+        CloseHandle(held.release);
+    }
     void* second = nullptr;
     check(create(&second) == S_OK && second == input, "script: a second GameInputCreate returns the same instance");
     if (second) static_cast<IGameInput*>(second)->Release();

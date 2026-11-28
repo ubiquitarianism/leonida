@@ -93,6 +93,13 @@ public:
         return it == fences_.end() || it->second < value;
     }
 
+    // The highest Signal submitted for the fence (or set by the CPU); 0 for an unknown semaphore.
+    std::uint64_t submitted_value(Semaphore semaphore) const {
+        std::lock_guard lock(mutex_);
+        const auto it = fences_.find(semaphore);
+        return it == fences_.end() ? 0 : it->second;
+    }
+
     // true when no submitted Signal reaches `value` yet. Unknown semaphores are satisfied.
     bool pending(Semaphore semaphore, std::uint64_t value) const {
         std::lock_guard lock(mutex_);

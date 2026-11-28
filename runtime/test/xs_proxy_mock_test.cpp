@@ -117,6 +117,9 @@ struct Mock {
     Mock* completes_with;    // fence: once its completed value reaches completes_at, a GetCompletedValue first
     std::uint64_t completes_at, completes_value;  // signals that fence to completes_value (GPU order across queues)
     bool signals_complete;   // queue: a Signal (slot 14) completes the fence at once, as an idle GPU would
+    const void* observed_queue;  // optional proxy pair to sample during a forwarded fence call
+    const void* observed_fence;
+    unsigned long observed_queue_refs, observed_fence_refs;
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][6];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
@@ -137,10 +140,61 @@ struct Mock {
     UINT clear_dsv_num_rects;
     const D3D12_RECT* clear_dsv_rects;
     D3D_FEATURE_LEVEL max_level;  // device: the highest level FEATURE_LEVELS reports (0: the query is refused)
+    // list: set by a call the Vulkan layer's list takes as invalid (a texture barrier with no resource at slot 80, a
+    // clear at slot 48 of a view made with no resource); Close (slot 9) then fails, as that list's does.
+    bool list_error;
+    // list slot 80 (Barrier): what the last call carried, copied (the proxy's converted groups live for the call).
+    UINT barrier_group_count;
+    D3D12_BARRIER_TYPE barrier_group_types[4];
+    UINT barrier_group_sizes[4];
+    UINT barrier_global_count;
+    D3D12_GLOBAL_BARRIER barrier_globals[8];
+    UINT barrier_texture_count;
+    D3D12_TEXTURE_BARRIER barrier_textures[8];
 };
 
 Mock g_pool[512];
 unsigned g_pool_used = 0;
+
+// The real handles the mock device last wrote an RTV with no resource at (device slot 20). A mock list's clear of one
+// sets list_error, as the Vulkan layer's empty view record does.
+SIZE_T g_mock_null_rtvs[16];
+unsigned g_mock_null_rtv_count = 0;
+
+void mock_note_rtv(SIZE_T handle, bool no_resource) {
+    for (unsigned i = 0; i < g_mock_null_rtv_count; ++i)
+        if (g_mock_null_rtvs[i] == handle) g_mock_null_rtvs[i--] = g_mock_null_rtvs[--g_mock_null_rtv_count];
+    if (no_resource && g_mock_null_rtv_count < std::size(g_mock_null_rtvs))
+        g_mock_null_rtvs[g_mock_null_rtv_count++] = handle;
+}
+
+bool mock_is_null_rtv(SIZE_T handle) {
+    for (unsigned i = 0; i < g_mock_null_rtv_count; ++i)
+        if (g_mock_null_rtvs[i] == handle) return true;
+    return false;
+}
+
+void mock_barrier(Mock* m, std::uint64_t count, std::uint64_t groups_word) {
+    const auto* groups = reinterpret_cast<const D3D12_BARRIER_GROUP*>(groups_word);
+    m->barrier_group_count = static_cast<UINT>(count);
+    m->barrier_global_count = m->barrier_texture_count = 0;
+    for (UINT g = 0; groups && g < static_cast<UINT>(count); ++g) {
+        const D3D12_BARRIER_GROUP& group = groups[g];
+        if (g < std::size(m->barrier_group_types)) {
+            m->barrier_group_types[g] = group.Type;
+            m->barrier_group_sizes[g] = group.NumBarriers;
+        }
+        for (UINT i = 0; i < group.NumBarriers; ++i) {
+            if (group.Type == D3D12_BARRIER_TYPE_GLOBAL && m->barrier_global_count < std::size(m->barrier_globals)) {
+                m->barrier_globals[m->barrier_global_count++] = group.pGlobalBarriers[i];
+            } else if (group.Type == D3D12_BARRIER_TYPE_TEXTURE) {
+                if (!group.pTextureBarriers[i].pResource) m->list_error = true;
+                if (m->barrier_texture_count < std::size(m->barrier_textures))
+                    m->barrier_textures[m->barrier_texture_count++] = group.pTextureBarriers[i];
+            }
+        }
+    }
+}
 
 void** mock_vtable();
 void** mock_list_vtable();
@@ -384,6 +438,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 if (a1) std::memcpy(&m->queue_desc, reinterpret_cast<const void*>(a1), sizeof(m->queue_desc));
                 return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
+            case 20: mock_note_rtv(static_cast<SIZE_T>(a3), a1 == 0); break;  // CreateRenderTargetView(res, desc, dest)
             // Slot 12 (CreateCommandList) never reaches this switch: the device vtable's slot is the dedicated
             // mock_create_command_list, which needs the sixth word the generic thunk does not declare on some
             // builds and which picks the list mock's chain breadth from full_chain_lists.
@@ -523,6 +578,15 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         const auto* dsv = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a4);
         m->om_has_dsv = dsv != nullptr;
         m->om_dsv = dsv ? dsv->ptr : 0;
+    }
+    if (m->kind == Kind::list || m->kind == Kind::command_list) {
+        if (slot == 9) return static_cast<std::uint32_t>(m->list_error ? E_INVALIDARG : S_OK);  // Close
+        if (slot == 48 && mock_is_null_rtv(static_cast<SIZE_T>(a1))) m->list_error = true;  // ClearRenderTargetView
+        if (slot == 80) mock_barrier(m, a1, a2);                                             // Barrier
+    }
+    if (m->kind == Kind::queue && (slot == 14 || slot == 15) && m->observed_queue) {
+        m->observed_queue_refs = xs::command_object_proxy_ref_count(m->observed_queue);
+        m->observed_fence_refs = xs::command_object_proxy_ref_count(m->observed_fence);
     }
     return S_OK;
 }
@@ -2419,7 +2483,8 @@ int check_lists() {
     so_view.BufferFilledSizeLocation = p2;
     EXPECT(hr_of(raw(list, 49, 0, 1, word(&so_view))) == S_OK && real->calls[45] == 1);
     // The console tail past the PC chain is refused with E_NOTIMPL only when the mapped PC slot is missing.
-    EXPECT(hr_of(raw(list, 146, word(list), 0)) == S_OK && real->calls[80] == 1);  // enhanced Barrier -> GCL7 80
+    // Enhanced Barrier -> GCL7 80; an empty call (no groups) goes through as the PC no-op it is.
+    EXPECT(hr_of(raw(list, 146, 0, 0)) == S_OK && real->calls[80] == 1);
     EXPECT(release(list) == 0 && real->refs == 0);
     EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
     EXPECT(xs::device_proxy_ref_count(device) == device_refs);
@@ -2952,6 +3017,36 @@ int check_render_target_sizes() {
     mips.MipLevels = 3;
     EXPECT(ask(&mips, 1).SizeInBytes == (135 + 40 + 12) * 65536ull);
 
+    // A texture the GPU writes through unordered access and the title also clears with the CPU through its lock
+    // with a layout word naming its mode: 0x100, linear. Its console layout is 36 slices of 32 rows
+    // of 256 bytes, 0x48000 bytes, where the PC device says 0x30000; the larger size wins, rounded to the
+    // description's alignment. The title's own layout word decides, though the PC form of the description has lost it.
+    D3D12_RESOURCE_DESC grid{};
+    grid.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    grid.Width = 32;
+    grid.Height = 32;
+    grid.DepthOrArraySize = 36;
+    grid.MipLevels = 1;
+    grid.Format = DXGI_FORMAT_R32_UINT;
+    grid.SampleDesc.Count = 1;
+    grid.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x100);
+    grid.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    EXPECT(ask(&grid, 1).SizeInBytes == 0x50000);
+    // In a list it takes its console size at its own offset.
+    const D3D12_RESOURCE_DESC grid_and_target[] = {grid, hd};
+    EXPECT(ask(grid_and_target, 2).SizeInBytes == 0x50000 + 8847360);
+    // The rule only grows: a mode XG lays out smaller (4 KiB thick blocks, 32x32x40 x 4 B = 0x28000) keeps the PC
+    // size, and so does a layout word that leaves the mode to XG, or a mode XG's model lacks.
+    D3D12_RESOURCE_DESC smaller = grid;
+    smaller.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+    EXPECT(ask(&smaller, 1).SizeInBytes == 0x30000);
+    D3D12_RESOURCE_DESC no_mode = grid;
+    no_mode.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    EXPECT(ask(&no_mode, 1).SizeInBytes == 0x30000);
+    D3D12_RESOURCE_DESC unknown_mode = grid;
+    unknown_mode.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x11b);  // SW_64KB_R_X
+    EXPECT(ask(&unknown_mode, 1).SizeInBytes == 0x30000);
+
     // The PC form (this in RCX, the buffer in RDX) is not the title's call: it gets the PC device's own size, 127
     // units of 64 KiB for the mock, so code that compares the proxy with the PC device still agrees.
     D3D12_RESOURCE_ALLOCATION_INFO pc{};
@@ -3200,9 +3295,16 @@ int check_tail(bool want_guarded) {
     EXPECT(queue && fence);
     EXPECT(xs::command_object_tables_guarded() == want_guarded);
     Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
-    // Signal (14) still reaches the real queue, with the real fence.
-    EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
-           queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
+    // Both wrappers keep a reference until the native call returns.
+    queue_mock->observed_queue = queue;
+    queue_mock->observed_fence = fence;
+    for (unsigned slot : {14u, 15u}) {
+        queue_mock->observed_queue_refs = queue_mock->observed_fence_refs = 0;
+        EXPECT(hr_of(raw(queue, slot, word(fence), 5)) == S_OK && queue_mock->calls[slot] == 1 &&
+               queue_mock->args[slot][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[slot][1] == 5);
+        EXPECT(queue_mock->observed_queue_refs == 2 && queue_mock->observed_fence_refs == 2);
+        EXPECT(xs::command_object_proxy_ref_count(queue) == 1 && xs::command_object_proxy_ref_count(fence) == 1);
+    }
     // Console-only queue methods (the tail past the PC chain, SignalX, PresentX) report S_OK instead of
     // refusing: frame pacing flows through them. Nothing is forwarded — the real queue never sees them.
     for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
@@ -3211,6 +3313,16 @@ int check_tail(bool want_guarded) {
     }
     EXPECT(raw(fence, 12) != 0);  // the completed value's address (check_fence_completed_value)
     for (unsigned slot = 13; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
+    for (unsigned slot : {16u, 17u, 25u}) {
+        const unsigned native_slot = slot == 17u ? 15u : 14u;
+        const unsigned expected_calls = queue_mock->calls[native_slot] + 1;
+        queue_mock->observed_queue_refs = queue_mock->observed_fence_refs = 0;
+        EXPECT(hr_of(raw(queue, slot, word(fence), 6)) == S_OK && queue_mock->calls[native_slot] == expected_calls &&
+               queue_mock->args[native_slot][0] == word(xs::fence_proxy_real_fence(fence)) &&
+               queue_mock->args[native_slot][1] == 6);
+        EXPECT(queue_mock->observed_queue_refs == 2 && queue_mock->observed_fence_refs == 2);
+        EXPECT(xs::command_object_proxy_ref_count(queue) == 1 && xs::command_object_proxy_ref_count(fence) == 1);
+    }
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
     return 0;
@@ -4556,6 +4668,85 @@ int check_list_values_more() {
     WaitForSingleObject(job, INFINITE);
     CloseHandle(job);
 
+    // 11. Work-aware timeout in Pump (src/list_value_wait_budget.h):
+    //   a) a matching in-flight producer pauses a held memory gate past the idle timeout until the producer lands;
+    //   b) a busy releaser executing an action gate pauses a concurrent memory gate past the idle timeout;
+    //   c) a demoted gate (4 ms budget) scales its pause caps with its short budget so unrelated active work does not
+    //      hold it for the full timeout's cap;
+    //   d) a matching producer stuck behind an unsignalled fence still hits a finite pause cap instead of hanging.
+    const auto write_on_a = [&](int index, std::uint64_t value, std::uint64_t& signal_value) -> bool {
+        if (FAILED(hr_of(raw(direct, 139, word(allocator), 0)))) return false;
+        raw(direct, 14, 1, 1, 1);  // Dispatch
+        raw(direct, 72, word(&g_cells2[index]), value, 0, 0);  // write64
+        if (FAILED(hr_of(raw(direct, 9)))) return false;
+        g_queue_call_count = 0;
+        if (submit(qa, direct) != 0) return false;
+        signal_value = logged_signal(qa_mock, a_written);
+        return signal_value != 0;
+    };
+    xs::set_list_value_wait_timeout_ms(40);
+    xs::reset_list_value_stats();
+    // 11a. Wait on qb before qa submits its matching write (so relay() misses it and Pump holds a gate).
+    EXPECT(hold_on(qb, 27, 1));
+    std::uint64_t producer_sig = 0;
+    EXPECT(write_on_a(27, 1, producer_sig));
+    EXPECT(!xs::list_values_idle(150));  // >3x the 40 ms idle timeout: pauses while producer is in flight
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_timed_out == 0 && stats.gates_met == 0 && cell2(27) == 0);
+    fence_signal(a_written, producer_sig);
+    EXPECT(xs::list_values_idle(3000) && cell2(27) == 1);
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_met == 1 && stats.gates_timed_out == 0);
+
+    // 11b. Releaser inside a 150 ms action gate pauses a concurrent memory gate past the 40 ms idle timeout.
+    xs::set_copy_page_mappings_hook([](std::uint32_t, const rt::xmem::PageBatch*, std::uintptr_t, std::uint32_t,
+                                       std::uint32_t) -> bool {
+        Sleep(150);
+        InterlockedExchange64(reinterpret_cast<volatile LONG64*>(&g_cells2[28]), 1);
+        return true;
+    });
+    g_queue_call_count = 0;
+    EXPECT(hr_of(raw(qc, 31, 1, word(remap), 0x7000000000, 16, 0)) == S_OK);
+    const std::uint64_t action_sig = logged_signal(qc_mock, c_written);
+    EXPECT(action_sig != 0);
+    const std::uint64_t met_before_rel = xs::list_value_stats().gates_met;
+    const std::uint64_t to_before_rel = xs::list_value_stats().gates_timed_out;
+    EXPECT(hold_on(qb, 28, 1));
+    fence_signal(c_written, action_sig);
+    EXPECT(xs::list_values_idle(3000) && cell2(28) == 1);
+    xs::set_copy_page_mappings_hook(nullptr);
+    stats = xs::list_value_stats();
+    EXPECT(stats.gates_met == met_before_rel + 1 && stats.gates_timed_out == to_before_rel);
+
+    // 11c. Demoted gate (3 timeouts -> 4 ms budget) with unrelated in-flight work on qa times out in a few ms, not
+    // the 12 s active-work cap of the 40 ms full timeout.
+    for (int i = 0; i < 3; ++i) EXPECT(hold_on(qb, 29, 1) && xs::list_values_idle(3000));
+    std::uint64_t unrelated_sig = 0;
+    EXPECT(write_on_a(30, 1, unrelated_sig));
+    const std::uint64_t short_before_dem = xs::list_value_stats().gates_short;
+    const std::uint64_t to_before_dem = xs::list_value_stats().gates_timed_out;
+    started = Clock::now();
+    EXPECT(hold_on(qb, 29, 1));
+    for (int i = 0; i < 1000 && xs::list_value_stats().gates_timed_out == to_before_dem; ++i) Sleep(1);
+    const auto demoted_active_ms = ms_since(started);
+    EXPECT(xs::list_value_stats().gates_timed_out == to_before_dem + 1 &&
+           xs::list_value_stats().gates_short == short_before_dem + 1 && demoted_active_ms < 500);
+    fence_signal(a_written, unrelated_sig);
+    EXPECT(xs::list_values_idle(3000));
+
+    // 11d. Stuck matching producer (fence never signals) still hits the finite max pause cap instead of hanging.
+    const std::uint64_t to_before_stuck = xs::list_value_stats().gates_timed_out;
+    started = Clock::now();
+    EXPECT(hold_on(qb, 29, 1));
+    std::uint64_t stuck_sig = 0;
+    EXPECT(write_on_a(29, 1, stuck_sig));
+    for (int i = 0; i < 1000 && xs::list_value_stats().gates_timed_out == to_before_stuck; ++i) Sleep(1);
+    const auto stuck_producer_ms = ms_since(started);
+    EXPECT(xs::list_value_stats().gates_timed_out == to_before_stuck + 1 && stuck_producer_ms < 500);
+    fence_signal(a_written, stuck_sig);
+    EXPECT(xs::list_values_idle(3000));
+    xs::set_list_value_wait_timeout_ms(5000);
+
     // 8. stop() ends both threads. Afterwards nothing new is landed or opened (the process is ending: a gate
     // signalled from another thread could open one whose remap was skipped, or go below one still to come), and
     // CopyPageMappingsBatchX remaps at the call rather than wait for a queue whose gates stay shut.
@@ -4807,10 +4998,18 @@ int check_console_command_list() {
     EXPECT(xs::is_command_list_proxy(list7_proxy));
     Mock* real_list7 = reinterpret_cast<Mock*>(xs::command_list_proxy_real_list(list7_proxy));
     EXPECT(real_list7 != nullptr);
-    // Console slot 146 -> PC slot 80 (since 80 < 81 slots)
-    raw(list7_proxy, 146, 0x9999, 0, 0, 0);
-    EXPECT(real_list7->calls[80] == 1);
-    EXPECT(real_list7->args[80][0] == 0x9999);
+    // Console slot 146 -> PC slot 80 (since 80 < 81 slots): a valid group goes through with the title's pointer.
+    {
+        const D3D12_GLOBAL_BARRIER global{D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_SYNC_ALL,
+                                          D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS};
+        D3D12_BARRIER_GROUP group{};
+        group.Type = D3D12_BARRIER_TYPE_GLOBAL;
+        group.NumBarriers = 1;
+        group.pGlobalBarriers = &global;
+        raw(list7_proxy, 146, 1, word(&group), 0, 0);
+        EXPECT(real_list7->calls[80] == 1);
+        EXPECT(real_list7->args[80][0] == 1 && real_list7->args[80][1] == word(&group));
+    }
     EXPECT(release(list7_proxy) == 0 && real_list7->refs == 0);
 
     // Clean up
@@ -4827,6 +5026,249 @@ int check_console_command_list() {
     EXPECT(!xs::list_slot_first_call_seen(32));
 
     std::printf("%s: console command list routing, cursor pinning, queue unwrapping, and slot mapping passed\n", g_label);
+    return 0;
+}
+
+// ---- Console list slots 146 and 52: what the console takes as a no-op or a global barrier ----
+//
+// The mock list stands in for the Vulkan layer's: a texture barrier with no resource, or a clear of a view made with
+// no resource, puts it in its error state and its Close fails (checked directly on the mock first, so the cases
+// below mean something). Through the proxy the barrier becomes a global barrier and the clear is skipped.
+int check_console_null_barrier_and_clear() {
+    g_mock_null_rtv_count = 0;
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, /*full_chain_lists=*/true);
+    EXPECT(device);
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    const IID gcl_iid = __uuidof(ID3D12GraphicsCommandList);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&allocator_iid), word(&allocator))) == S_OK);
+    void* list = nullptr;
+    EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, word(allocator), 0, word(&gcl_iid),
+                     word(&list))) == S_OK);
+    Mock* const real = reinterpret_cast<Mock*>(xs::list_proxy_real_list(list));
+    EXPECT(real && real->kind == Kind::list);
+    Mock* const texture_a = new_mock(Kind::resource);  // never dereferenced: only the pointers are compared
+    Mock* const texture_b = new_mock(Kind::resource);
+    auto* const resource_a = reinterpret_cast<ID3D12Resource*>(texture_a);
+    auto* const resource_b = reinterpret_cast<ID3D12Resource*>(texture_b);
+
+    // A texture barrier with no resource, as the title records it: render target to pixel-shader read.
+    D3D12_TEXTURE_BARRIER no_resource{};
+    no_resource.SyncBefore = D3D12_BARRIER_SYNC_RENDER_TARGET;
+    no_resource.SyncAfter = D3D12_BARRIER_SYNC_PIXEL_SHADING;
+    no_resource.AccessBefore = D3D12_BARRIER_ACCESS_RENDER_TARGET;
+    no_resource.AccessAfter = D3D12_BARRIER_ACCESS_SHADER_RESOURCE;
+    no_resource.LayoutBefore = D3D12_BARRIER_LAYOUT_RENDER_TARGET;
+    no_resource.LayoutAfter = D3D12_BARRIER_LAYOUT_SHADER_RESOURCE;
+    no_resource.Subresources.IndexOrFirstMipLevel = 0xffffffffu;
+    D3D12_BARRIER_GROUP texture_group{};
+    texture_group.Type = D3D12_BARRIER_TYPE_TEXTURE;
+    texture_group.NumBarriers = 1;
+    texture_group.pTextureBarriers = &no_resource;
+
+    // The mock models the PC list: the same group sent to it directly fails its Close.
+    raw(real, 80, 1, word(&texture_group));
+    EXPECT(real->list_error && hr_of(raw(real, 9)) == E_INVALIDARG);
+    real->list_error = false;
+    real->calls[80] = 0;
+
+    // 1. Through the proxy: one global barrier with the same sync and access, in the call's own storage; the
+    //    title's group and barrier are not written; Close succeeds.
+    EXPECT(hr_of(raw(list, 146, 1, word(&texture_group))) == S_OK);
+    EXPECT(real->calls[80] == 1 && real->args[80][0] == 1 && real->args[80][1] != word(&texture_group));
+    EXPECT(real->barrier_group_count == 1 && real->barrier_group_types[0] == D3D12_BARRIER_TYPE_GLOBAL &&
+           real->barrier_group_sizes[0] == 1 && real->barrier_global_count == 1 && real->barrier_texture_count == 0);
+    EXPECT(real->barrier_globals[0].SyncBefore == D3D12_BARRIER_SYNC_RENDER_TARGET &&
+           real->barrier_globals[0].SyncAfter == D3D12_BARRIER_SYNC_PIXEL_SHADING &&
+           real->barrier_globals[0].AccessBefore == D3D12_BARRIER_ACCESS_RENDER_TARGET &&
+           real->barrier_globals[0].AccessAfter == D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+    EXPECT(texture_group.Type == D3D12_BARRIER_TYPE_TEXTURE && texture_group.pTextureBarriers == &no_resource &&
+           !no_resource.pResource);
+    EXPECT(!real->list_error && hr_of(raw(list, 9)) == S_OK);
+
+    // 2. Valid barriers pass unchanged: a texture group with resources goes through with the title's own pointer.
+    D3D12_TEXTURE_BARRIER with_resource[2] = {no_resource, no_resource};
+    with_resource[0].pResource = resource_a;
+    with_resource[1].pResource = resource_b;
+    with_resource[1].Subresources = {2, 1, 0, 1, 0, 1};
+    D3D12_BARRIER_GROUP valid_group{};
+    valid_group.Type = D3D12_BARRIER_TYPE_TEXTURE;
+    valid_group.NumBarriers = 2;
+    valid_group.pTextureBarriers = with_resource;
+    EXPECT(hr_of(raw(list, 146, 1, word(&valid_group))) == S_OK);
+    EXPECT(real->calls[80] == 2 && real->args[80][0] == 1 && real->args[80][1] == word(&valid_group));
+    EXPECT(real->barrier_texture_count == 2 && real->barrier_global_count == 0 &&
+           real->barrier_textures[0].pResource == resource_a && real->barrier_textures[1].pResource == resource_b &&
+           real->barrier_textures[1].LayoutAfter == D3D12_BARRIER_LAYOUT_SHADER_RESOURCE &&
+           real->barrier_textures[1].Subresources.IndexOrFirstMipLevel == 2);
+    EXPECT(!real->list_error && hr_of(raw(list, 9)) == S_OK);
+
+    // 3. Mixed: a buffer group, then a texture group of [resource, none, none, resource]. The buffer group passes as
+    //    it is and the texture group splits into texture(1), global(2), texture(1), in order.
+    const D3D12_BUFFER_BARRIER buffer{D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                                      D3D12_BARRIER_ACCESS_COPY_DEST, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                                      resource_a, 0, UINT64_MAX};
+    D3D12_TEXTURE_BARRIER mixed[4] = {with_resource[0], no_resource, no_resource, with_resource[1]};
+    mixed[2].SyncBefore = D3D12_BARRIER_SYNC_COMPUTE_SHADING;
+    mixed[2].AccessBefore = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS;
+    D3D12_BARRIER_GROUP mixed_groups[2]{};
+    mixed_groups[0].Type = D3D12_BARRIER_TYPE_BUFFER;
+    mixed_groups[0].NumBarriers = 1;
+    mixed_groups[0].pBufferBarriers = &buffer;
+    mixed_groups[1].Type = D3D12_BARRIER_TYPE_TEXTURE;
+    mixed_groups[1].NumBarriers = 4;
+    mixed_groups[1].pTextureBarriers = mixed;
+    EXPECT(hr_of(raw(list, 146, 2, word(mixed_groups))) == S_OK);
+    EXPECT(real->calls[80] == 3 && real->args[80][0] == 4);
+    EXPECT(real->barrier_group_types[0] == D3D12_BARRIER_TYPE_BUFFER && real->barrier_group_sizes[0] == 1 &&
+           real->barrier_group_types[1] == D3D12_BARRIER_TYPE_TEXTURE && real->barrier_group_sizes[1] == 1 &&
+           real->barrier_group_types[2] == D3D12_BARRIER_TYPE_GLOBAL && real->barrier_group_sizes[2] == 2 &&
+           real->barrier_group_types[3] == D3D12_BARRIER_TYPE_TEXTURE && real->barrier_group_sizes[3] == 1);
+    EXPECT(real->barrier_texture_count == 2 && real->barrier_textures[0].pResource == resource_a &&
+           real->barrier_textures[1].pResource == resource_b);
+    EXPECT(real->barrier_global_count == 2 &&
+           real->barrier_globals[0].SyncBefore == D3D12_BARRIER_SYNC_RENDER_TARGET &&
+           real->barrier_globals[1].SyncBefore == D3D12_BARRIER_SYNC_COMPUTE_SHADING &&
+           real->barrier_globals[1].AccessBefore == D3D12_BARRIER_ACCESS_UNORDERED_ACCESS &&
+           real->barrier_globals[1].AccessAfter == D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+    EXPECT(!real->list_error && hr_of(raw(list, 9)) == S_OK);
+
+    // 4. Arrays that cannot be read safely are refused whole: nothing reaches the list, which stays valid and keeps
+    //    taking calls.
+    D3D12_BARRIER_GROUP unknown_type = texture_group;
+    reinterpret_cast<std::uint32_t&>(unknown_type.Type) = 7;
+    D3D12_BARRIER_GROUP null_barriers{};
+    null_barriers.Type = D3D12_BARRIER_TYPE_TEXTURE;
+    null_barriers.NumBarriers = 3;
+    D3D12_BARRIER_GROUP huge_group = valid_group;
+    huge_group.NumBarriers = 0x10000000u;
+    EXPECT(hr_of(raw(list, 146, 1, 0)) == S_OK);                       // null array, nonzero count
+    EXPECT(hr_of(raw(list, 146, 1, word(&unknown_type))) == S_OK);     // a group type the layer does not know
+    EXPECT(hr_of(raw(list, 146, 1, word(&null_barriers))) == S_OK);    // null barrier array, nonzero count
+    EXPECT(hr_of(raw(list, 146, 1, word(&huge_group))) == S_OK);       // barrier count over the limit
+    EXPECT(hr_of(raw(list, 146, 0x40000000u, word(&valid_group))) == S_OK);  // group count over the limit
+    // A malformed group after a convertible one refuses the call as well: nothing of it is recorded.
+    D3D12_BARRIER_GROUP half_bad[2] = {texture_group, unknown_type};
+    EXPECT(hr_of(raw(list, 146, 2, word(half_bad))) == S_OK);
+    EXPECT(real->calls[80] == 3 && !real->list_error);
+    EXPECT(hr_of(raw(list, 146, 1, word(&texture_group))) == S_OK && real->calls[80] == 4);
+    EXPECT(!real->list_error && hr_of(raw(list, 9)) == S_OK);
+
+    // 5. ClearRenderTargetView (console 52 -> PC 48) of a view made with no resource is skipped; a view made with a
+    //    resource is still cleared. No custom heap range here, so the handles reach the device unchanged.
+    const SIZE_T rtv_none = kMockHeapCpuStart + 0x1000;
+    const SIZE_T rtv_real = rtv_none + kMockDescriptorInc;
+    const SIZE_T rtv_copy = rtv_none + 4 * kMockDescriptorInc;
+    const FLOAT color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    raw(device, 20, 0, 0, rtv_none);              // CreateRenderTargetView(nullptr, nullptr, handle)
+    raw(device, 20, word(resource_a), 0, rtv_real);
+    EXPECT(mock->calls[20] == 2 && mock_is_null_rtv(rtv_none) && !mock_is_null_rtv(rtv_real));
+    raw(real, 48, rtv_none, word(color), 0, 0);   // the mock's model: the direct clear fails the list
+    EXPECT(real->list_error && hr_of(raw(real, 9)) == E_INVALIDARG);
+    real->list_error = false;
+    real->calls[48] = 0;
+
+    EXPECT(hr_of(raw(list, 52, rtv_none, word(color), 0, 0)) == S_OK && real->calls[48] == 0);
+    EXPECT(!real->list_error && hr_of(raw(list, 9)) == S_OK);
+    const D3D12_RECT rect{0, 0, 4, 4};
+    raw(list, 52, rtv_real, word(color), 1, word(&rect));
+    EXPECT(real->calls[48] == 1 && real->args[48][0] == rtv_real && real->args[48][1] == word(color) &&
+           real->args[48][2] == 1 && real->args[48][3] == word(&rect));
+    EXPECT(!real->list_error && hr_of(raw(list, 9)) == S_OK);
+
+    // A view made again at the same handle with a resource is cleared from then on.
+    raw(device, 20, word(resource_b), 0, rtv_none);
+    raw(list, 52, rtv_none, word(color), 0, 0);
+    EXPECT(real->calls[48] == 2 && real->args[48][0] == rtv_none);
+    raw(device, 20, 0, 0, rtv_none);  // and with no resource again: skipped again
+    raw(list, 52, rtv_none, word(color), 0, 0);
+    EXPECT(real->calls[48] == 2);
+
+    // Descriptor copies move the mark: CopyDescriptorsSimple of the empty view, then of the real one over it.
+    raw(device, 24, 1, rtv_copy, rtv_none, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    raw(list, 52, rtv_copy, word(color), 0, 0);
+    EXPECT(real->calls[48] == 2);
+    raw(device, 24, 1, rtv_copy, rtv_real, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    raw(list, 52, rtv_copy, word(color), 0, 0);
+    EXPECT(real->calls[48] == 3 && real->args[48][0] == rtv_copy);
+    // A copy of another heap type leaves the RTV marks alone.
+    raw(device, 24, 1, rtv_copy, rtv_none, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    raw(list, 52, rtv_copy, word(color), 0, 0);
+    EXPECT(real->calls[48] == 4);
+    // CopyDescriptors with ranges: one destination range of two from two source ranges of one (empty, then real).
+    const D3D12_CPU_DESCRIPTOR_HANDLE dest_starts[1] = {{rtv_copy}};
+    const UINT dest_sizes[1] = {2};
+    const D3D12_CPU_DESCRIPTOR_HANDLE src_starts[2] = {{rtv_none}, {rtv_real}};
+    const UINT src_sizes[2] = {1, 1};
+    raw10(device, 23, {1, word(dest_starts), word(dest_sizes), 2, word(src_starts), word(src_sizes),
+                       D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 0, 0, 0});
+    EXPECT(mock->calls[23] == 1);
+    raw(list, 52, rtv_copy, word(color), 0, 0);
+    EXPECT(real->calls[48] == 4);
+    raw(list, 52, rtv_copy + kMockDescriptorInc, word(color), 0, 0);
+    EXPECT(real->calls[48] == 5 && real->args[48][0] == rtv_copy + kMockDescriptorInc);
+    EXPECT(!real->list_error && hr_of(raw(list, 9)) == S_OK);
+
+    // Releasing an RTV heap drops the marks in its real range, so a heap made later at the same address starts
+    // unmarked; a mark outside that range stays.
+    g_heap_hook.next_ptr = nullptr;  // a plain PC heap even if a descriptor-heap hook is registered: real handles
+    D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{};
+    rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rtv_heap_desc.NumDescriptors = 4;
+    const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
+    void* rtv_heap = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&rtv_heap_desc), word(&heap_iid), word(&rtv_heap)))));
+    EXPECT(rtv_heap && xs::is_heap_proxy(rtv_heap) && raw(rtv_heap, 9) == kMockHeapCpuStart);
+    const SIZE_T in_heap = kMockHeapCpuStart + 2 * kMockDescriptorInc;
+    raw(device, 20, 0, 0, in_heap);
+    const unsigned clears = real->calls[48];
+    raw(list, 52, in_heap, word(color), 0, 0);
+    EXPECT(real->calls[48] == clears);  // marked while the heap lives: skipped
+    EXPECT(raw(rtv_heap, 2) == 0);
+    raw(list, 52, in_heap, word(color), 0, 0);
+    EXPECT(real->calls[48] == clears + 1 && real->args[48][0] == in_heap);  // the mark went with the heap
+    real->list_error = false;  // the mock list still takes its own view there as invalid
+    raw(list, 52, rtv_none, word(color), 0, 0);
+    EXPECT(real->calls[48] == clears + 1);  // outside the released heap: still skipped
+    // A second RTV heap at the same address: the view made there with a resource is cleared, and a view made with
+    // no resource is marked again for as long as that heap lives.
+    void* rtv_heap2 = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&rtv_heap_desc), word(&heap_iid), word(&rtv_heap2)))));
+    raw(device, 20, word(resource_a), 0, in_heap);
+    raw(list, 52, in_heap, word(color), 0, 0);
+    EXPECT(real->calls[48] == clears + 2 && !real->list_error);
+    raw(device, 20, 0, 0, in_heap);
+    raw(list, 52, in_heap, word(color), 0, 0);
+    EXPECT(real->calls[48] == clears + 2);
+    EXPECT(raw(rtv_heap2, 2) == 0);
+    EXPECT(!real->list_error && hr_of(raw(list, 9)) == S_OK);
+
+    // The marks are the device's own: another device's clear at a handle marked on the first is forwarded (its mock
+    // list then takes the view as invalid, which is what that device was told).
+    Mock* other_mock = nullptr;
+    void* other = make_device(other_mock, 9, true, true, true);
+    EXPECT(other);
+    void* other_allocator = nullptr;
+    EXPECT(hr_of(raw(other, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&allocator_iid), word(&other_allocator))) == S_OK);
+    void* other_list = nullptr;
+    EXPECT(hr_of(raw(other, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, word(other_allocator), 0, word(&gcl_iid),
+                     word(&other_list))) == S_OK);
+    Mock* const other_real = reinterpret_cast<Mock*>(xs::list_proxy_real_list(other_list));
+    raw(other_list, 52, rtv_none, word(color), 0, 0);
+    EXPECT(other_real->calls[48] == 1 && other_real->args[48][0] == rtv_none);
+
+    EXPECT(release(other_list) == 0 && other_real->refs == 0);
+    EXPECT(release(other_allocator) == 0);
+    EXPECT(release(other) == 0 && other_mock->refs == 0);
+    EXPECT(release(list) == 0 && real->refs == 0);
+    EXPECT(release(allocator) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    g_mock_null_rtv_count = 0;
+    std::printf("%s: list slot 146 turns texture barriers with no resource into global barriers (valid groups pass "
+                "unchanged, unreadable ones are refused whole) and slot 52 skips the clear of an RTV made with no "
+                "resource; the list stays valid\n",
+                g_label);
     return 0;
 }
 
@@ -4980,6 +5422,7 @@ int main(int argc, char** argv) {
         check_slot74() ||
         check_xbox_queue_slots() ||
         check_list_cpu_handles() ||
+        check_console_null_barrier_and_clear() ||
         check_presentation_wiring() || check_queue_copy_page_mappings())
         return 1;
     if (check_placed_resource_x() || check_depth_provider_refusal()) return 1;
