@@ -3171,6 +3171,8 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_indirect_group_budget PROPERTIES SKIP_RETURN_CODE 77
         ENVIRONMENT "LEONIDA_INDIRECT_GROUP_BUDGET=2")
       set_tests_properties(d3d12_indirect_dispatch_count PROPERTIES SKIP_RETURN_CODE 77)
+      add_test(NAME d3d12_bundle_indirect_dispatch COMMAND d3d12_indirect_dispatch_count_test --bundle)
+      set_tests_properties(d3d12_bundle_indirect_dispatch PROPERTIES SKIP_RETURN_CODE 77)
 
       # A single ordinary compute PSO and direct dispatch for cold/warm production journal comparisons;
       # only the authored two-counter shader is shared with the indirect test.

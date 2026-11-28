@@ -164,6 +164,181 @@ std::array<UINT, 2> expected(UINT count, bool update, UINT second_count = 3) {
     return result;
 }
 
+// --bundle: a fixed-count DISPATCH ExecuteIndirect recorded in a bundle and executed twice by a direct list. The
+// bundle starts with the compute pipeline it was created with and has no root signature or root UAV of its own; the
+// parent binds the root UAV at slot 0 for the first ExecuteBundle and at slot 1 for the second, then dispatches one
+// group directly at slot 2. Each slot holds the shader's two counters (8 bytes, 64 bytes apart), so a slot shows
+// which root arguments the indirect records ran with: three records of 1, 2 and 3 groups give 6/10 in slot 0. After
+// the second ExecuteBundle a UAV barrier and a direct Dispatch(1, 1, 1) run before any rebind, so slot 1 holds 7/11
+// only if the parent's root UAV survived the bundle; the last direct Dispatch(1, 1, 1) gives 1/1 in slot 2 (the
+// bundle's pipeline stays on the parent, the parent's root signature and arguments stay as they were).
+// `same_root`: the bundle sets the parent's root signature before the call, which keeps the parent's root arguments
+// (docs/d3d12_vulkan.md, bundles).
+constexpr UINT kSlot = 64;  // bytes between the slots' counters
+using BundleResult = std::array<UINT, 6>;
+
+bool run_bundle(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, bool same_root, BundleResult& result,
+                bool shim) {
+    Ref<ID3D12RootSignature> root;
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    param.Descriptor = {0, 0};
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    root_desc.Desc_1_0 = {1, &param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    const auto serialized = serialize_root_signature(root_desc);
+    if (serialized.empty() ||
+        FAILED(dev->CreateRootSignature(0, serialized.data(), serialized.size(), IID_PPV_ARGS(&root.p))))
+        return false;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = root.p;
+    desc.CS = {shader.data(), shader.size()};
+    Ref<ID3D12PipelineState> pso;
+    if (FAILED(dev->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso.p)))) return false;
+    const D3D12_INDIRECT_ARGUMENT_DESC argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
+    const D3D12_COMMAND_SIGNATURE_DESC signature_desc{kStride, 1, &argument, 0};
+    Ref<ID3D12CommandSignature> signature;
+    if (FAILED(dev->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature.p)))) return false;
+    const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    Ref<ID3D12Resource> source, args, output, readback;
+    const auto create = [&](Ref<ID3D12Resource>& dest, D3D12_HEAP_PROPERTIES heap, D3D12_RESOURCE_STATES state,
+                            D3D12_RESOURCE_FLAGS flags) {
+        const auto buffer = buffer_desc(512, flags);
+        return SUCCEEDED(dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, state, nullptr,
+                                                      IID_PPV_ARGS(&dest.p)));
+    };
+    if (!create(source, upload_heap, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE) ||
+        !create(args, default_heap, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE) ||
+        !create(output, default_heap, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+        !create(readback, readback_heap, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE))
+        return false;
+    std::array<UINT, 128> input{};  // bytes 256..511 stay zero: the output's initial value
+    for (UINT i = 0; i < kMaximum; ++i) {
+        const UINT base = (kArgsOffset + i * kStride) / 4;
+        input[base] = i + 1;
+        input[base + 1] = input[base + 2] = 1;
+        input[base + 3] = 0xa5a5a5a5;  // padding: must be ignored
+        input[base + 4] = 0x5a5a5a5a;
+    }
+    void* mapped = nullptr;
+    if (FAILED(source->Map(0, nullptr, &mapped)) || !mapped) return false;
+    std::memcpy(mapped, input.data(), sizeof(input));
+    source->Unmap(0, nullptr);
+
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator, bundle_allocator;
+    Ref<ID3D12GraphicsCommandList> list, bundle;
+    Ref<ID3D12Fence> fence;
+    if (FAILED(dev->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))) ||
+        FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) ||
+        FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle_allocator.p))) ||
+        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.p, pso.p,
+                                      IID_PPV_ARGS(&bundle.p))) ||
+        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                      IID_PPV_ARGS(&list.p))) ||
+        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
+        return false;
+    if (same_root) bundle->SetComputeRootSignature(root.p);
+    bundle->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, nullptr, 0);
+    if (FAILED(bundle->Close())) return false;
+
+    list->CopyBufferRegion(args.p, kArgsOffset, source.p, kArgsOffset, kMaximum * kStride);
+    list->CopyBufferRegion(output.p, 0, source.p, 256, 3 * kSlot);
+    const D3D12_RESOURCE_BARRIER ready[] = {
+        transition(args.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+        transition(output.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
+    list->ResourceBarrier(2, ready);
+    list->SetComputeRootSignature(root.p);
+    const D3D12_GPU_VIRTUAL_ADDRESS va = output->GetGPUVirtualAddress();
+    list->SetComputeRootUnorderedAccessView(0, va);
+    list->ExecuteBundle(bundle.p);
+    list->SetComputeRootUnorderedAccessView(0, va + kSlot);
+    list->ExecuteBundle(bundle.p);
+    // No rebind before this direct dispatch: it must still find the parent's root UAV (slot 1) after the bundle.
+    D3D12_RESOURCE_BARRIER uav{};
+    uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav.UAV.pResource = output.p;
+    list->ResourceBarrier(1, &uav);
+    list->Dispatch(1, 1, 1);
+    list->SetComputeRootUnorderedAccessView(0, va + 2 * kSlot);
+    list->Dispatch(1, 1, 1);
+    const auto to_copy = transition(output.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->ResourceBarrier(1, &to_copy);
+    list->CopyBufferRegion(readback.p, 0, output.p, 0, 3 * kSlot);
+    if (FAILED(list->Close())) return false;
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    if (shim && rt::d3d12::last_execute_result(queue.p) != leonida::ReplayResult::success) return false;
+    if (FAILED(queue->Signal(fence.p, 1))) return false;
+    const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event) return false;
+    const bool completed = SUCCEEDED(fence->SetEventOnCompletion(1, event)) &&
+                           WaitForSingleObject(event, 20000) == WAIT_OBJECT_0;
+    CloseHandle(event);
+    if (!completed || FAILED(dev->GetDeviceRemovedReason()) || FAILED(readback->Map(0, nullptr, &mapped)) || !mapped)
+        return false;
+    const auto* words = static_cast<const UINT*>(mapped);
+    for (UINT slot = 0; slot < 3; ++slot) {
+        result[2 * slot] = words[slot * kSlot / 4];
+        result[2 * slot + 1] = words[slot * kSlot / 4 + 1];
+    }
+    readback->Unmap(0, nullptr);
+    return true;
+}
+
+// What a bundle's Close returns for the ExecuteIndirect calls a bundle may not make: a count buffer, and a signature
+// that writes a root constant before its DISPATCH. Only Close is called: executing a bundle whose Close failed
+// crashes the PC runtime (d3d12_bundle_forbidden_test).
+bool bundle_refusals(ID3D12Device* dev, HRESULT& with_count, HRESULT& with_constant) {
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[0].Descriptor = {0, 0};
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants = {0, 0, 1};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    root_desc.Desc_1_0 = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    const auto serialized = serialize_root_signature(root_desc);
+    Ref<ID3D12RootSignature> root;
+    if (serialized.empty() ||
+        FAILED(dev->CreateRootSignature(0, serialized.data(), serialized.size(), IID_PPV_ARGS(&root.p))))
+        return false;
+    const D3D12_INDIRECT_ARGUMENT_DESC dispatch{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
+    D3D12_INDIRECT_ARGUMENT_DESC compound[2] = {};
+    compound[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    compound[0].Constant = {1, 0, 1};
+    compound[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    const D3D12_COMMAND_SIGNATURE_DESC simple_desc{kStride, 1, &dispatch, 0};
+    const D3D12_COMMAND_SIGNATURE_DESC compound_desc{kStride, 2, compound, 0};
+    Ref<ID3D12CommandSignature> simple, constant;
+    if (FAILED(dev->CreateCommandSignature(&simple_desc, nullptr, IID_PPV_ARGS(&simple.p))) ||
+        FAILED(dev->CreateCommandSignature(&compound_desc, root.p, IID_PPV_ARGS(&constant.p))))
+        return false;
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const auto buffer = buffer_desc(256);
+    Ref<ID3D12Resource> args;
+    if (FAILED(dev->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, nullptr, IID_PPV_ARGS(&args.p))))
+        return false;
+    const auto close = [&](ID3D12CommandSignature* sig, ID3D12Resource* count, HRESULT& hr) {
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12GraphicsCommandList> bundle;
+        if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&allocator.p))) ||
+            FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, allocator.p, nullptr,
+                                          IID_PPV_ARGS(&bundle.p))))
+            return false;
+        if (sig == constant.p) bundle->SetComputeRootSignature(root.p);
+        bundle->ExecuteIndirect(sig, 1, args.p, 0, count, count ? 128 : 0);
+        hr = bundle->Close();
+        return true;
+    };
+    return close(simple.p, args.p, with_count) && close(constant.p, nullptr, with_constant);
+}
+
 // Build and revision of a loaded system DLL ("22621.5415"; Windows shows it as 10.0.22621.5415), or "unknown".
 std::string module_version(const wchar_t* name) {
     const HMODULE module = GetModuleHandleW(name);
@@ -208,12 +383,41 @@ int make_host(Ref<ID3D12Device>& host, std::vector<std::uint8_t>& native_code) {
 
 int main(int argc, char** argv) {
     const bool clamp = argc == 2 && !std::strcmp(argv[1], "--clamp");
+    const bool bundle = argc == 2 && !std::strcmp(argv[1], "--bundle");
+    if (argc != 1 && !clamp && !bundle) return 2;
     // Wine has no WARP (its host is vkd3d on the GPU); the layer is still checked against expected().
     const bool compare_host = !hostwine::host_is_wine();
     Ref<ID3D12Device> host;
     std::vector<std::uint8_t> native_code;
     if (!clamp && compare_host) {
         if (const int status = make_host(host, native_code)) return status;
+    }
+    // --bundle runs on WARP and, outside Wine, on the default adapter too: both are held to the same values.
+    const BundleResult bundle_want{6, 10, 7, 11, 1, 1};
+    unsigned bundle_hosts = 0;
+    if (bundle && compare_host) {
+        Ref<ID3D12Device> adapter_default;
+        ID3D12Device* devices[] = {host.p, nullptr};
+        const char* names[] = {"WARP", "the default adapter"};
+        if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&adapter_default.p))))
+            devices[1] = adapter_default.p;
+        for (int i = 0; i < 2; ++i) {
+            if (!devices[i]) continue;
+            HRESULT with_count = S_OK, with_constant = S_OK;
+            if (!bundle_refusals(devices[i], with_count, with_constant)) return 1;
+            std::printf("%s: bundle ExecuteIndirect Close with a count buffer 0x%08lx, with a root constant 0x%08lx\n",
+                        names[i], static_cast<unsigned long>(with_count), static_cast<unsigned long>(with_constant));
+            if (SUCCEEDED(with_count) || SUCCEEDED(with_constant)) return 1;
+            for (const bool same_root : {false, true}) {
+                BundleResult got{};
+                if (!run_bundle(devices[i], native_code, same_root, got, false) || got != bundle_want) {
+                    std::fprintf(stderr, "%s same_root=%d: %u/%u %u/%u %u/%u, expected 6/10 7/11 1/1\n", names[i],
+                                 int(same_root), got[0], got[1], got[2], got[3], got[4], got[5]);
+                    return 1;
+                }
+            }
+            ++bundle_hosts;
+        }
     }
     vktest::Device vk;
     vk.request_buffer_device_address = true;
@@ -247,6 +451,31 @@ int main(int argc, char** argv) {
     Ref<ID3D12Device> layer;
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&layer.p)))) return 1;
 
+    if (bundle) {
+        HRESULT with_count = S_OK, with_constant = S_OK;
+        if (!bundle_refusals(layer.p, with_count, with_constant) || with_count != E_INVALIDARG ||
+            with_constant != E_INVALIDARG) {
+            std::fprintf(stderr, "layer: bundle ExecuteIndirect Close with a count buffer 0x%08lx, with a root "
+                         "constant 0x%08lx, expected E_INVALIDARG for both\n",
+                         static_cast<unsigned long>(with_count), static_cast<unsigned long>(with_constant));
+            return 1;
+        }
+        for (const bool same_root : {false, true}) {
+            BundleResult got{};
+            if (!run_bundle(layer.p, container, same_root, got, true) || got != bundle_want) {
+                std::fprintf(stderr, "layer same_root=%d: %u/%u %u/%u %u/%u, expected 6/10 7/11 1/1\n",
+                             int(same_root), got[0], got[1], got[2], got[3], got[4], got[5]);
+                return 1;
+            }
+        }
+        if (vk.validation_errors()) {
+            std::fprintf(stderr, "validation errors: %u\n", vk.validation_errors());
+            return 1;
+        }
+        std::printf("bundle ExecuteIndirect(DISPATCH): layer and %u host adapter(s) gave 6/10 7/11 1/1 in both "
+                    "cases; count buffer and root constant refused\n", bundle_hosts);
+        return 0;
+    }
     if (clamp) {
         for (bool fixed : {false, true}) {
             for (UINT count : {0u, 1u, 7u}) {
