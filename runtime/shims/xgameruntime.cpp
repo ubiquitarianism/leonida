@@ -35,6 +35,8 @@
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
+#include "../../third_party/xtaskqueue/Source/Task/XAsyncProviderPriv.h"
+#include "../../third_party/xtaskqueue/Source/Task/XTaskQueuePriv.h"
 
 #include "console_identity.h"
 #include "file_system.h"
@@ -170,25 +172,6 @@ ULONG STDMETHODCALLTYPE object_release(void* self) {
     return static_cast<ULONG>(prev > 1 ? prev - 1 : 1);  // the singleton's own reference stays
 }
 
-// A private slot whose signature isn't public: logged once, answers 0 (S_OK / false / nothing to do).
-template <int Slot> uint64_t STDMETHODCALLTYPE private_slot(void*) {
-    static std::atomic<bool> s_logged{false};
-    if (!s_logged.exchange(true))
-        std::fprintf(stderr, "[rt] xgameruntime: XThreadingImpl private slot %d called; answering 0\n", Slot);
-    return 0;
-}
-
-// Slot 8, XAsyncBeginAlloc: private (no public page) and never called by the package's DLLs, so its signature here
-// is not measured. Refuse it: answering S_OK would tell the caller its async call has begun while no provider ever
-// receives XAsyncOp::Begin, so its completion never arrives.
-HRESULT STDMETHODCALLTYPE begin_alloc_not_provided(void*) {
-    static std::atomic<bool> s_logged{false};
-    if (!s_logged.exchange(true))
-        std::fprintf(stderr, "[rt] xgameruntime: XThreadingImpl slot 8 (XAsyncBeginAlloc) called; not provided, "
-                             "returning E_NOTIMPL\n");
-    return E_NOTIMPL;
-}
-
 // XThreadSetTimeSensitive / XThreadIsTimeSensitive / XThreadAssertNotTimeSensitive. The flag is per thread, as in
 // the GDK; nothing is enforced offline (a time-sensitive thread may still block).
 thread_local bool t_time_sensitive = false;
@@ -208,7 +191,7 @@ const void* const kThreadingVtable[] = {
     XM(XAsyncCancel),                       // 5
     XM(XAsyncRun),                          // 6
     XM(XAsyncBegin),                        // 7
-    reinterpret_cast<const void*>(&begin_alloc_not_provided),  // 8  XAsyncBeginAlloc (private, not called by the package)
+    XM(XAsyncBeginAlloc),                   // 8
     XM(XAsyncSchedule),                     // 9
     XM(XAsyncComplete),                     // 10
     XM(XAsyncGetResult),                    // 11
@@ -228,7 +211,7 @@ const void* const kThreadingVtable[] = {
     XM(XTaskQueueGetCurrentProcessTaskQueue),  // 25
     XM(XTaskQueueSetCurrentProcessTaskQueue),  // 26
     reinterpret_cast<const void*>(&thread_set_time_sensitive),         // 27
-    reinterpret_cast<const void*>(&private_slot<28>),                  // 28 XTaskQueueIsEmpty (private; no arguments)
+    XM(XTaskQueueIsEmpty),                                            // 28
     reinterpret_cast<const void*>(&thread_assert_not_time_sensitive),  // 29
     reinterpret_cast<const void*>(&thread_is_time_sensitive),          // 30
 };
