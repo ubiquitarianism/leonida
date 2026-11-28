@@ -1896,7 +1896,39 @@ pub(crate) fn targets_room_kept() -> u64 {
     let (last, since) = targets_seen(last, since, targets, now);
     GREW[0].store(last, Relaxed);
     GREW[1].store(since, Relaxed);
-    targets_kept(most, targets, now.saturating_sub(since), settle)
+    let kept = targets_kept(most, targets, now.saturating_sub(since), settle);
+    // One line each time the reserve is given up or taken back, for a run to
+    // show when and how much (none with the setting at 0).
+    static GIVEN_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let given_up = kept == 0 && targets < most;
+    if GIVEN_UP.swap(given_up, Relaxed) != given_up {
+        tracing::info!("{}", targets_line(given_up, most, targets, now));
+    }
+    kept
+}
+
+/// The line [`targets_room_kept`] writes when the reserve for render
+/// targets is given up (`given_up`) or taken back: the targets' bytes and
+/// what is freed or kept, in MB, and the time of the run in seconds.
+#[cfg(any(windows, test))]
+fn targets_line(given_up: bool, most: u64, targets: u64, now_ms: u64) -> String {
+    let mb = |b: u64| b >> 20;
+    let rest = mb(most.saturating_sub(targets));
+    if given_up {
+        format!(
+            "render-target reserve (LEONIDA_CARD_ROOM_FOR_TARGETS_SETTLE_MS): given up at {:.1} s, targets {} MB, {} MB freed for textures",
+            now_ms as f64 / 1000.0,
+            mb(targets),
+            rest
+        )
+    } else {
+        format!(
+            "render-target reserve (LEONIDA_CARD_ROOM_FOR_TARGETS_SETTLE_MS): taken back at {:.1} s, targets {} MB, {} MB kept",
+            now_ms as f64 / 1000.0,
+            mb(targets),
+            rest
+        )
+    }
 }
 
 /// [`targets_room_kept`]'s record of the targets' bytes (`last`) and of
@@ -5266,6 +5298,16 @@ float4 lit() : SV_Target { return 1.0; }
         let (last, since) = targets_seen(2400 * MIB, 1_000, 1000 * MIB, 9_000);
         assert_eq!((last, since), (1000 * MIB, 1_000));
         assert_eq!(targets_seen(last, since, 2400 * MIB, 30_000), (2400 * MIB, 30_000));
+
+        // The run's line says when, and how much is freed or kept again.
+        assert_eq!(
+            targets_line(true, most, 2432 * MIB, 41_300),
+            "render-target reserve (LEONIDA_CARD_ROOM_FOR_TARGETS_SETTLE_MS): given up at 41.3 s, targets 2432 MB, 640 MB freed for textures"
+        );
+        assert_eq!(
+            targets_line(false, most, 2496 * MIB, 95_000),
+            "render-target reserve (LEONIDA_CARD_ROOM_FOR_TARGETS_SETTLE_MS): taken back at 95.0 s, targets 2496 MB, 576 MB kept"
+        );
     }
 
     /// A placed texture viewed from a later level has a host copy of that
