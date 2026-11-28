@@ -648,6 +648,20 @@ fn next(screens_only: bool) -> Arc<Pending> {
     }
 }
 
+/// Stack of each pipeline worker: room for the driver's shader compiler,
+/// which runs on it (reserved address space; committed only as used).
+const PIPELINE_STACK: usize = 64 << 20;
+
+/// The thread builder of pipeline worker `i`.
+fn worker_builder(i: usize) -> std::thread::Builder {
+    std::thread::Builder::new()
+        .name(format!("leonida-pipelines-{i}"))
+        // The driver compiles pipelines on this thread, recursively:
+        // NVIDIA's compiler (nvgpucomp64) overflowed the default 2 MB
+        // on a world compute program and refused it as out of memory.
+        .stack_size(PIPELINE_STACK)
+}
+
 /// How many workers make pipelines: `asked` (`LEONIDA_PIPELINE_WORKERS`, 1 to
 /// 64), else two thirds of the logical processors, 2 to 16. They run below the
 /// title's own threads, and a cold cache queues hundreds at once.
@@ -679,8 +693,7 @@ fn workers() -> bool {
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
             let screens_only = i >= workers;
-            let spawned = std::thread::Builder::new()
-                .name(format!("leonida-pipelines-{i}"))
+            let spawned = worker_builder(i)
                 .spawn(move || {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
@@ -738,6 +751,25 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The driver's compiler runs on the worker and recursed past the default
+    /// 2 MB on NVIDIA: a worker must reserve the whole of `PIPELINE_STACK`.
+    #[test]
+    fn pipeline_workers_reserve_a_64_mb_stack() {
+        use windows::Win32::System::Threading::GetCurrentThreadStackLimits;
+        let reserved = worker_builder(0)
+            .spawn(|| {
+                let (mut low, mut high) = (0usize, 0usize);
+                // SAFETY: both pointers are to locals that live through the call.
+                unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+                high - low
+            })
+            .expect("a worker thread")
+            .join()
+            .expect("the stack limits");
+        assert!(reserved >= PIPELINE_STACK, "stack of {reserved} bytes");
+        assert_eq!(PIPELINE_STACK, 64 << 20);
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
