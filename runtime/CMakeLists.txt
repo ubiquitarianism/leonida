@@ -4681,6 +4681,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_copy_offset_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_copy_offset COMMAND replay_copy_offset_test)
+    # Indexed draw offset alignment check (VUID-vkCmdBindIndexBuffer-offset-08783; no GPU).
+    add_executable(replay_index_align_test test/replay_index_align_test.cpp)
+    target_link_libraries(replay_index_align_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_index_align_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_index_align COMMAND replay_index_align_test)
     # KHR CopyRaytracingAccelerationStructure (CLONE, COMPACT) and COMPACTED_SIZE postbuild (no GPU).
     add_executable(replay_khr_as_copy_postbuild_test test/replay_khr_as_copy_postbuild_test.cpp)
     target_link_libraries(replay_khr_as_copy_postbuild_test PRIVATE Vulkan::Headers)
