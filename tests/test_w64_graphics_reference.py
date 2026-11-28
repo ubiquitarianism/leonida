@@ -13,6 +13,36 @@ import w64_graphics
 
 
 class TierCReferenceTests(unittest.TestCase):
+    def test_default_width_does_not_stand_in_for_a_wave32_draw(self) -> None:
+        name = "ps_w64_c_lane_id"
+        count = w64_graphics.W * w64_graphics.H
+        frames = {width: [(i % width, i % 32, i % 64, 0) for i in range(count)] for width in (32, 64)}
+        with tempfile.TemporaryDirectory() as work, patch.dict(os.environ, W64G_REF=work, W64G_SAVE_REF=""), \
+                patch.object(w64_graphics, "_device_range", None):
+            (Path(work) / f"{name}.spv").touch()
+            (Path(work) / f"{name}.ref64.raw").write_bytes(
+                b"".join(struct.pack("<4I", *pixel) for pixel in frames[64])
+            )
+            for required, default, limits, should_compare in (
+                ((32, 64), 64, "32..64", True),
+                ((32, 64), 32, "32..64", True),
+                ((32,), 32, "32..32", True),
+                ((64,), 64, "64..64", False),
+                ((), 32, "32..32", True),    # VS/GS with a fixed width and no applied stage request
+                ((), 64, "32..64", False),   # the harness has no proof of the default draw's width
+            ):
+                def draw(_tools, _spirv, _name, size, _tmp):
+                    w64_graphics._record_device_range(f"device: test (subgroup {limits})")
+                    return frames[size if size in required else default], None, size in required
+
+                with self.subTest(required=required, default=default), \
+                        patch.object(w64_graphics, "draw", side_effect=draw):
+                    result = w64_graphics.check(work, work, name)
+                    if should_compare:
+                        self.assertEqual(result, "")
+                    else:
+                        self.assertIsInstance(result, w64_graphics.Skip)
+
     def test_partition_invariant_word_must_match_reference(self) -> None:
         name = "ps_w64_c_lane_id"
         # The fixture writes lane ID, lane ID within a half, pixel X and zero.
@@ -30,6 +60,7 @@ class TierCReferenceTests(unittest.TestCase):
             with patch.dict(os.environ, W64G_REF=work, W64G_SAVE_REF=""):
                 for case, reference, frame, expected in (
                     ("valid", wave64, wave32, ""),
+                    ("same lanes", wave64, wave64, "equals the 64-lane reference"),
                     ("bad draw", wave64, wrong_x, "partition-invariant word"),
                     ("bad reference", wrong_reference, wave32, "partition-invariant word"),
                     ("same wrong x", wrong_reference, wrong_x, "partition-invariant word"),
@@ -46,6 +77,21 @@ class TierCReferenceTests(unittest.TestCase):
                             self.assertIn(expected, result)
                         else:
                             self.assertEqual(result, "")
+
+    def test_unverified_width_still_checks_reference_invariants(self) -> None:
+        name = "ps_w64_c_lane_id"
+        count = w64_graphics.W * w64_graphics.H
+        frame = [(i % 64, i % 32, i % 64, 0) for i in range(count)]
+        reference = frame.copy()
+        reference[0] = (0, 0, 1, 0)
+        with tempfile.TemporaryDirectory() as work, patch.dict(os.environ, W64G_REF=work, W64G_SAVE_REF=""), \
+                patch.object(w64_graphics, "_device_range", (32, 64)), \
+                patch.object(w64_graphics, "draw", return_value=(frame, None, False)):
+            (Path(work) / f"{name}.spv").touch()
+            (Path(work) / f"{name}.ref64.raw").write_bytes(
+                b"".join(struct.pack("<4I", *pixel) for pixel in reference)
+            )
+            self.assertIn("partition-invariant word", w64_graphics.check(work, work, name))
 
     def test_two_measured_widths_still_check_the_triangle_index(self) -> None:
         name = "gs_w64_c_lane_id"
