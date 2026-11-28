@@ -493,6 +493,7 @@ private:
         std::uint64_t token = 0, origin_us = 0, present_us = 0, display_us = 0;
         std::uint64_t due_us = 0;  // vblank after this token's origin, fixed when issued
         float percent_scanned = 0.0f;
+        bool origin_observed = false;
         bool presented = false, displayed = false;
     };
 
@@ -527,7 +528,7 @@ private:
         if (token != 0) {
             for (const Record& r : records_) {
                 if (r.token == token) {
-                    if (now >= r.origin_us) {
+                    if (r.origin_observed && now >= r.origin_us) {
                         latency_ring_[latency_head_] = now - r.origin_us;
                         latency_head_ = (latency_head_ + 1) % frame_pacing_window;
                         if (latency_count_ < frame_pacing_window) ++latency_count_;
@@ -565,8 +566,9 @@ private:
         auto& tick = last_event_tick_[frame_event_origin];
         tick = std::max(tick, newest);
         const auto origin = first + static_cast<std::uint64_t>(tick) * period_us_;
-        // The current token can be polled before the first configured origin.
-        *token = issue_token_locked(std::min(origin, now), origin - offset + period_us_);
+        // The current token can be polled before the first configured origin: its origin is clamped to now, and it
+        // has not observed a tick, so it stays out of the origin latency samples.
+        *token = issue_token_locked(std::min(origin, now), origin - offset + period_us_, now >= origin);
         return pacer_hr::ok;
     }
 
@@ -574,12 +576,13 @@ private:
         return event_armed_[0] || event_armed_[1] || event_armed_[2];
     }
 
-    std::uint64_t issue_token_locked(std::uint64_t origin_us, std::uint64_t due_us) {
+    std::uint64_t issue_token_locked(std::uint64_t origin_us, std::uint64_t due_us, bool origin_observed = true) {
         const std::uint64_t tok = tokens_->issue();  // the shared token source (the device proxy and PresentX pace with it)
         Record record;
         record.token = tok;
         record.origin_us = origin_us;
         record.due_us = due_us;
+        record.origin_observed = origin_observed;
         records_.push_back(record);
         if (records_.size() > 64) records_.pop_front();
         return tok;
@@ -628,7 +631,7 @@ private:
             if (give_up != no_deadline && now >= give_up) {
                 if (is_origin && token_on_timeout) {
                     // Frame started early on timeout: issue a consecutive token without consuming the tick.
-                    *token = issue_token_locked(now, next_us - offset + period_us_);
+                    *token = issue_token_locked(now, next_us - offset + period_us_, false);
                     return pacer_hr::false_;
                 }
                 return token_on_timeout ? pacer_hr::false_ : pacer_hr::timeout;

@@ -211,6 +211,25 @@ int main() {
         EXPECT(next.get().token == 4);
     }
 
+    // A current-token poll before the first origin can return a token, but has not observed a tick.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock, nullptr, true);
+        constexpr std::uint64_t offset = 5000;
+        EXPECT(setup(pacer, 4, offset));
+        std::uint64_t early = 0, observed = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &early) == pacer_hr::ok);
+        clock.advance_us(period + offset + 1000);
+        pacer.commit_present_token(early, 1);
+        EXPECT(pacer.pacing_summary().latency_samples == 0);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &observed) == pacer_hr::ok &&
+               observed == early + 1);
+        clock.advance_us(1000);
+        pacer.commit_present_token(observed, 1);
+        const auto summary = pacer.pacing_summary();
+        EXPECT(summary.frames == 2 && summary.latency_samples == 1 && summary.latency_p50_us == 2000);
+    }
+
     // A current-token poll before the first origin offset still issues immediately.
     {
         ManualFrameClock clock;
@@ -932,6 +951,15 @@ int main() {
         FramePacingSummary s1 = pacer.pacing_summary();
         EXPECT(s1.frames == 1 && s1.samples == 0 && s1.latency_samples == 1 && s1.latency_p50_us == 2000);
         EXPECT(near(s1.mean_us, 0.0) && near(s1.drift_us, 0.0));
+
+        std::uint64_t early = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, frame_wait_flag_token_on_timeout, &early) ==
+               pacer_hr::false_ && early == tok + 1);
+        clock.advance_us(3000);
+        pacer.commit_present_token(early, 1);
+        const auto after_early = pacer.pacing_summary();
+        EXPECT(after_early.frames == 2 && after_early.samples == 1 && after_early.p50_us == 3000);
+        EXPECT(after_early.latency_samples == 1 && after_early.latency_p50_us == 2000);
 
         // 2) 100 known intervals (16000 + 100*i us for i = 1..100) and known origin->present latencies:
         //    mean = 16000 + 5050 = 21050.0 us, drift = +5050.0 us,
