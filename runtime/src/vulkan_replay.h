@@ -4145,7 +4145,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         if (!ind->pipeline || !vk.dispatch_indirect || !vk.prepare_counted_dispatch ||
                             !vk.emit_counted_dispatch || (statistics_active && !statistics_helpers) ||
                             !vk.prepare_counted_dispatch(p.binding.buffer, p.binding.buffer_offset + ind->argument_offset,
-                                                         p.source.buffer, p.source.buffer_offset + ind->count_offset,
+                                                         ind->count_buffer ? p.source.buffer : VK_NULL_HANDLE,
+                                                         ind->count_buffer ? p.source.buffer_offset + ind->count_offset
+                                                                           : 0,
                                                          ind->stride, ind->max_count, p.counted_dispatch))
                             return unsupported_at(__LINE__);
                     } else if (!vk.dispatch_indirect) {

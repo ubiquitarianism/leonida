@@ -80,6 +80,9 @@ public:
                      CountedDispatch& out) {
             out = {};
             constexpr VkDeviceSize record_bytes = 3 * sizeof(std::uint32_t);
+            // Without a count buffer (LEONIDA_INDIRECT_GROUP_BUDGET only) `count_offset` means nothing: it is neither
+            // checked nor added to an address, and the job has no count (as IndirectArgumentClamp::prepare).
+            if (!count) count_offset = 0;
             if (!arguments || (!count && !indirect_group_budget()) || stride < record_bytes || stride % 4 ||
                 (argument_offset % 4) != 0 || (count_offset % 4) != 0 || !max_count ||
                 !owner.limits_.maxComputeWorkGroupCount[0] || !owner.make_pipeline()) return false;

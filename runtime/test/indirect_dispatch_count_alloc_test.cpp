@@ -2,7 +2,9 @@
 //   - skips undersized memory heaps (VUID-vkAllocateMemory-pAllocateInfo-01713) via memory_type_order;
 //   - falls back to subsequent compatible memory types on VK_ERROR_OUT_OF_DEVICE_MEMORY;
 //   - rejects stride < 12 (4 or 8) and non-4-byte-aligned argument/count offsets;
-//   - chunks emit() dispatches cleanly without zero-group or 32-bit workgroup overflow.
+//   - chunks emit() dispatches cleanly without zero-group or 32-bit workgroup overflow;
+//   - with LEONIDA_INDIRECT_GROUP_BUDGET and no count buffer, ignores the count offset: no alignment check, no count
+//     address and has_count 0 in emit()'s push constants (the test sets the budget to 4 before anything reads it).
 // No GPU, Vulkan loader, or game files required.
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
@@ -11,6 +13,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -31,6 +34,8 @@ struct MockState {
     std::vector<std::pair<std::uint32_t, VkDeviceSize>> alloc_attempts;
     std::vector<std::uint32_t> dispatch_groups_x;
     std::vector<std::uint32_t> push_records;
+    std::vector<std::uint64_t> push_counts;      // the count address of each push
+    std::vector<std::uint32_t> push_has_count;
 };
 
 MockState* g_mock = nullptr;
@@ -119,6 +124,12 @@ VKAPI_ATTR void VKAPI_CALL mock_cmd_push_constants(VkCommandBuffer, VkPipelineLa
         std::uint32_t records = 0;
         std::memcpy(&records, static_cast<const std::uint8_t*>(values) + 32, sizeof(records));
         g_mock->push_records.push_back(records);
+        std::uint64_t count = 0;
+        std::uint32_t has_count = 0;
+        std::memcpy(&count, static_cast<const std::uint8_t*>(values) + 8, sizeof(count));
+        std::memcpy(&has_count, static_cast<const std::uint8_t*>(values) + 40, sizeof(has_count));
+        g_mock->push_counts.push_back(count);
+        g_mock->push_has_count.push_back(has_count);
     }
 }
 
@@ -165,6 +176,12 @@ VkPhysicalDeviceLimits make_limits(std::uint32_t max_wg_x = 65535u) {
 
 int main() {
     using namespace leonida;
+    // indirect_group_budget() reads this once, on its first call; set it before any.
+#ifdef _WIN32
+    _putenv_s("LEONIDA_INDIRECT_GROUP_BUDGET", "4");
+#else
+    setenv("LEONIDA_INDIRECT_GROUP_BUDGET", "4", 1);
+#endif
     const VkDevice dummy_device = make_handle<VkDevice>(1);
     const VkBuffer args_buf = make_handle<VkBuffer>(100);
     const VkBuffer count_buf = make_handle<VkBuffer>(200);
@@ -278,6 +295,40 @@ int main() {
         CHECK(state.push_records[0] == 128u && state.push_records[1] == 2u);
         CHECK(state.dispatch_groups_x.size() == 2);
         CHECK(state.dispatch_groups_x[0] == 2u && state.dispatch_groups_x[1] == 1u);
+    }
+
+    // 6. LEONIDA_INDIRECT_GROUP_BUDGET with no count buffer: the count offset is not used. An unaligned one is not
+    //    refused, a large one does not become a count address (0x40 from a null buffer), and emit() pushes no count
+    //    (has_count 0), so the shader never reads one. With a count buffer the offset is still checked and added.
+    {
+        CHECK(indirect_group_budget() == 4u);
+        MockState state;
+        g_mock = &state;
+        VkPhysicalDeviceMemoryProperties mem{};
+        mem.memoryHeapCount = 1;
+        mem.memoryHeaps[0] = {VkDeviceSize(1) << 30, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+        mem.memoryTypeCount = 1;
+        mem.memoryTypes[0] = {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0};
+
+        IndirectDispatchCounter counter(mock_get_device_proc_addr, dummy_device, mem, make_limits());
+        auto batch = counter.batch();
+        CountedDispatch out{};
+        CHECK(batch->prepare(args_buf, 0, VK_NULL_HANDLE, 2, 12, 4u, out));
+        CHECK(out.count == 0);
+        CHECK(batch->prepare(args_buf, 0, VK_NULL_HANDLE, 64, 12, 4u, out));
+        CHECK(out.count == 0);
+        CHECK(batch->prepare(args_buf, 0, VK_NULL_HANDLE, ~VkDeviceSize{3}, 12, 4u, out));
+        CHECK(out.count == 0);
+        counter.emit(dummy_cb, out);
+        CHECK(state.push_counts.size() == 1 && state.push_counts[0] == 0 && state.push_has_count[0] == 0);
+
+        CHECK(!batch->prepare(args_buf, 0, count_buf, 2, 12, 4u, out));
+        CHECK(batch->prepare(args_buf, 0, count_buf, 64, 12, 4u, out));
+        CHECK(out.count == 0x10000000ull + 200 * 16 + 64);  // the mock's address of count_buf, plus the offset
+        state.push_counts.clear();
+        state.push_has_count.clear();
+        counter.emit(dummy_cb, out);
+        CHECK(state.push_counts.size() == 1 && state.push_counts[0] == out.count && state.push_has_count[0] == 1);
     }
 
     std::printf("indirect_dispatch_count_alloc_test: all checks passed\n");
