@@ -456,12 +456,9 @@ struct Json {
     double number = 0;
     std::string string;
     std::vector<Json> array;
-    // Declared through the incomplete JsonObjectEntry and destroyed out of line: a vector element type that holds a
-    // Json by value cannot be instantiated while Json is still being defined. GCC tolerates it, Clang with libstdc++
-    // does not (the pair<string, Json> form used to fail to build there). Structured bindings still work.
+    // The forward declaration lets entries hold Json by value. Implicit special members let vectors move subtrees.
     std::vector<JsonObjectEntry> object;
 
-    ~Json();
     const Json* find(std::string_view key) const;
 };
 
@@ -469,8 +466,6 @@ struct JsonObjectEntry {
     std::string key;
     Json value;
 };
-
-inline Json::~Json() = default;
 
 inline const Json* Json::find(std::string_view key) const {
     for (const auto& [k, v] : object)
