@@ -37,6 +37,18 @@ Paths are placeholders: `<checkout>` is the repository, `<build>` the folder wit
   runs used `LEONIDA_SKIP_COMPUTE=<name>,<name>,...` with those programs' names (picked by module size from
   `<work>/shaders/spirv/library/index.json`), which drops their dispatches at play, and `LEONIDA_RT_AS=off`, which
   drops acceleration-structure builds. The picture then lacks what they draw.
+- **The DirectStorage predictor profile.** The runtime decodes the title's BCPack textures with a profile fitted from
+  the local package, `<work>/shaders/bcpack/history.bcph` ([directstorage.md](directstorage.md)). The runtime stage
+  of `make_game.py` regenerates it when the fitter changes; a runtime built without that stage (`cmake` or
+  `scripts/build_runtime.ps1` directly) keeps the old one. Since `2a491668a` the fitter fills the BC7 history fields
+  of packed mip tails, whose missing values made the story load's tail requests fail with `missing-endpoint`
+  (`E_DSTORAGE_DECOMPRESSION_ERROR`; [#2019](https://github.com/ubiquitarianism/leonida/issues/2019),
+  [#2396](https://github.com/ubiquitarianism/leonida/issues/2396)). With an older profile, run
+  `python -I tools/build_dstorage_history.py <package> --out <work>/shaders/bcpack/history.bcph --trainer <build>/bcpack_history_train.exe`
+  once (about 11 minutes here). The runtime's load line then reports 4,406 of 6,144 BC7 endpoint fields (4,228
+  before). On an RTX 4070 SUPER (Windows 11, NVIDIA 621.01), with the old profile, 7-8 such errors a run and the
+  story load did not finish in 1,800 s (2 runs); with the new one, none, and the run reached the opening sequence
+  (1 run) ([reported by others](https://github.com/ubiquitarianism/leonida/issues/1608#issuecomment-7226672676)).
 
 ## Recommended variables (all platforms)
 
