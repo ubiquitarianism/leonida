@@ -19,21 +19,27 @@ import sys
 
 PEEK = re.compile(r"\[rt\] peek t=(\d+)s:(.*)")
 FIELD = re.compile(r"0x([0-9a-fA-F]+)=([0-9a-fA-F?,]+)")
-PRESS = re.compile(r"\[rt\] gameinput: scripted press of button (\d+) at ([0-9.]+) s")
+PRESS = re.compile(r"\[rt\] gameinput: scripted press of button (\d+) at ([0-9]+(?:\.[0-9]+)?) s")
 
 SESSION = {1: "boot screens", 3: "landing", 0xD: "first-run pages", 0: "story load"}
 GAME = {0: "not started", 2: "init", 3: "running"}
 
 
 def first_value(text):
-    if text is None or text.startswith("?"):
+    if not text:
         return None
-    return int(text.split(",")[0], 16)
+    head = text.split(",", 1)[0]
+    if not head or "?" in head:
+        return None
+    try:
+        return int(head, 16)
+    except ValueError:
+        return None
 
 
 def read(path):
     peeks, presses = [], []
-    with open(path, encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             m = PEEK.search(line)
             if m:
@@ -57,7 +63,7 @@ def timeline(peeks, presses):
     seen_load_byte = False
     for p in peeks:
         load = p["load"]
-        ended = p["session"] == 0 and load is not None and seen_load_byte and (load & 0xFF) == 0
+        ended = p["game"] == 3 and p["session"] == 0 and load is not None and seen_load_byte and (load & 0xFF) == 0
         if load is not None and (load & 0xFF) == 2:
             seen_load_byte = True
         name = "story load (loading screen ended)" if ended else (
@@ -72,12 +78,16 @@ def timeline(peeks, presses):
     return events
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("log")
     ap.add_argument("--json", action="store_true", help="print the stages and presses as JSON")
-    a = ap.parse_args()
-    peeks, presses = read(a.log)
+    a = ap.parse_args(argv)
+    try:
+        peeks, presses = read(a.log)
+    except OSError as e:
+        print(f"stage_timeline: {a.log}: {e.strerror or e}", file=sys.stderr)
+        return 2
     if not peeks:
         print("no peek lines: run with LEONIDA_PEEK=0x7446510,0x98f828c,0x7453ed0", file=sys.stderr)
         return 1

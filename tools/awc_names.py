@@ -178,18 +178,24 @@ def _files(path: str):
 
 def read_words(path: str) -> list:
     """Words from a text file (one per line), a hashdict.py JSON object or a JSON list of words."""
-    with open(path, "rb") as fh:
-        head = fh.read(1).lstrip()
-    if path.lower().endswith(".json") or head == b"{":
-        with open(path, encoding="utf-8") as fh:
-            doc = json.load(fh)
-        if isinstance(doc, dict):
-            return [str(v) for v in doc.values()]
-        if isinstance(doc, list):
-            return [str(v) for v in doc]
-        raise ValueError(f"expected a JSON object of hash -> word or a list of words, got {type(doc).__name__}")
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        return [line.strip() for line in fh if line.strip()]
+    is_json = path.lower().endswith(".json")
+    if not is_json:
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
+            for chunk in iter(lambda: fh.read(4096), ""):
+                content = chunk.lstrip(" \t\r\n")
+                if content:
+                    is_json = content.startswith("{")
+                    break
+            if not is_json:
+                fh.seek(0)
+                return [line.strip() for line in fh if line.strip()]
+    with open(path, encoding="utf-8-sig") as fh:
+        doc = json.load(fh)
+    if isinstance(doc, dict):
+        return [str(v) for v in doc.values()]
+    if isinstance(doc, list):
+        return [str(v) for v in doc]
+    raise ValueError(f"expected a JSON object of hash -> word or a list of words, got {type(doc).__name__}")
 
 
 def conversation_waves(paths) -> list:

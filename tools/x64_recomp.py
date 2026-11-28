@@ -1008,6 +1008,8 @@ class Asm:
         start = len(self.words)
         if not nz:
             self.movz(rd, 0)
+        elif not nzc:
+            self.movn(rd, 0)
         elif len(nzc) < len(nz):
             self.movn(rd, chunks[nzc[0]] ^ 0xFFFF, nzc[0])
             for i in nzc[1:]:
@@ -2197,11 +2199,11 @@ class FunctionTranslator:
         sz = self._op_size(dst)
         need = self.needed.get(ins.addr, set())
         flaggy = bool(need) or ins.addr in self.mat
-        self._load(ins, src, T1)
+        self._load(ins, src, T1, as_size=sz)
         self._load(ins, dst, T0, as_size=sz)
         # partial-width ops compute in a widened temp to get correct N/Z at sz;
         # stash unshifted operands first for lazy AF
-        if "A" in need:
+        if "A" in need or ins.addr in self.mat:
             a.stur(T0, CTX_REG, CTX_A, size=8)
             a.stur(T1, CTX_REG, CTX_B, size=8)
         sh = (32 - sz * 8) if sz < 4 else 0
@@ -2256,7 +2258,7 @@ class FunctionTranslator:
         dst, src = ins.ops
         sz = self._op_size(dst)
         need = self.needed.get(ins.addr, set())
-        self._load(ins, src, T1)
+        self._load(ins, src, T1, as_size=sz)
         self._load(ins, dst, T0, as_size=sz)
         # stash unshifted result/operands before widening for flag semantics
         if "P" in need or "A" in need or ins.addr in self.mat:
@@ -2265,7 +2267,7 @@ class FunctionTranslator:
             else:
                 a.and_r(T2, T0, T1, 1)
             a.stur(T2, CTX_REG, CTX_RES, size=8)
-            if "A" in need:
+            if "A" in need or ins.addr in self.mat:
                 a.stur(T0, CTX_REG, CTX_A, size=8)
                 a.stur(T1, CTX_REG, CTX_B, size=8)
         sh = (32 - sz * 8) if sz < 4 else 0
@@ -2284,43 +2286,71 @@ class FunctionTranslator:
         a = self.asm
         op = ins.ops[0]
         sz = self._op_size(op)
+        sf = 1 if sz == 8 else 0
         need = self.needed.get(ins.addr, set())
-        keep_c = "C" in need or ins.addr in self.mat
+        flaggy = bool(need) or ins.addr in self.mat
         self._load(ins, op, T0)
+        if flaggy and ("A" in need or ins.addr in self.mat):
+            a.stur(T0, CTX_REG, CTX_A, size=8)
+            a.movz(T1, 1, 0, sf=0)
+            a.stur(T1, CTX_REG, CTX_B, size=8)
         sh = (32 - sz * 8) if sz < 4 else 0
+        if not flaggy:
+            (a.add if ins.mnem == "inc" else a.sub)(T0, T0, 1, sf)
+            if sz == 1:
+                a.uxtb(T0, T0)
+            elif sz == 2:
+                a.uxth(T0, T0)
+            self._store(ins, op, T0)
+            return
         if sh:
             a.lsl(T0, T0, sh, sf=0)
-        if keep_c:
-            a.mrs_nzcv(GTMP)
-        (a.adds if ins.mnem == "inc" else a.subs)(T0, T0, 1, 1 if sz == 8 else 0)
-        if keep_c:
-            a.mrs_nzcv(T3)
-            a.bfi(T3, GTMP, 29, 1)
-            a.msr_nzcv(T3)
+            a.movz(T1, 1 << (sh - 16), 1, sf=0)
+        a.mrs_nzcv(GTMP)
+        if sh:
+            (a.adds_r if ins.mnem == "inc" else a.subs_r)(T0, T0, T1, sf=0)
+        else:
+            (a.adds if ins.mnem == "inc" else a.subs)(T0, T0, 1, sf)
+        a.mrs_nzcv(T3)
+        a.ubfx(GTMP, GTMP, 29, 1)
+        a.bfi(T3, GTMP, 29, 1)
+        a.msr_nzcv(T3)
         if sh:
             a.lsr(T0, T0, sh, sf=0)
         self._store(ins, op, T0)
         self._stash_res(ins, T0)
-        self._maybe_mkflags(ins)
+        if ins.addr in self.mat:
+            # Preserve ctx.eflags CF (bit 0) and do not invert ARM C (dec does not write CF).
+            a.ldur(GTMP, CTX_REG, CTX_EFLAGS, size=8)
+            self._mkflags(0)
+            a.ldur(T0, CTX_REG, CTX_EFLAGS, size=8)
+            a.bfi(T0, GTMP, 0, 1)
+            a.stur(T0, CTX_REG, CTX_EFLAGS, size=8)
 
     def _emit_negnot(self, ins):
         a = self.asm
         op = ins.ops[0]
         sz = self._op_size(op)
+        sf = 1 if sz == 8 else 0
         self._load(ins, op, T0)
-        sh = (32 - sz * 8) if sz < 4 else 0
-        if ins.mnem == "neg":
-            if sh:
-                a.lsl(T0, T0, sh, sf=0)
-            a.subs_r(T0, 31, T0, 1 if sz == 8 else 0)
-            if sh:
-                a.lsr(T0, T0, sh, sf=0)
-        else:
-            a.mvn(T0, T0, 1 if sz == 8 else 0)
+        if ins.mnem == "not":
+            a.mvn(T0, T0, sf)
             if sz == 1:
                 a.uxtb(T0, T0)
             elif sz == 2:
                 a.uxth(T0, T0)
+            self._store(ins, op, T0)
+            return
+        need = self.needed.get(ins.addr, set())
+        if "A" in need or ins.addr in self.mat:
+            a.stur(31, CTX_REG, CTX_A, size=8)
+            a.stur(T0, CTX_REG, CTX_B, size=8)
+        sh = (32 - sz * 8) if sz < 4 else 0
+        if sh:
+            a.lsl(T0, T0, sh, sf=0)
+        a.subs_r(T0, 31, T0, sf)
+        if sh:
+            a.lsr(T0, T0, sh, sf=0)
         self._store(ins, op, T0)
         self._stash_res(ins, T0)
         self._maybe_mkflags(ins)
@@ -2395,18 +2425,12 @@ class FunctionTranslator:
         a = self.asm
         m = ins.mnem
         dst, src = ins.ops
-        if m == "mov":
-            if dst[0] == "r" and src[0] == "i" and dst[2] == 8 and src[2] == 4:
-                # C7 /0 form: the imm32 sign-extends into the 64-bit destination
-                v = src[1]
-                a.li(T0, v - (1 << 32) if v & 0x80000000 else v)
-                self._store(ins, dst, T0)
-                return
+        if m in ("mov", "movnti"):
             if dst[0] == "r" and src[0] == "r" and dst[2] == src[2] == 8:
                 if GMAP[dst[1]] != GMAP[src[1]]:
                     a.mov(GMAP[dst[1]], GMAP[src[1]])
                 return
-            self._load(ins, src, T0)
+            self._load(ins, src, T0, as_size=self._op_size(dst))
             self._store(ins, dst, T0)
         elif m == "movzx":
             self._load(ins, src, T0)
@@ -2500,19 +2524,20 @@ class FunctionTranslator:
         a = self.asm
         m = ins.mnem
         if m == "cbtw":
-            if ins.opsize:
+            if ins.rexw:
+                a.sxtw(GMAP[0], GMAP[0])
+            elif ins.opsize:
                 a.sxtb(T0, GMAP[0], sf=0)
                 a.bfi(GMAP[0], T0, 0, 16)
-            elif ins.rexw:
-                a.sxtw(GMAP[0], GMAP[0])
             else:
                 a.sxth(GMAP[0], GMAP[0], sf=0)
         elif m == "cwtd":
-            if ins.opsize:
-                a.sxth(T0, GMAP[0], sf=0)
-                a.bfi(GMAP[2], T0, 0, 16)
-            elif ins.rexw:
+            if ins.rexw:
                 a.asr(GMAP[2], GMAP[0], 63)
+            elif ins.opsize:
+                a.sxth(T0, GMAP[0], sf=0)
+                a.asr(T0, T0, 16, sf=0)
+                a.bfi(GMAP[2], T0, 0, 16)
             else:
                 a.asr(GMAP[2], GMAP[0], 31, sf=0)
         else:
@@ -2535,28 +2560,65 @@ class FunctionTranslator:
             if cval == 0:
                 return
             self._load(ins, dst, T0)
+            if m == "sar" and width < 32:
+                (a.sxtb if width == 8 else a.sxth)(T0, T0, sf=0)
             a.mov(T2, T0)  # original for CF
             if m in ("shl", "sal"):
-                a.lsl(T0, T0, cval, sf)
+                if cval >= width:
+                    a.movz(T0, 0, 0, sf=0)
+                else:
+                    a.lsl(T0, T0, cval, sf)
+                    if width == 8:
+                        a.uxtb(T0, T0)
+                    elif width == 16:
+                        a.uxth(T0, T0)
             elif m == "shr":
-                a.lsr(T0, T0, cval, sf)
+                if cval >= width:
+                    a.movz(T0, 0, 0, sf=0)
+                else:
+                    a.lsr(T0, T0, cval, sf)
             elif m == "sar":
                 a.asr(T0, T0, cval, sf)
-            elif m == "ror":
-                a.ror(T0, T0, cval % width or width, sf)
-            elif m == "rol":
-                a.ror(T0, T0, width - (cval % width or width), sf)
+                if width == 8:
+                    a.uxtb(T0, T0)
+                elif width == 16:
+                    a.uxth(T0, T0)
+            elif m in ("rol", "ror"):
+                r = cval % width
+                if r != 0:
+                    if width < 32:
+                        if width == 8:
+                            a.orr_r(T0, T0, T0, sf=0, shift=0, imm6=8)
+                        a.orr_r(T0, T0, T0, sf=0, shift=0, imm6=16)
+                        a.ror(T0, T0, r if m == "ror" else width - r, sf=0)
+                        (a.uxtb if width == 8 else a.uxth)(T0, T0)
+                    else:
+                        a.ror(T0, T0, r if m == "ror" else width - r, sf)
             self._store(ins, dst, T0)
             if flaggy:
-                res = GMAP[dst[1]] if dst[0] == "r" and self._op_size(dst) >= 4 else T0
-                a.tst_r(res, res, sf)
-                if need_c:
-                    self._shift_cf_imm(ins, m, cval, width)
-            self._stash_res(ins, T0)
-            self._maybe_mkflags(ins)
+                if m in ("rol", "ror"):
+                    if need_c:
+                        self._shift_cf_imm(ins, m, cval, width)
+                        if ins.addr in self.mat:
+                            a.ldur(T1, CTX_REG, CTX_EFLAGS, size=8)
+                            a.bfi(T1, T3, 0, 1)
+                            a.stur(T1, CTX_REG, CTX_EFLAGS, size=8)
+                else:
+                    if width < 32:
+                        (a.sxtb if width == 8 else a.sxth)(T3, T0, sf=0)
+                        a.tst_r(T3, T3, sf=0)
+                    else:
+                        res = GMAP[dst[1]] if dst[0] == "r" else T0
+                        a.tst_r(res, res, sf)
+                    if need_c:
+                        self._shift_cf_imm(ins, m, cval, width)
+                    self._stash_res(ins, T0)
+                    self._maybe_mkflags(ins)
             return
         # variable count in cl
         self._load(ins, dst, T0)
+        if m == "sar" and width < 32:
+            (a.sxtb if width == 8 else a.sxth)(T0, T0, sf=0)
         a.mov(T2, T0)
         a.mov(T1, GMAP[1], sf=0)
         a.and_i(T1, T1, 0x3F if width == 64 else 0x1F, sf=0)
@@ -2567,24 +2629,56 @@ class FunctionTranslator:
         a.cbz(T1, skip, sf=0)
         if m in ("shl", "sal"):
             a.lslv(T0, T0, T1, sf)
+            if width == 8:
+                a.uxtb(T0, T0)
+            elif width == 16:
+                a.uxth(T0, T0)
         elif m == "shr":
             a.lsrv(T0, T0, T1, sf)
         elif m == "sar":
             a.asrv(T0, T0, T1, sf)
-        elif m == "ror":
-            a.rorv(T0, T0, T1, sf)
-        elif m == "rol":
-            a.movz(T3, width, 0, sf=0)
-            a.sub_r(T3, T3, T1, sf=0)
-            a.rorv(T0, T0, T3, sf)
+            if width == 8:
+                a.uxtb(T0, T0)
+            elif width == 16:
+                a.uxth(T0, T0)
+        elif m in ("rol", "ror"):
+            if width < 32:
+                if width == 8:
+                    a.orr_r(T0, T0, T0, sf=0, shift=0, imm6=8)
+                a.orr_r(T0, T0, T0, sf=0, shift=0, imm6=16)
+                if m == "ror":
+                    a.rorv(T0, T0, T1, sf=0)
+                else:
+                    a.movz(T3, 32, 0, sf=0)
+                    a.sub_r(T3, T3, T1, sf=0)
+                    a.rorv(T0, T0, T3, sf=0)
+                (a.uxtb if width == 8 else a.uxth)(T0, T0)
+            elif m == "ror":
+                a.rorv(T0, T0, T1, sf)
+            else:
+                a.movz(T3, width, 0, sf=0)
+                a.sub_r(T3, T3, T1, sf=0)
+                a.rorv(T0, T0, T3, sf)
         self._store(ins, dst, T0)
         if flaggy:
-            res = GMAP[dst[1]] if dst[0] == "r" and self._op_size(dst) >= 4 else T0
-            a.tst_r(res, res, sf)
-            if need_c:
-                self._shift_cf_var(ins, m, width)
-        self._stash_res(ins, T0)
-        self._maybe_mkflags(ins)
+            if m in ("rol", "ror"):
+                if need_c:
+                    self._shift_cf_var(ins, m, width)
+                    if ins.addr in self.mat:
+                        a.ldur(T1, CTX_REG, CTX_EFLAGS, size=8)
+                        a.bfi(T1, T3, 0, 1)
+                        a.stur(T1, CTX_REG, CTX_EFLAGS, size=8)
+            else:
+                if width < 32:
+                    (a.sxtb if width == 8 else a.sxth)(T3, T0, sf=0)
+                    a.tst_r(T3, T3, sf=0)
+                else:
+                    res = GMAP[dst[1]] if dst[0] == "r" else T0
+                    a.tst_r(res, res, sf)
+                if need_c:
+                    self._shift_cf_var(ins, m, width)
+                self._stash_res(ins, T0)
+                self._maybe_mkflags(ins)
         a.label(skip)
 
     def _set_cf(self, bit_reg):
@@ -2596,32 +2690,39 @@ class FunctionTranslator:
 
     def _shift_cf_imm(self, ins, m, cval, width):
         a = self.asm
-        if cval >= width:
-            a.movz(T3, 0, 0, sf=0)
-        elif m in ("shl", "sal"):
-            a.ubfx(T3, T2, width - cval, 1, sf=0)
-        elif m in ("shr", "sar"):
-            a.ubfx(T3, T2, cval - 1, 1, sf=0)
-        elif m == "rol":
+        sf = 1 if width == 64 else 0
+        if m == "rol":
             a.and_i(T3, T0, 1, sf=0)
         elif m == "ror":
-            a.ubfx(T3, T0, width - 1, 1, sf=0)
+            a.ubfx(T3, T0, width - 1, 1, sf)
+        elif m == "sar":
+            a.ubfx(T3, T2, min(cval - 1, width - 1), 1, sf)
+        elif cval > width:
+            a.movz(T3, 0, 0, sf=0)
+        elif m in ("shl", "sal"):
+            a.ubfx(T3, T2, width - cval, 1, sf)
+        elif m == "shr":
+            a.ubfx(T3, T2, cval - 1, 1, sf)
         self._set_cf(T3)
 
     def _shift_cf_var(self, ins, m, width):
         a = self.asm
+        sf = 1 if width == 64 else 0
         # count in T1, original in T2, result in T0
         if m in ("shl", "sal"):
             a.movz(T3, width, 0, sf=0)
             a.sub_r(T3, T3, T1, sf=0)
-            a.lsrv(T3, T2, T3, sf=0)
-        elif m in ("shr", "sar"):
+            a.lsrv(T3, T2, T3, sf)
+        elif m == "shr":
             a.sub(T3, T1, 1, sf=0)
-            a.lsrv(T3, T2, T3, sf=0)
+            a.lsrv(T3, T2, T3, sf)
+        elif m == "sar":
+            a.sub(T3, T1, 1, sf=0)
+            a.asrv(T3, T2, T3, sf)
         elif m == "rol":
             a.mov(T3, T0, sf=0)
         elif m == "ror":
-            a.lsr(T3, T0, width - 1, sf=0)
+            a.lsr(T3, T0, width - 1, sf)
         a.and_i(T3, T3, 1, sf=0)
         self._set_cf(T3)
 
@@ -2629,78 +2730,321 @@ class FunctionTranslator:
         a = self.asm
         m = ins.mnem
         need = self.needed.get(ins.addr, set())
+        want_cv = "C" in need or "V" in need or ins.addr in self.mat
+
+        def emit_cv(ovf_reg):
+            a.mrs_nzcv(GTMP)
+            a.and_i(GTMP, GTMP, 0xC0000000)   # keep N,Z; clear C,V
+            a.bfi(GTMP, ovf_reg, 28, 1)       # V
+            a.bfi(GTMP, ovf_reg, 29, 1)       # C
+            a.msr_nzcv(GTMP)
+            self._maybe_mkflags(ins)
+
         if m == "imul" and len(ins.ops) >= 2:
             dst, src = ins.ops[0], ins.ops[1]
             sz = self._op_size(dst)
-            sf = 1 if sz == 8 else 0
             self._load(ins, src, T0)
             if len(ins.ops) > 2:
-                a.li(T1, ins.ops[2][1])
+                imm = ins.ops[2][1] & 0xFFFFFFFFFFFFFFFF
+                if imm == 0xFFFFFFFFFFFFFFFF:
+                    a.movn(T1, 0)
+                else:
+                    a.li(T1, imm)
             else:
                 self._load(ins, dst, T1)
-            a.mul(T0, T1, T0, sf)
-            self._store(ins, dst, T0)
-            if "C" in need or "V" in need or ins.addr in self.mat:
-                # CF=OF = (high half of product != sign extension of result)
-                if sf:
-                    a.smulh(T2, T1, T0)
-                else:
-                    a.smaddl(T2, T1, T0, 31)
-                    a.asr(T2, T2, 32)
-                res = GMAP[dst[1]] if dst[0] == "r" else T0
-                a.asr(T3, res, 63 if sf else 31, sf)
-                a.cmp_r(T2, T3, sf)          # eq -> no overflow -> C=V=0
-                a.cset(T3, "eq", sf=0)
-                a.eor_i(T3, T3, 1, sf=0)     # T3 = overflow
-                a.mrs_nzcv(GTMP)
-                a.and_i(GTMP, GTMP, 0xC0000000)   # keep N,Z
-                a.bfi(GTMP, T3, 28, 1)            # V
-                a.bfi(GTMP, T3, 29, 1)            # C
-                a.msr_nzcv(GTMP)
+            if sz == 2:
+                a.sxth(T0, T0, sf=0)
+                a.sxth(T1, T1, sf=0)
+                a.mul(T2, T1, T0, sf=0)
+                self._store(ins, dst, T2)
+                if want_cv:
+                    a.sxth(T3, T2, sf=0)
+                    a.cmp_r(T2, T3, sf=0)
+                    a.cset(T3, "ne", sf=0)
+                    emit_cv(T3)
+            elif sz == 4:
+                a.smaddl(T2, T1, T0, 31)
+                self._store(ins, dst, T2)
+                if want_cv:
+                    a.sxtw(T3, T2)
+                    a.cmp_r(T2, T3, sf=1)
+                    a.cset(T3, "ne", sf=0)
+                    emit_cv(T3)
+            elif sz == 8:
+                a.mul(T2, T1, T0, sf=1)
+                if want_cv:
+                    a.smulh(T3, T1, T0)
+                self._store(ins, dst, T2)
+                if want_cv:
+                    a.asr(GTMP, T2, 63, sf=1)
+                    a.cmp_r(T3, GTMP, sf=1)
+                    a.cset(T3, "ne", sf=0)
+                    emit_cv(T3)
+            else:
+                raise UnhandledInsn(ins, f"imul size {sz}")
             return
         if m in ("mul", "imul") and len(ins.ops) == 1:
             src = ins.ops[0]
             sz = self._op_size(src)
-            if sz == 8:
-                self._load(ins, src, T0)
-                (a.umulh if m == "mul" else a.smulh)(GMAP[2], GMAP[0], T0)
-                a.mul(GMAP[0], GMAP[0], T0)
+            self._load(ins, src, T0)
+            if sz == 1:
+                if m == "mul":
+                    a.uxtb(T1, GMAP[0])
+                    a.mul(T2, T1, T0, sf=0)
+                    a.bfi(GMAP[0], T2, 0, 16)
+                    if want_cv:
+                        a.ubfx(T3, T2, 8, 8, sf=0)
+                        a.cmp(T3, 0, sf=0)
+                        a.cset(T3, "ne", sf=0)
+                        emit_cv(T3)
+                else:
+                    a.sxtb(T0, T0, sf=0)
+                    a.sxtb(T1, GMAP[0], sf=0)
+                    a.mul(T2, T1, T0, sf=0)
+                    a.bfi(GMAP[0], T2, 0, 16)
+                    if want_cv:
+                        a.sxtb(T3, T2, sf=0)
+                        a.cmp_r(T2, T3, sf=0)
+                        a.cset(T3, "ne", sf=0)
+                        emit_cv(T3)
+            elif sz == 2:
+                if m == "mul":
+                    a.uxth(T1, GMAP[0])
+                    a.mul(T2, T1, T0, sf=0)
+                    a.bfi(GMAP[0], T2, 0, 16)
+                    a.lsr(T3, T2, 16, sf=0)
+                    a.bfi(GMAP[2], T3, 0, 16)
+                    if want_cv:
+                        a.cmp(T3, 0, sf=0)
+                        a.cset(T3, "ne", sf=0)
+                        emit_cv(T3)
+                else:
+                    a.sxth(T0, T0, sf=0)
+                    a.sxth(T1, GMAP[0], sf=0)
+                    a.mul(T2, T1, T0, sf=0)
+                    a.bfi(GMAP[0], T2, 0, 16)
+                    a.lsr(T3, T2, 16, sf=0)
+                    a.bfi(GMAP[2], T3, 0, 16)
+                    if want_cv:
+                        a.sxth(T3, T2, sf=0)
+                        a.cmp_r(T2, T3, sf=0)
+                        a.cset(T3, "ne", sf=0)
+                        emit_cv(T3)
             elif sz == 4:
-                self._load(ins, src, T0)
                 (a.umaddl if m == "mul" else a.smaddl)(T1, GMAP[0], T0, 31)
                 a.mov(GMAP[0], T1, sf=0)
                 a.lsr(GMAP[2], T1, 32)
+                if want_cv:
+                    if m == "mul":
+                        a.cmp(GMAP[2], 0, sf=0)
+                    else:
+                        a.asr(T3, GMAP[0], 31, sf=0)
+                        a.cmp_r(GMAP[2], T3, sf=0)
+                    a.cset(T3, "ne", sf=0)
+                    emit_cv(T3)
+            elif sz == 8:
+                (a.umulh if m == "mul" else a.smulh)(T2, GMAP[0], T0)
+                a.mul(GMAP[0], GMAP[0], T0, sf=1)
+                a.mov(GMAP[2], T2, sf=1)
+                if want_cv:
+                    if m == "mul":
+                        a.cmp(GMAP[2], 0, sf=1)
+                    else:
+                        a.asr(T3, GMAP[0], 63, sf=1)
+                        a.cmp_r(GMAP[2], T3, sf=1)
+                    a.cset(T3, "ne", sf=0)
+                    emit_cv(T3)
             else:
                 raise UnhandledInsn(ins, f"{m} size {sz}")
-            if "C" in need or "V" in need or ins.addr in self.mat:
-                res = GMAP[2]
-                a.cmp(res, 0, 1 if sz == 8 else 0)
-                a.cset(T3, "ne", sf=0)
-                a.mrs_nzcv(GTMP)
-                a.and_i(GTMP, GTMP, 0xC0000000)
-                a.bfi(GTMP, T3, 28, 1)
-                a.bfi(GTMP, T3, 29, 1)
-                a.msr_nzcv(GTMP)
             return
         if m in ("div", "idiv") and len(ins.ops) == 1:
             src = ins.ops[0]
             sz = self._op_size(src)
-            if sz != 4:
-                raise UnhandledInsn(ins, f"{m} size {sz} (128-bit dividend)")
             self._load(ins, src, T1)
-            if m == "idiv":
-                a.sxtw(T1, T1)
-            ok = self._skip_lbl()
-            a.cbnz(T1, ok, sf=1)
-            a.brk(0xD1)
-            a.label(ok)
-            # dividend = edx:eax
-            a.mov(T0, GMAP[0], sf=0)
-            a.orr_r(T0, T0, GMAP[2], sf=1, shift=0, imm6=32)
-            (a.udiv if m == "div" else a.sdiv)(T2, T0, T1, sf=1)
-            a.msub(T3, T2, T1, T0, sf=1)
-            a.mov(GMAP[0], T2, sf=0)
-            a.mov(GMAP[2], T3, sf=0)
+            if sz == 1:
+                if m == "idiv":
+                    a.sxtb(T1, T1, sf=0)
+                    a.sxth(T0, GMAP[0], sf=0)
+                else:
+                    a.uxth(T0, GMAP[0])
+                ok_nz, ok_ovf = self._skip_lbl(), self._skip_lbl()
+                a.cbnz(T1, ok_nz, sf=0)
+                a.brk(0xD1)
+                a.label(ok_nz)
+                (a.udiv if m == "div" else a.sdiv)(T2, T0, T1, sf=0)
+                if m == "div":
+                    a.lsr(GTMP, T2, 8, sf=0)
+                    a.cbz(GTMP, ok_ovf, sf=0)
+                else:
+                    a.sxtb(GTMP, T2, sf=0)
+                    a.cmp_r(T2, GTMP, sf=0)
+                    a.bcond("eq", ok_ovf)
+                a.brk(0xD2)
+                a.label(ok_ovf)
+                a.msub(T3, T2, T1, T0, sf=0)
+                a.bfi(GMAP[0], T2, 0, 8)
+                a.bfi(GMAP[0], T3, 8, 8)
+            elif sz == 2:
+                if m == "idiv":
+                    a.sxth(T1, T1, sf=0)
+                ok_nz, ok_ovf = self._skip_lbl(), self._skip_lbl()
+                a.cbnz(T1, ok_nz, sf=0)
+                a.brk(0xD1)
+                a.label(ok_nz)
+                a.uxth(T0, GMAP[0])
+                a.bfi(T0, GMAP[2], 16, 16)
+                (a.udiv if m == "div" else a.sdiv)(T2, T0, T1, sf=0)
+                if m == "div":
+                    a.lsr(GTMP, T2, 16, sf=0)
+                    a.cbz(GTMP, ok_ovf, sf=0)
+                else:
+                    a.sxth(GTMP, T2, sf=0)
+                    a.cmp_r(T2, GTMP, sf=0)
+                    a.bcond("eq", ok_ovf)
+                a.brk(0xD2)
+                a.label(ok_ovf)
+                a.msub(T3, T2, T1, T0, sf=0)
+                a.bfi(GMAP[0], T2, 0, 16)
+                a.bfi(GMAP[2], T3, 0, 16)
+            elif sz == 4:
+                if m == "idiv":
+                    a.sxtw(T1, T1)
+                ok_nz, ok_ovf = self._skip_lbl(), self._skip_lbl()
+                a.cbnz(T1, ok_nz, sf=1)
+                a.brk(0xD1)
+                a.label(ok_nz)
+                # dividend = edx:eax
+                a.mov(T0, GMAP[0], sf=0)
+                a.orr_r(T0, T0, GMAP[2], sf=1, shift=0, imm6=32)
+                (a.udiv if m == "div" else a.sdiv)(T2, T0, T1, sf=1)
+                if m == "div":
+                    a.lsr(GTMP, T2, 32, sf=1)
+                    a.cbz(GTMP, ok_ovf, sf=1)
+                else:
+                    a.sxtw(GTMP, T2)
+                    a.cmp_r(T2, GTMP, sf=1)
+                    a.bcond("eq", ok_ovf)
+                a.brk(0xD2)
+                a.label(ok_ovf)
+                a.msub(T3, T2, T1, T0, sf=1)
+                a.mov(GMAP[0], T2, sf=0)
+                a.mov(GMAP[2], T3, sf=0)
+            elif sz == 8:
+                ok_nz = self._skip_lbl()
+                a.cbnz(T1, ok_nz, sf=1)
+                a.brk(0xD1)
+                a.label(ok_nz)
+                slow, done = self._skip_lbl(), self._skip_lbl()
+                if m == "div":
+                    # Fast path when rdx == 0 (plain 64 / 64 unsigned division).
+                    a.cbnz(GMAP[2], slow, sf=1)
+                    a.udiv(T2, GMAP[0], T1, sf=1)
+                    a.msub(T3, T2, T1, GMAP[0], sf=1)
+                    a.mov(GMAP[0], T2, sf=1)
+                    a.mov(GMAP[2], T3, sf=1)
+                    a.b(done)
+                    # Full 128-by-64 unsigned restoring division: T2:T0 / T1.
+                    a.label(slow)
+                    a.mov(T0, GMAP[0], sf=1)
+                    a.mov(T2, GMAP[2], sf=1)
+                    ok_ovf = self._skip_lbl()
+                    a.cmp_r(T2, T1, sf=1)
+                    a.bcond("cc", ok_ovf)
+                    a.brk(0xD2)
+                    a.label(ok_ovf)
+                    a.movz(T3, 64, 0, sf=0)
+                    loop, do_sub, no_sub = self._skip_lbl(), self._skip_lbl(), self._skip_lbl()
+                    a.label(loop)
+                    a.lsr(GTMP, T2, 63, sf=1)
+                    a.lsl(T2, T2, 1, sf=1)
+                    a.orr_r(T2, T2, T0, sf=1, shift=1, imm6=63)
+                    a.lsl(T0, T0, 1, sf=1)
+                    a.cbnz(GTMP, do_sub, sf=1)
+                    a.cmp_r(T2, T1, sf=1)
+                    a.bcond("cc", no_sub)
+                    a.label(do_sub)
+                    a.sub_r(T2, T2, T1, sf=1)
+                    a.orr_i(T0, T0, 1, sf=1)
+                    a.label(no_sub)
+                    a.subs(T3, T3, 1, sf=0)
+                    a.bcond("ne", loop)
+                    a.mov(GMAP[0], T0, sf=1)
+                    a.mov(GMAP[2], T2, sf=1)
+                    a.label(done)
+                else:
+                    # Fast path when rdx == (rax >> 63) and divisor != -1 (handles cqo; idiv r64).
+                    a.asr(T0, GMAP[0], 63, sf=1)
+                    a.cmp_r(GMAP[2], T0, sf=1)
+                    a.bcond("ne", slow)
+                    a.adds(GTMP, T1, 1, sf=1)
+                    a.bcond("eq", slow)
+                    a.sdiv(T2, GMAP[0], T1, sf=1)
+                    a.msub(T3, T2, T1, GMAP[0], sf=1)
+                    a.mov(GMAP[0], T2, sf=1)
+                    a.mov(GMAP[2], T3, sf=1)
+                    a.b(done)
+                    # Full 128-by-64 signed division: T3[7:0]=64, T3[8]=sign(dividend), T3[9]=sign(divisor).
+                    a.label(slow)
+                    a.mov(T0, GMAP[0], sf=1)
+                    a.mov(T2, GMAP[2], sf=1)
+                    a.lsr(T3, T2, 63, sf=1)
+                    a.lsl(T3, T3, 8, sf=1)
+                    a.lsr(GTMP, T1, 63, sf=1)
+                    a.orr_r(T3, T3, GTMP, sf=1, shift=0, imm6=9)
+                    a.add(T3, T3, 64, sf=1)
+                    pos_divd, pos_divr = self._skip_lbl(), self._skip_lbl()
+                    a.tbz(T2, 63, pos_divd)
+                    a.subs_r(T0, 31, T0, sf=1)
+                    a.sbcs(T2, 31, T2, sf=1)
+                    a.label(pos_divd)
+                    a.tbz(T1, 63, pos_divr)
+                    a.sub_r(T1, 31, T1, sf=1)
+                    a.label(pos_divr)
+                    ok_uovf = self._skip_lbl()
+                    a.cmp_r(T2, T1, sf=1)
+                    a.bcond("cc", ok_uovf)
+                    a.brk(0xD2)
+                    a.label(ok_uovf)
+                    loop, do_sub, no_sub = self._skip_lbl(), self._skip_lbl(), self._skip_lbl()
+                    a.label(loop)
+                    a.lsr(GTMP, T2, 63, sf=1)
+                    a.lsl(T2, T2, 1, sf=1)
+                    a.orr_r(T2, T2, T0, sf=1, shift=1, imm6=63)
+                    a.lsl(T0, T0, 1, sf=1)
+                    a.cbnz(GTMP, do_sub, sf=1)
+                    a.cmp_r(T2, T1, sf=1)
+                    a.bcond("cc", no_sub)
+                    a.label(do_sub)
+                    a.sub_r(T2, T2, T1, sf=1)
+                    a.orr_i(T0, T0, 1, sf=1)
+                    a.label(no_sub)
+                    a.sub(T3, T3, 1, sf=1)
+                    a.tst_i(T3, 0xFF, sf=0)
+                    a.bcond("ne", loop)
+                    # Quotient sign = bit8 ^ bit9; max unsigned magnitude is 2^63-1 (pos) or 2^63 (neg).
+                    a.lsr(GTMP, T3, 8, sf=1)
+                    a.eor_shift(GTMP, GTMP, GTMP, 1, 1, sf=0)
+                    a.and_i(GTMP, GTMP, 1, sf=0)
+                    a.movn(T1, 0, 0, sf=1)
+                    a.lsr(T1, T1, 1, sf=1)
+                    a.add_r(T1, T1, GTMP, sf=1)
+                    ok_sovf = self._skip_lbl()
+                    a.cmp_r(T0, T1, sf=1)
+                    a.bcond("ls", ok_sovf)
+                    a.brk(0xD2)
+                    a.label(ok_sovf)
+                    skip_neg_q, skip_neg_r = self._skip_lbl(), self._skip_lbl()
+                    a.cbz(GTMP, skip_neg_q, sf=0)
+                    a.sub_r(T0, 31, T0, sf=1)
+                    a.label(skip_neg_q)
+                    a.tbz(T3, 8, skip_neg_r)
+                    a.sub_r(T2, 31, T2, sf=1)
+                    a.label(skip_neg_r)
+                    a.mov(GMAP[0], T0, sf=1)
+                    a.mov(GMAP[2], T2, sf=1)
+                    a.label(done)
+            else:
+                raise UnhandledInsn(ins, f"{m} size {sz}")
             return
         raise UnhandledInsn(ins, f"{m} form")
 
@@ -2790,37 +3134,50 @@ class FunctionTranslator:
                 a.b("rt_dispatch")
             return
         if ins.cc == "jcxz":
-            a.cbz(GMAP[1], self._target_lbl(ins.ops[0][1]), sf=0)
+            a.cbz(GMAP[1], self._target_lbl(ins.ops[0][1]), sf=0 if ins.addrsize else 1)
             return
         if ins.cc in ("loop", "loope", "loopne"):
-            a.sub(GMAP[1], GMAP[1], 1)
+            sf = 0 if ins.addrsize else 1
+            lbl = self._target_lbl(ins.ops[0][1])
+            a.sub(GMAP[1], GMAP[1], 1, sf)
             if ins.cc == "loop":
-                a.cbnz(GMAP[1], self._target_lbl(ins.ops[0][1]))
+                a.cbnz(GMAP[1], lbl, sf)
             else:
                 skip = self._skip_lbl()
-                a.cbz(GMAP[1], skip)
-                a.bcond("eq" if ins.cc == "loope" else "ne",
-                        self._target_lbl(ins.ops[0][1]))
+                a.cbz(GMAP[1], skip, sf)
+                prod = self.arm_path.get(ins.addr)
+                if prod is not None and "Z" in FLAG_WRITERS.get(prod.mnem, ""):
+                    a.bcond("eq" if ins.cc == "loope" else "ne", lbl)
+                else:
+                    self._ctx_jcc("e" if ins.cc == "loope" else "ne", lbl)
                 a.label(skip)
             return
         self._emit_jcc(ins)
 
     def _emit_call(self, ins):
         a = self.asm
-        a.li(T0, ins.addr + ins.size)
-        a.str_pre(T0, GMAP[4], -8)
         op = ins.ops[0]
         if op[0] == "a" and op[1] in self.by_addr:
+            a.li(T0, ins.addr + ins.size)
+            a.str_pre(T0, GMAP[4], -8)
             a.b(self._lbl(op[1]))
         else:
-            self._load(ins, op, ADDR_T)
+            self._load(ins, op, ADDR_T, as_size=8)
+            a.li(T0, ins.addr + ins.size)
+            a.str_pre(T0, GMAP[4], -8)
             a.b("rt_dispatch")
 
     def _emit_ret(self, ins):
         a = self.asm
         a.ldr_post(ADDR_T, GMAP[4], 8)
         if ins.ops and ins.ops[0][0] == "i":
-            a.add(GMAP[4], GMAP[4], ins.ops[1] & 0xFFFF)
+            imm = ins.ops[0][1] & 0xFFFF
+            if imm:
+                if imm < 4096:
+                    a.add(GMAP[4], GMAP[4], imm)
+                else:
+                    a.li(T0, imm)
+                    a.add_r(GMAP[4], GMAP[4], T0)
         a.b("rt_dispatch")
 
     def _emit_leave(self, ins):

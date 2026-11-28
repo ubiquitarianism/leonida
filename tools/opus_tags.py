@@ -146,7 +146,10 @@ def load_names(path, source=None):
     with open(path, encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         fields = reader.fieldnames or ()
-        missing = [name for name in ("bank", "stream_id", "name") if name not in fields]
+        required = ["bank", "stream_id", "name"]
+        if source:
+            required.append("source")
+        missing = [name for name in required if name not in fields]
         if missing:
             raise ValueError(f"{path}: missing columns in names CSV header: {', '.join(missing)}")
         reject_duplicate_headers(path, fields, {"bank", "stream_id", "name", "source"})
@@ -173,6 +176,8 @@ def load_dialogue(path):
     with open(path, encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         fields = reader.fieldnames or ()
+        if "wave" not in fields:
+            raise ValueError(f"{path}: missing wave column in dialogue CSV header")
         text_fields = [field for field in fields if field.startswith("text_")]
         reject_duplicate_headers(path, fields, {"wave", "label", "speaker", *text_fields})
         langs = [field[5:] for field in text_fields]
@@ -236,7 +241,8 @@ def tag_folder(root, names, dialogue=None, langs=(), dry_run=False, ambiguous=No
                 continue
             stats["ogg files"] += 1
             if streams is None:
-                label = bank_label(names, rel) if rel != "." else None
+                bank_path = os.path.abspath(root).replace(os.sep, "/") if rel == "." else rel
+                label = bank_label(names, bank_path)
                 streams = names[label] if label is not None else {}
             sid = int(m.group(1), 16) & 0x1FFFFFFF
             if sid in ambiguous.get(label, ()):

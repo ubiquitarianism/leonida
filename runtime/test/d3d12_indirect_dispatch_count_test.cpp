@@ -168,12 +168,15 @@ std::array<UINT, 2> expected(UINT count, bool update, UINT second_count = 3) {
 // bundle starts with the compute pipeline it was created with and has no root signature or root UAV of its own; the
 // parent binds the root UAV at slot 0 for the first ExecuteBundle and at slot 1 for the second, then dispatches one
 // group directly at slot 2. Each slot holds the shader's two counters (8 bytes, 64 bytes apart), so a slot shows
-// which root arguments the indirect records ran with: three records of 1, 2 and 3 groups give 6/10 in slots 0 and
-// 1, and the direct Dispatch(1, 1, 1) gives 1/1 in slot 2 (the bundle's pipeline stays on the parent, the parent's
-// root signature and arguments stay as they were). `same_root`: the bundle sets the parent's root signature before the call,
-// which keeps the parent's root arguments (docs/d3d12_vulkan.md, bundles).
-// --bundle-direct (`direct`): the same bundle records Dispatch(3, 1, 1) instead of the indirect call, so slots 0 and
-// 1 hold 3/6 (groups 0, 1 and 2 add 1, 2 and 3) and slot 2 still holds 1/1.
+// which root arguments the indirect records ran with: three records of 1, 2 and 3 groups give 6/10 in slot 0. After
+// the second ExecuteBundle a UAV barrier and a direct Dispatch(1, 1, 1) run before any rebind, so slot 1 holds 7/11
+// only if the parent's root UAV survived the bundle; the last direct Dispatch(1, 1, 1) gives 1/1 in slot 2 (the
+// bundle's pipeline stays on the parent, the parent's root signature and arguments stay as they were).
+// `same_root`: the bundle sets the parent's root signature before the call, which keeps the parent's root arguments
+// (docs/d3d12_vulkan.md, bundles).
+// --bundle-direct (`direct`): the same bundle records Dispatch(3, 1, 1) instead of the indirect call, so slot 0
+// holds 3/6 (groups 0, 1 and 2 add 1, 2 and 3), slot 1 holds 4/7 (the direct dispatch after the second bundle
+// adds 1/1) and slot 2 still holds 1/1.
 constexpr UINT kSlot = 64;  // bytes between the slots' counters
 using BundleResult = std::array<UINT, 6>;
 
@@ -259,6 +262,12 @@ bool run_bundle(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, bool
     list->ExecuteBundle(bundle.p);
     list->SetComputeRootUnorderedAccessView(0, va + kSlot);
     list->ExecuteBundle(bundle.p);
+    // No rebind before this direct dispatch: it must still find the parent's root UAV (slot 1) after the bundle.
+    D3D12_RESOURCE_BARRIER uav{};
+    uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav.UAV.pResource = output.p;
+    list->ResourceBarrier(1, &uav);
+    list->Dispatch(1, 1, 1);
     list->SetComputeRootUnorderedAccessView(0, va + 2 * kSlot);
     list->Dispatch(1, 1, 1);
     const auto to_copy = transition(output.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -390,8 +399,8 @@ int main(int argc, char** argv) {
     }
     // --bundle and --bundle-direct run on WARP and, outside Wine, on the default adapter too: both are held to the
     // same values.
-    const BundleResult bundle_want = direct ? BundleResult{3, 6, 3, 6, 1, 1} : BundleResult{6, 10, 6, 10, 1, 1};
-    const char* const want_text = direct ? "3/6 3/6 1/1" : "6/10 6/10 1/1";
+    const BundleResult bundle_want = direct ? BundleResult{3, 6, 4, 7, 1, 1} : BundleResult{6, 10, 7, 11, 1, 1};
+    const char* const want_text = direct ? "3/6 4/7 1/1" : "6/10 7/11 1/1";
     unsigned bundle_hosts = 0;
     if (bundle && compare_host) {
         Ref<ID3D12Device> adapter_default;
@@ -474,9 +483,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (direct)
-            std::printf("bundle Dispatch: layer and %u host adapter(s) gave 3/6 3/6 1/1 in both cases\n", bundle_hosts);
+            std::printf("bundle Dispatch: layer and %u host adapter(s) gave 3/6 4/7 1/1 in both cases\n", bundle_hosts);
         else
-            std::printf("bundle ExecuteIndirect(DISPATCH): layer and %u host adapter(s) gave 6/10 6/10 1/1 in both "
+            std::printf("bundle ExecuteIndirect(DISPATCH): layer and %u host adapter(s) gave 6/10 7/11 1/1 in both "
                         "cases; count buffer and root constant refused\n", bundle_hosts);
         return 0;
     }
