@@ -168,10 +168,12 @@ std::array<UINT, 2> expected(UINT count, bool update, UINT second_count = 3) {
 // bundle starts with the compute pipeline it was created with and has no root signature or root UAV of its own; the
 // parent binds the root UAV at slot 0 for the first ExecuteBundle and at slot 1 for the second, then dispatches one
 // group directly at slot 2. Each slot holds the shader's two counters (8 bytes, 64 bytes apart), so a slot shows
-// which root arguments the indirect records ran with: three records of 1, 2 and 3 groups give 6/10 in slots 0 and
-// 1, and the direct Dispatch(1, 1, 1) gives 1/1 in slot 2 (the bundle's pipeline stays on the parent, the parent's
-// root signature and arguments stay as they were). `same_root`: the bundle sets the parent's root signature before the call,
-// which keeps the parent's root arguments (docs/d3d12_vulkan.md, bundles).
+// which root arguments the indirect records ran with: three records of 1, 2 and 3 groups give 6/10 in slot 0. After
+// the second ExecuteBundle a UAV barrier and a direct Dispatch(1, 1, 1) run before any rebind, so slot 1 holds 7/11
+// only if the parent's root UAV survived the bundle; the last direct Dispatch(1, 1, 1) gives 1/1 in slot 2 (the
+// bundle's pipeline stays on the parent, the parent's root signature and arguments stay as they were).
+// `same_root`: the bundle sets the parent's root signature before the call, which keeps the parent's root arguments
+// (docs/d3d12_vulkan.md, bundles).
 constexpr UINT kSlot = 64;  // bytes between the slots' counters
 using BundleResult = std::array<UINT, 6>;
 
@@ -256,6 +258,12 @@ bool run_bundle(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, bool
     list->ExecuteBundle(bundle.p);
     list->SetComputeRootUnorderedAccessView(0, va + kSlot);
     list->ExecuteBundle(bundle.p);
+    // No rebind before this direct dispatch: it must still find the parent's root UAV (slot 1) after the bundle.
+    D3D12_RESOURCE_BARRIER uav{};
+    uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav.UAV.pResource = output.p;
+    list->ResourceBarrier(1, &uav);
+    list->Dispatch(1, 1, 1);
     list->SetComputeRootUnorderedAccessView(0, va + 2 * kSlot);
     list->Dispatch(1, 1, 1);
     const auto to_copy = transition(output.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -385,7 +393,7 @@ int main(int argc, char** argv) {
         if (const int status = make_host(host, native_code)) return status;
     }
     // --bundle runs on WARP and, outside Wine, on the default adapter too: both are held to the same values.
-    const BundleResult bundle_want{6, 10, 6, 10, 1, 1};
+    const BundleResult bundle_want{6, 10, 7, 11, 1, 1};
     unsigned bundle_hosts = 0;
     if (bundle && compare_host) {
         Ref<ID3D12Device> adapter_default;
@@ -403,7 +411,7 @@ int main(int argc, char** argv) {
             for (const bool same_root : {false, true}) {
                 BundleResult got{};
                 if (!run_bundle(devices[i], native_code, same_root, got, false) || got != bundle_want) {
-                    std::fprintf(stderr, "%s same_root=%d: %u/%u %u/%u %u/%u, expected 6/10 6/10 1/1\n", names[i],
+                    std::fprintf(stderr, "%s same_root=%d: %u/%u %u/%u %u/%u, expected 6/10 7/11 1/1\n", names[i],
                                  int(same_root), got[0], got[1], got[2], got[3], got[4], got[5]);
                     return 1;
                 }
@@ -455,7 +463,7 @@ int main(int argc, char** argv) {
         for (const bool same_root : {false, true}) {
             BundleResult got{};
             if (!run_bundle(layer.p, container, same_root, got, true) || got != bundle_want) {
-                std::fprintf(stderr, "layer same_root=%d: %u/%u %u/%u %u/%u, expected 6/10 6/10 1/1\n",
+                std::fprintf(stderr, "layer same_root=%d: %u/%u %u/%u %u/%u, expected 6/10 7/11 1/1\n",
                              int(same_root), got[0], got[1], got[2], got[3], got[4], got[5]);
                 return 1;
             }
@@ -464,7 +472,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "validation errors: %u\n", vk.validation_errors());
             return 1;
         }
-        std::printf("bundle ExecuteIndirect(DISPATCH): layer and %u host adapter(s) gave 6/10 6/10 1/1 in both "
+        std::printf("bundle ExecuteIndirect(DISPATCH): layer and %u host adapter(s) gave 6/10 7/11 1/1 in both "
                     "cases; count buffer and root constant refused\n", bundle_hosts);
         return 0;
     }
