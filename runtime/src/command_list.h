@@ -222,6 +222,9 @@ constexpr std::uint32_t query_result_size(std::uint32_t query_type) {
     }
 }
 
+inline constexpr std::uint32_t dsv_read_only_depth = 0x1;    // D3D12_DSV_FLAG_READ_ONLY_DEPTH
+inline constexpr std::uint32_t dsv_read_only_stencil = 0x2;  // D3D12_DSV_FLAG_READ_ONLY_STENCIL
+
 // A view captured by value while recording: the CPU descriptor slot may be rewritten after the call.
 struct TargetView {
     ResourceId resource;
@@ -229,6 +232,7 @@ struct TargetView {
     std::uint32_t first_layer;
     std::uint32_t layer_count;
     ColorViewFormat format = ColorViewFormat::resource;
+    std::uint32_t dsv_flags = 0;  // dsv_read_only_depth | dsv_read_only_stencil
 };
 
 // D3D12_RECT: right and bottom are exclusive.

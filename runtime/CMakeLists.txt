@@ -4306,6 +4306,15 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_depth24_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_depth24_draw COMMAND d3d12_depth24_draw_test)
       set_tests_properties(d3d12_depth24_draw PROPERTIES SKIP_RETURN_CODE 77)
+      add_executable(d3d12_dsv_readonly_test test/d3d12_dsv_readonly_test.cpp
+                     ${LEONIDA_TEST_VS_DEPTH} ${LEONIDA_TEST_PS_DEPTH_EMPTY})
+      target_link_libraries(d3d12_dsv_readonly_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_dsv_readonly_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_DEPTH_SPV="${LEONIDA_TEST_VS_DEPTH}"
+                                 LEONIDA_TEST_PS_DEPTH_EMPTY_SPV="${LEONIDA_TEST_PS_DEPTH_EMPTY}")
+      target_compile_options(d3d12_dsv_readonly_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_dsv_readonly COMMAND d3d12_dsv_readonly_test)
+      set_tests_properties(d3d12_dsv_readonly PROPERTIES SKIP_RETURN_CODE 77)
       # Set 0 from the compute bind point: a compute PSO whose shader declares set-0 bindings samples through the
       # device's bindless set, which nothing but the layer binds.
       set(LEONIDA_TEST_CS_SET0_SAMPLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_set0_sample.spv)
@@ -4743,6 +4752,12 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(clear_color_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME clear_color COMMAND clear_color_test)
+    add_executable(dsv_readonly_replay_test test/dsv_readonly_replay_test.cpp)
+    target_link_libraries(dsv_readonly_replay_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(dsv_readonly_replay_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME dsv_readonly_replay COMMAND dsv_readonly_replay_test)
     # FramePacer of the Xbox presentation path on a fake clock (src/frame_pacer.h); no GPU, no Vulkan.
     add_executable(frame_pacer_test test/frame_pacer_test.cpp)
     find_package(Threads REQUIRED)

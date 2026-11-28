@@ -2048,7 +2048,7 @@ private:
         std::uint32_t bound = 0;
         for (UINT slot = 0; slot < render_target_count_ && slot < render_targets_.size(); ++slot)
             if (render_targets_[slot].resource) bound |= 1u << slot;
-        request_pipeline_build(graphics_pipeline_, bound, depth_.resource != 0);
+        request_pipeline_build(graphics_pipeline_, bound, depth_.resource != 0, depth_.dsv_flags);
     }
 
     // One recorder for both entry points: the direct ExecuteIndirect call and a bundle call deferred into its

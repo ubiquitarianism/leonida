@@ -1124,7 +1124,8 @@ public:
     // xdxr: acceleration-structure builds write XDXR BVH4 records (xdxr_build.h) instead; needs bufferDeviceAddress.
     VulkanContext(PFN_vkGetDeviceProcAddr get, VkDevice device, bool separate_depth_stencil_layouts,
                   bool conditional_rendering = false, bool ray_tracing = false, bool xdxr = false,
-                  GraphicsIndirectCapabilities indirect = {})
+                  GraphicsIndirectCapabilities indirect = {},
+                  bool separate_depth_stencil_attachment_access = false)
         : device_(device), tracker_(separate_depth_stencil_layouts), ray_tracing_(ray_tracing) {
         loaded_ = vk.load(get, device);
         // VK_EXT_transform_feedback: enabled on the device when its indexed-query entry points resolved (D3D-302).
@@ -1304,6 +1305,7 @@ public:
             return it == query_pools_.end() ? nullptr : &it->second;
         };
         replay_.separate_depth_stencil_layouts = separate_depth_stencil_layouts;
+        replay_.separate_depth_stencil_attachment_access = separate_depth_stencil_attachment_access;
         if (loaded_) {
             fence_dispatcher_ = std::make_unique<FenceWaitDispatcher>(device_, vk, device_lost_);
         }
