@@ -170,6 +170,38 @@ class RunnerTest(unittest.TestCase):
             self.assertIn(tmp, result.stderr)
             self.assertNotIn("Traceback", result.stdout + result.stderr)
 
+    @unittest.skipUnless(os.name == "posix", "POSIX worker process groups")
+    def test_timeout_stops_helpers_holding_the_output_pipe(self):
+        child = "import time; time.sleep(6); print('helper-finished-marker', flush=True)"
+        for jobs, linger in ((1, True), (2, True), (2, False)):
+            with self.subTest(jobs=jobs, worker_lingers=linger), tempfile.TemporaryDirectory() as tmp:
+                source = ("import subprocess, sys, time, unittest\n"
+                          "class T(unittest.TestCase):\n"
+                          "    def test_helper(self):\n"
+                          f"        subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+                          "        print('helper-started-marker', flush=True)\n")
+                if linger:
+                    source += "        time.sleep(10)\n"
+                suite(tmp, {"test_helper.py": source})
+                result = cli(tmp, "-j", str(jobs), "--timeout", "2")
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 1, output)
+                self.assertIn("helper-started-marker", output)
+                self.assertIn("TIMED OUT after 2 s:", output)
+                self.assertNotIn("helper-finished-marker", output)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX worker process groups")
+    def test_untimed_workers_keep_the_runner_process_group(self):
+        source = ("import os, unittest\n"
+                  "class T(unittest.TestCase):\n"
+                  "    def test_group(self):\n"
+                  "        self.assertEqual(os.getpgrp(), os.getpgid(os.getppid()))\n")
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                suite(tmp, {"test_group.py": source})
+                result = cli(tmp, "-j", str(jobs))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_timeout_requires_positive_finite_seconds(self):
         for value in ("0", "-1", "nan", "inf", "-inf"):
             with self.subTest(value=value):

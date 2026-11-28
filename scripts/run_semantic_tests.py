@@ -26,7 +26,10 @@ without a completed result, or after unittest reported failure, fails the run.
 `--timeout SECONDS` limits each module subprocess in parallel mode, or the entire discover subprocess with
 `-j 1`. The value must be positive and at most 86400 seconds (24 hours), keeping it within platform wait limits.
 A timeout fails the run and reports any output already produced; other parallel modules keep running.
-The default has no time limit. This stops the direct test subprocess, not any descendants it may have started.
+The default has no time limit. On POSIX, timed test subprocesses run in their own sessions: timeout and
+cancellation stop their entire process groups, including helpers still holding the output pipes. Untimed
+subprocesses stay in the caller's process group. Descendants that leave a timed worker's group are outside
+the cleanup boundary.
 """
 import argparse
 import concurrent.futures
@@ -60,6 +63,14 @@ def _unregister_process(proc):
         _active_processes.discard(proc)
 
 
+def _start_test_process(cmd, timeout, **kwargs):
+    # Do not detach untimed jobs from the caller's ordinary process-group signals.
+    owns_group = os.name == "posix" and timeout is not None
+    proc = subprocess.Popen(cmd, start_new_session=owns_group, **kwargs)
+    proc._semantic_owns_group = owns_group
+    return proc
+
+
 def _kill_process_tree(proc):
     if proc is None:
         return
@@ -68,6 +79,13 @@ def _kill_process_tree(proc):
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
+            pass
+    elif os.name == "posix" and getattr(proc, "_semantic_owns_group", False):
+        # A launcher can exit while a helper still owns a copy of its output pipe. The session's group ID is
+        # the original worker PID even after the launcher exits.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
             pass
     try:
         proc.kill()
@@ -202,7 +220,7 @@ def run_discover(directory, pattern, verbose, timeout):
     args = ["discover", "-s", directory, "-p", pattern, *(["-v"] if verbose else [])]
     with tempfile.TemporaryDirectory() as scratch:
         path, env = result_environment(scratch)
-        proc = subprocess.Popen([sys.executable, "-c", CHILD_PROGRAM, *args], env=env)
+        proc = _start_test_process([sys.executable, "-c", CHILD_PROGRAM, *args], timeout, env=env)
         _register_process(proc)
         start_time = time.monotonic()
         try:
@@ -245,7 +263,7 @@ def run_module(directory, module, verbose, timeout=None):
     cmd = [sys.executable, "-c", CHILD_PROGRAM, *(["-v"] if verbose else []), target]
     with tempfile.TemporaryDirectory() as scratch:
         result_path, env = result_environment(scratch)
-        proc = subprocess.Popen(cmd, cwd=directory, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        proc = _start_test_process(cmd, timeout, cwd=directory, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, errors="replace")
         _register_process(proc)
         try:
