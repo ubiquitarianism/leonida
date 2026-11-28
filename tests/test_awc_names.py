@@ -268,6 +268,26 @@ class TestConversations(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_incomplete_bank_walk_preserves_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            banks = os.path.join(tmp, "banks")
+            os.mkdir(banks)
+            write(os.path.join(banks, "ok.awc"), make_bank(["sample_name"]))
+            words = write(os.path.join(tmp, "words.txt"), "sample_name\n")
+            out = write(os.path.join(tmp, "report.json"), "previous report")
+            def partial_walk(path, *, onerror=None):
+                yield banks, [], ["ok.awc"]
+                if onerror:
+                    onerror(PermissionError("blocked subtree"))
+            err = io.StringIO()
+            with mock.patch.object(A.os, "walk", partial_walk), contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                rc = A.main([banks, "--words", words, "--out", out])
+            self.assertEqual(rc, 2)
+            self.assertIn("blocked subtree", err.getvalue())
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "previous report")
+
     def test_sources_with_same_basename_keep_separate_summaries_and_streams(self):
         with tempfile.TemporaryDirectory() as tmp:
             sources = []

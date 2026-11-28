@@ -450,7 +450,9 @@ WINE=wine WINEPREFIX="$(mktemp -d)" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG
   --require run_tiny_game --require run_tiny_game_exit_code
 ```
 
-The session script initializes a dedicated prefix and stops its Wine processes at exit. On a headless host,
+The session script initializes a dedicated prefix and stops its Wine processes at exit, with the Wine named by
+`WINE` (default `wine`) and the `wineserver` next to it (or `WINESERVER`), so Proton's or UMU-Proton's
+`files/bin/wine` works without a system Wine. On a headless host,
 put `xvfb-run -a` before `bash` so prefix initialization and the tests share one virtual display. The test runner
 maps the recorded Windows drive to the Linux checkout for shaders referenced by absolute Windows paths. It keeps one
 wineserver alive for the run and stops it at the end, and adds `winedbg.exe=d;winemenubuilder.exe=d` to each test's

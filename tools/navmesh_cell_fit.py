@@ -26,6 +26,7 @@ import re
 import struct
 import sys
 from collections import Counter
+from functools import lru_cache
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -148,10 +149,14 @@ def measure(archive, hashes=None, min_fraction=0.9, static_every=0):
 def summarise_control(tiles, min_fraction=0.9):
     """Static tiles: for each cell size, how many fit it and the mean chance baseline of their step."""
     out = {"tiles": len(tiles), "cells": {}}
+    extents = Counter(tuple(e for e in t["ext"][:2] if e > 0) for t in tiles)
+    extents.pop((), None)  # A tile without a measurable horizontal axis has no chance baseline.
+    measured = sum(extents.values())
+    cached_baseline = lru_cache(maxsize=256)(baseline)
     for c in DOC_CELLS + OTHER_CELLS:
-        bases = [max(baseline(t["ext"][k], c) for k in (0, 1) if t["ext"][k] > 0) for t in tiles[:20]]
+        total = sum(count * max(cached_baseline(e, c) for e in axes) for axes, count in extents.items())
         out["cells"][str(c)] = {"fit": sum(1 for t in tiles if t["fit"][c] >= min_fraction),
-                                "baseline_mean": round(sum(bases) / len(bases), 4) if bases else None}
+                                "baseline_mean": round(total / measured, 4) if measured else None}
     return out
 
 

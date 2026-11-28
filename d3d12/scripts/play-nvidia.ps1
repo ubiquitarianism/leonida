@@ -252,7 +252,15 @@ if ($FrameGen) { $settings.LEONIDA_FRAME_GEN = "$FrameGen" }
 # shown. It generates only while the game's window has the focus. -NoFrameGen leaves it off (Smooth Motion then).
 if (-not $FrameGen -and -not $NoFrameGen -and $Resolution -and -not $RayTracing -and $StreamlineDir) {
     $card = try { (Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object { $_.Name }) -join ';' } catch { '' }
-    if ($card -match 'RTX\s*(40|50)\d\d') { $settings.LEONIDA_FRAME_GEN = '2' }
+    if ($card -match 'RTX\s*(40|50)\d\d') {
+        $settings.LEONIDA_FRAME_GEN = '2'
+        # Reflex holds the frames shown to 28 a second (14 rendered, 71.4 ms apart), so that the made frames fall
+        # evenly between the rendered ones (fg.rs, limit_us). Same save, 1080 lines, RTX 4060 Ti (2026-11-28): rendered
+        # frames 70.6 ms mean, 68.8 median, 76.6 p90 without it; 72.5, 71.4, 76.7 with 28 (the spread of a phase's
+        # p90 over its median 7.8 -> 5.3 ms); 26 cost two shown frames a second for no more evenness.
+        # -More @{LEONIDA_FG_LIMIT_FPS='0'}: no limit.
+        $settings.LEONIDA_FG_LIMIT_FPS = '28'
+    }
 }
 if ($Aspect) { $settings.LEONIDA_ASPECT = $Aspect }
 if ($PresentScale) { $settings.LEONIDA_PRESENT_SCALE = $PresentScale }

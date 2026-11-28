@@ -145,7 +145,10 @@ def load_banks(source: str) -> dict:
     if os.path.isfile(source):
         return {os.path.splitext(os.path.basename(source))[0]: bank_ids(source)}
     out = {}
-    for root, _dirs, files in os.walk(source):
+    def scan_failed(error):
+        raise error
+
+    for root, _dirs, files in os.walk(source, onerror=scan_failed):
         for name in sorted(files):
             if name.lower().endswith(".awc"):
                 full = os.path.join(root, name)
