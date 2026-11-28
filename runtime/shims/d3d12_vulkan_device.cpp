@@ -2546,10 +2546,12 @@ bool is_tiled_layout(D3D12_TEXTURE_LAYOUT layout) {
 // A volume RTV covers W slices of one mip. UINT_MAX extends through the last slice of that mip.
 leonida::TargetView volume_rtv(leonida::ResourceId id, const D3D12_RESOURCE_DESC& resource,
                                const D3D12_RENDER_TARGET_VIEW_DESC* view) {
-    if (!(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) || vulkan_format(resource.Format, false).typeless)
+    if (!(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) return {};
+    const bool typeless = vulkan_format(resource.Format, false).typeless;
+    if (typeless && (!view || view->ViewDimension != D3D12_RTV_DIMENSION_TEXTURE3D)) return {};
+    if (!typeless && view && (view->ViewDimension != D3D12_RTV_DIMENSION_TEXTURE3D ||
+                              (view->Format != DXGI_FORMAT_UNKNOWN && view->Format != resource.Format)))
         return {};
-    if (view && (view->ViewDimension != D3D12_RTV_DIMENSION_TEXTURE3D ||
-                 (view->Format != DXGI_FORMAT_UNKNOWN && view->Format != resource.Format))) return {};
     const D3D12_TEX3D_RTV slices = view ? view->Texture3D : D3D12_TEX3D_RTV{0, 0, UINT_MAX};
     if (slices.MipSlice >= resource.MipLevels) return {};
     const UINT depth = std::max(1u, UINT(resource.DepthOrArraySize) >> slices.MipSlice);
@@ -18667,8 +18669,11 @@ public:
                 if (!r || !r->a8_as_alpha() || rd.Format != DXGI_FORMAT_A8_UNORM || !plain_2d ||
                     (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != DXGI_FORMAT_A8_UNORM))
                     view = {};
-            } else if (r && rd.Format==DXGI_FORMAT_B4G4R4A4_UNORM && r->format()==VK_FORMAT_R8G8B8A8_UNORM) {
-                if(!desc || desc->Format==DXGI_FORMAT_UNKNOWN || desc->Format==rd.Format) view.format=leonida::ColorViewFormat::resource;
+            } else if (r && rd.Format == DXGI_FORMAT_B4G4R4A4_UNORM && r->format() == VK_FORMAT_R8G8B8A8_UNORM) {
+                if (!desc || desc->Format == DXGI_FORMAT_UNKNOWN || desc->Format == rd.Format)
+                    view.format = leonida::ColorViewFormat::resource;
+                else
+                    view = {};
             } else if (r && r->uint_backed() == VK_FORMAT_A1R5G5B5_UNORM_PACK16) {
                 // An R16_UINT-backed B5G5R5A1 UAV texture (Format::uint_backed) renders through an A1R5G5B5 view, in
                 // its own format only.
@@ -18711,15 +18716,20 @@ public:
                     const bool array_2d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
                     const bool ms = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS;
                     const bool ms_array = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+                    const bool volume_3d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE3D;
                     const UINT plane = plain_2d ? desc->Texture2D.PlaneSlice :
                         array_2d ? desc->Texture2DArray.PlaneSlice : 0;
                     const bool dim_ok = ((plain_1d || array_1d) && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) ||
                                         ((plain_2d || array_2d || ms || ms_array) &&
-                                         rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D);
+                                         rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) ||
+                                        (volume_3d && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D);
+                    const UINT max_slices =
+                        volume_3d && view.mip < rd.MipLevels ? std::max(1u, UINT(rd.DepthOrArraySize) >> view.mip)
+                                                             : UINT(rd.DepthOrArraySize);
                     // Subtraction keeps malformed layer ranges from overflowing during validation.
                     if (!dim_ok || plane || !view.resource || view.mip >= rd.MipLevels ||
-                        !view.layer_count || view.first_layer >= rd.DepthOrArraySize ||
-                        view.layer_count > rd.DepthOrArraySize - view.first_layer ||
+                        !view.layer_count || view.first_layer >= max_slices ||
+                        view.layer_count > max_slices - view.first_layer ||
                         !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
                         view = {};
                     } else {
@@ -18746,6 +18756,12 @@ public:
                     view = {}; // No typed-resource format casting is advertised by this backend.
                 }
                 if (!view.resource) log_once("unsupported typeless or RGBA8 RTV format/subresource:", int(requested));
+            } else if (desc && desc->Format != DXGI_FORMAT_UNKNOWN && desc->Format != rd.Format) {
+                view = {};
+                if (first_diagnostic("mismatched typed RTV format",
+                                     (int(rd.Format) << 16) | (int(desc->Format) & 0xffff)))
+                    std::fprintf(stderr, "[rt] d3d12: mismatched typed RTV format: view %d on resource %d\n",
+                                 int(desc->Format), int(rd.Format));
             }
         } else if (resource) {
             stub("ID3D12Device::CreateRenderTargetView(resource from another device)");

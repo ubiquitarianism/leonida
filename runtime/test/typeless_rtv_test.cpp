@@ -265,8 +265,33 @@ int main() {
     EXPECT(rejects(wrong, {1, 2, 0, 1, ColorViewFormat::rgba8_uint}, ReplayResult::invalid_subresource));
     wrong = binding; wrong.array_layers = 2;
     EXPECT(rejects(wrong, {1, 0, 1, 2, ColorViewFormat::rgba8_srgb}, ReplayResult::invalid_subresource));
-    wrong = binding; wrong.volume = true;
-    EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_srgb}));
+    // Typeless 3D volumes accept family view formats across full and partial W-slice ranges and still reject
+    // omitted format, other families, and out-of-range W slices.
+    {
+        auto volume = binding;
+        volume.volume = true;
+        volume.depth = 4;
+        volume.mip_levels = 3;
+        volume.array_layers = 1;
+        for (const auto [format, expected] : formats) {
+            CommandList vol_list;
+            EXPECT(vol_list.clear_render_target({1, 0, 1, 2, format}, color) && vol_list.close());
+            EXPECT(run(vol_list, volume, vk) == ReplayResult::success);
+            EXPECT(image_clears == 0 && attachment_clears == 1 && requested_format == expected);
+            EXPECT(requested_range.baseMipLevel == 0 && requested_range.baseArrayLayer == 1 &&
+                   requested_range.layerCount == 2 && rendering_layers == 2);
+            ++checks;
+        }
+        // Whole mip 1 (depth 2) in resource format takes the transfer clear; other formats use the 2D-array attachment.
+        CommandList vol_full;
+        EXPECT(vol_full.clear_render_target({1, 1, 0, 2, ColorViewFormat::rgba8_unorm}, color) && vol_full.close());
+        EXPECT(run(vol_full, volume, vk) == ReplayResult::success);
+        EXPECT(image_clears == 1 && attachment_clears == 0);
+        EXPECT(rejects(volume, {1, 0, 0, 4, ColorViewFormat::resource}));
+        EXPECT(rejects(volume, {1, 0, 0, 4, static_cast<ColorViewFormat>(VK_FORMAT_B8G8R8A8_UNORM)}));
+        EXPECT(rejects(volume, {1, 1, 1, 2, ColorViewFormat::rgba8_srgb}, ReplayResult::invalid_subresource));
+        checks += 4;
+    }
     // A castable RGBA8 or BGRA8 image clears through a view in the other channel order (the device checked that the
     // list names it); without a castable list, or for a UINT image, the other order stays refused.
     {

@@ -206,6 +206,25 @@ int main() {
     readback->Unmap(0, nullptr);
     EXPECT(wrong == 0);
 
+    // 5. A mismatched RTV format on the RGBA8-backed B4G4R4A4 resource must be rejected.
+    {
+        Ref<ID3D12DescriptorHeap> bad_heap;
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&bad_heap.p))));
+        const auto bad_rtv = bad_heap->GetCPUDescriptorHandleForHeapStart();
+        device->CreateRenderTargetView(tex.p, nullptr, bad_rtv);  // seed valid slot first
+        D3D12_RENDER_TARGET_VIEW_DESC bad_desc{};
+        bad_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        bad_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        device->CreateRenderTargetView(tex.p, &bad_desc, bad_rtv);
+        Ref<ID3D12CommandAllocator> bad_alloc;
+        Ref<ID3D12GraphicsCommandList> bad_list;
+        EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&bad_alloc.p))));
+        EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, bad_alloc.p, nullptr,
+                                                   IID_PPV_ARGS(&bad_list.p))));
+        bad_list->ClearRenderTargetView(bad_rtv, outside_color, 0, nullptr);
+        EXPECT(bad_list->Close() == E_INVALIDARG);
+    }
+
     readback.reset();
     tex.reset();
     big_tex.reset();

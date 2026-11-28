@@ -1691,8 +1691,7 @@ inline bool rgba8_any_order(VkFormat format) {
 // has none, so it needs an explicit one). A typeless resource, or one created with a castable-format list (its image
 // is mutable and lists the view formats), may be viewed in another format of its family: the image is mutable, so
 // the view reinterprets its bits (D3D-275; before it only the RGBA8 family was). A castable RGBA8 or BGRA8 image may
-// also be viewed in the other channel order, which the device let through only when the list names it. A volume
-// keeps its own format.
+// also be viewed in the other channel order, which the device let through only when the list names it.
 inline VkFormat color_view_format(const ResourceBinding& resource, const TargetView& target) {
     if (target.format == ColorViewFormat::resource)
         return resource.typeless ? VK_FORMAT_UNDEFINED : resource.format;
@@ -1704,7 +1703,7 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
         return format == resource.format ? format : VK_FORMAT_UNDEFINED;
     const bool other_order = resource.castable_view_formats && rgba8_any_order(format) &&
                              rgba8_any_order(resource.format);
-    if ((family != typeless_view_family(resource.format) && !other_order) || resource.volume || resource.depth != 1)
+    if (family != typeless_view_family(resource.format) && !other_order)
         return VK_FORMAT_UNDEFINED;
     return format;
 }
@@ -2816,11 +2815,16 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
         // rendering requires the counts to agree, so the list fails here instead of in the driver.
         if (a.binding.samples != pipeline->samples) return ReplayResult::invalid_subresource;
         if (!view_range(a.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, a.range)) return ReplayResult::invalid_subresource;
+        VkImageSubresourceRange iv_range = a.range;
+        if (a.binding.volume) {
+            iv_range.baseArrayLayer = target.first_layer;
+            iv_range.layerCount = target.layer_count;
+        }
         ResourceBinding viewed = a.binding;
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline->color_formats[slot];
-        a.view = vk.image_view(viewed, a.range);
+        a.view = vk.image_view(viewed, iv_range);
         if (!a.view) return unsupported_at(__LINE__);
-        shrink(a.binding, target, a.range);
+        shrink(a.binding, target, iv_range);
     }
     if (draw.depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED) {
         const ResourceBinding* binding = resolve(draw.depth.resource);

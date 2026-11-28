@@ -407,6 +407,157 @@ bool clear_and_read_msaa(ID3D12Device* device, DXGI_FORMAT resource_format,
     readback->Unmap(0, &none);
     return true;
 }
+
+bool clear_and_read_volume(ID3D12Device* device, std::vector<unsigned char>& pixels) {
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    CHECK(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                              IID_PPV_ARGS(&list.p))));
+    CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+
+    constexpr UINT width = 5, height = 3, depth = 4, mips = 2;
+    Ref<ID3D12Resource> image, readback;
+    D3D12_HEAP_PROPERTIES heap_properties{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC texture{};
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    texture.Width = width;
+    texture.Height = height;
+    texture.DepthOrArraySize = depth;
+    texture.MipLevels = mips;
+    texture.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    texture.SampleDesc.Count = 1;
+    texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&image.p))));
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT placed[mips]{};
+    UINT64 total = 0;
+    device->GetCopyableFootprints(&texture, 0, mips, 0, placed, nullptr, nullptr, &total);
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = total;
+    buffer.Height = buffer.SampleDesc.Count = 1;
+    buffer.DepthOrArraySize = buffer.MipLevels = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    heap_properties.Type = D3D12_HEAP_TYPE_READBACK;
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &buffer,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback.p))));
+
+    Ref<ID3D12DescriptorHeap> heap;
+    const D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    CHECK(SUCCEEDED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap.p))));
+    const UINT step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto slot = [&](UINT i) {
+        auto h = heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += SIZE_T(i) * step;
+        return h;
+    };
+
+    D3D12_RENDER_TARGET_VIEW_DESC v{};
+    v.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+    // Seed both mips through UINT views (WSize = UINT_MAX covers every W slice of the mip).
+    v.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+    for (UINT mip = 0; mip < mips; ++mip) {
+        v.Texture3D = {mip, 0, UINT_MAX};
+        device->CreateRenderTargetView(image.p, &v, slot(0));
+        const FLOAT seed[] = {FLOAT(10 + mip * 20), 40, 80, 120};
+        list->ClearRenderTargetView(slot(0), seed, 0, nullptr);
+    }
+    // Mip 0 partial W slices 1..2: whole-slice sRGB clear, then sub-rect UNORM clear.
+    v.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    v.Texture3D = {0, 1, 2};
+    device->CreateRenderTargetView(image.p, &v, slot(1));
+    v.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    device->CreateRenderTargetView(image.p, &v, slot(2));
+    const FLOAT srgb_color[4] = {0.25f, 0.5f, 0.75f, 0.25f};
+    const FLOAT unorm_color[4] = {0.125f, 0.75f, 0.25f, 1.0f};
+    const D3D12_RECT rect{1, 1, 4, 3};
+    list->ClearRenderTargetView(slot(1), srgb_color, 0, nullptr);
+    list->ClearRenderTargetView(slot(2), unorm_color, 1, &rect);
+    // Mip 1 slice 1: UINT clear.
+    v.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+    v.Texture3D = {1, 1, 1};
+    device->CreateRenderTargetView(image.p, &v, slot(3));
+    const FLOAT mip1_uint[4] = {7, 99, 200, 255};
+    list->ClearRenderTargetView(slot(3), mip1_uint, 0, nullptr);
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {image.p, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    list->ResourceBarrier(1, &barrier);
+    for (UINT mip = 0; mip < mips; ++mip) {
+        D3D12_TEXTURE_COPY_LOCATION src{image.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        src.SubresourceIndex = mip;
+        D3D12_TEXTURE_COPY_LOCATION dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        dst.PlacedFootprint = placed[mip];
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    CHECK(SUCCEEDED(list->Close()));
+    ID3D12CommandList* lists[] = {list.p};
+    queue->ExecuteCommandLists(1, lists);
+    CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
+    Event event;
+    CHECK(event.handle && SUCCEEDED(fence->SetEventOnCompletion(1, event.handle)));
+    CHECK(WaitForSingleObject(event.handle, 5000) == WAIT_OBJECT_0);
+    void* mapped = nullptr;
+    const D3D12_RANGE range{0, SIZE_T(total)};
+    CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
+    pixels.clear();
+    for (UINT mip = 0; mip < mips; ++mip) {
+        const auto& f = placed[mip].Footprint;
+        const std::size_t slice_stride = std::size_t(f.RowPitch) * f.Height;
+        for (UINT z = 0; z < f.Depth; ++z) {
+            for (UINT y = 0; y < f.Height; ++y) {
+                const auto* row = static_cast<unsigned char*>(mapped) + placed[mip].Offset +
+                                  z * slice_stride + y * f.RowPitch;
+                pixels.insert(pixels.end(), row, row + f.Width * 4);
+            }
+        }
+    }
+    const D3D12_RANGE none{};
+    readback->Unmap(0, &none);
+    return true;
+}
+
+bool rejects_volume_view(ID3D12Device* device, DXGI_FORMAT resource_format, const D3D12_RENDER_TARGET_VIEW_DESC* view) {
+    Ref<ID3D12Resource> resource;
+    D3D12_HEAP_PROPERTIES heap_properties{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC texture{};
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    texture.Width = 4;
+    texture.Height = 4;
+    texture.DepthOrArraySize = 4;
+    texture.MipLevels = 2;
+    texture.Format = resource_format;
+    texture.SampleDesc.Count = 1;
+    texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    CHECK(SUCCEEDED(device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &texture,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&resource.p))));
+    Ref<ID3D12DescriptorHeap> heap;
+    const D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    CHECK(SUCCEEDED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap.p))));
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                              IID_PPV_ARGS(&list.p))));
+    const auto handle = heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_RENDER_TARGET_VIEW_DESC seed{};
+    seed.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+    seed.Format = resource_format == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM : resource_format;
+    seed.Texture3D = {0, 0, UINT_MAX};
+    device->CreateRenderTargetView(resource.p, &seed, handle);
+    device->CreateRenderTargetView(resource.p, view, handle);
+    const FLOAT color[] = {1, 1, 1, 1};
+    list->ClearRenderTargetView(handle, color, 0, nullptr);
+    CHECK(list->Close() == E_INVALIDARG);
+    return true;
+}
 } // namespace
 
 int main() {
@@ -631,6 +782,16 @@ int main() {
             invalid.Format = format;
             if (!rejects(DXGI_FORMAT_R8G8B8A8_UNORM, &invalid)) return 1;
         }
+        // Typed non-RGBA8 resources must also reject mismatched RTV formats.
+        invalid.Format = DXGI_FORMAT_R16G16B16A16_UINT;
+        if (!rejects(DXGI_FORMAT_R16G16B16A16_FLOAT, &invalid)) return 1;
+        invalid.Format = DXGI_FORMAT_R8_UINT;
+        if (!rejects(DXGI_FORMAT_R8_UNORM, &invalid)) return 1;
+        invalid.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        if (!rejects(DXGI_FORMAT_B8G8R8A8_UNORM, &invalid)) return 1;
+        invalid.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (!rejects(DXGI_FORMAT_R8G8B8A8_SNORM, &invalid)) return 1;
+        invalid.Format = DXGI_FORMAT_R8G8B8A8_UINT;
         invalid.Texture2D.MipSlice = 1;
         if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid)) return 1;
         invalid.Texture2D.MipSlice = 0;
@@ -738,6 +899,42 @@ int main() {
             bad_msaa.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
             bad_msaa.Format = DXGI_FORMAT_R8G8B8A8_UINT;
             if (!rejects(DXGI_FORMAT_R8G8B8A8_UNORM, &bad_msaa, 1, 1, 4, srgb_list, 2)) return 1;
+        }
+        // Typeless 3D (TEXTURE3D) RTV clears across multiple mips, W-slice ranges, and family formats vs WARP.
+        {
+            std::vector<unsigned char> actual, expected;
+            if (!clear_and_read_volume(ours.p, actual) || !clear_and_read_volume(host.p, expected)) return 1;
+            ++comparisons;
+            if (actual.size() != expected.size()) return 1;
+            for (std::size_t i = 0; i < actual.size(); ++i) {
+                if (std::abs(int(actual[i]) - int(expected[i])) > 1) {
+                    std::fprintf(stderr, "typeless 3D RTV mismatch byte %zu: ours %u WARP %u\n", i,
+                                 unsigned(actual[i]), unsigned(expected[i]));
+                    return 1;
+                }
+            }
+            const auto rejects3d = [&](DXGI_FORMAT rf, const D3D12_RENDER_TARGET_VIEW_DESC* v) {
+                if (!rejects_volume_view(ours.p, rf, v)) return false;
+                ++rejected;
+                return true;
+            };
+            if (!rejects3d(DXGI_FORMAT_R8G8B8A8_TYPELESS, nullptr)) return 1;
+            D3D12_RENDER_TARGET_VIEW_DESC bad3d{};
+            bad3d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+            bad3d.Texture3D = {0, 0, UINT_MAX};
+            for (const auto fmt : {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R16G16B16A16_FLOAT}) {
+                bad3d.Format = fmt;
+                if (!rejects3d(DXGI_FORMAT_R8G8B8A8_TYPELESS, &bad3d)) return 1;
+            }
+            bad3d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            bad3d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            if (!rejects3d(DXGI_FORMAT_R8G8B8A8_TYPELESS, &bad3d)) return 1;
+            bad3d.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+            bad3d.Texture3D = {1, 1, 2};  // mip 1 has depth 2, so FirstWSlice=1 WSize=2 overflows
+            if (!rejects3d(DXGI_FORMAT_R8G8B8A8_TYPELESS, &bad3d)) return 1;
+            bad3d.Texture3D = {0, 0, UINT_MAX};
+            bad3d.Format = DXGI_FORMAT_R16G16B16A16_UINT;
+            if (!rejects3d(DXGI_FORMAT_R16G16B16A16_FLOAT, &bad3d)) return 1;
         }
     }
     if (vk.validation_errors()) return 1;
