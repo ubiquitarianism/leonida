@@ -11,8 +11,11 @@
 //   layer_looser    WARP fails the list, the layer closes it.
 // The `warp_ok` column is WARP's verdict as measured on Windows 11 26200 (d3d10warp.dll 10.0.26100.9818); it is
 // the reference when no WARP device can be made (Wine, whose vkd3d answers differently, or a machine without WARP),
-// and a live WARP answer that differs from it is printed. Calls that crash the PC runtime (ExecuteIndirect with a
-// null command signature) are left out. No game data.
+// and a live WARP answer that differs from it is printed. The unaligned placed-footprint copies are accepted there
+// only because that runtime reports D3D12_OPTIONS13.UnrestrictedBufferTextureCopyPitchSupported; a WARP without it
+// (Windows 10's built-in d3d12.dll predates the feature) refuses them as the layer does, so they are compared as
+// matches there. Calls that crash the PC runtime (ExecuteIndirect with a null command signature) are left out.
+// No game data.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "host_wine.h"
@@ -148,7 +151,16 @@ struct Case {
     bool warp_ok;  // WARP's Close verdict, measured
     Known known;
     Recorder record;
+    bool relaxed_pitch = false;  // WARP accepts it only with UnrestrictedBufferTextureCopyPitchSupported
 };
+
+// D3D12_OPTIONS13.UnrestrictedBufferTextureCopyPitchSupported: lifts the 512-byte placement and 256-byte row pitch
+// alignment of copy footprints. A runtime that predates OPTIONS13 answers E_INVALIDARG, which also means no.
+bool relaxed_copy_pitch(ID3D12Device* device) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS13 options{};
+    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS13, &options, sizeof(options))) &&
+           options.UnrestrictedBufferTextureCopyPitchSupported;
+}
 
 #define CALLS(...) [](Env& e) { __VA_ARGS__; return true; }
 #define RECORD_COPY(dst_location, x, src_location, box) do { \
@@ -268,11 +280,11 @@ std::vector<Case> cases() {
         {"CopyTextureRegion upload, offset 0, row pitch 256", true, match,
          CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 0, 256), nullptr))},
         {"CopyTextureRegion upload, offset 16 (not 512-aligned)", true, stricter,
-         CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 16, 256), nullptr))},
+         CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 16, 256), nullptr)), true},
         {"CopyTextureRegion upload, offset 4 (not 512-aligned)", true, stricter,
-         CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 4, 256), nullptr))},
+         CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 4, 256), nullptr)), true},
         {"CopyTextureRegion upload, row pitch 260 (not 256-aligned)", true, stricter,
-         CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 0, 260), nullptr))},
+         CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 0, 260), nullptr)), true},
         {"CopyTextureRegion upload, row pitch 128 (shorter than a row)", false, match,
          CALLS(RECORD_COPY(subresource(e.tex.p, 0), 0, footprint(e.upload.p, 0, 128), nullptr))},
         {"CopyTextureRegion upload, footprint format UNKNOWN", false, looser,
@@ -525,7 +537,7 @@ int main() {
         return 77;
     }
     REQUIRE(device_status == vktest::DeviceStatus::ready);
-    const auto table = cases();
+    auto table = cases();
     const unsigned errors_before = vk.validation_errors();
 
     std::vector<HRESULT> layer(table.size(), not_run), warp(table.size(), not_run);
@@ -559,6 +571,15 @@ int main() {
             // Nothing is executed, so nothing should remove the device; if something did, its answers are suspect.
             REQUIRE(host->GetDeviceRemovedReason() == S_OK);
             warp_ran = true;
+            if (!relaxed_copy_pitch(host.p)) {
+                std::printf("WARP has no UnrestrictedBufferTextureCopyPitchSupported (D3D12_OPTIONS13): it refuses the "
+                            "unaligned footprint copies, as the layer does\n");
+                for (Case& c : table)
+                    if (c.relaxed_pitch) {
+                        c.warp_ok = false;
+                        c.known = Known::match;
+                    }
+            }
         } else {
             std::printf("no WARP device: the layer is compared with the measured WARP column\n");
         }
