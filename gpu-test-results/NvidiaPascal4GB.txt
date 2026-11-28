@@ -1,0 +1,53 @@
+GPU:        NVIDIA GPU (Pascal class, 4 GB of VRAM), subgroup 32..32 (model and PCI id withheld)
+Driver:     NVIDIA 582.28 (proprietary), Vulkan device API 1.4.312
+OS:         Windows 10 Pro, 10.0.19045
+Commit:     82a2aabcc33bf296b5c2e3e4e7021fa506f8570e (main, 2026-11-24)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools, AMDGPU target), SPIRV-Tools v2026.4,
+            CMake 4.4.5, Ninja 1.13.2, g++ 13.2.0 (Strawberry MinGW-w64 UCRT), Python 3.13, Release
+build.py:   284 shaders: 284 translated, 284 pass spirv-val
+            not built (need a DXBC container with signatures): ms_clip, ms_f16_pack, ms_tri,
+            ms_v5_workgroup, ms_w64x_ballot, ms_wave_info_s3
+check.py:   178 of 222 pass, 42 skipped, 2 failed
+run_gpu_tests.py: 284 shaders: 284 translated, 284 pass spirv-val
+            native:                 191/252 passed, 59 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  222/252 passed, 28 skipped, 2 failed
+Failed:     cs_imgload_tfe and cs_imgload_d16_tfe, both "exit 1: r32 sint (sint view): 64 bad,
+            texel(5,3) = 2071". Deterministic here: 3 of 3 isolated --filter reruns per case failed
+            with the same texel and count, in the native and the emulated path alike. Known rows,
+            not new: #31 on Intel Meteor Lake (passing there with #98) and the Apple M5 run (passing
+            with #291).
+Spot reruns (same commit and binaries, --filter, each case 3 times native and 3 emulated):
+            cs_fma_fused            3/3 pass native, 3/3 pass emulated ("8/8 fused exact")
+            ps_imgatomic            3/3 pass native, 3/3 pass emulated (0 of 256 texels, 0 of 4096 pixels wrong)
+            The two rows that fail or flake on MoltenVK are stable passes here. Three wave64 cases that only
+            run emulated also pass 2/2 each: cs_w64_exec_computed, cs_wave64_ballot, cs_w64_mask_detect.
+Fallback runs (the device has no VK_KHR_fragment_shader_barycentric, so the default run skips these):
+            with LEONIDA_BARY_FALLBACK=1, 2/2 pass each and exact: ps_bary (4096/4096 pixels),
+            ps_persp_bary (perspective-correct on every covered pixel), ps_scc_mask32 and ps_uniform_branch.
+            With LEONIDA_F16_INTERP_FALLBACK=1, ps_interp_f16_high passes 2/2 (halves and control within 2e-3).
+            ps_ij_computed still skips with both variables set: it wants PerVertexKHR inputs and the fallbacks
+            do not provide them. These passes are conditional on the variable, so compare them with the
+            default-run numbers above, not instead of them.
+w64_graphics.py runs (the 29 wave64 VS/PS/GS fixtures this program owns, which the suite above does not run):
+            built into a work folder by hand (the translator for the ps_, gs_ fixtures, the same assembler),
+            2 full passes: 17 of 29 "ok" in both, the same 17 both times, 12 tier C skipped both times.
+            Tiers A and B pass exactly: 12 pixel, 4 vertex and 1 geometry fixtures, all against the words their
+            headers derive. Tier C needs one device that can require both 64 and 32 lanes before it can compare the
+            two images, so it skips here (or needs W64G_REF from a 64-lane GPU); this card has no 64-wide fragment
+            subgroup. So the A/B result is the single-size check, not the two-size comparison.
+Skipped:    Both runs: the six mesh cases (no VK_EXT_mesh_shader), five pixel cases reading
+            BaryCoordKHR (no VK_KHR_fragment_shader_barycentric: ps_bary, ps_persp_bary,
+            ps_scc_mask32, ps_uniform_branch, and ps_ij_computed, which was not translated),
+            one 64-wide fragment subgroup case, and 16 cases run by the d3d12_*_test program
+            (the w64_graphics.py cases were run separately, see above). Native additionally skipped 31 cases needing a 64-wide
+            compute subgroup; the emulated run carried those.
+Notes:
+- The Vulkan test tools were built from the same commit with LEONIDA_BUILD_WINDOWS_RUNTIME=OFF
+  and LEONIDA_VULKAN_HEADERS_FETCH=ON. The separate D3D12 and w64_graphics test programs were
+  not run (the d3d12_* CMake targets need the Windows SDK d3d12.h, which this machine lacks;
+  the GPU suite below does not link them).
+- Implicit Vulkan layers disabled (VK_LOADER_LAYERS_DISABLE=~implicit~): the machine has the OBS
+  and RenderDoc implicit layers installed.
+- Wave64 VS/PS/GS on 32-wide subgroups: tier A: 11, tier B: 8, tier C: 13. Tier C is not exact there.
+- No game files were used; the suite runs its handwritten fixtures.
+- AI-assisted: OpenCode (DeepSeek V4.1 Flash) built the tools, ran the tests and prepared this report.
