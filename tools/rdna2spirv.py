@@ -1010,7 +1010,30 @@ class Gen:
         # 64 used as f32 operands (@Sanonymous01, SHADER-298). The f16 operands widen to normal f32 values.
         return [self.f16_in(src, sb[i]) if hb[i] else self.flush_f32(self.src_f(src)) for i, src in enumerate(a[1:4])]
 
-    def f16_bits(self, f, rtz=False, exact_tiny=False, is_z=None):
+    def _round_mode_flags(self, is_neg, mode_val=None):
+        """Return (mode_val, is_trunc, is_away) for MODE.FP_ROUND[3:2] given sign bit boolean ``is_neg``.
+        0 = RNE, 1 = RTP (+inf), 2 = RTN (-inf), 3 = RTZ."""
+        t = self.tmp
+        if mode_val is None:
+            mode_val = t()
+            self.emit(f"{mode_val} = OpLoad %uint %mode_r16")
+        m1, m2, m3, is_pos = t(), t(), t(), t()
+        self.emit(f"{m1} = OpIEqual %bool {mode_val} {self.cu(1)}")
+        self.emit(f"{m2} = OpIEqual %bool {mode_val} {self.cu(2)}")
+        self.emit(f"{m3} = OpIEqual %bool {mode_val} {self.cu(3)}")
+        self.emit(f"{is_pos} = OpLogicalNot %bool {is_neg}")
+        t1, t2, t12, is_trunc = t(), t(), t(), t()
+        self.emit(f"{t1} = OpLogicalAnd %bool {m1} {is_neg}")
+        self.emit(f"{t2} = OpLogicalAnd %bool {m2} {is_pos}")
+        self.emit(f"{t12} = OpLogicalOr %bool {t1} {t2}")
+        self.emit(f"{is_trunc} = OpLogicalOr %bool {m3} {t12}")
+        a1, a2, is_away = t(), t(), t()
+        self.emit(f"{a1} = OpLogicalAnd %bool {m1} {is_pos}")
+        self.emit(f"{a2} = OpLogicalAnd %bool {m2} {is_neg}")
+        self.emit(f"{is_away} = OpLogicalOr %bool {a1} {a2}")
+        return mode_val, is_trunc, is_away
+
+    def f16_bits(self, f, rtz=False, exact_tiny=False, is_z=None, mode_val=None):
         """f32 ``f`` -> f16 bits in the low 16 bits of a %uint, computed with integer ops only (SHADER-56).
 
         GLSL.std.450 PackHalf2x16 leaves the rounding mode to the implementation, and drivers fold a
@@ -1018,6 +1041,7 @@ class Gen:
         5080), so a following f16 op would see the unrounded f32. Integer ops can't be folded through.
         ``rtz=False``: round to nearest even, |x| >= 65520 -> inf (v_cvt_f16_f32 and every f16 ALU result).
         ``rtz=True``: round toward zero, finite values above the range -> +-65504 (v_cvt_pkrtz_f16_f32).
+        ``mode_val``: dynamic MODE.FP_ROUND[3:2] %uint (0=RNE, 1=RTP/+inf, 2=RTN/-inf, 3=RTZ).
         f16 denormals are produced (RDNA2's default FP16 denorm mode keeps them); f32 denormal inputs give +-0.
         NaN -> quiet NaN with the top payload bits kept; +-inf -> +-inf.
         ``exact_tiny``: the caller guarantees that every ``f`` below 2^-14 in magnitude is already an f16 value (a
@@ -1028,17 +1052,27 @@ class Gen:
         self.emit(f"{sgn} = OpShiftRightLogical %uint {x} {self.cu(16)}")
         self.emit(f"{sg} = OpBitwiseAnd %uint {sgn} {self.cu(0x8000)}")
         self.emit(f"{a} = OpBitwiseAnd %uint {x} {self.cu(0x7FFFFFFF)}")
+        is_trunc = is_z
+        is_away = None
+        if mode_val is not None:
+            is_neg = t()
+            self.emit(f"{is_neg} = OpINotEqual %bool {sg} {self.cu(0)}")
+            _, is_trunc, is_away = self._round_mode_flags(is_neg, mode_val)
         # normal range: rebias the exponent (127 -> 15) and drop 13 mantissa bits
         m, nh = t(), t()
         self.emit(f"{m} = OpISub %uint {a} {self.cu(0x38000000)}")
         if rtz:
             self.emit(f"{nh} = OpShiftRightLogical %uint {m} {self.cu(13)}")
         else:
-            lsb, bias, mb, = t(), t(), t()
+            lsb, bias, mb = t(), t(), t()
             self.emit(f"{lsb} = OpBitFieldUExtract %uint {m} {self.cu(13)} {self.cu(1)}")
             self.emit(f"{bias} = OpIAdd %uint {lsb} {self.cu(0xFFF)}")
-            if is_z:
-                bias = self.unless_rtz(is_z, bias)
+            if is_away is not None:
+                bias_a = t()
+                self.emit(f"{bias_a} = OpSelect %uint {is_away} {self.cu(0x1FFF)} {bias}")
+                bias = bias_a
+            if is_trunc is not None:
+                bias = self.unless_rtz(is_trunc, bias)
             self.emit(f"{mb} = OpIAdd %uint {m} {bias}")
             self.emit(f"{nh} = OpShiftRightLogical %uint {mb} {self.cu(13)}")
         # subnormal range (2^-25 <= |x| < 2^-14): shift the full mantissa right by 126 - e (14..25)
@@ -1059,8 +1093,15 @@ class Gen:
             self.emit(f"{below} = OpISub %uint {half} {self.cu(1)}")
             self.emit(f"{odd} = OpBitwiseAnd %uint {sub} {self.cu(1)}")
             self.emit(f"{bias2} = OpIAdd %uint {below} {odd}")
-            if is_z:
-                bias2 = self.unless_rtz(is_z, bias2)
+            if is_away is not None:
+                all_ones, e_nz, away_nz, bias2_a = t(), t(), t(), t()
+                self.emit(f"{all_ones} = OpISub %uint {one} {self.cu(1)}")
+                self.emit(f"{e_nz} = OpINotEqual %bool {e} {self.cu(0)}")
+                self.emit(f"{away_nz} = OpLogicalAnd %bool {is_away} {e_nz}")
+                self.emit(f"{bias2_a} = OpSelect %uint {away_nz} {all_ones} {bias2}")
+                bias2 = bias2_a
+            if is_trunc is not None:
+                bias2 = self.unless_rtz(is_trunc, bias2)
             self.emit(f"{mb2} = OpIAdd %uint {man} {bias2}")
             self.emit(f"{sub2} = OpShiftRightLogical %uint {mb2} {shc}")
             sub = sub2
@@ -1073,16 +1114,20 @@ class Gen:
         if rtz:
             self.emit(f"{big} = OpUGreaterThanEqual %bool {a} {self.cu(0x47800000)}")
             self.emit(f"{r3} = OpSelect %uint {big} {self.cu(0x7BFF)} {r2}")
-        elif is_z:
+        elif is_trunc is not None:
             limit, top = t(), t()
-            self.emit(f"{limit} = OpSelect %uint {is_z} {self.cu(0x47800000)} {self.cu(0x477FF000)}")
-            self.emit(f"{top} = OpSelect %uint {is_z} {self.cu(0x7BFF)} {self.cu(0x7C00)}")
+            lim_non_trunc = self.cu(0x477FF000)
+            if is_away is not None:
+                lim_non_trunc = t()
+                self.emit(f"{lim_non_trunc} = OpSelect %uint {is_away} {self.cu(0x477FE001)} {self.cu(0x477FF000)}")
+            self.emit(f"{limit} = OpSelect %uint {is_trunc} {self.cu(0x47800000)} {lim_non_trunc}")
+            self.emit(f"{top} = OpSelect %uint {is_trunc} {self.cu(0x7BFF)} {self.cu(0x7C00)}")
             self.emit(f"{big} = OpUGreaterThanEqual %bool {a} {limit}")
             self.emit(f"{r3} = OpSelect %uint {big} {top} {r2}")
         else:
             self.emit(f"{big} = OpUGreaterThanEqual %bool {a} {self.cu(0x477FF000)}")
             self.emit(f"{r3} = OpSelect %uint {big} {self.cu(0x7C00)} {r2}")
-        if rtz or is_z:
+        if rtz or is_trunc is not None:
             self.emit(f"{isinf} = OpIEqual %bool {a} {self.cu(0x7F800000)}")
             self.emit(f"{r4} = OpSelect %uint {isinf} {self.cu(0x7C00)} {r3}")
         else:
@@ -1102,15 +1147,13 @@ class Gen:
 
     def f16_res(self, f, exact_tiny=False):
         """f32 ``f`` -> f16 bits (low 16) as a VALU f16 result rounds it: to nearest even (f16_bits), or, when the
-        program writes MODE.FP_ROUND[3:2], by the current mode in %mode_r16 (0 nearest even, 3 toward zero with
-        f16_bits(rtz=True); 1 and 2 are refused when the setreg is translated). Shaders that never write the field
-        get exactly f16_bits. Integer ops only either way (SHADER-56)."""
+        program writes MODE.FP_ROUND[3:2], by the current mode in %mode_r16 (0 RNE, 1 RTP/+inf, 2 RTN/-inf, 3 RTZ).
+        Shaders that never write the field get exactly f16_bits. Integer ops only either way (SHADER-56)."""
         if not self.round_mode:
             return self.f16_bits(f, exact_tiny=exact_tiny)
-        m, is_z = self.tmp(), self.tmp()
+        m = self.tmp()
         self.emit(f"{m} = OpLoad %uint %mode_r16")
-        self.emit(f"{is_z} = OpIEqual %bool {m} {self.cu(3)}")
-        return self.f16_bits(f, exact_tiny=exact_tiny, is_z=is_z)
+        return self.f16_bits(f, exact_tiny=exact_tiny, mode_val=m)
 
     def unless_rtz(self, is_z, v):
         r = self.tmp()
@@ -1151,11 +1194,11 @@ class Gen:
             self.emit(f"{over} = OpUGreaterThanEqual %bool {e} {self.cu(31 - d)}")
             self.emit(f"{inf} = OpBitwiseOr %uint {sign} {self.cu(0x7C00)}")
             if self.round_mode:
-                m, is_z, top, sel = t(), t(), t(), t()
-                self.emit(f"{m} = OpLoad %uint %mode_r16")
-                self.emit(f"{is_z} = OpIEqual %bool {m} {self.cu(3)}")
+                is_neg, top, sel = t(), t(), t()
+                self.emit(f"{is_neg} = OpINotEqual %bool {sign} {self.cu(0)}")
+                _, is_trunc, _ = self._round_mode_flags(is_neg)
                 self.emit(f"{top} = OpBitwiseOr %uint {sign} {self.cu(0x7BFF)}")
-                self.emit(f"{sel} = OpSelect %uint {is_z} {top} {inf}")
+                self.emit(f"{sel} = OpSelect %uint {is_trunc} {top} {inf}")
                 inf = sel
             self.emit(f"{big} = OpSelect %uint {over} {inf} {add}")
             scaled = big
@@ -1180,7 +1223,7 @@ class Gen:
         self.emit(f"{t2} = OpFSub %float {x} {t1}")
         self.emit(f"{t3} = OpFSub %float {y} {bb}")
         self.emit(f"{e} = OpFAdd %float {t2} {t3}")
-        rp, rn, ep, en, a1, a2, away, m, isz, step = (self.tmp() for _ in range(10))
+        rp, rn, ep, en, a1, a2, away, t1, t2, toward = (self.tmp() for _ in range(10))
         self.emit(f"{rp} = OpFOrdGreaterThan %bool {r} %f0")
         self.emit(f"{rn} = OpFOrdLessThan %bool {r} %f0")
         self.emit(f"{ep} = OpFOrdGreaterThan %bool {e} %f0")
@@ -1188,13 +1231,31 @@ class Gen:
         self.emit(f"{a1} = OpLogicalAnd %bool {rp} {en}")
         self.emit(f"{a2} = OpLogicalAnd %bool {rn} {ep}")
         self.emit(f"{away} = OpLogicalOr %bool {a1} {a2}")
-        self.emit(f"{m} = OpLoad %uint %mode_r16")
-        self.emit(f"{isz} = OpIEqual %bool {m} {self.cu(3)}")
-        self.emit(f"{step} = OpLogicalAnd %bool {away} {isz}")
-        u, dec, su = self.tou(r), self.tmp(), self.tmp()
+        self.emit(f"{t1} = OpLogicalAnd %bool {rp} {ep}")
+        self.emit(f"{t2} = OpLogicalAnd %bool {rn} {en}")
+        self.emit(f"{toward} = OpLogicalOr %bool {t1} {t2}")
+        m, is_trunc, is_away = self._round_mode_flags(rn)
+        step_dn, step_up = self.tmp(), self.tmp()
+        self.emit(f"{step_dn} = OpLogicalAnd %bool {away} {is_trunc}")
+        self.emit(f"{step_up} = OpLogicalAnd %bool {toward} {is_away}")
+        u, dec, inc, su1, su2 = self.tou(r), self.tmp(), self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{dec} = OpISub %uint {u} {self.cu(1)}")
-        self.emit(f"{su} = OpSelect %uint {step} {dec} {u}")
-        return self.tof(su)
+        self.emit(f"{inc} = OpIAdd %uint {u} {self.cu(1)}")
+        self.emit(f"{su1} = OpSelect %uint {step_dn} {dec} {u}")
+        self.emit(f"{su2} = OpSelect %uint {step_up} {inc} {su1}")
+        # IEEE-754 RTN: exact cancellation (+x) + (-x) or (+0) + (-0) yields -0.0.
+        rz, sx, sy, xors, sbits, opp, m2, c1, neg_zero, su3 = (self.tmp() for _ in range(10))
+        self.emit(f"{rz} = OpFOrdEqual %bool {r} %f0")
+        self.emit(f"{sx} = OpBitcast %uint {x}")
+        self.emit(f"{sy} = OpBitcast %uint {y}")
+        self.emit(f"{xors} = OpBitwiseXor %uint {sx} {sy}")
+        self.emit(f"{sbits} = OpBitwiseAnd %uint {xors} {self.cu(0x80000000)}")
+        self.emit(f"{opp} = OpINotEqual %bool {sbits} {self.cu(0)}")
+        self.emit(f"{m2} = OpIEqual %bool {m} {self.cu(2)}")
+        self.emit(f"{c1} = OpLogicalAnd %bool {rz} {opp}")
+        self.emit(f"{neg_zero} = OpLogicalAnd %bool {c1} {m2}")
+        self.emit(f"{su3} = OpSelect %uint {neg_zero} {self.cu(0x80000000)} {su2}")
+        return self.tof(su3)
 
     def sum_toward_zero2(self, x, y, r):
         """sum_toward_zero on each half of v2float operands; returns a v2float."""
@@ -1358,26 +1419,50 @@ class Gen:
         nf = self.tmp()
         self.emit(f"{nf} = OpLogicalNot %bool {xf}")
         self.emit(f"{of} = OpLogicalAnd %bool {ri} {nf}")
-        step, any_, m, isz = (self.tmp() for _ in range(4))
+        t1, t2, toward, sign_hi, is_neg = (self.tmp() for _ in range(5))
+        self.emit(f"{t1} = OpLogicalAnd %bool {rp} {ep}")
+        self.emit(f"{t2} = OpLogicalAnd %bool {rn} {en}")
+        self.emit(f"{toward} = OpLogicalOr %bool {t1} {t2}")
+        self.emit(f"{sign_hi} = OpBitwiseAnd %uint {hi} {self.cu(0x80000000)}")
+        self.emit(f"{is_neg} = OpINotEqual %bool {sign_hi} {self.cu(0)}")
+        m, is_trunc, is_away = self._round_mode_flags(is_neg)
+        any_, step_dn, step_up = self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{any_} = OpLogicalOr %bool {away} {of}")
-        self.emit(f"{m} = OpLoad %uint %mode_r16")
-        self.emit(f"{isz} = OpIEqual %bool {m} {self.cu(3)}")
-        self.emit(f"{step} = OpLogicalAnd %bool {any_} {isz}")
+        self.emit(f"{step_dn} = OpLogicalAnd %bool {any_} {is_trunc}")
+        self.emit(f"{step_up} = OpLogicalAnd %bool {toward} {is_away}")
         # one ulp toward zero on the magnitude bits: (hi:lo) - 1 (inf - 1 = DBL_MAX)
-        nlo, bor, bu, nhi, rlo, rhi = (self.tmp() for _ in range(6))
+        nlo, bor, bu, nhi, lo1, hi1 = (self.tmp() for _ in range(6))
         self.emit(f"{nlo} = OpISub %uint {lo} {self.cu(1)}")
         self.emit(f"{bor} = OpIEqual %bool {lo} {self.cu(0)}")
         self.emit(f"{bu} = OpSelect %uint {bor} {self.cu(1)} {self.cu(0)}")
         self.emit(f"{nhi} = OpISub %uint {hi} {bu}")
-        self.emit(f"{rlo} = OpSelect %uint {step} {nlo} {lo}")
-        self.emit(f"{rhi} = OpSelect %uint {step} {nhi} {hi}")
+        self.emit(f"{lo1} = OpSelect %uint {step_dn} {nlo} {lo}")
+        self.emit(f"{hi1} = OpSelect %uint {step_dn} {nhi} {hi}")
+        # one ulp away from zero on the magnitude bits: (hi:lo) + 1 (DBL_MAX + 1 = inf)
+        plo, cry, cu, phi, lo2, hi2 = (self.tmp() for _ in range(6))
+        self.emit(f"{plo} = OpIAdd %uint {lo} {self.cu(1)}")
+        self.emit(f"{cry} = OpIEqual %bool {lo} {self.cu(0xFFFFFFFF)}")
+        self.emit(f"{cu} = OpSelect %uint {cry} {self.cu(1)} {self.cu(0)}")
+        self.emit(f"{phi} = OpIAdd %uint {hi} {cu}")
+        self.emit(f"{lo2} = OpSelect %uint {step_up} {plo} {lo1}")
+        self.emit(f"{hi2} = OpSelect %uint {step_up} {phi} {hi1}")
+        # IEEE-754 RTN: exact cancellation (+x) + (-x) or (+0) + (-0) yields -0.0.
+        rz, xors, sbits, opp, m2, c1, neg_zero, rlo, rhi = (self.tmp() for _ in range(9))
+        self.emit(f"{rz} = OpFOrdEqual %bool {r} {zd}")
+        self.emit(f"{xors} = OpBitwiseXor %uint {xhi} {yhi}")
+        self.emit(f"{sbits} = OpBitwiseAnd %uint {xors} {self.cu(0x80000000)}")
+        self.emit(f"{opp} = OpINotEqual %bool {sbits} {self.cu(0)}")
+        self.emit(f"{m2} = OpIEqual %bool {m} {self.cu(2)}")
+        self.emit(f"{c1} = OpLogicalAnd %bool {rz} {opp}")
+        self.emit(f"{neg_zero} = OpLogicalAnd %bool {c1} {m2}")
+        self.emit(f"{rlo} = OpSelect %uint {neg_zero} {self.cu(0)} {lo2}")
+        self.emit(f"{rhi} = OpSelect %uint {neg_zero} {self.cu(0x80000000)} {hi2}")
         return rlo, rhi
 
     def mode_write(self, op, a):
-        """s_setreg* on HW_REG_MODE. Only FP_ROUND[3:2] (f16/f64 rounding) is modelled, the one MODE field the
-        corpus writes (9,417 writes: value 3 = toward zero 6,694, value 0 = nearest even 2,723). A write that
-        reaches another MODE bit or only part of the field, sets directed rounding (+inf/-inf), or takes its value
-        from an SGPR is refused, so nothing changes silently. Other hardware registers (FLAT_SCR, POPS packer) are not MODE: ignored."""
+        """s_setreg* on HW_REG_MODE. Only FP_ROUND[3:2] (f16/f64 rounding: 0=RNE, 1=RTP, 2=RTN, 3=RTZ) is
+        modelled. A write that reaches another MODE bit or only part of the field is refused so nothing changes
+        silently. Other hardware registers (FLAT_SCR, POPS packer) are not MODE: ignored."""
         t = a[0].get("t", "") if a and a[0]["k"] == "special" else ""
         m = re.match(r"hwreg\((\w+)(?:,\s*(\d+),\s*(\d+))?\)", t)
         if not m or m.group(1) != "HW_REG_MODE":
@@ -1385,14 +1470,16 @@ class Gen:
         off, size = (int(m.group(2)), int(m.group(3))) if m.group(2) else (0, 32)
         if (off, size) != (2, 2):
             raise Unsupported(f"{op} on MODE bits {off}..{off + size - 1} (only FP_ROUND[3:2] as a whole is modelled)")
-        if op != "s_setreg_imm32_b32" or a[1]["k"] != "imm":
-            raise Unsupported(f"{op} with a register value on MODE.FP_ROUND")
-        self.write_half_round_mode(op, a[1]["v"] & 3)
+        if op == "s_setreg_imm32_b32" and a[1]["k"] == "imm":
+            self.write_half_round_mode(op, a[1]["v"] & 3)
+        elif op == "s_setreg_b32":
+            val = self.emit_and(self.src_u(a[1]), 3)
+            self.emit(f"OpStore %mode_r16 {val}")
+        else:
+            raise Unsupported(f"{op} with unsupported operand on MODE.FP_ROUND")
 
     def write_half_round_mode(self, op: str, mode: int) -> None:
-        if mode in (1, 2):
-            raise Unsupported(f"{op}: MODE.FP_ROUND[3:2] directed rounding (+inf/-inf)")
-        self.emit(f"OpStore %mode_r16 {self.cu(mode)}")
+        self.emit(f"OpStore %mode_r16 {self.cu(mode & 3)}")
 
     def emit_ne0(self, v):
         r = self.tmp()

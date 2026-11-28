@@ -109,14 +109,16 @@ REFUSED_MODE_VARIANTS = [
     "s_round_mode 0x3",
     "s_round_mode 1",
     "s_round_mode 2",
-    "s_round_mode 4",
-    "s_round_mode 8",
 ]
 
 MODELLED_MODE_VARIANTS = [
     ("s_round_mode 0", "%c0"),
+    ("s_round_mode 4", "%c1"),
+    ("s_round_mode 8", "%c2"),
     ("s_round_mode 12", "%c3"),
     ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0", "%c0"),
+    ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 1", "%c1"),
+    ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 2", "%c2"),
     ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3", "%c3"),
 ]
 
@@ -606,9 +608,6 @@ class ModeInstructionsTests(unittest.TestCase):
             "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 2), 3",
             "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 4), 15",
             "s_setreg_imm32_b32 hwreg(HW_REG_MODE), 0",
-            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 1",
-            "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 2",
-            "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s2",
         ]
         for insn in bad_mode_writes:
             with self.subTest(insn=insn):
