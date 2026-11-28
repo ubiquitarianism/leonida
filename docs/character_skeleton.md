@@ -399,9 +399,9 @@ the report carries.
 skinning data and which are static, `JOINTS_n`/`WEIGHTS_n` pairing, every vertex's weight sum
 as FLOAT or normalized `UNSIGNED_BYTE`/`UNSIGNED_SHORT`, the joint-index range and the POSITION
 bounds computed from the accessor. A malformed container, a file with no skin, or a skin whose
-`inverseBindMatrices` count differs from its joint count exits nonzero; `--json report.json`
-writes the same report as LF-only JSON. `python -I tests/test_glb_skinning.py` runs its 17
-synthetic tests and needs no game files.
+accessor has fewer inverse bind matrices than joints exits nonzero. Extra matrices are allowed.
+`--json report.json` writes the same report as LF-only JSON. Run `python -I tests/test_glb_skinning.py`
+to check it with synthetic inputs.
 
 ## Texture parameter split
 
