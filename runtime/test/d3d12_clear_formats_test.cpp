@@ -234,6 +234,7 @@ const std::vector<Color> kSint = {{-1, -2, -128, 127}, {-1.5f, -2.5f, 2.5f, 3.5f
 
 const ColorCase kColorCases[] = {
     {"UNORM", "R8_UNORM", DXGI_FORMAT_R8_UNORM, 1, &kUnorm},
+    {"UNORM", "A8_UNORM", DXGI_FORMAT_A8_UNORM, 1, &kUnorm},  // the alpha component only
     {"UNORM", "R8G8_UNORM", DXGI_FORMAT_R8G8_UNORM, 2, &kUnorm},
     {"UNORM", "R8G8B8A8_UNORM", DXGI_FORMAT_R8G8B8A8_UNORM, 4, &kUnorm},
     {"UNORM", "B8G8R8A8_UNORM", DXGI_FORMAT_B8G8R8A8_UNORM, 4, &kUnorm},
@@ -336,6 +337,7 @@ int main() {
         info.device = vk.device;
         info.queue = vk.queue;
         info.queue_family = vk.family;
+        info.a8_render_target = vk.a8_render_target;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         Ref<IDXGIFactory4> factory;
         Ref<IDXGIAdapter> warp;

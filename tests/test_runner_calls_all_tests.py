@@ -50,6 +50,7 @@ RUNNER_SKIPS = {
         "test_a_failed_check_fails_only_its_own_test",
         "test_out_via_directory_alias_into_corpus_is_a_usage_error",
         "test_out_hard_link_to_carved_index_is_a_usage_error",
+        "test_out_named_like_the_optional_spirv_index",
     },
 }
 

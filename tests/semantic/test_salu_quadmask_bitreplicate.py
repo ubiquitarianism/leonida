@@ -155,6 +155,14 @@ class QuadmaskBitreplicateTests(unittest.TestCase):
                 self.assertEqual(run([f"s_mov_b32 s2, {lo:#x}", "s_bitreplicate_b64_b32 s[10:11], s2"])[:2],
                                  (bitreplicate(lo) & M32, bitreplicate(lo) >> 32))
 
+    def test_bitreplicate_into_vcc_in_wave32_is_refused(self):
+        # In wave32 VCC's high word is data, which a lane mask cannot carry; the wave64 form runs on every lane in
+        # tests/semantic/test_lane_mask_bitreplicate_flbit.py.
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate(["s_bitreplicate_b64_b32 vcc, 0x0f0f0f0f",
+                       "v_cndmask_b32_e64 v0, 0x40000000, 0x40000001, vcc",
+                       "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"])
+
     def test_lane_masks_rejected(self):
         for lines in (["v_cmp_gt_u32_e32 vcc, 5, v0", "s_quadmask_b64 s[10:11], vcc"],
                       ["s_quadmask_b32 s10, exec_lo"],

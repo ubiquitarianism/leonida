@@ -176,6 +176,11 @@ struct MockReplay {
             expect(!current->conditional, "resolve fill inside predicate");
             current->fill(b, off, n, value);
         };
+        // A plain buffer copy is ordered after earlier transfer writes with a barrier, as image copies are; this
+        // fake only has to accept the call.
+        v.pipeline_barrier = +[](VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+                                 unsigned, const VkMemoryBarrier*, unsigned, const VkBufferMemoryBarrier*, unsigned,
+                                 const VkImageMemoryBarrier*) {};
         v.copy_buffer = +[](VkCommandBuffer, VkBuffer a, VkBuffer b, unsigned n, const VkBufferCopy* copies) {
             ++current->native_copies;
             for (unsigned i = 0; i < n; ++i) {

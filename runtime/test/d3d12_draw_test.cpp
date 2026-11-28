@@ -10,6 +10,8 @@
 //     checks the viewport flip (D3D clip space is y-up) and the front-face winding;
 //   - full-screen blends that read destination alpha into B8G8R8X8 and B8G8R8A8 targets cleared with alpha 0.25:
 //     B8G8R8X8 has no alpha, so destination alpha reads 1 there, as on WARP and AMD's D3D12 driver;
+//   - an A8_UNORM render target where the device has VK_FORMAT_A8_UNORM_KHR: a draw and two alpha blends, also on
+//     one created with A8_UNORM as its castable list (an R8_UNORM list is refused);
 //   - draws through RTVs in a format the texture's castable list names, in the other channel order (RGBA8 and BGRA8)
 //     or across B8G8R8X8 and B8G8R8A8: the bytes land in the view's order and encoding.
 // The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
@@ -21,12 +23,14 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
+#include "../src/title_va_alias.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 
 #if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_VS_INT_SPV) || \
     !defined(LEONIDA_TEST_PS_UINT_SPV)
@@ -42,6 +46,24 @@ using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slot 9: ha
 
 namespace {
 
+struct TitleGeometryPages {
+    static constexpr UINT bytes_per_view = 3 * 1024 * 1024;
+    static constexpr UINT count = 7;
+    std::byte* base = nullptr;
+    ~TitleGeometryPages() {
+        if (base) {
+            leonida::title_va_aliases().remove_title_memory(reinterpret_cast<UINT64>(base));
+            VirtualFree(base,0,MEM_RELEASE);
+        }
+    }
+    bool allocate() {
+        base = static_cast<std::byte*>(VirtualAlloc(nullptr,SIZE_T(bytes_per_view)*count,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+        if(!base) return false;
+        leonida::title_va_aliases().add_title_memory(reinterpret_cast<UINT64>(base),SIZE_T(bytes_per_view)*count);
+        return true;
+    }
+};
+
 struct Vertex {
     float x, y;
     std::uint8_t r, g, b, a;
@@ -55,14 +77,51 @@ static_assert(offsetof(Vertex, wrong_color) == 16);
 
 }  // namespace
 
-int main() {
+// Positive-only offscreen variant, sharing the translated-shader fixture, root signature and PSO description.
+int check_stateful_indirect_pixels(ID3D12Device* device, ID3D12RootSignature* root, D3D12_GRAPHICS_PIPELINE_STATE_DESC desc,
+                                  bool multi, bool counted, bool nonindexed_only);
+
+int main(int argc, char** argv) {
+    const bool nonindexed_only = argc == 3 && std::strcmp(argv[2], "--nonindexed-only") == 0;
+    const bool indirect_mode = argc == 2 || nonindexed_only;
+    const bool multi_pixels = indirect_mode && std::strcmp(argv[1], "--stateful-indirect-multi-pixels") == 0;
+    const bool count_pixels = indirect_mode && std::strcmp(argv[1], "--stateful-indirect-counted-pixels") == 0;
+    const bool indirect_pixels = multi_pixels || count_pixels ||
+                                 (indirect_mode && std::strcmp(argv[1], "--stateful-indirect-pixels") == 0);
+    if (argc > 2 && !(nonindexed_only && indirect_pixels)) return 1;
+    const bool title_index = argc == 2 && std::strcmp(argv[1], "--title-index-window") == 0;
+    const bool title_vertex = argc == 2 && std::strcmp(argv[1], "--title-vertex-window") == 0;
+    const bool title_window = title_index || title_vertex;
     vktest::Device d;
+    d.request_draw_indirect_first_instance = indirect_pixels;
+    d.request_robust_index_view = indirect_pixels && !nonindexed_only;
+    // Only the uncounted multi-record commands require multiDrawIndirect. Keep it disabled in the counted fixture.
+    d.request_multi_draw_indirect = multi_pixels;
+    d.request_draw_indirect_count = count_pixels;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) {
         std::fprintf(stderr, "SKIP: no usable Vulkan 1.3 device\n");
         return 77;
     }
     EXPECT(device_status == vktest::DeviceStatus::ready);
+    if (indirect_pixels && !d.enabled.drawIndirectFirstInstance) {
+        std::fprintf(stderr, "SKIP: drawIndirectFirstInstance is unavailable\n");
+        return 77;
+    }
+
+    if (nonindexed_only) EXPECT(!d.robust_index_view);
+    if (d.request_robust_index_view && !d.robust_index_view) {
+        std::fprintf(stderr, "SKIP: indexed indirect pixels require maintenance5 and compatible robustBufferAccess2\n");
+        return 77;
+    }
+    if (multi_pixels && (!d.enabled.multiDrawIndirect || d.max_draw_indirect_count < 2)) {
+        std::fprintf(stderr, "SKIP: multiDrawIndirect unavailable or maxDrawIndirectCount < 2\n");
+        return 77;
+    }
+    if (count_pixels && (!d.draw_indirect_count_enabled || d.max_draw_indirect_count != UINT32_MAX)) {
+        std::fprintf(stderr, "SKIP: counted replay requires drawIndirectCount and maxDrawIndirectCount == UINT32_MAX\n");
+        return 77;
+    }
 
     // Shader programs and the index that maps their hashes to the compiled test modules.
     const auto vs_program = fssm_program({0x56530001, 0xbf810000});
@@ -111,6 +170,19 @@ int main() {
     std::vector<std::uint8_t> step2_pixels(size * 256), step1_pixels(size * 256);
     const bool logic_op = d.enabled.logicOp == VK_TRUE;
     const bool has_divisor = d.vertex_attribute_divisor;
+    constexpr UINT title_bytes = 2 * 65536;
+    auto& aliases = leonida::title_va_aliases();
+    const auto release_title = [&](std::uint8_t* pages) {
+        aliases.remove_title_memory(reinterpret_cast<std::uintptr_t>(pages));
+        VirtualFree(pages, 0, MEM_RELEASE);
+    };
+    std::unique_ptr<std::uint8_t, decltype(release_title)> title_pages(title_window ? static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, title_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) : nullptr, release_title);
+    const auto title_va = reinterpret_cast<std::uintptr_t>(title_pages.get());
+    if (title_window) {
+        EXPECT(title_pages);
+        aliases.add_title_memory(title_va, title_bytes);
+    }
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -119,17 +191,23 @@ int main() {
         info.device = d.device;
         info.queue = d.queue;
         info.queue_family = d.family;
+        info.a8_render_target = d.a8_render_target;
         info.buffer_device_address = true;
         info.subgroup = d.subgroup;
         info.shader_dir = library.string();
         // Of the PSO features only logicOp is passed on, so the other feature refusals below still apply.
         info.features.logicOp = d.enabled.logicOp;
+        info.draw_indirect_first_instance = d.enabled.drawIndirectFirstInstance == VK_TRUE;
+        info.multi_draw_indirect = d.enabled.multiDrawIndirect == VK_TRUE;
+        info.draw_indirect_count_enabled = d.draw_indirect_count_enabled;
+        info.robust_index_view = d.robust_index_view;
+        info.max_draw_indirect_count = d.max_draw_indirect_count;
         info.vertex_attribute_divisor = d.vertex_attribute_divisor;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
 
         // Root signature: [0] two constants (s0, s1: offset), [1] a root CBV (s2:s3: tint).
@@ -165,6 +243,12 @@ int main() {
         pso_desc.NumRenderTargets = 1;
         pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         pso_desc.SampleDesc.Count = 1;
+        if (indirect_pixels) {
+            const int result = check_stateful_indirect_pixels(device.p, root.p, pso_desc, multi_pixels || count_pixels,
+                                                              count_pixels, nonindexed_only);
+            EXPECT(d.validation_errors() == 0);
+            return result;
+        }
         Ref<ID3D12PipelineState> pso, unfed, mrt, instanced, refused, xor_pso, fullscreen;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
         pso_desc.InputLayout = {elements, 1};  // COLOR missing: D3D12 rejects a layout that leaves an input unfed
@@ -372,16 +456,43 @@ int main() {
             transition(vertex_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
             transition(target.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)};
         list->ResourceBarrier(2, barriers);
-        const FLOAT blue[4] = {0, 0, 1, 1};
+        const FLOAT blue[4] = {0, 0, 1, title_window ? 0.f : 1.f};
         list->ClearRenderTargetView(rtv, blue, 0, nullptr);
 
         // State for the draws; the pipeline came with CreateCommandList.
         list->SetGraphicsRootSignature(root.p);
         list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        const D3D12_VERTEX_BUFFER_VIEW vbv{vertex_buffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex)};
-        list->IASetVertexBuffers(0, 1, &vbv);
+        const bool large_batch = std::getenv("LEONIDA_TEST_GEOMETRY_BATCH") != nullptr;
+        TitleGeometryPages title_vertices;
+        D3D12_VERTEX_BUFFER_VIEW vbv{vertex_buffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex)};
+        if (large_batch) {
+            EXPECT(title_vertices.allocate());
+            std::memcpy(title_vertices.base,vertices,sizeof(vertices));
+            vbv.BufferLocation=reinterpret_cast<UINT64>(title_vertices.base);
+            vbv.SizeInBytes=TitleGeometryPages::bytes_per_view;
+        }
+        constexpr UINT vertex_after_window = (65536 + sizeof(Vertex) - 1) / sizeof(Vertex);
+        if (title_vertex) {
+            std::memcpy(title_pages.get() + vertex_after_window * sizeof(Vertex), vertices, sizeof(vertices));
+            const D3D12_VERTEX_BUFFER_VIEW small_view{title_va, sizeof(vertices), sizeof(Vertex)};
+            const D3D12_VERTEX_BUFFER_VIEW large_view{title_va, title_bytes, sizeof(Vertex)};
+            list->IASetVertexBuffers(0, 1, &small_view);
+            list->IASetVertexBuffers(0, 1, &large_view);
+        } else {
+            list->IASetVertexBuffers(0, 1, &vbv);
+        }
         const D3D12_INDEX_BUFFER_VIEW ibv{upload_va + 256, sizeof(indices), DXGI_FORMAT_R16_UINT};
-        list->IASetIndexBuffer(&ibv);
+        if (title_index) {
+            // First binding creates a 64 KiB window. A later view at the same VA
+            // needs indices in the second 64 KiB.
+            const D3D12_INDEX_BUFFER_VIEW small_title_ib{title_va, sizeof(indices), DXGI_FORMAT_R16_UINT};
+            const D3D12_INDEX_BUFFER_VIEW large_title_ib{title_va, title_bytes, DXGI_FORMAT_R16_UINT};
+            std::memcpy(title_pages.get() + 65536, indices, sizeof(indices));
+            list->IASetIndexBuffer(&small_title_ib);
+            list->IASetIndexBuffer(&large_title_ib);
+        } else {
+            list->IASetIndexBuffer(&ibv);
+        }
         const D3D12_VIEWPORT viewport{0, 0, float(size), float(size), 0, 1};
         const D3D12_RECT scissor{0, 0, LONG(size), LONG(size)};
         list->RSSetViewports(1, &viewport);
@@ -394,7 +505,14 @@ int main() {
         list->SetPipelineState(mrt.p);
         list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
-        list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+        list->DrawIndexedInstanced(6, 1, title_index ? 65536 / sizeof(indices[0]) : 0,
+                                   title_vertex ? vertex_after_window : 0, 0);
+        if (title_window) {
+            // Only draw 1 contributes to the coverage check.
+            const D3D12_RECT empty{};
+            list->RSSetScissorRects(1, &empty);
+            list->IASetIndexBuffer(&ibv);
+        }
         // Draw 2: offset (1, -1), green tint -> bottom-right quadrant green. The root signature is set again after
         // the arguments; it is the same one, so they stay bound (else the quad would land top-left, untinted).
         list->SetPipelineState(pso.p);
@@ -423,6 +541,18 @@ int main() {
         list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
         list->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
+        if (large_batch) {
+            // More live bytes than the old 16 MiB ring. These zero-area triangles genuinely consume
+            // six separate CPU-backed views without changing the reference image of the five prior draws.
+            list->SetPipelineState(pso.p);
+            for (UINT i=1; i<TitleGeometryPages::count; ++i) {
+                const D3D12_VERTEX_BUFFER_VIEW extra{reinterpret_cast<UINT64>(title_vertices.base)+
+                    UINT64(i)*TitleGeometryPages::bytes_per_view,TitleGeometryPages::bytes_per_view,sizeof(Vertex)};
+                list->IASetVertexBuffers(0,1,&extra);
+                list->DrawInstanced(3,1,0,0);
+            }
+            list->IASetVertexBuffers(0,1,&vbv);
+        }
         D3D12_RESOURCE_BARRIER to_copy = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                     D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->ResourceBarrier(1, &to_copy);
@@ -443,6 +573,25 @@ int main() {
         void* mapped = nullptr;
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
+        if (title_window) {
+            unsigned painted = 0, wrong = 0;
+            for (unsigned y = 0; y < size; ++y) {
+                for (unsigned x = 0; x < size; ++x) {
+                    const bool inside = x < size / 2 && y < size / 2;
+                    const auto alpha = pixels[y * 256 + x * 4 + 3];
+                    painted += alpha == 255;
+                    wrong += alpha != (inside ? 255 : 0);
+                }
+            }
+            std::printf("title %s window: %u/%u pixels painted; %u differences from expected coverage\n",
+                        title_vertex ? "vertex" : "index", painted, size * size / 4, wrong);
+            EXPECT(wrong == 0);
+            EXPECT(aliases.shader_va(title_va + 65536) == aliases.shader_va(title_va) + 65536);
+            EXPECT(aliases.shader_va(title_va + 65536) != title_va + 65536);
+            readback->Unmap(0, nullptr);
+            EXPECT(d.validation_errors() == 0);
+            return 0;
+        }
 
         // Second pass on the same target, cleared blue again: the full-screen triangle (yellow, red tint: red)
         // through a viewport on the bottom-right quadrant, with no vertex buffer in its pipeline.
@@ -856,6 +1005,116 @@ int main() {
                         unsigned(std::size(x8_cases)));
         }
 
+        // An A8_UNORM render target (VK_FORMAT_A8_UNORM_KHR, VulkanDeviceInfo::a8_render_target): the full-screen draw
+        // writes alpha 1, and the alpha blend reads the cleared alpha 0.25 (byte 64) as the destination.
+        {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT a8_support{DXGI_FORMAT_A8_UNORM};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &a8_support,
+                                                         sizeof(a8_support))));
+            if (!(a8_support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) {
+                std::printf("A8_UNORM render target: not supported on this device (no VK_FORMAT_A8_UNORM_KHR)\n");
+            } else {
+                struct A8Case {
+                    const char* name;
+                    BOOL blend;
+                    D3D12_BLEND src_alpha, dst_alpha;
+                    int want;
+                };
+                constexpr A8Case a8_cases[] = {
+                    {"no blend", FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, 255},
+                    {"alpha ZERO, ONE", TRUE, D3D12_BLEND_ZERO, D3D12_BLEND_ONE, 64},
+                    {"alpha INV_DEST_ALPHA, ZERO", TRUE, D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_ZERO, 191},
+                };
+                const D3D12_DESCRIPTOR_HEAP_DESC a8_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                                              D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+                Ref<ID3D12DescriptorHeap> a8_heap;
+                EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&a8_heap_desc, IID_PPV_ARGS(&a8_heap.p))));
+                const D3D12_CPU_DESCRIPTOR_HANDLE a8_rtv{
+                    SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(a8_heap.p, 9))(a8_heap.p))};
+                D3D12_RESOURCE_DESC a8_desc = rt_desc;
+                a8_desc.Width = a8_desc.Height = 4;
+                a8_desc.Format = DXGI_FORMAT_A8_UNORM;
+                Ref<ID3D12Resource> a8_target;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &a8_desc,
+                                                                 D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                                 IID_PPV_ARGS(&a8_target.p))));
+                // The same target through CreateCommittedResource3 with its own format as the castable list. An R8_UNORM
+                // list is refused: no other format can be a view format of a VK_FORMAT_A8_UNORM_KHR image.
+                Ref<ID3D12Device10> a8_inner10;
+                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&a8_inner10.p))));
+                D3D12_RESOURCE_DESC1 a8_desc1{};
+                a8_desc1.Dimension = a8_desc.Dimension;
+                a8_desc1.Width = a8_desc.Width;
+                a8_desc1.Height = a8_desc.Height;
+                a8_desc1.DepthOrArraySize = a8_desc.DepthOrArraySize;
+                a8_desc1.MipLevels = a8_desc.MipLevels;
+                a8_desc1.Format = a8_desc.Format;
+                a8_desc1.SampleDesc = a8_desc.SampleDesc;
+                a8_desc1.Layout = a8_desc.Layout;
+                a8_desc1.Flags = a8_desc.Flags;
+                const DXGI_FORMAT a8_own = DXGI_FORMAT_A8_UNORM, a8_r8 = DXGI_FORMAT_R8_UNORM;
+                Ref<ID3D12Resource> a8_cast_target, a8_r8_target;
+                EXPECT(SUCCEEDED(a8_inner10->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &a8_desc1,
+                    D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, 1, &a8_own, IID_PPV_ARGS(&a8_cast_target.p))));
+                EXPECT(a8_inner10->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &a8_desc1,
+                    D3D12_BARRIER_LAYOUT_RENDER_TARGET, nullptr, nullptr, 1, &a8_r8, IID_PPV_ARGS(&a8_r8_target.p)) ==
+                       E_INVALIDARG);
+                EXPECT(!a8_r8_target.p);
+                const FLOAT a8_clear[4] = {0.9f, 0.8f, 0.7f, 0.25f};  // only alpha lands
+                const D3D12_VIEWPORT a8_viewport{0, 0, 4, 4, 0, 1};
+                const D3D12_RECT a8_scissor{0, 0, 4, 4};
+                UINT64 a8_fence = 50;  // after the B8G8R8X8 block's 41..50; 51..56, before the step-rate block's 61
+                for (ID3D12Resource* const a8_resource : {a8_target.p, a8_cast_target.p})
+                for (const A8Case& c : a8_cases) {
+                    device->CreateRenderTargetView(a8_resource, nullptr, a8_rtv);
+                    D3D12_GRAPHICS_PIPELINE_STATE_DESC a8_pso_desc = fullscreen_desc;
+                    a8_pso_desc.RTVFormats[0] = DXGI_FORMAT_A8_UNORM;
+                    a8_pso_desc.BlendState.RenderTarget[0] = {
+                        c.blend, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, c.src_alpha,
+                        c.dst_alpha, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
+                    Ref<ID3D12PipelineState> a8_pso;
+                    EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&a8_pso_desc, IID_PPV_ARGS(&a8_pso.p))));
+                    EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, a8_pso.p)));
+                    list->ClearRenderTargetView(a8_rtv, a8_clear, 0, nullptr);
+                    list->SetGraphicsRootSignature(root.p);
+                    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    list->RSSetViewports(1, &a8_viewport);
+                    list->RSSetScissorRects(1, &a8_scissor);
+                    list->OMSetRenderTargets(1, &a8_rtv, FALSE, nullptr);
+                    list->SetGraphicsRootConstantBufferView(1, upload_va + 2048);
+                    list->DrawInstanced(3, 1, 0, 0);
+                    const auto a8_to_copy = transition(a8_resource, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                       D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    list->ResourceBarrier(1, &a8_to_copy);
+                    D3D12_TEXTURE_COPY_LOCATION a8_dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                    a8_dst.PlacedFootprint = {0, {DXGI_FORMAT_A8_UNORM, 4, 4, 1, 256}};
+                    D3D12_TEXTURE_COPY_LOCATION a8_src{a8_resource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                    list->CopyTextureRegion(&a8_dst, 0, 0, 0, &a8_src, nullptr);
+                    const auto a8_to_target = transition(a8_resource, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                         D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    list->ResourceBarrier(1, &a8_to_target);
+                    EXPECT(list->Close() == S_OK);
+                    queue->ExecuteCommandLists(1, lists);
+                    EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                    ++a8_fence;
+                    EXPECT(SUCCEEDED(queue->Signal(fence.p, a8_fence)) &&
+                           SUCCEEDED(fence->SetEventOnCompletion(a8_fence, nullptr)));
+                    const auto* got = static_cast<const std::uint8_t*>(mapped);
+                    for (UINT y = 0; y < 4; ++y)
+                        for (UINT x = 0; x < 4; ++x) {
+                            const int byte = got[y * 256 + x];
+                            if (std::abs(byte - c.want) <= 1) continue;
+                            std::fprintf(stderr, "A8 target%s, %s: texel (%u,%u) got %d, want %d\n",
+                                         a8_resource == a8_cast_target.p ? " (castable list)" : "", c.name, x, y,
+                                         byte, c.want);
+                            return 1;
+                        }
+                }
+                std::printf("A8_UNORM render target: clear, draw and %u alpha blends matched, also with an A8_UNORM "
+                            "castable list (R8_UNORM refused)\n", unsigned(std::size(a8_cases)));
+            }
+        }
+
         // Instance step rate > 1 (VK_KHR/EXT_vertex_attribute_divisor): two per-instance colours in slot 1:
         // entry 0 = red, entry 1 = magenta (both preserved by the {1,0,1} tint). With step rate 2:
         // - Draw 1 (top-left, 2 instances from 0): instances 0 and 1 both read entry 0/2 = 0 (red).
@@ -1028,7 +1287,12 @@ int main() {
         allocator.reset();
         queue.reset();
         fence.reset();
-        EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+        // The device keeps the buffers it made over the title's vertex pages until it goes (make_title_buffer), and
+        // each holds a reference: the large batch leaves seven of them.
+        if (std::getenv("LEONIDA_TEST_GEOMETRY_BATCH"))
+            EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) >= 1);
+        else
+            EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
 
     unsigned mismatches = 0;

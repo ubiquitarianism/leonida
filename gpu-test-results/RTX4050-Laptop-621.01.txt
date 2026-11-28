@@ -1,0 +1,37 @@
+GPU:        NVIDIA GeForce RTX 4050 Laptop GPU (Ada, PCI 10de:28a1), subgroup 32..32
+Driver:     NVIDIA 621.01 (Windows 32.0.16.2101), Vulkan 1.4.357
+Subgroup:   32..32 (tools/vk_subgroup_info.py: min 32, max 32, native 64-wide compute: false)
+OS:         Windows 11 Pro 10.0.26200 x64
+Commit:     3ff2a2adcd3517f09d120540ae441c947d422e34 (main, 2026-11-25)
+Date:       2026-11-24
+CPU:        13th Gen Intel(R) Core(TM) i5-13420H
+RAM:        15.7 GiB reported
+VRAM:       6141 MiB reported by nvidia-smi
+Tools:      llvm-mc 21.1.8 (Ubuntu LLVM, AMDGPU target, called from Windows as
+            "wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"), SPIRV-Tools v2026.4 and glslang 16.6.0
+            (Vulkan SDK 1.4.363.0), CMake 4.4.5 + Ninja 1.13.2, Clang 23.1.6 (llvm-mingw 20261117 UCRT),
+            Vulkan-Headers (main, shallow clone), Python 3.14.7
+run_gpu_tests.py: 267 shaders: 267 translated, 267 pass spirv-val
+            native:                 208/258 passed, 50 skipped, 0 failed
+            LEONIDA_W64_EMULATE=1:  241/258 passed, 17 skipped, 0 failed
+Failed:     none, in either run.
+Skipped:    native: 32 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this
+            device" and 1 "cannot require a 64-wide fragment subgroup: subgroup 32..32" (the wave64
+            fixtures, which the emulated run covers except the fragment one), plus 16 "run by
+            d3d12_*_test / w64_graphics.py" cases. Emulated: those 16 plus the 64-wide fragment one.
+Scope:      the six standalone Vulkan programs only (vk_harness, vk_compute_test, vk_texture_test,
+            vk_sampler_test, vk_store_test, vk_bindless_test) and scripts/run_gpu_tests.py. The runtime
+            ctest suite was not built or run here.
+Relation:   #532 records this card on c023a365 with driver 610.47 and two failures (cs_imgload_tfe,
+            cs_imgload_d16_tfe). Both pass here, on a later main, in both runs ("r32 sint (sint view):
+            0 bad, texel(5,3) = 71"), as in the RTX 4080 rerun after #892. This file is a second data
+            point, on driver 621.01 and Windows 11 build 26200, not a replacement for #532.
+Notes:
+- Built from a git archive of main at the commit above, copied to C:\leonida-gpu. No machine-wide
+  Visual Studio installation was used; the standalone tools build with llvm-mingw and the Vulkan headers
+  alone (docs/testing.md).
+- The device was confirmed as the NVIDIA GPU with tools/vk_subgroup_info.py (vendor 0x10de, device
+  0x28a1); the machine also has an Intel UHD Graphics adapter.
+- No game files, keys or proprietary data were used or included.
+- AI-assisted: yes (an AI coding agent ran the build and the tests; the results were reviewed before
+  submission).

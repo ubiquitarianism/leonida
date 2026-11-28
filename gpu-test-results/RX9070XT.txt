@@ -1,20 +1,26 @@
 GPU:        AMD Radeon RX 9070 XT (RDNA4 / GFX1201, Navi 48, PCI 1002:7550), subgroup 32..64
 Driver:     AMD proprietary 26.11.2 (LLPC), Vulkan 1.4.359
 Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; default 64, subgroupSizeControl)
-OS:         Windows 11, 10.0.26300.9550
-Commit:     5d74c272363f2703265d44e6aaab1a1df8ddfaf3 (main, 2026-11-23)
-Tools:      llvm-mc from ROCm/AOMP 18.0-12 (LLVM 19.0.0git), SPIRV-Tools v2026.4
-            (Vulkan SDK 1.4.363.1), CMake 4.4.5, Visual Studio 17 2022 generator,
-            MSVC 19.44.35230.0, Python 3.11.9
-run_gpu_tests.py: 247 shaders: 247 translated, 247 pass spirv-val
-            native:                 224/241 passed, 16 skipped, 1 failed
-            LEONIDA_W64_EMULATE=1:  225/241 passed, 16 skipped, 0 failed
-Failed:     ms_wave_info_s3: at (0,0) got (-1.0000,-1.0000,-1.0000,-1.0000), want
-            (0.0078,0.0078,0.5,1.0). Native: 3 of 3 isolated --filter reruns failed.
-            Emulated: the one full-suite run passed it, then 1 of 3 isolated reruns
-            passed, so the emulated path is flaky here while native fails every time.
-            Same signature as #6172 / #5273 and as the RTX 4060 record (#8752), where
-            it failed 3 of 3.
+OS:         Windows 11, 10.0.26200.9974
+Commit:     58be9cdf8df9a31bc7f6c068991f1aed381f7f4d (main, 2026-11-24)
+Tools:      llvm-mc LLVM 23.1.6 (conda-forge, AMDGPU target), SPIRV-Tools v2026.4
+            (Vulkan SDK 1.4.363.0), CMake 4.4.4, Visual Studio 17 2022 generator,
+            MSVC 14.44.35207, Python 3.12.10
+run_gpu_tests.py: 261 shaders: 261 translated, 261 pass spirv-val
+            native:                 236/252 passed, 16 skipped, 0 failed
+            LEONIDA_W64_EMULATE=1:  236/252 passed, 16 skipped, 0 failed
+build.py:   exit 0 (native and LEONIDA_W64_EMULATE=1); wave64 VS/PS/GS on 32-wide subgroups:
+            tier A 11, tier B 8, tier C 13. Not built (need a DXBC container with
+            signatures): ms_clip, ms_f16_pack, ms_tri, ms_v5_workgroup, ms_w64x_ballot,
+            ms_wave_info_s3.
+check.py:   219 of 222 pass, 3 skipped (native and LEONIDA_W64_EMULATE=1). The skips are
+            mesh fixtures build.py does not build (ms_w64x_ballot, ms_wave_info_s3,
+            ms_v5_workgroup); run_gpu_tests.py builds and runs them, and they pass there.
+Failed:     none.
+ms_wave_info_s3: passes, 4096/4096 pixels exact, in both full-suite runs and in 3 of 3
+            isolated --filter reruns each way (native and emulated). The 2026-11-23
+            record on 5d74c27 failed it on every native run; that no longer reproduces
+            on this driver at this commit.
 Skipped:    16 skips are the documented "run by d3d12_*_test / w64_graphics.py" cases:
             cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect, ps_live_width,
             ps_m15, ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post,
@@ -22,10 +28,11 @@ Skipped:    16 skips are the documented "run by d3d12_*_test / w64_graphics.py" 
 Notes:
 - Built with cmake -S runtime -B runtime/build (default Visual Studio 17 2022
   generator) and cmake --build runtime/build --config RelWithDebInfo.
-- The suite ran on the AMD LLPC driver with the project's own vk_harness /
+- build.py <out> and check.py <out> runtime/build/RelWithDebInfo, once without and once
+  with LEONIDA_W64_EMULATE=1 set for both.
+- The suites ran on the AMD LLPC driver with the project's own vk_harness /
   vk_compute_test / vk_store_test binaries. No implicit layer beyond the SDK's.
-- Every other pixel and compute case was exact.
-- build.py and check.py (the two D3D12-side columns in the table) were not run on
-  this machine; the counts here come from run_gpu_tests.py, which builds and
-  translates the same fixtures.
-- AI-assisted (Cline).
+- Every case that ran was exact or within its documented judge.
+- The two cs_imgload*_tfe failures of earlier runs on this GPU are gone with the fixture
+  fix on main (#892).
+- AI-assisted: yes.

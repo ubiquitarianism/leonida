@@ -91,6 +91,60 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 self.assertEqual(invalid, 0)
                 self.assertIn(op + " v1, v2, v3, v4", asm)
 
+    def test_vop2_and_vop3_legacy_mac_fmac_target_and_roundtrip(self):
+        # VOP2 0x06 and VOP3 0x106 are v_mac_legacy_f32 on gfx101* (console gfx1013) and v_fmac_legacy_f32 on gfx103*.
+        vop2_code = words((0x06 << 25) | (0 << 17) | (2 << 9) | (256 + 1))         # v0, v1, v2
+        vop3_code = words((0x35 << 26) | (0x106 << 16) | 0, (256 + 2) << 9 | (256 + 1))  # v0, v1, v2
+        for kind, code, suf in (("vop2", vop2_code, "_e32"), ("vop3", vop3_code, "_e64")):
+            for cpu, base in (("gfx1013", "v_mac_legacy_f32"), ("gfx1030", "v_fmac_legacy_f32")):
+                with self.subTest(kind=kind, cpu=cpu):
+                    ins, = rdna2_decode.decode_bytes(code, mcpu=cpu)["insns"]
+                    self.assertEqual(ins["op"], base + suf)
+                    asm, invalid, _ = shader_disasm.disasm(code, cpu, backend="python")
+                    self.assertEqual(invalid, 0)
+                    self.assertIn(f"{base}{suf} v0, v1, v2", asm)
+        # End-to-end gfx1013 binary -> python disasm -> rdna2spirv -> interpreter:
+        # v0 = 4.0; v1 = 2.0; v2 = 2.0; v_mac_legacy_f32 v0, v1, v2 -> 2.0 * 2.0 + 4.0 = 8.0 (0x41000000)
+        prog = words(
+            (0x3F << 25) | (0 << 17) | (1 << 9) | 246,   # v_mov_b32 v0, 4.0
+            (0x3F << 25) | (1 << 17) | (1 << 9) | 244,   # v_mov_b32 v1, 2.0
+            (0x3F << 25) | (2 << 17) | (1 << 9) | 244,   # v_mov_b32 v2, 2.0
+            (0x06 << 25) | (0 << 17) | (2 << 9) | 257,   # v_mac_legacy_f32_e32 v0, v1, v2
+            (0x3E << 26) | (1 << 12) | (1 << 11) | 0xF,  # exp mrt0 v0, v0, v0, v0 done vm
+            0,
+            0xBF810000,                                   # s_endpgm
+        )
+        asm, bad, _ = shader_disasm.disasm(prog, "gfx1013", backend="python")
+        self.assertEqual(bad, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm_dir = os.path.join(tmp, "disasm")
+            os.mkdir(disasm_dir)
+            with open(os.path.join(tmp, "ps_mac.dxbc"), "wb") as f:
+                f.write(b"DXBC" + bytes(28))
+            src = os.path.join(disasm_dir, "ps_mac.s")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write("; ps_mac  code 0x0..0x1c (python), gfx1013, 0 invalid words\n" + asm)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                spv = rdna2spirv.translate(src)
+        self.assertEqual(list(si.run_fragment(spv)["%out_mrt0"]), [0x41000000] * 4)
+        # Negative control: disassembling the same binary for gfx1030 emits v_fmac_legacy_f32_e32,
+        # which rdna2spirv intentionally rejects as Unsupported (docs/design.md).
+        asm1030, bad1030, _ = shader_disasm.disasm(prog, "gfx1030", backend="python")
+        self.assertEqual(bad1030, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm_dir = os.path.join(tmp, "disasm")
+            os.mkdir(disasm_dir)
+            with open(os.path.join(tmp, "ps_fmac.dxbc"), "wb") as f:
+                f.write(b"DXBC" + bytes(28))
+            src = os.path.join(disasm_dir, "ps_fmac.s")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write("; ps_fmac  code 0x0..0x1c (python), gfx1030, 0 invalid words\n" + asm1030)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                with self.assertRaises(rdna2spirv.Unsupported):
+                    rdna2spirv.translate(src)
+
     def test_sopp_endpgm_branch_and_waitcnt(self):
         # s_waitcnt vmcnt(0) lgkmcnt(0) = 0xBF8C0070; s_cbranch_scc1 -4 = 0xBF85FFFC;
         # s_branch -20 = 0xBF82FFEC; s_endpgm = 0xBF810000
@@ -382,12 +436,34 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 for field in ("op", "args", "mods"):
                     self.assertEqual(reparsed[field], expected[field])
 
+    def test_sopk_imm16_is_sign_extended_for_the_signed_ops_only(self):
+        # SOPK word: 0xB << 28 | op << 23 | sdst << 16 | simm16. The ten signed ops give the 16 bits sign-extended,
+        # the six unsigned compares give them as they are, and the printed line reads back as the same value.
+        signed = {0: "s_movk_i32", 2: "s_cmovk_i32", 3: "s_cmpk_eq_i32", 4: "s_cmpk_lg_i32", 5: "s_cmpk_gt_i32",
+                  6: "s_cmpk_ge_i32", 7: "s_cmpk_lt_i32", 8: "s_cmpk_le_i32", 15: "s_addk_i32", 16: "s_mulk_i32"}
+        unsigned = {9: "s_cmpk_eq_u32", 10: "s_cmpk_lg_u32", 11: "s_cmpk_gt_u32", 12: "s_cmpk_ge_u32",
+                    13: "s_cmpk_lt_u32", 14: "s_cmpk_le_u32"}
+        for table, sign_extends in ((signed, True), (unsigned, False)):
+            for opcode, name in table.items():
+                for simm16 in (0x0001, 0x7FFF, 0x8000, 0xFFFD, 0xFFFF):
+                    with self.subTest(op=name, simm16=hex(simm16)):
+                        code = words(0xB << 28 | opcode << 23 | 5 << 16 | simm16)
+                        ins, = rdna2_decode.decode_bytes(code)["insns"]
+                        want = simm16 - 0x10000 if sign_extends and simm16 & 0x8000 else simm16
+                        self.assertEqual((ins["op"], ins["args"][0]["r"], ins["args"][1]),
+                                         (name, 5, {"k": "imm", "v": want}))
+                        text, bad = rdna2_decode.disasm_bytes(code)
+                        self.assertEqual(bad, 0)
+                        self.assertEqual(shader_ir.parse_line(text.strip())["args"], ins["args"])
+
     def test_parity_with_llvm_mc_on_shader_fixtures(self):
         mc = os.environ.get("LLVM_MC") or shutil.which("llvm-mc") or shutil.which("llvm-mc-18")
         if not mc:
             self.skipTest("llvm-mc not available")
         asms = sorted(glob.glob(os.path.join(ROOT, "runtime", "test", "shaders", "*.asm")))
         self.assertGreater(len(asms), 50)
+        sopk_signed = {"s_movk_i32", "s_cmovk_i32", "s_addk_i32", "s_mulk_i32"} | {
+            f"s_cmpk_{cond}_i32" for cond in ("eq", "lg", "gt", "ge", "lt", "le")}
 
         def norm_op(op):
             for suf in ("_e32", "_e64", "_sdwa", "_dpp"):
@@ -401,7 +477,10 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 return (k, a["r"], a.get("n", 1), bool(a.get("neg")), bool(a.get("abs")), bool(a.get("sext")))
             if k == "imm":
                 # LLVM 18 disassembles SOPP branch offsets unsigned (0xfff0), LLVM 21/22 signed (-16).
-                mask = 0xFFFF if op in rdna2_decode._SOPP_BRANCHES else 0xFFFFFFFF
+                # The signed SOPK ops hold 16 bits as well: the decoder gives them sign-extended (s_addk_i32 s52,
+                # -32768; the test above), llvm-mc 23.1.4 prints the same word as 0x8000, and the translator reads
+                # the low 16 bits of either. cs_w32_salu_ext is the first fixture with bit 15 set in one.
+                mask = 0xFFFF if op in rdna2_decode._SOPP_BRANCHES or op in sopk_signed else 0xFFFFFFFF
                 return ("imm", a["v"] & mask, bool(a.get("neg")), bool(a.get("abs")))
             if k == "fimm":
                 return ("fimm", round(a["v"], 6), bool(a.get("neg")), bool(a.get("abs")))
@@ -519,6 +598,180 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(parsed[0]["args"][1]["v"], 1.0)
         self.assertEqual(parsed[3]["args"][1]["k"], "fimm")
         self.assertEqual(parsed[3]["args"][1]["v"], 1.0)
+
+    def test_mimg_addr_data_and_rsrc_widths_match_llvm(self):
+        # Hand-encoded GFX10/GFX1030 MIMG vectors covering LLVM AMDGPU::getAddrSizeMIMGOp,
+        # atomic TFE/cmpswap VDATA widths, and non-BVH r128 8-SGPR resource descriptors.
+        cases = (
+            # BVH with a16 (8 VGPRs for bvh32, 9 for bvh64)
+            ("019f98f109040140", "image_bvh_intersect_ray v[4:7], v[9:16], s[4:7] a16"),
+            ("059f98f1322703402e1711100f151400",
+             "image_bvh_intersect_ray v[39:42], [v50, v46, v23, v17, v16, v15, v21, v20], s[12:15] a16"),
+            ("019f9cf109040140", "image_bvh64_intersect_ray v[4:7], v[9:17], s[4:7] a16"),
+            # image_msaa_load must not misread `_load` as `_l`
+            ("010f00f005010200", "image_msaa_load v[1:4], v5, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_1D"),
+            ("090100f001050280", "image_msaa_load v5, v[1:2], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D d16"),
+            ("3b0100f0cc0e0a000b0e1300",
+             "image_msaa_load v14, [v204, v11, v14, v19], s[40:47] dmask:0x1 dim:SQ_RSRC_IMG_2D_MSAA_ARRAY"),
+            # *_mip_pck / *_mip_pck_sgn include the mip VGPR; non-BVH r128 keeps 8 SGPRs
+            ("000110f001050200", "image_load_mip_pck v5, v[1:2], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_1D"),
+            ("089f14f008100100",
+             "image_load_mip_pck_sgn v[16:19], v[8:10], s[4:11] dmask:0xf dim:SQ_RSRC_IMG_2D unorm r128"),
+            ("00812cf002fc0300", "image_store_mip_pck v252, v[2:3], s[12:19] dmask:0x1 dim:SQ_RSRC_IMG_1D r128"),
+            # image_sample_*cd* coarse derivatives (and c_cd)
+            ("080fa0f100004040", "image_sample_cd v[0:3], v[0:4], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D a16"),
+            ("2c0fa8f108102503090a0b0c0d0e0f10",
+             "image_sample_c_cd v[16:19], [v8, v9, v10, v11, v12, v13, v14, v15], s[20:27], s[100:103] "
+             "dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY"),
+            ("160fb4f108102503090a0b0c0d0e0f1011121314",
+             "image_sample_cd_cl_o v[16:19], [v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18], "
+             "s[20:27], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_3D"),
+            # _g16 packed derivatives (alignTo<2>(grad_coords)) + _cl/_o before _g16
+            ("150f88f0000040000203050607080000",
+             "image_sample_d_g16 v[0:3], [v0, v2, v3, v5, v6, v7, v8], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_3D"),
+            ("0d0facf0000040000103050607000000",
+             "image_sample_c_d_cl_g16 v[0:3], [v0, v1, v3, v5, v6, v7], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D"),
+            ("010facf100004000",
+             "image_sample_c_cd_cl_g16 v[0:3], v[0:4], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_1D"),
+            # Odd-coord a16 packing of (coords + cl/lod/mip): 1D + cl packs into 1 VGPR
+            ("000f8cf000004040", "image_sample_d_cl v[0:3], v[0:2], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_1D a16"),
+            ("000facf000004040", "image_sample_c_d_cl v[0:3], v[0:3], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_1D a16"),
+            # image_atomic_* with tfe and cmpswap with dmask:0x1
+            ("003140f0c0040700",
+             "image_atomic_cmpswap v[4:5], v192, s[28:35] dmask:0x1 dim:SQ_RSRC_IMG_1D unorm glc"),
+            ("000145f001050200", "image_atomic_add v[5:6], v1, s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_1D tfe"),
+            ("000341f001050200", "image_atomic_cmpswap v[5:7], v1, s[8:15] dmask:0x3 dim:SQ_RSRC_IMG_1D tfe"),
+            ("000f41f001050200", "image_atomic_cmpswap v[5:9], v1, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_1D tfe"),
+        )
+        for hexcode, asm in cases:
+            with self.subTest(hexcode=hexcode, asm=asm):
+                raw = bytes.fromhex(hexcode)
+                dec = rdna2_decode.decode_bytes(raw)
+                self.assertEqual(dec["invalid"], 0)
+                (ins,) = dec["insns"]
+                expected = shader_ir.parse_line(asm)
+                for field in ("op", "args"):
+                    self.assertEqual(ins[field], expected[field])
+                self.assertEqual(sorted(ins["mods"]), sorted(expected["mods"]))
+                text, bad = rdna2_decode.disasm_bytes(raw)
+                self.assertEqual(bad, 0)
+                reparsed = shader_ir.parse_line(text.strip())
+                self.assertEqual(reparsed["op"], expected["op"])
+                self.assertEqual(reparsed["args"], expected["args"])
+                self.assertEqual(sorted(reparsed["mods"]), sorted(expected["mods"]))
+
+        # Edge-case addr/data counts not covered by individual encodings above
+        # (_MIMG_DIM_COORDS: dim=1 -> 2D (2 coords), dim=2 -> 3D (3 coords)):
+        # _by2/_by4 must not trigger bias; _mip_by2/_mip_pck4 add mip; image_get_lod honors a16; fcmpswap+tfe.
+        self.assertEqual(rdna2_decode._mimg_addr_count("image_load_by2", 1, False), 2)        # 2D
+        self.assertEqual(rdna2_decode._mimg_addr_count("image_store_by4", 2, False), 3)       # 3D
+        self.assertEqual(rdna2_decode._mimg_addr_count("image_load_mip_by2", 1, False), 3)    # 2D + mip
+        self.assertEqual(rdna2_decode._mimg_addr_count("image_store_mip_pck4", 2, True), 2)   # (3D + mip) a16
+        self.assertEqual(rdna2_decode._mimg_addr_count("image_get_lod", 1, True), 1)          # 2D a16
+        self.assertEqual(rdna2_decode._mimg_addr_count("image_get_lod", 2, True), 2)          # 3D a16
+        self.assertEqual(rdna2_decode._mimg_data_count("image_atomic_fcmpswap", 1, False, True), 3)
+
+    def test_vop16_int_inline_constants_match_llvm_and_translate(self):
+        # Codes 240..248 on scalar 16-bit integer operands carry binary16 bit patterns
+        # (AMD RDNA2 ISA + LLVM AMDGPUDisassembler::getInlineImmValF16 / printImmediateInt16).
+        expected_hex16 = {
+            240: 0x3800, 241: 0xB800, 242: 0x3C00, 243: 0xBC00,
+            244: 0x4000, 245: 0xC000, 246: 0x4400, 247: 0xC400, 248: 0x3118,
+        }
+        # 1. All 9 inline codes on VOP1 (v_cvt_f16_i16_e32 / v_cvt_f16_u16_e32)
+        for opc, name in ((0x50, "v_cvt_f16_u16_e32"), (0x51, "v_cvt_f16_i16_e32")):
+            for code_id, val16 in expected_hex16.items():
+                with self.subTest(op=name, code=code_id):
+                    raw = words((0x3F << 25) | (5 << 17) | (opc << 9) | code_id)
+                    (ins,) = rdna2_decode.decode_bytes(raw)["insns"]
+                    self.assertEqual(ins["op"], name)
+                    self.assertEqual(ins["args"][1], {"k": "imm", "v": val16})
+                    line = rdna2_decode.format_insn(ins).split(";", 1)[0].strip()
+                    self.assertEqual(line, f"{name} v5, 0x{val16:x}")
+                    self.assertEqual(shader_ir.parse_line(line)["args"], ins["args"])
+
+        # 2. VOPC (_e32), VOP3 (_e64 / 2-op / 3-op), mixed-width VOP3, and negative controls
+        cases = (
+            # VOPC _e32 (v_cmp_eq_i16_e32, v_cmp_lt_u16_e32, v_cmpx_ge_i16_e32)
+            ("f004147d", "v_cmp_eq_i16_e32 vcc_lo, 0x3800, v2"),
+            ("f704527d", "v_cmp_lt_u16_e32 vcc_lo, 0xc400, v2"),
+            ("f0043c7d", "v_cmpx_ge_i16_e32 0x3800, v2"),
+            # VOP3 1-op, 2-op, 3-op scalar 16-bit integer ops (including VOPC _e64)
+            ("0500d1d5f0000000", "v_cvt_f16_i16_e64 v5, 0x3800"),
+            ("05008ad4f0ee0100", "v_cmp_eq_i16_e64 s5, 0x3800, 0xc400"),
+            ("05000dd7f0040200", "v_add_nc_i16 v5, 0x3800, v2"),
+            ("050003d701ef0100", "v_add_nc_u16 v5, v1, 0xc400"),
+            ("05000ed7f7040200", "v_sub_nc_i16 v5, 0xc400, v2"),
+            ("050004d701e10100", "v_sub_nc_u16 v5, v1, 0x3800"),
+            ("050005d7f0040200", "v_mul_lo_u16 v5, 0x3800, v2"),
+            ("050014d7f7040200", "v_lshlrev_b16 v5, 0xc400, v2"),
+            ("050007d701e10100", "v_lshrrev_b16 v5, v1, 0x3800"),
+            ("050008d7f0040200", "v_ashrrev_i16 v5, 0x3800, v2"),
+            ("05000ad7f7040200", "v_max_i16 v5, 0xc400, v2"),
+            ("05000bd701e10100", "v_min_u16 v5, v1, 0x3800"),
+            ("050055d7f0040e04", "v_max3_i16 v5, 0x3800, v2, v3"),
+            ("050053d70105de03", "v_min3_u16 v5, v1, v2, 0xc400"),
+            ("050058d701ef0d04", "v_med3_i16 v5, v1, 0xc400, v3"),
+            ("05005ed70105de03", "v_mad_i16 v5, v1, v2, 0xc400"),
+            ("050040d70105c203", "v_mad_u16 v5, v1, v2, 0x3800"),
+            # Mixed-width VOP3: SRC0/SRC1 are 16-bit (hex), SRC2 is 32-bit (float inline)
+            ("050075d7f0040e04", "v_mad_i32_i16 v5, 0x3800, v2, v3"),
+            ("050075d701ef0d04", "v_mad_i32_i16 v5, v1, 0xc400, v3"),
+            ("050075d70105de03", "v_mad_i32_i16 v5, v1, v2, -4.0"),
+            ("050073d7f7040e04", "v_mad_u32_u16 v5, 0xc400, v2, v3"),
+            ("050073d70105c203", "v_mad_u32_u16 v5, v1, v2, 0.5"),
+            # Negative controls: f16, 32-bit-src0, packed V2INT16/VOP3P, SDWA, and scalar ops stay float inline
+            ("f0a60a7e", "v_cvt_i16_f16_e32 v5, 0.5"),
+            ("f0c40a7e", "v_sat_pk_u8_i16_e32 v5, 0.5"),
+            ("05005cd5f0040e04", "v_sad_u16 v5, 0.5, v2, v3"),
+            ("05006bd7f0040200", "v_cvt_pk_i16_i32 v5, 0.5, v2"),
+            ("05003bd501e10100", "v_ldexp_f16_e64 v5, v1, 0.5"),
+            ("050002ccf0040218", "v_pk_add_i16 v5, 0.5, v2"),
+            ("05000accf0040218", "v_pk_add_u16 v5, 0.5, v2"),
+            ("050004ccf0040218", "v_pk_lshlrev_b16 v5, 0.5, v2"),
+            ("054014ccf0040e1c", "v_dot2_i32_i16 v5, 0.5, v2, v3"),
+            ("f01a80be", "s_sext_i32_i16 s0, 0.5"),
+        )
+        for hexcode, exp_asm in cases:
+            with self.subTest(hexcode=hexcode, exp_asm=exp_asm):
+                raw = bytes.fromhex(hexcode)
+                dec = rdna2_decode.decode_bytes(raw, wave32=True)
+                self.assertEqual(dec["invalid"], 0)
+                (ins,) = dec["insns"]
+                got_asm = re.sub(r"\s+", " ", rdna2_decode.format_insn(ins).split(";", 1)[0].strip())
+                self.assertEqual(got_asm, exp_asm)
+                self.assertEqual(shader_ir.parse_line(got_asm)["args"], ins["args"])
+
+        # 3. End-to-end semantic round-trip: raw binary -> rdna2_decode -> rdna2spirv -> spirv_mini_interp.
+        # Verifies 16-bit integer inline constants preserve binary16 bits (not truncated binary32 low-half 0):
+        #   v0 = v_add_nc_u16(0x3800, 1)            -> 0x3801
+        #   v1 = v_cvt_f16_u16_e32(0x3800)          -> f16(14336.0) = 0x7300
+        #   v2 = v_mad_i32_i16(0x3800, 2, 0.5)      -> 14336 * 2 + 0x3f000000 = 0x3f007000
+        prog = words(
+            (0x3F << 25) | (0 << 17) | (1 << 9) | 128,                      # v_mov_b32_e32 v0, 0 (clear hi half)
+            (0x3F << 25) | (1 << 17) | (1 << 9) | 128,                      # v_mov_b32_e32 v1, 0 (clear hi half)
+            (0x35 << 26) | (0x303 << 16) | 0, (129 << 9) | 240,             # v_add_nc_u16 v0, 0x3800, 1
+            (0x3F << 25) | (1 << 17) | (0x50 << 9) | 240,                   # v_cvt_f16_u16_e32 v1, 0x3800
+            (0x35 << 26) | (0x375 << 16) | 2, (240 << 18) | (130 << 9) | 240,  # v_mad_i32_i16 v2, 0x3800, 2, 0.5
+            (0x3E << 26) | (1 << 12) | (1 << 11) | 0xF,                     # exp mrt0 v0, v1, v2, v0 done vm
+            (0 << 24) | (2 << 16) | (1 << 8) | 0,
+            0xBF810000,                                                     # s_endpgm
+        )
+        asm, bad = rdna2_decode.disasm_bytes(prog, wave32=True)
+        self.assertEqual(bad, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm_dir = os.path.join(tmp, "disasm")
+            os.mkdir(disasm_dir)
+            with open(os.path.join(tmp, "ps_vop16_inline.dxbc"), "wb") as f:
+                f.write(b"DXBC" + bytes(28))
+            src = os.path.join(disasm_dir, "ps_vop16_inline.s")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write("; ps_vop16_inline  code 0x0..0x0 (synthetic), gfx1013, 0 invalid words\n" + asm)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                spv = rdna2spirv.translate(src)
+        out = si.run_fragment(spv)["%out_mrt0"]
+        self.assertEqual(list(out), [0x00003801, 0x00007300, 0x3F007000, 0x00003801])
 
 
 if __name__ == "__main__":

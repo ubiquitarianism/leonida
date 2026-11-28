@@ -103,6 +103,42 @@ class Conventions(unittest.TestCase):
         self.assertEqual(reader.read(b'<R><Item value="1"/><Item value="2"/></R>')[2], [1, 2])
         self.assertEqual(reader.read(b'<R>leaf</R>')[2], "leaf")
 
+    def test_empty_typed_objects_keep_class_in_roots_lists_and_maps(self):
+        cases = (
+            (b'<Root type="CEmpty"/>', {"$type": "CEmpty"}, 1),
+            (b'<Root type="CEmpty"> \t\n </Root>', {"$type": "CEmpty"}, 1),
+            (b'<Root><Item type="CEmpty"/><Item type="CEmpty" name="named" userFlags="3">\n</Item></Root>',
+             [{"$type": "CEmpty"}, {"$type": "CEmpty", "@name": "named", "@userFlags": 3}], 2),
+            (b'<Root><Item key="first" type="CEmpty"/><Item key="second" type="CEmpty"/></Root>',
+             {"first": {"$type": "CEmpty"}, "second": {"$type": "CEmpty"}}, 2),
+        )
+        for raw, expected, object_count in cases:
+            with self.subTest(raw=raw):
+                stream_reader = R.Reader(root_handlers={}, type_handlers={})
+                whole_reader = R.Reader(root_handlers={}, type_handlers={})
+                self.assertEqual(stream_reader.read(raw)[2], expected)
+                self.assertEqual(whole_reader.convert(ET.fromstring(raw)), expected)
+                self.assertEqual(stream_reader.stats, whole_reader.stats)
+                self.assertEqual(stream_reader.types, {"CEmpty": object_count})
+                self.assertEqual(stream_reader.types, whole_reader.types)
+                self.assertEqual(stream_reader.stats["object"], object_count)
+                self.assertEqual(stream_reader.stats["text"], 0)
+
+    def test_empty_objects_do_not_change_other_leaf_conventions(self):
+        raw = (b'<Root><plain/><null type="NULL"/><text type="CText"> leaf </text>'
+               b'<scalar type="CScalar" value="0"/><vector type="CVector" x="1" y="2"/>'
+               b'<array type="CArray" content="short_array"/><ref type="CRef" ref="target"/></Root>')
+        expected = {"plain": "", "null": None, "text": "leaf", "scalar": 0, "vector": (1.0, 2.0),
+                    "array": [], "ref": {"$ref": "target"}}
+        stream_reader = R.Reader(root_handlers={}, type_handlers={})
+        whole_reader = R.Reader(root_handlers={}, type_handlers={})
+        self.assertEqual(stream_reader.read(raw)[2], expected)
+        self.assertEqual(whole_reader.convert(ET.fromstring(raw)), expected)
+        self.assertEqual(stream_reader.stats, whole_reader.stats)
+        self.assertEqual(stream_reader.types, whole_reader.types)
+        self.assertEqual(stream_reader.stats["object"], 0)
+        self.assertEqual(stream_reader.stats["text"], 2)
+
     def test_vector_with_extra_attributes_and_non_vector_xyzw(self):
         reader = R.Reader(root_handlers={}, type_handlers={})
         self.assertEqual(
@@ -165,6 +201,31 @@ class Conventions(unittest.TestCase):
 
 
 class Dispatch(unittest.TestCase):
+    def test_empty_type_handler_can_use_generic_class_without_double_counting(self):
+        def empty(el, reader):
+            generic = reader.convert(el, use_type_handler=False)
+            return {**generic, "default": 7}
+
+        raw = b'<Root><Item type="CEmpty" name="named"/></Root>'
+        reader = R.Reader(root_handlers={}, type_handlers={"CEmpty": empty})
+        self.assertEqual(reader.read(raw)[2], [{"$type": "CEmpty", "@name": "named", "default": 7}])
+        self.assertEqual(reader.types, {"CEmpty": 1})
+        self.assertEqual(reader.stats["type handler"], 1)
+        self.assertEqual(reader.stats["object"], 1)
+        self.assertEqual(reader.stats["extra attributes"], 1)
+
+        calls = []
+
+        def root(el, reader):
+            calls.append((el.tag, el.attrib["type"]))
+            return "root default"
+
+        root_reader = R.Reader(root_handlers={"Root": root}, type_handlers={"CEmpty": empty})
+        self.assertEqual(root_reader.read(b'<Root type="CEmpty"/>')[2], "root default")
+        self.assertEqual(calls, [("Root", "CEmpty")])
+        self.assertEqual(root_reader.stats["root handler"], 1)
+        self.assertEqual(root_reader.stats["type handler"], 0)
+
     def test_type_handler(self):
         calls = []
 
@@ -396,6 +457,59 @@ class Run(unittest.TestCase):
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertNotIn("Traceback", r.stderr)
         self.assertIn("not a directory", r.stderr)
+
+    def test_namespaced_root_exports_safely_and_matches_root_filter(self):
+        ns_xml = os.path.join(self.tmp.name, "ns.xml")
+        with open(ns_xml, "wb") as f:
+            f.write(b'<Root xmlns="http://example.com/ns"><v value="7"/></Root>')
+        out_all = os.path.join(self.tmp.name, "ns_all")
+        s_all = R.run([ns_xml], out_dir=out_all, reader=R.Reader(root_handlers={}, type_handlers={}))
+        self.assertEqual(s_all["documents"], 1)
+        out = os.path.join(self.tmp.name, "ns_out")
+        s = R.run([ns_xml], root_filter="{http://example.com/ns}Root", out_dir=out,
+                  reader=R.Reader(root_handlers={}, type_handlers={}))
+        self.assertEqual(s["documents"], 1)
+        files = os.listdir(out)
+        self.assertEqual(len(files), 1)
+        with open(os.path.join(out, files[0]), "rb") as f:
+            raw = f.read()
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertEqual(json.loads(raw.decode("utf-8")), {"{http://example.com/ns}v": 7})
+
+    def test_root_filter_matches_doctype_without_root_hint(self):
+        doc_xml = os.path.join(self.tmp.name, "doctype.xml")
+        other_xml = os.path.join(self.tmp.name, "wrong.xml")
+        with open(doc_xml, "wb") as f:
+            f.write(b'<!DOCTYPE CTarget><CTarget value="9"/>')
+        with open(other_xml, "wb") as f:
+            f.write(b'<!DOCTYPE CWrong><CWrong value="1"/>')
+        s = R.run([doc_xml, other_xml], root_filter="CTarget",
+                  reader=R.Reader(root_handlers={}, type_handlers={}))
+        self.assertEqual(s["documents"], 1)
+        self.assertEqual(s["per_root_documents"], {"CTarget": 1})
+
+    def test_cli_empty_out_and_atomic_write_error_reporting(self):
+        xml = os.path.join(self.dir, "c.xml")
+        for bad in ("", "   "):
+            with self.subTest(bad=bad):
+                r = self._cli(xml, "--out", bad)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("must not be empty", r.stderr)
+
+        out = os.path.join(self.tmp.name, "atomic_out")
+        os.makedirs(out)
+        existing = os.path.join(out, "COther_c.xml.json")
+        with open(existing, "w", encoding="utf-8", newline="\n") as f:
+            f.write("keep-me\n")
+        err = io.StringIO()
+        with mock.patch.object(R.replace_retry, "replace", side_effect=OSError("disk full")), \
+                mock.patch("sys.stderr", err):
+            rc = R.main([xml, "--out", out])
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR: cannot write", err.getvalue())
+        with open(existing, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep-me\n")
+        self.assertEqual([n for n in os.listdir(out) if n.endswith(".tmp")], [])
 
 
 if __name__ == "__main__":

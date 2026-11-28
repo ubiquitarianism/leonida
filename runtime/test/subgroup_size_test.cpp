@@ -7,8 +7,10 @@
 //   - an old RADV: sizes 32..64, COMPUTE only.
 // No game data.
 #include "../src/subgroup_size.h"
+#include "test_temp_dir.h"
 
 #include <cstdio>
+#include <fstream>
 #include <string>
 
 #define CHECK(condition) do {                                    \
@@ -138,6 +140,31 @@ int main() {
         CHECK(emulated.outcome == SubgroupOutcome::emulated && emulated.size == 0);
     }
 
+    // Read the translator's graphics tier through the same index lookup used at pipeline creation: tiers A and B are
+    // partition invariant (the device's 32-wide size is exact for them), C, an unknown tier and a non-string are not.
+    {
+        const testfiles::ScratchDir scratch("leonida_subgroup_graphics");
+        std::ofstream(scratch.path() / "index.json") << R"({
+            "a": {"stage":"vs","wave64":true,"subgroup_size":64,"fssm_sha256":"a","wave64_graphics":"A"},
+            "b": {"stage":"ps","wave64":true,"subgroup_size":64,"fssm_sha256":"b","wave64_graphics":"B"},
+            "c": {"stage":"gs","wave64":true,"subgroup_size":64,"fssm_sha256":"c","wave64_graphics":"C"},
+            "unknown": {"stage":"ps","wave64":true,"fssm_sha256":"unknown","wave64_graphics":"D"},
+            "bad": {"stage":"ps","wave64":true,"fssm_sha256":"bad","wave64_graphics":1}
+        })";
+        ShaderLibrary library;
+        CHECK(library.load(scratch.path()));
+        const auto* a = library.find("vs", "a");
+        const auto* b = library.find("ps", "b");
+        CHECK(a && b && graphics_partition_invariant(*a) && graphics_partition_invariant(*b));
+        for (const auto* shader : {library.find("gs", "c"), library.find("ps", "unknown"), library.find("ps", "bad")})
+            CHECK(shader && !graphics_partition_invariant(*shader));
+        // The size decision itself does not change: 64 cannot be had on NVIDIA, and AMD still gets it natively.
+        const auto fixed = decide_subgroup_size(*b, nvidia());
+        CHECK(fixed.outcome == SubgroupOutcome::unavailable && fixed.wanted == 64 && fixed.size == 0 && fixed.flags == 0);
+        const auto native = decide_subgroup_size(*b, amd());
+        CHECK(native.outcome == SubgroupOutcome::required && native.size == 64);
+    }
+
     // --- An old RADV: COMPUTE only ----------------------------------------------------------------------------------
     {
         const SubgroupSizeCaps caps = old_radv();
@@ -210,6 +237,73 @@ int main() {
         CHECK(decide_subgroup_size(entry("ps", false), caps).outcome == SubgroupOutcome::unavailable);
     }
 
+    // --- Malformed or half-zero [min_size, max_size] ranges ---------------------------------------------------------
+    {
+        // Half-zero range (min_size == 0, max_size == 64): lower bound is unset, so requiredSubgroupSize must not be
+        // chained (VUID -requiredSubgroupSize-02761); fall back to default_size or unavailable.
+        SubgroupSizeCaps caps = amd();
+        caps.min_size = 0;
+        caps.max_size = 64;
+        caps.default_size = 64;
+        auto r = decide_subgroup_size(entry("cs", true), caps);
+        CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0 && r.flags == 0);
+        r = decide_subgroup_size(entry("cs", false), caps);
+        CHECK(r.outcome == SubgroupOutcome::unavailable && r.size == 0 && r.flags == 0);
+        r = decide_subgroup_size(entry("ps", false), caps);
+        CHECK(r.outcome == SubgroupOutcome::unavailable && r.size == 0 && r.flags == 0);
+
+        // Same half-zero range with default_size == 32: wave64 cannot be required, wave32 falls back to default.
+        caps.default_size = 32;
+        r = decide_subgroup_size(entry("cs", true), caps);
+        CHECK(r.outcome == SubgroupOutcome::unavailable && r.size == 0 && r.flags == 0);
+        r = decide_subgroup_size(entry("cs", false), caps);
+        CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0 && r.flags == 0);
+
+        // Half-zero range with default_size == 0: neither a default nor a valid [min, max] range is known.
+        caps.default_size = 0;
+        r = decide_subgroup_size(entry("cs", true), caps);
+        CHECK(r.outcome == SubgroupOutcome::unknown_device && r.size == 0 && r.flags == 0);
+        r = decide_subgroup_size(entry("cs", false), caps);
+        CHECK(r.outcome == SubgroupOutcome::unknown_device && r.size == 0 && r.flags == 0);
+
+        // Mirror half-zero (min_size == 32, max_size == 0) and inverted range (min_size > max_size).
+        caps = amd();
+        caps.default_size = 0;
+        caps.min_size = 32;
+        caps.max_size = 0;
+        CHECK(decide_subgroup_size(entry("cs", false), caps).outcome == SubgroupOutcome::unknown_device);
+        caps.min_size = 64;
+        caps.max_size = 32;
+        CHECK(decide_subgroup_size(entry("cs", true), caps).outcome == SubgroupOutcome::unknown_device);
+        caps.default_size = 64;
+        CHECK(decide_subgroup_size(entry("cs", true), caps).outcome == SubgroupOutcome::device_default);
+        CHECK(decide_subgroup_size(entry("cs", false), caps).outcome == SubgroupOutcome::unavailable);
+
+        // Non-power-of-two bounds violate VkPhysicalDeviceSubgroupSizeControlProperties and must not be trusted.
+        caps = amd();
+        caps.min_size = 24;
+        caps.max_size = 64;
+        caps.default_size = 64;
+        r = decide_subgroup_size(entry("cs", false), caps);
+        CHECK(r.outcome == SubgroupOutcome::unavailable && r.size == 0 && r.flags == 0);
+        r = decide_subgroup_size(entry("cs", true), caps);
+        CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0 && r.flags == 0);
+        caps.min_size = caps.max_size = 48;
+        ShaderEntry odd = entry("cs", true);
+        odd.subgroup_size = 48;
+        CHECK(decide_subgroup_size(odd, caps).outcome == SubgroupOutcome::unavailable);
+
+        // Control: a valid power-of-two range with default_size == 0 still requires sizes within [min, max].
+        caps = amd();
+        caps.default_size = 0;
+        r = decide_subgroup_size(entry("cs", true), caps);
+        CHECK(r.outcome == SubgroupOutcome::required && r.size == 64);
+        r = decide_subgroup_size(entry("cs", false), caps);
+        CHECK(r.outcome == SubgroupOutcome::required && r.size == 32);
+        odd.subgroup_size = 16;
+        CHECK(decide_subgroup_size(odd, caps).outcome == SubgroupOutcome::unavailable);
+    }
+
     // --- The create-info chain -------------------------------------------------------------------------------------
     {
         const SubgroupSizeCaps caps = amd();
@@ -259,6 +353,32 @@ int main() {
         CHECK(caps.default_size == 64 && caps.min_size == 32 && caps.max_size == 64 &&
               caps.max_compute_workgroup_subgroups == 16 && caps.required_stages == amd_stages);
         CHECK(caps.subgroup_size_control && !caps.compute_full_subgroups);
+    }
+
+    // --- Partition-invariant wave64 graphics ----------------------------------------------------------------
+    {
+        // The translator's tier (index.json `wave64_graphics`, docs/design.md "Wave64 graphics"): A and B are exact
+        // when the wave is cut into two 32-lane halves, C is not. An entry without the analysis stays conservative.
+        ShaderEntry e = entry("ps", true);
+        CHECK(!graphics_partition_invariant(e));
+        e.wave64_graphics = "A";
+        CHECK(graphics_partition_invariant(e));
+        e.wave64_graphics = "B";
+        CHECK(graphics_partition_invariant(e));
+        e.wave64_graphics = "C";
+        CHECK(!graphics_partition_invariant(e));
+        // Only a wave64 VS/PS/GS carries the analysis; compute, mesh and wave32 entries do not.
+        e = entry("vs", true);
+        e.wave64_graphics = "A";
+        CHECK(graphics_partition_invariant(e));
+        for (const char* stage : {"cs", "ms"}) {
+            e = entry(stage, true);
+            e.wave64_graphics = "A";
+            CHECK(!graphics_partition_invariant(e));
+        }
+        e = entry("ps", false);
+        e.wave64_graphics = "A";
+        CHECK(!graphics_partition_invariant(e));
     }
 
     std::printf("subgroup size decision: AMD-like, NVIDIA-like, old RADV, limits, create-info chain and query OK\n");

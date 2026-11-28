@@ -230,8 +230,7 @@ def write_json_report(path, data):
             with open(fd, "w", encoding="utf-8", newline="\n") as f:
                 fd = None
                 json.dump(data, f, indent=2)
-            if os.name != "nt":
-                os.chmod(tmp, published_mode(destination))
+            os.chmod(tmp, published_mode(destination))
             replace_retry(tmp, destination)
         except BaseException:
             if fd is not None:
@@ -276,30 +275,34 @@ def main(argv=None):
     except runner.Unavailable as exc:
         print(f"SKIP: {exc}", file=sys.stderr)
         return 77
-    if asm.family(oracle.arch) != "gfx10":
-        print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
-        return 77
-    out = {"arch": oracle.arch, "waves": {}}
-    mismatches = 0
-    for wave in waves:
-        c = probe_cases(oracle, asm, wave)
-        t = probe_transcendentals(oracle, asm, wave)
-        out["waves"][str(wave)] = {"cases": c, "transcendentals": t}
-        if c["ok"] != c["total"] or not t["all_ok"]:
-            mismatches += 1
-        t_ok = sum(info["ok"] for info in t["ops"].values())
-        print(f"wave{wave} ({oracle.arch}): {c['ok']}/{c['total']} f16/f64 RNE/RTZ cases exact; "
-              f"{t_ok}/{len(t['ops'])} f16 transcendentals 0/65536 RNE/RTZ diffs")
-        for op, info in t["ops"].items():
-            if not info["ok"]:
-                print(f"  {op}: {info['rne_rtz_diffs']}/{info['inputs']} RNE/RTZ diffs, "
-                      f"RTZ spot word {info['spot_got']} (want {info['spot_want']})")
-    if args.json_out is not None:
-        write_err = write_json_report(args.json_out, out)
-        if write_err:
-            print(f"error: {write_err}", file=sys.stderr)
-            return 1
-    return 1 if mismatches else 0
+    try:
+        if asm.family(oracle.arch) != "gfx10":
+            print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
+            return 77
+        out = {"arch": oracle.arch, "waves": {}}
+        mismatches = 0
+        for wave in waves:
+            c = probe_cases(oracle, asm, wave)
+            t = probe_transcendentals(oracle, asm, wave)
+            out["waves"][str(wave)] = {"cases": c, "transcendentals": t}
+            if c["ok"] != c["total"] or not t["all_ok"]:
+                mismatches += 1
+            t_ok = sum(info["ok"] for info in t["ops"].values())
+            print(f"wave{wave} ({oracle.arch}): {c['ok']}/{c['total']} f16/f64 RNE/RTZ cases exact; "
+                  f"{t_ok}/{len(t['ops'])} f16 transcendentals 0/65536 RNE/RTZ diffs")
+            for op, info in t["ops"].items():
+                if not info["ok"]:
+                    print(f"  {op}: {info['rne_rtz_diffs']}/{info['inputs']} RNE/RTZ diffs, "
+                          f"RTZ spot word {info['spot_got']} (want {info['spot_want']})")
+        if args.json_out is not None:
+            write_err = write_json_report(args.json_out, out)
+            if write_err:
+                print(f"error: {write_err}", file=sys.stderr)
+                return 1
+        return 1 if mismatches else 0
+    finally:
+        if hasattr(oracle, "close"):
+            oracle.close()
 
 
 if __name__ == "__main__":

@@ -141,12 +141,29 @@ def lane_slot(vgpr, lane):
     return ("lane", vgpr["r"], lane["v"] & 63)
 
 
+def wave32_vcc_pair_op(op, args):
+    """Data moves between a scalar pair and VCC, or their 64-bit XOR into VCC."""
+    if op not in ("s_mov_b64", "s_xor_b64"):
+        return False
+    pairs = [a.get("k") == "sgpr" and a.get("n") == 2 for a in args]
+    vcc = [a.get("t") == "vcc" for a in args]
+    if op == "s_mov_b64":
+        return len(args) == 2 and ((vcc[0] and pairs[1]) or (pairs[0] and vcc[1]))
+    return len(args) == 3 and vcc[0] and ((vcc[1] and pairs[2]) or (pairs[1] and vcc[2]))
+
+
 def step(state, ins, wave64=True):
     """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR.
 
     `wave64` False: the program runs in 32-lane waves, where a 64-bit s_bfm_b64 result can't be a lane mask."""
     op, a = base_op(ins["op"]), ins["args"]
     if not a or op.startswith(NO_DESTINATION):
+        return
+    if ins.get("vcc_data_pair"):
+        # Gen materializes both scalar words (including a source mask's lane bits).
+        put(state, a[0], None, wave64)
+        if a[0].get("t") == "vcc":
+            state.pop("vcc_hi", None)
         return
     mods = ins.get("mods", ())
     if op.startswith(("buffer_load", "tbuffer_load")) and "lds" in mods:
@@ -216,6 +233,8 @@ def step(state, ins, wave64=True):
             return op != "v_mov_b32"
     if "_saveexec_b" in op or "_wrexec_b" in op:
         put(state, a[0], MASK_LO if (wave64 and op.endswith("_b32")) else MASK, wave64)
+    elif wave64 and op == "s_bitreplicate_b64_b32" and a[0].get("t") == "vcc":
+        put(state, a[0], MASK, wave64)
     elif op == "s_bfm_b64":
         # In wave32 code it is 64-bit data, e.g. the first two words of an S# built in place (the pipeline library's
         # wave32 compute programs: s_bfm_b64 s[88:89], 2, 54); rdna2spirv computes the value there.

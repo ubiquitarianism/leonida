@@ -20,9 +20,14 @@ on:
       - ".gitattributes"
       - "tools/hw_oracle/**"
       - "tools/bary_fallback_gs.py"
+      - "tools/bcpack.py"
+      - "tools/bcpack_history_train.cpp"
+      - "tools/bcpack_tables.py"
+      - "tools/bcpack_tables_bptc.py"
       - "tools/cf_diff.py"
       - "tools/cf_ref.py"
       - "tools/cfg_structure.py"
+      - "tools/conformance/**"
       - "tools/cpu_ref.py"
       - "tools/f32_fuzz.py"
       - "tools/file_mode.py"
@@ -30,6 +35,7 @@ on:
       - "tools/fspx_unpack.py"
       - "tools/fssm_header.py"
       - "tools/fssm_unpack.py"
+      - "tools/gen_bcpack_runtime_tables.py"
       - "tools/gen_d3d12_stubs.py"
       - "tools/gfx10_formats.json"
       - "tools/lane_masks.py"
@@ -50,6 +56,7 @@ on:
       - "tools/shader_stage_manifest.py"
       - "tools/spirv_asm.py"
       - "tools/spirv_asm_tables.py"
+      - "tools/spirv_loop_guard.py"
       - "tools/spirv_opt.py"
       - "tools/spirv_stubs.py"
       - "tools/vk_subgroup_info.py"
@@ -65,9 +72,14 @@ on:
       - ".gitattributes"
       - "tools/hw_oracle/**"
       - "tools/bary_fallback_gs.py"
+      - "tools/bcpack.py"
+      - "tools/bcpack_history_train.cpp"
+      - "tools/bcpack_tables.py"
+      - "tools/bcpack_tables_bptc.py"
       - "tools/cf_diff.py"
       - "tools/cf_ref.py"
       - "tools/cfg_structure.py"
+      - "tools/conformance/**"
       - "tools/cpu_ref.py"
       - "tools/f32_fuzz.py"
       - "tools/file_mode.py"
@@ -75,6 +87,7 @@ on:
       - "tools/fspx_unpack.py"
       - "tools/fssm_header.py"
       - "tools/fssm_unpack.py"
+      - "tools/gen_bcpack_runtime_tables.py"
       - "tools/gen_d3d12_stubs.py"
       - "tools/gfx10_formats.json"
       - "tools/lane_masks.py"
@@ -95,6 +108,7 @@ on:
       - "tools/shader_stage_manifest.py"
       - "tools/spirv_asm.py"
       - "tools/spirv_asm_tables.py"
+      - "tools/spirv_loop_guard.py"
       - "tools/spirv_opt.py"
       - "tools/spirv_stubs.py"
       - "tools/vk_subgroup_info.py"
@@ -102,12 +116,16 @@ on:
       - "tools/wave64_halves.py"
       - "tools/xdxr_bvh.py"
   workflow_dispatch:
+  # Daily default-branch snapshot, staggered after CI; ordinary pushes keep coalescing.
+  schedule:
+    - cron: "53 3 * * *"
 
 permissions:
   contents: read
 
 concurrency:
   # Coalesce superseded pending pushes per branch without canceling an active main build.
+  # Scheduled/manual runs already use run_id and cannot be replaced by queued pushes.
   group: runtime-${{ github.event_name }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -123,6 +141,8 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
@@ -329,6 +349,8 @@ jobs:
     name: wine (${{ matrix.wine }})
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: runtime-windows
@@ -390,6 +412,8 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Cache Vulkan headers
         id: vulkan-headers-cache
@@ -572,11 +596,9 @@ jobs:
         if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}  # also after a runtime test failure
         shell: bash
         env:
-          # ps_ssharp: #1845 (the S#'s LOD bias, which a Metal sampler can't take). cs_fma_fused is newer than the job
-          # and wrong on MoltenVK: https://github.com/ItsNotRexed/Leonida/issues/3796#issuecomment-7086691314
+          # ps_ssharp: #1845 (the S#'s LOD bias, which a Metal sampler can't take).
           EXPECTED_FAILURES: >-
             ps_ssharp
-            cs_fma_fused
         run: |
           set +e
           python3 -I scripts/run_gpu_tests.py --build runtime/build --llvm-mc "$LLVM_MC" --work "$RUNNER_TEMP/gpu" 2>&1 |

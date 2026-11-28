@@ -281,7 +281,7 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
         if (rt::d3d12::device_push_constants_need_fallback(inner)) {
             std::printf("d3d12_fspx_compute_test: skipped, the PSOs need 144 push-constant bytes and this GPU has %u\n",
@@ -345,6 +345,18 @@ int main() {
             pso_desc.CS = {code_c.data(), code_c.size()};
             EXPECT(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&none_bare.p)) == E_INVALIDARG &&
                    !none_bare.p);
+
+            // LEONIDA_STUB_PIPELINES=1 stubs only a missing translation: the unknown kind-0 state becomes a stub,
+            // while the ambiguous bare program, whose translations exist, is still refused.
+            EXPECT(SetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", L"1"));
+            Ref<ID3D12PipelineState> stub_other, still_bare;
+            pso_desc.CS = {c_other.data(), c_other.size()};
+            const HRESULT stub_hr = device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&stub_other.p));
+            pso_desc.CS = {code_c.data(), code_c.size()};
+            const HRESULT bare_hr = device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&still_bare.p));
+            SetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", nullptr);
+            EXPECT(stub_hr == S_OK && stub_other.p);
+            EXPECT(bare_hr == E_INVALIDARG && !still_bare.p);
         }
 
         // Slot 67 with all four pairs (RT-99): the proxy passes kind 0 on, so program C resolves by its state there

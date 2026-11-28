@@ -2423,8 +2423,8 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         fail("unknown feature unexpectedly answered");
 
     // Local invariants for what this layer actually implements.
-    if (o2.DepthBoundsTestSupported ||
-        o2.ProgrammableSamplePositionsTier != D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED)
+    // DepthBoundsTestSupported follows the device's depthBounds feature.
+    if (o2.ProgrammableSamplePositionsTier != D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED)
         fail("OPTIONS2 unexpected support");
     if (o3.CastingFullyTypedFormatSupported ||
         o3.WriteBufferImmediateSupportFlags != D3D12_COMMAND_LIST_SUPPORT_FLAG_NONE ||
@@ -4374,6 +4374,14 @@ int compare_invalid_arguments(ID3D12Device* ours) {
                 std::printf("invalid arguments format %d %s: the host accepts it, this Vulkan driver can't\n", f, what);
                 continue;
             }
+            // The other way round is a mismatch, except where the layer takes a console format stand-in the host
+            // cannot attach: an R9G9B9E5 render target is made as B10G11R11 (console format stand-ins, fa83b2825),
+            // which the title asserts on. Only present on a GPU without a native E5B9G9R9 attachment.
+            if (SUCCEEDED(a) && FAILED(b) && format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP &&
+                flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+                std::printf("invalid arguments format %d RT: a console stand-in the host itself refuses\n", f);
+                continue;
+            }
             ++mismatches;
             std::fprintf(stderr, "invalid arguments format %d %s: ours 0x%08lx, host 0x%08lx\n", f, what, a, b);
         }
@@ -5094,7 +5102,7 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);  // the proxy now owns `inner`
         EXPECT(rt::d3d12_xs::is_device_proxy(device.p));
         EXPECT(rt::d3d12_xs::device_proxy_slot_count(device.p) == 80);  // ID3D12Device11
@@ -5428,7 +5436,7 @@ int main() {
             EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(fallback_info, IID_PPV_ARGS(&fallback_inner))));
             Ref<ID3D12Device> fallback_device;
             EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(fallback_inner, __uuidof(ID3D12Device),
-                                                               reinterpret_cast<void**>(&fallback_device.p))));
+                                                               reinterpret_cast<void**>(&fallback_device.p), /*console_lists=*/false)));
             rt::d3d12::set_device_outer(fallback_inner, fallback_device.p);
             D3D12_FEATURE_DATA_D3D12_OPTIONS8 options8{TRUE};
             EXPECT(fallback_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &options8,
@@ -5533,7 +5541,11 @@ int main() {
         if (feature_mismatches < 0)
             std::printf("CheckFeatureSupport: no host D3D12 device to compare with, skipped\n");
         EXPECT(feature_mismatches <= 0);
-        const int allocation_mismatches = compare_allocation_info(device.p);
+        // GetResourceAllocationInfo is compared on the layer's own PC device, not on the proxy: the proxy answers the
+        // console's placement of a title description (whole console tiles at the console's own alignment,
+        // d3d12_xs_alloc_size.h), which xs_proxy_mock's slot 25 test pins. The layer itself must match the PC runtime.
+        ID3D12Device* const layer_device = rt::d3d12_xs::device_proxy_real_device(device.p);
+        const int allocation_mismatches = compare_allocation_info(layer_device);
         if (allocation_mismatches < 0)
             std::printf("GetResourceAllocationInfo: no host D3D12 device to compare with, skipped\n");
         EXPECT(allocation_mismatches <= 0);
@@ -5590,7 +5602,14 @@ int main() {
             Ref<ID3D12CommandQueue> granted_q;
             EXPECT(SUCCEEDED(device->CreateCommandQueue(&rt_desc, IID_PPV_ARGS(&granted_q.p))) && granted_q.p);
             if (granted_q.p) {
-                EXPECT(granted_q->GetDesc().Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
+                // PC GetDesc shares console slot 18 with the newer layout's GetTimestampFrequency; the proxy
+                // serves the frequency getter while the layout is undetected, so the desc is read on the real
+                // queue instead.
+                if (auto* real_q = rt::d3d12_xs::queue_proxy_real_queue(granted_q.p)) {
+                    EXPECT(real_q->GetDesc().Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
+                } else {
+                    EXPECT(granted_q->GetDesc().Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
+                }
             }
             granted_q.reset();
             rt::d3d12::set_global_realtime_privilege_override_for_test(-1);
@@ -5764,8 +5783,12 @@ int main() {
                    E_INVALIDARG);
         }
         {
+            // On the Xbox device proxy, slot 61 is the title's CreateSamplerX (e22994464), where ID3D12Device5 has
+            // CreateMetaCommand, so these PC methods are checked on the Vulkan device behind the proxy.
+            ID3D12Device* const pc5 = rt::d3d12_xs::is_device_proxy(device.p) ? rt::d3d12_xs::device_proxy_real_device(device.p)
+                                                                               : device.p;
             Ref<ID3D12Device5> device5;
-            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5.p))));
+            EXPECT(SUCCEEDED(pc5->QueryInterface(IID_PPV_ARGS(&device5.p))));
             UINT meta_count = 7;
             EXPECT(device5->EnumerateMetaCommands(&meta_count, nullptr) == S_OK && meta_count == 0);
             EXPECT(device5->EnumerateMetaCommands(nullptr, nullptr) == E_INVALIDARG);
@@ -6580,12 +6603,18 @@ int main() {
                 Ref<ID3D12Device10> device10;
                 Ref<ID3D12Resource> one, two;
                 EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
-                // Not through the proxy: its slot 78 is the Xbox SetFrameIntervalX (2dbcb882c), not this method.
-                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device10.p))));
-                EXPECT(SUCCEEDED(device4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                                  nullptr, IID_PPV_ARGS(&one.p))));
+                // On the Xbox device proxy, slot 78 is the title's SetFrameIntervalX (#6935) and slot 55 is the Xbox
+                // CreateDerivedPipelineState, so the PC methods are checked on the Vulkan device behind the proxy.
+                ID3D12Device* pc = rt::d3d12_xs::is_device_proxy(device.p) ? rt::d3d12_xs::device_proxy_real_device(device.p)
+                                                                            : device.p;
+                EXPECT(SUCCEEDED(pc->QueryInterface(IID_PPV_ARGS(&device10.p))));
+                Ref<ID3D12Device4> real4;
+                EXPECT(SUCCEEDED(pc->QueryInterface(IID_PPV_ARGS(&real4.p))));
+                EXPECT(SUCCEEDED(real4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                nullptr, IID_PPV_ARGS(&one.p))));
                 EXPECT(SUCCEEDED(device10->CreateReservedResource2(&tiled_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
                                                                    nullptr, 0, nullptr, IID_PPV_ARGS(&two.p))));
+                EXPECT(two.p);
                 EXPECT(one.p && two.p);
                 UINT tiles = 0;
                 device->GetResourceTiling(two.p, &tiles, nullptr, nullptr, nullptr, 0, nullptr);
@@ -6737,8 +6766,11 @@ int main() {
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&timestamps.p))));
             query_desc = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, 0, 0};
             EXPECT(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&refused.p)) == E_INVALIDARG && !refused.p);
-            // The layer has no stream output, so stream-output statistics heaps are made without a Vulkan pool and
-            // every query reads zero (D3D-302).
+            // D3D-302: an SO_STATISTICS heap is a real transform-feedback pool on a device with
+            // VK_EXT_transform_feedback whose transformFeedbackQueries property is set (indexed on the stream); without
+            // them the heap is made without a Vulkan pool and every query reads zero. A stream past
+            // maxTransformFeedbackStreams reads zero too. StreamOutput PSOs are still refused, so no stream output runs
+            // and the resolved counts are 0 in either case.
             query_desc = {D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 3, 0};
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&so.p))));
             query_desc = {D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 2, 0};

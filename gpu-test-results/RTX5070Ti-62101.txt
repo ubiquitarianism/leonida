@@ -1,0 +1,53 @@
+GPU:        NVIDIA GeForce RTX 5070 Ti (Blackwell), 16 GiB VRAM
+Driver:     NVIDIA 621.01 (nvidia-smi), Vulkan 1.4.357 (vulkaninfo)
+Subgroup:   32 (no 64-wide compute subgroup, as reported by the harness)
+OS:         Windows 11 Pro, 26H2, build 10.0.26300.9457
+Date:       2026-11-25
+Commit:     e0b08c77d3e168483b3e6f0a0bb093893b4e54d3 (main)
+Tools:      Python 3.13.15, MSVC 19.44.35227 (Visual Studio 2022 Community),
+            CMake 3.31.6-msvc6 (Visual Studio 17 2022 generator, RelWithDebInfo),
+            Khronos Vulkan-Headers 6802bb4733b63ed5efd3adb308a6c885ef180ea1
+            (LEONIDA_VULKAN_HEADERS_FETCH=ON, the pin in runtime/CMakeLists.txt)
+Device:     LEONIDA_VK_DEVICE='RTX 5070 Ti' (the machine also has an AMD Radeon iGPU;
+            every GPU run below is pinned to the RTX 5070 Ti)
+Scope:      ONLY tests/semantic/fixtures/disasm, the pre-disassembled synthetic subset.
+            101 listings translated and assembled in each run with tools/spirv_asm.py.
+            No llvm-mc or spirv-val was available; this is NOT a full-suite or
+            SPIR-V-validation result. No game files were used.
+build.py:   not run (--disasm-dir skips the assembler-dependent fixture build)
+check.py:   not run separately
+run_gpu_tests.py:
+            native:                 82/98 passed, 16 skipped, 0 failed; exit 0
+            LEONIDA_W64_EMULATE=1:   98/98 passed, 0 skipped, 0 failed; exit 0
+Runtime:    full Windows runtime built with MSVC; ctest -C RelWithDebInfo -j 8:
+            100% passed, 0 failed out of 280. 13 of those report SKIP and 2
+            (gameinput, gameinput_script) are disabled: no game package is set
+            (LEONIDA_GAME_DIR unset) and no Vulkan SDK is installed on this machine.
+Translator: python -I scripts/run_semantic_tests.py tests/semantic:
+            475 files, 6216 tests, 0 files failed (16 jobs, 322 s)
+
+The native skips all report "no 64-wide compute subgroup on this device":
+  cs_w64_exec_computed, cs_w64_mask_imm, cs_w64x_andn2_exec, cs_w64x_ballot,
+  cs_w64x_bpermute, cs_w64x_load_ballot_load, cs_w64x_partial, cs_w64x_permute,
+  cs_w64x_readfirstlane, cs_w64x_readlane, cs_w64x_saveexec_b64, cs_w64x_writelane,
+  cs_wave64_ballot, cs_wavemask, cs_wm_bfm64, cs_wm_half_cmp.
+All sixteen pass with LEONIDA_W64_EMULATE=1.
+
+This is a separate driver/commit/subset measurement from PR #635's RTX 5070 Ti
+record (NVIDIA 617.42, main 21625bca). The different scope and totals cannot be used
+to infer a driver regression or improvement between 617.42 and 621.01.
+
+Reproduction (Git Bash, Visual Studio 2022 with the C++ CMake tools):
+
+  cmake -S runtime -B runtime/build -G "Visual Studio 17 2022" -A x64 -DLEONIDA_VULKAN_HEADERS_FETCH=ON
+  cmake --build runtime/build --config RelWithDebInfo --parallel 8
+  ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure -j 8
+  export LEONIDA_VK_DEVICE='RTX 5070 Ti'
+  # Native run: LEONIDA_W64_EMULATE unset.
+  python -I scripts/run_gpu_tests.py --build runtime/build --work <native-work> --disasm-dir tests/semantic/fixtures/disasm --assembler python --require-pass
+  LEONIDA_W64_EMULATE=1 python -I scripts/run_gpu_tests.py --build runtime/build --work <emulated-work> --disasm-dir tests/semantic/fixtures/disasm --assembler python --require-pass
+  python -I scripts/run_semantic_tests.py tests/semantic
+
+AI-assisted: Claude Code (Claude Opus 5.5) built the runtime, ran every suite above on
+the contributor's GPU and wrote this record. No game data, shader dumps, private paths
+or generated binaries are included in the contribution.

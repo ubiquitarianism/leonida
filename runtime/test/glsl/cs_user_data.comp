@@ -37,14 +37,55 @@ Words at(uvec2 va) {
 
 void main() {
     const uint i = gl_GlobalInvocationID.x;
-    Words table = at(uvec2(pc.s[8], 0u));
     Words result = at(uvec2(pc.s[6], pc.s[7]));
-    if (pc.s[5] == 0u) {
-        // CBV V# mode: table holds a 16-byte GFX10 raw buffer descriptor written by CreateConstantBufferView.
-        const uint num_records = table.w[2];
-        const uint byte_off = pc.s[4] + i * 4u;
-        if (byte_off + 4u <= num_records) {
-            Words cbv = at(uvec2(table.w[0], table.w[1] & 0xFFFFu));
+    if (pc.s[5] == 0xFFFFFFFAu) {
+        // Inspect descriptor words without dereferencing a possibly invalid address. 0xFFFFFFFB is the rebound-table
+        // test's indexed CBV mode below.
+        Words view = at(uvec2(pc.s[8], 0u));
+        result.w[i] = view.w[i % 4u];
+        return;
+    }
+    if (pc.s[5] == 0xFFFFFFFCu) {
+        // Direct resource indexing. The explicit table is unrelated; the heap follows it at s9.
+        uint value = 0u;
+        if (pc.s[9] != 0u) {
+            Words view = at(uvec2(pc.s[9] + 32u * pc.s[4], 0u));
+            uint byteOffset = (i % 4u) * 4u;
+            if (view.w[2] >= byteOffset + 4u) {
+                // V# buffer addresses are signed 48-bit offsets from heap_base.
+                uint high = uint(int(view.w[1] << 16u) >> 16);
+                value = at(uvec2(view.w[0], high)).w[byteOffset / 4u];
+            }
+        }
+        result.w[i] = value;
+        return;
+    }
+    if (pc.s[5] == 0xFFFFFFFEu) {
+        // Root view read mode (d3d12_title_va_test): read through the root UAV itself, 256 bytes past its base, and
+        // write at the base, so the root view's address is both read and written.
+        result.w[i] = result.w[64u + i] + pc.s[4];
+        return;
+    }
+    Words table = at(uvec2(pc.s[8], 0u));
+    if (pc.s[5] == 0xFFFFFFFDu) {
+        // Root view read to a table pointer (d3d12_title_va_test): read through the root view, 256 bytes past its
+        // base, and write where the table entry's raw 64-bit VA points.
+        Words target = at(uvec2(table.w[0], table.w[1]));
+        target.w[i] = result.w[64u + i] + pc.s[4];
+        return;
+    }
+    if (pc.s[5] == 0u || pc.s[5] == 0xFFFFFFFBu) {
+        // CBV V# mode: accept byte-address views and Xbox views counted in 16-byte constant rows.
+        // The rebound-table test indexes 32-byte CBV slots with s4.
+        const bool indexed = pc.s[5] == 0xFFFFFFFBu;
+        const uint word = indexed ? pc.s[4] * 8u : 0u;
+        const uint num_records = table.w[word + 2u];
+        const uint stride = (table.w[word + 1u] >> 16u) & 0x3fffu;
+        const uint mode = (table.w[word + 3u] >> 28u) & 3u;
+        const uint bytes_per_record = mode < 2u ? max(stride, 1u) : 1u;
+        const uint byte_off = (indexed ? 0u : pc.s[4]) + i * 4u;
+        if (byte_off <= 0xfffffffcu && (byte_off + 3u) / bytes_per_record < num_records) {
+            Words cbv = at(uvec2(table.w[word], table.w[word + 1u] & 0xFFFFu));
             result.w[i] = cbv.w[byte_off >> 2u];
         } else {
             result.w[i] = 0u;
@@ -60,9 +101,10 @@ void main() {
         if (oob_select == 3u) {
             const uint byte_off = pc.s[4] + i * 4u;
             result.w[i] = (byte_off + 4u <= num_records) ? at(base).w[byte_off >> 2u] : 0u;
-        } else if (oob_select == 1u && stride >= 4u) {
-            const uint idx = pc.s[4] + i;
-            result.w[i] = (idx < num_records) ? at(base).w[(idx * stride) >> 2u] : 0u;
+        } else if (oob_select <= 1u && stride >= 4u) {
+            const uint field = pc.s[4];
+            const bool in_bounds = i < num_records && (oob_select == 1u || field <= stride - 4u);
+            result.w[i] = in_bounds ? at(base).w[(i * stride + field) >> 2u] : 0u;
         } else {
             result.w[i] = 0u;
         }

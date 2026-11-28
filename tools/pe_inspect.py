@@ -11,6 +11,11 @@ given twice with the same import search folder is inspected once. Reads the file
 The report also lists run-time load candidates: DLL names the image holds as ASCII or UTF-16 strings without
 importing them, where a LoadLibrary* the import table doesn't show would point (docs/runtime_imports.md).
 
+Each DLL's "where" is bundled (in the game folder, any case), system, shim or, on a host that isn't Windows and has
+no Wine prefix, unverified (classify_dll). On Windows, system means System32 or the OS API-set schema; elsewhere the
+Wine prefix's system32 ($WINEPREFIX, else ~/.wine) and its apisetschema.dll stand in, and the report's
+"system_dlls" says which was used.
+
 Standard library only: the headers, the section table, the import, delay-import, export, TLS and relocation
 directories are parsed with struct, so the tool runs under `python -I` without third-party packages and is covered
 by the same standard-library-only CI job as the other tools.
@@ -28,6 +33,10 @@ from collections import Counter
 from collections.abc import Iterator
 
 SYSTEM32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+# Whether this host is Windows: there SYSTEM32 and the OS API-set schema answer `system`; elsewhere a Wine prefix's
+# system32 does (classify_dll). A module flag so that a test can stand in for either host.
+IS_WINDOWS = os.name == "nt"
+RUNTIME_SHIMS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runtime", "shims")
 
 MACHINES = {0x8664: "x86-64", 0x14C: "x86", 0xAA64: "ARM64"}
 SUBSYSTEMS = {2: "GUI", 3: "Console", 14: "Xbox"}
@@ -233,12 +242,13 @@ class PeImage:
 
 def _imports(img: PeImage, kind: str, index: int, delay: bool = False) -> list[dict]:
     entries = []
-    for dll_rva, iat_rva, int_rva, _va_entries in img.import_descriptors(index, delay=delay):
-        dll = img.string_at(dll_rva)
+    for dll_rva, iat_rva, int_rva, va_entries in img.import_descriptors(index, delay=delay):
+        dll = img.string_at(dll_rva) if dll_rva > 0 else None
         if dll is None:
             continue
         lookup = int_rva if int_rva > 0 else iat_rva
-        entries.append({"dll": dll, "kind": kind, "functions": img.thunk_names(lookup) if lookup > 0 else []})
+        entries.append({"dll": dll, "kind": kind,
+                        "functions": img.thunk_names(lookup, va_entries=va_entries) if lookup > 0 else []})
     return entries
 
 
@@ -278,6 +288,245 @@ def _exports(img: PeImage) -> list[str]:
         if i not in named and has_export_at(i):
             names.append(f"#{base + i}")
     return names
+
+
+# The resource directory (data directory 2) and its RT_VERSION block. The version block names the build, and its
+# values are free UTF-16 text that can name the title, so the report never holds a value: the fixed info's numbers,
+# the languages, the standard key names and, per value, its length and SHA-256. Neither are the names of named
+# resource types or of a key outside VERSION_KEYS, which are counted or hashed instead. A damaged tree or block is
+# reported in "problems" (offsets and counts only) and never stops the report.
+DIR_RESOURCE = 2
+RT_VERSION = 16
+RT_NAMES = {1: "CURSOR", 2: "BITMAP", 3: "ICON", 4: "MENU", 5: "DIALOG", 6: "STRING", 7: "FONTDIR", 8: "FONT",
+            9: "ACCELERATOR", 10: "RCDATA", 11: "MESSAGETABLE", 12: "GROUP_CURSOR", 14: "GROUP_ICON", 16: "VERSION",
+            17: "DLGINCLUDE", 19: "PLUGPLAY", 20: "VXD", 21: "ANICURSOR", 22: "ANIICON", 23: "HTML", 24: "MANIFEST"}
+# The StringFileInfo keys the VERSIONINFO documentation defines; any other key is reported by its hash.
+VERSION_KEYS = frozenset({"Comments", "CompanyName", "FileDescription", "FileVersion", "InternalName",
+                          "LegalCopyright", "LegalTrademarks", "OriginalFilename", "PrivateBuild", "ProductName",
+                          "ProductVersion", "SpecialBuild"})
+VS_FIXED_SIGNATURE = 0xFEEF04BD
+VS_FF = {0x01: "DEBUG", 0x02: "PRERELEASE", 0x04: "PATCHED", 0x08: "PRIVATEBUILD", 0x10: "INFOINFERRED",
+         0x20: "SPECIALBUILD"}
+VOS = {0x00000: "UNKNOWN", 0x00004: "WINDOWS32", 0x10000: "DOS", 0x40000: "NT", 0x10001: "DOS_WINDOWS16",
+       0x10004: "DOS_WINDOWS32", 0x40004: "NT_WINDOWS32"}
+VFT = {0: "UNKNOWN", 1: "APP", 2: "DLL", 3: "DRV", 4: "FONT", 5: "VXD", 7: "STATIC_LIB"}
+VERSION_KEY_LIMIT = 256  # characters; a block key longer than this is not a key
+
+
+def _sha256(text: str) -> str:
+    import hashlib  # here, not with the imports at the top, which other open changes edit
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _align4(at: int) -> int:
+    return (at + 3) & ~3
+
+
+def _vs_block(data: bytes, at: int, end: int) -> dict | None:
+    """One version block (wLength, wValueLength, wType, szKey, Value, Children) at `at`, read no further than `end`:
+    the key, where its value and children start and where it ends. None when the header or key doesn't fit, or the
+    length is shorter than a header."""
+    if at + 6 > end:
+        return None
+    length, value_length, kind = struct.unpack_from("<HHH", data, at)
+    if length < 6:
+        return None
+    stop = min(at + length, end)
+    key_end = None
+    for i in range(at + 6, min(stop - 1, at + 6 + 2 * VERSION_KEY_LIMIT), 2):
+        if data[i] == 0 and data[i + 1] == 0:
+            key_end = i
+            break
+    if key_end is None:
+        return None
+    value = _align4(key_end + 2)
+    value_size = value_length * 2 if kind == 1 else value_length
+    return {"key": data[at + 6:key_end].decode("utf-16-le", errors="replace"), "kind": kind,
+            "value": min(value, stop), "value_end": min(value + value_size, stop),
+            "children": min(_align4(value + value_size), stop), "end": stop, "cut": at + length > end}
+
+
+def _vs_children(data: bytes, block: dict, what: str, problems: list[str]) -> list[dict]:
+    """The child blocks of `block`. Zero bytes after the last child are padding; a child that can't be read ends the
+    list with a problem."""
+    out, at = [], block["children"]
+    while at + 6 <= block["end"] and len(out) < MAX_ENTRIES:
+        if not struct.unpack_from("<H", data, at)[0]:
+            break
+        child = _vs_block(data, at, block["end"])
+        if child is None:
+            problems.append(f"version block: {what} child at +{at:#x} is malformed")
+            break
+        if child["cut"]:
+            problems.append(f"version block: {what} child at +{at:#x} runs past its parent")
+        out.append(child)
+        at = _align4(child["end"])
+    return out
+
+
+def _version_info(data: bytes, problems: list[str]) -> dict:
+    """VS_VERSIONINFO read from the bytes of one RT_VERSION resource. String values are returned as length and
+    SHA-256 (of the value as UTF-8, without its terminating NUL), never as text."""
+    out = {"fixed": None, "translations": [], "string_tables": [], "string_count": 0, "other_blocks": 0}
+    root = _vs_block(data, 0, len(data))
+    if root is None:
+        problems.append("version block: VS_VERSIONINFO header is malformed")
+        return out
+    if root["cut"]:
+        problems.append(f"version block: declares more bytes than the resource's {len(data)}")
+    if root["key"] != "VS_VERSION_INFO":
+        problems.append("version block: key is not VS_VERSION_INFO")
+    fixed_at, fixed_end = root["value"], root["value_end"]
+    if fixed_end - fixed_at >= 52:
+        (signature, struct_version, file_ms, file_ls, product_ms, product_ls, flags_mask, flags, os_id, file_type,
+         subtype, date_ms, date_ls) = struct.unpack_from("<13I", data, fixed_at)
+        if signature != VS_FIXED_SIGNATURE:
+            problems.append(f"version block: VS_FIXEDFILEINFO signature {signature:#x} is not "
+                            f"{VS_FIXED_SIGNATURE:#x}")
+        else:
+            out["fixed"] = {
+                "file_version": f"{file_ms >> 16}.{file_ms & 0xFFFF}.{file_ls >> 16}.{file_ls & 0xFFFF}",
+                "product_version": f"{product_ms >> 16}.{product_ms & 0xFFFF}.{product_ls >> 16}."
+                                   f"{product_ls & 0xFFFF}",
+                "struct_version": f"{struct_version >> 16}.{struct_version & 0xFFFF}",
+                "flags_mask": flags_mask, "flags": flags,
+                "flag_names": [name for bit, name in VS_FF.items() if flags & flags_mask & bit],
+                "os": os_id, "os_name": VOS.get(os_id),
+                "type": file_type, "type_name": VFT.get(file_type), "subtype": subtype,
+                "date": (date_ms << 32) | date_ls,
+            }
+    elif fixed_end > fixed_at:
+        problems.append(f"version block: VS_FIXEDFILEINFO is {fixed_end - fixed_at} bytes, not 52")
+    for child in _vs_children(data, root, "VS_VERSIONINFO", problems):
+        if child["key"] == "StringFileInfo":
+            for table in _vs_children(data, child, "StringFileInfo", problems):
+                key = table["key"]
+                lang = key.lower() if re.fullmatch(r"[0-9A-Fa-f]{8}", key) else None
+                if lang is None:
+                    problems.append("version block: a string table's key is not 8 hex digits")
+                strings = []
+                for s in _vs_children(data, table, "string table", problems):
+                    raw = data[s["value"]:s["end"]]
+                    value = raw[:len(raw) & ~1].decode("utf-16-le", errors="replace").split("\0", 1)[0]
+                    entry = {"key": s["key"]} if s["key"] in VERSION_KEYS else {"key": None,
+                                                                               "key_sha256": _sha256(s["key"])}
+                    entry.update({"chars": len(value), "sha256": _sha256(value)})
+                    strings.append(entry)
+                out["string_tables"].append({"lang_codepage": lang, "strings": strings})
+                out["string_count"] += len(strings)
+        elif child["key"] == "VarFileInfo":
+            for var in _vs_children(data, child, "VarFileInfo", problems):
+                if var["key"] != "Translation":
+                    out["other_blocks"] += 1
+                    continue
+                for at in range(var["value"], var["value_end"] - 3, 4):
+                    lang, codepage = struct.unpack_from("<HH", data, at)
+                    out["translations"].append(f"{lang:04x}{codepage:04x}")
+        else:
+            out["other_blocks"] += 1
+    return out
+
+
+def _resources(img: PeImage) -> dict:
+    """The resource directory: the types it holds and the first RT_VERSION block (_version_info). The tree is read
+    three levels deep (type, name, language) inside the file bytes the directory's RVA maps to; a directory reached
+    a second time (a loop, or two entries sharing a subdirectory) is not read again."""
+    out = {"present": False, "types": [], "named_types": 0, "version": None, "problems": []}
+    problems = out["problems"]
+    rva, size = img.directory(DIR_RESOURCE)
+    if not rva or not size:
+        return out
+    out["present"] = True
+    bounds = img._range(rva)
+    if bounds is None:
+        problems.append(f"resource directory RVA {rva:#x} has no file bytes")
+        return out
+    base, end = bounds
+    data = img.data
+    seen: set[int] = set()
+    budget = [MAX_ENTRIES]
+
+    def entries(offset: int, level: str) -> list[tuple[int | None, int, bool]]:
+        """(id, None for a named entry; child offset; child is a directory) of the directory at `offset`."""
+        if offset in seen:
+            problems.append(f"resource tree: {level} directory at +{offset:#x} is reached a second time "
+                            "(a loop or a shared subdirectory)")
+            return []
+        seen.add(offset)
+        at = base + offset
+        if at + 16 > end:
+            problems.append(f"resource tree: {level} directory at +{offset:#x} is past the end of its file bytes")
+            return []
+        named, ids = struct.unpack_from("<HH", data, at + 12)
+        rows = []
+        for i in range(named + ids):
+            entry = at + 16 + i * 8
+            if entry + 8 > end:
+                problems.append(f"resource tree: {level} directory at +{offset:#x} is cut short after {i} of "
+                                f"{named + ids} entries")
+                break
+            if budget[0] <= 0:
+                problems.append(f"resource tree: more than {MAX_ENTRIES} entries; the rest are not read")
+                break
+            budget[0] -= 1
+            name, child = struct.unpack_from("<II", data, entry)
+            rows.append((None if name & 0x80000000 else name, child & 0x7FFFFFFF, bool(child & 0x80000000)))
+        return rows
+
+    # (type id or None, language, data entry offset) of every leaf, in tree order
+    leaves: list[tuple[int | None, int | None, int]] = []
+    for type_id, type_at, type_dir in entries(0, "type"):
+        if type_id is None:
+            out["named_types"] += 1
+        if not type_dir:
+            problems.append(f"resource tree: a type entry points at data (+{type_at:#x}), not a directory")
+            continue
+        for _name, name_at, name_dir in entries(type_at, "name"):
+            if not name_dir:
+                leaves.append((type_id, None, name_at))
+                continue
+            for lang, leaf_at, leaf_dir in entries(name_at, "language"):
+                if leaf_dir:
+                    problems.append(f"resource tree: a language entry points at a directory (+{leaf_at:#x}); "
+                                    "only three levels are read")
+                    continue
+                leaves.append((type_id, lang, leaf_at))
+
+    types: dict[int | None, dict] = {}
+    for type_id, lang, leaf_at in leaves:
+        at = base + leaf_at
+        name = "(named)" if type_id is None else RT_NAMES.get(type_id, f"#{type_id}")
+        row = types.setdefault(type_id, {"type": name, "id": type_id, "entries": 0, "bytes": 0})
+        row["entries"] += 1
+        if at + 16 > end:
+            problems.append(f"resource tree: data entry at +{leaf_at:#x} is past the end of its file bytes")
+            continue
+        data_rva, data_size, codepage = struct.unpack_from("<III", data, at)
+        row["bytes"] += data_size
+        if type_id != RT_VERSION or out["version"] is not None:
+            continue
+        span = img._range(data_rva) if data_size else None
+        if span is None:
+            problems.append(f"version block: data RVA {data_rva:#x} ({data_size} bytes) has no file bytes")
+            continue
+        start, stop = span
+        avail = min(data_size, stop - start)
+        if avail < data_size:
+            problems.append(f"version block: {data_size} bytes declared, {avail} in the file")
+        version = {"language": lang, "codepage": codepage, "size": data_size}
+        version.update(_version_info(bytes(data[start:start + avail]), problems))
+        out["version"] = version
+    out["types"] = sorted(types.values(), key=lambda t: (t["id"] is None, t["id"] or 0))
+    return out
+
+
+def resources(img: PeImage) -> dict:
+    """_resources, with a table it misreads anyway reported as a problem instead of stopping the report."""
+    try:
+        return _resources(img)
+    except (struct.error, IndexError) as e:
+        return {"present": True, "types": [], "named_types": 0, "version": None,
+                "problems": [f"resource directory: truncated or corrupt table ({e})"]}
 
 
 def _export_module_name(img: PeImage) -> str:
@@ -373,16 +622,193 @@ def dll_strings(data: bytes, imported: set[str], own_name: str | tuple[str, ...]
             for n, e in sorted(seen.items()) if n not in skip]
 
 
+# Host DLLs the runtime's shim registry does not own although a SHIM_TABLE lists them: only a few of their functions
+# are replaced (runtime/shims/registry.cpp, owns_dll). API sets are never owned either.
+_SHIM_HOST_DLLS = frozenset({"kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
+                             "vulkan-1.dll", "ntdll.dll", "user32.dll", "ws2_32.dll", "wsock32.dll",
+                             "advapi32.dll"})
+_SHIM_TABLE_DLL = re.compile(r'[{(]\s*"([A-Za-z0-9_.\-]+\.[dD][lL][lL])"\s*[,)]')
+_shim_dlls_cache: dict[str, frozenset[str]] = {}
+
+
+def _shim_table_bodies(text: str) -> list[str]:
+    """The argument text of every SHIM_TABLE(...) in a source file (parentheses matched; export names hold none)."""
+    bodies = []
+    at = text.find("SHIM_TABLE(")
+    while at >= 0:
+        start = i = at + len("SHIM_TABLE(")
+        depth = 1
+        while i < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[i], 0)
+            i += 1
+        bodies.append(text[start:i - 1])
+        at = text.find("SHIM_TABLE(", i)
+    return bodies
+
+
+def runtime_shim_dlls(folder: str = RUNTIME_SHIMS) -> frozenset[str]:
+    """Lower-cased names of the DLLs the runtime's shims own (owns_dll in runtime/shims/registry.cpp): every DLL a
+    SHIM_TABLE in `folder`'s .cpp files lists, less the host DLLs and API sets the registry only patches. Empty when
+    the sources are not there (a copy of this tool outside the repository)."""
+    key = os.path.abspath(folder)
+    if key not in _shim_dlls_cache:
+        names: set[str] = set()
+        try:
+            files = sorted(n for n in os.listdir(folder) if n.endswith(".cpp"))
+        except OSError:
+            files = []
+        for n in files:
+            try:
+                with open(os.path.join(folder, n), encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for body in _shim_table_bodies(text):
+                names.update(m.lower() for m in _SHIM_TABLE_DLL.findall(body))
+        _shim_dlls_cache[key] = frozenset(
+            n for n in names if n not in _SHIM_HOST_DLLS and not n.startswith(("api-ms-", "ext-ms-")))
+    return _shim_dlls_cache[key]
+
+
+_listing_cache: dict[tuple[str, int], dict[str, str]] = {}
+
+
+def _file_names(folder: str) -> dict[str, str]:
+    """{lower-cased name: name on disk} of the files in `folder` (empty when it can't be read). Read once per folder
+    state: the key holds the folder's mtime, which changes when a file is added, removed or renamed."""
+    try:
+        stamp = os.stat(folder).st_mtime_ns
+    except OSError:
+        return {}
+    key = (os.path.abspath(folder), stamp)
+    if key not in _listing_cache:
+        try:
+            with os.scandir(folder) as entries:
+                _listing_cache[key] = {e.name.lower(): e.name for e in entries if e.is_file()}
+        except OSError:
+            _listing_cache[key] = {}
+    return _listing_cache[key]
+
+
+def wine_system32() -> str | None:
+    """On a host that isn't Windows, the Wine prefix's system32, which stands in for System32:
+    $WINEPREFIX/drive_c/windows/system32 when WINEPREFIX is set, else ~/.wine's. None when that folder is missing (a
+    WINEPREFIX that names no prefix is not replaced by ~/.wine, which would answer for another prefix)."""
+    prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
+    path = os.path.join(prefix, "drive_c", "windows", "system32")
+    return path if os.path.isdir(path) else None
+
+
+def system_dll_source() -> tuple[str, str | None]:
+    """Where `system` is checked on this host: ("windows", SYSTEM32), ("wine-prefix", <the prefix's system32>), or
+    ("none", None) on a host that isn't Windows and has no Wine prefix."""
+    if IS_WINDOWS:
+        return "windows", SYSTEM32
+    path = wine_system32()
+    return ("wine-prefix", path) if path else ("none", None)
+
+
+_wine_apiset_cache: dict[tuple[str, int], frozenset[str]] = {}
+
+
+def _schema_contracts(data: bytes) -> frozenset[str]:
+    """The contracts an API-set schema (an .apiset section) maps to a host DLL. Version 6 only, the layout of
+    Windows 10 and later and of Wine: a header of version, size, flags, count, entry offset, hash offset and hash
+    factor; a 24-byte namespace entry of flags, name offset, name length, hashed length, value offset and value count;
+    a 20-byte value entry of flags, name offset, name length, value offset and value length. Each contract is the
+    lower-cased name cut at its hashed length (up to the last hyphen), which is what a lookup compares."""
+    if len(data) < 28 or struct.unpack_from("<I", data, 0)[0] != 6:
+        return frozenset()
+    count, entries = struct.unpack_from("<II", data, 12)
+    found = set()
+    for i in range(min(count, MAX_ENTRIES)):
+        at = entries + i * 24
+        if at + 24 > len(data):
+            break
+        _flags, name_at, _name_len, hashed_len, values_at, value_count = struct.unpack_from("<6I", data, at)
+        if name_at + hashed_len > len(data):
+            continue
+        hosts = 0
+        for v in range(min(value_count, MAX_ENTRIES)):
+            value = values_at + v * 20
+            if value + 20 > len(data):
+                break
+            hosts += struct.unpack_from("<I", data, value + 16)[0] > 0
+        if hosts:
+            found.add(data[name_at:name_at + hashed_len].decode("utf-16-le", errors="replace").lower())
+    return frozenset(found)
+
+
+def wine_apisets(system32: str) -> frozenset[str]:
+    """The API-set contracts the prefix's apisetschema.dll resolves (_schema_contracts); empty when the file, its
+    .apiset section or a version-6 schema is missing. Wine resolves API sets this way and installs no file for most
+    of them."""
+    disk = _file_names(system32).get("apisetschema.dll")
+    if disk is None:
+        return frozenset()
+    path = os.path.join(system32, disk)
+    try:
+        key = (os.path.abspath(path), os.stat(path).st_mtime_ns)
+    except OSError:
+        return frozenset()
+    if key not in _wine_apiset_cache:
+        try:
+            with open(path, "rb") as f:
+                img = PeImage(f.read())
+            section = next((s for s in img.sections if s["name"] == ".apiset"), None)
+            _wine_apiset_cache[key] = _schema_contracts(img.section_data(section) if section else b"")
+        except (OSError, PeFormatError, struct.error):
+            _wine_apiset_cache[key] = frozenset()
+    return _wine_apiset_cache[key]
+
+
+def _apiset_key(name: str) -> str:
+    """An API-set name as a schema lookup compares it: lower case, without ".dll" and the part after the last
+    hyphen."""
+    base = name.lower()
+    if base.endswith(".dll"):
+        base = base[:-4]
+    return base.rsplit("-", 1)[0]
+
+
+def _bundled(name: str, game_dir: str | None) -> bool:
+    """Ships in the game folder, compared without case as Windows does: an import of MSVCP140.dll finds the package's
+    msvcp140.dll on a case-sensitive file system too."""
+    if not game_dir:
+        return False
+    return os.path.isfile(os.path.join(game_dir, name)) or name.lower() in _file_names(game_dir)
+
+
+# The values of an import's "where". "unverified" is reported only on a host that isn't Windows and has no Wine
+# prefix: the DLL is not bundled and the runtime's shims don't own it, so it is most likely a system DLL, but there
+# was nothing to check it against. The Markdown report shows it as "system (unverified)".
+CLASSES = ("bundled", "system", "shim", "unverified")
+LABELS = {"unverified": "system (unverified)"}
+
+
 def classify_dll(name: str, game_dir: str | None) -> str:
-    """bundled = ships beside the game, system = present on this Windows, shim = must be reimplemented."""
-    if game_dir and os.path.isfile(os.path.join(game_dir, name)):
+    """One of CLASSES. bundled = ships beside the game; system = present on this Windows, or in the Wine prefix's
+    system32 (or its API-set schema) on another host; shim = must be reimplemented; unverified = on a host that isn't
+    Windows and has no Wine prefix, neither bundled nor owned by the runtime's shims (runtime_shim_dlls)."""
+    if _bundled(name, game_dir):
         return "bundled"
     low = name.lower()
-    if low.startswith("api-ms-win-") or low.startswith("ext-ms-win-"):
-        # API sets resolve through the OS schema: ask this Windows whether it knows the contract.
-        return "system" if _apiset_resolves(name) else "shim"
-    if os.path.isfile(os.path.join(SYSTEM32, name)):
+    apiset = low.startswith("api-ms-win-") or low.startswith("ext-ms-win-")
+    if IS_WINDOWS:
+        if apiset:
+            # API sets resolve through the OS schema: ask this Windows whether it knows the contract.
+            return "system" if _apiset_resolves(name) else "shim"
+        if os.path.isfile(os.path.join(SYSTEM32, name)):
+            return "system"
+        return "shim"
+    system32 = wine_system32()
+    if system32 is None:
+        # Nothing to check against: only a module the runtime's shims own is known to need a shim.
+        return "shim" if not apiset and low in runtime_shim_dlls() else "unverified"
+    if low in _file_names(system32):
         return "system"
+    if apiset:
+        return "system" if _apiset_key(name) in wine_apisets(system32) else "shim"
     return "shim"
 
 
@@ -422,6 +848,7 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         entry["where"] = classify_dll(entry["name"], game_dir)
     pdata_rva, pdata_size = img.directory(DIR_EXCEPTION)
     reloc_rva, reloc_size = img.directory(DIR_BASERELOC)
+    checked, system_dir = system_dll_source()
 
     return {
         "file": os.path.basename(path),
@@ -435,6 +862,7 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         "entry_rva": hex(img.entry_rva),
         "has_relocs": bool(reloc_rva and reloc_size),
         "dynamic_base": bool(img.dll_characteristics & 0x40),
+        "resources": resources(img),
         "sections": sections,
         "imports": imports,
         "export_count": len(exports),
@@ -442,7 +870,21 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         "pdata_functions": pdata_size // 12 if pdata_rva and pdata_size >= 12 else 0,
         "tls_callbacks": _tls_callbacks(img),
         "runtime_load_candidates": loads,
+        # Where `system` was checked: "windows" (System32 and the OS API-set schema), "wine-prefix" (its system32
+        # and apisetschema.dll) or "none" (no Wine prefix on a host that isn't Windows: see "unverified").
+        "system_dlls": {"checked": checked, "dir": system_dir},
     }
+
+
+def system_dlls_note(r: dict) -> str | None:
+    """One line on where system DLLs were checked, for a report made on a host that isn't Windows; None otherwise."""
+    info = r.get("system_dlls") or {}
+    if info.get("checked") == "wine-prefix":
+        return f"System DLLs checked in the Wine prefix's `{info['dir']}`."
+    if info.get("checked") == "none":
+        return ("System DLLs could not be checked: no Wine prefix (set `WINEPREFIX`, or make `~/.wine`). A DLL that "
+                "is not bundled and that the runtime's shims don't own is listed as `system (unverified)`.")
+    return None
 
 
 def to_markdown(r: dict) -> str:
@@ -460,17 +902,21 @@ def to_markdown(r: dict) -> str:
     by_where = Counter()
     for imp in r["imports"]:
         by_where[imp["where"]] += len(imp["functions"])
-    out.append(", ".join(f"{k}: {v}" for k, v in sorted(by_where.items())) or "none")
+    out.append(", ".join(f"{LABELS.get(k, k)}: {v}" for k, v in sorted(by_where.items())) or "none")
+    note = system_dlls_note(r)
+    if note:
+        out += ["", note]
     out += ["", "| dll | kind | resolves | functions |", "|---|---|---|---|"]
     for imp in sorted(r["imports"], key=lambda i: (i["where"] != "shim", i["dll"].lower())):
-        out.append(f"| {imp['dll']} | {imp['kind']} | {imp['where']} | {len(imp['functions'])} |")
+        out.append(f"| {imp['dll']} | {imp['kind']} | {LABELS.get(imp['where'], imp['where'])} | "
+                   f"{len(imp['functions'])} |")
     loads = r.get("runtime_load_candidates", [])
     if loads:
         out += ["", "## Run-time load candidates", "",
                 "DLL names held as strings but not imported: a `LoadLibrary*` the import table doesn't show "
                 "(a string is where to look, not proof of a load).", "",
                 "| dll | encoding | resolves |", "|---|---|---|"]
-        out += [f"| {d['name']} | {d['encoding']} | {d['where']} |" for d in loads]
+        out += [f"| {d['name']} | {d['encoding']} | {LABELS.get(d['where'], d['where'])} |" for d in loads]
     shims = [i for i in r["imports"] if i["where"] == "shim"]
     if shims:
         out += ["", "## Needs checking or a shim", ""]
@@ -479,7 +925,57 @@ def to_markdown(r: dict) -> str:
             out.append("")
             out.append(", ".join(f"`{f}`" for f in imp["functions"]))
             out.append("")
+    out += resources_markdown(r.get("resources"))
     return "\n".join(out) + "\n"
+
+
+def resources_markdown(res: dict | None) -> list[str]:
+    """The resource section of the Markdown report: types and counts, then the version block without its values."""
+    if not res or not res["present"]:
+        return ["", "## Resources", "", "none"]
+    out = ["", "## Resources", ""]
+    types = ", ".join(f"{t['type']} {t['entries']} ({t['bytes']:,} bytes)" for t in res["types"])
+    out.append(f"- types: {types or 'none'}" + (f"; named types: {res['named_types']}" if res["named_types"] else ""))
+    out += [f"- problem: {p}" for p in res["problems"]]
+    v = res["version"]
+    if v is None:
+        out += ["", "No version block (RT_VERSION)."]
+        return out
+    out += ["", "### Version block", ""]
+    lang = "-" if v["language"] is None else f"{v['language']:#06x}"
+    out.append(f"- resource language {lang}, code page {v['codepage']}, {v['size']:,} bytes")
+    f = v["fixed"]
+    if f:
+        out.append(f"- file version {f['file_version']}, product version {f['product_version']}")
+        out.append(f"- flags: {', '.join(f['flag_names']) or 'none'} (flags {f['flags']:#x}, mask "
+                   f"{f['flags_mask']:#x}); OS {f['os_name'] or hex(f['os'])}; type "
+                   f"{f['type_name'] or f['type']}, subtype {f['subtype']}; date {f['date']}")
+    else:
+        out.append("- no VS_FIXEDFILEINFO")
+    out.append(f"- translations: {', '.join(v['translations']) or 'none'}; string tables: "
+               f"{', '.join(t['lang_codepage'] or '?' for t in v['string_tables']) or 'none'}; "
+               f"other blocks: {v['other_blocks']}")
+    if v["string_count"]:
+        out += ["", f"{v['string_count']} string values, not shown: each is listed by key with its length and the "
+                "start of its SHA-256 (the JSON has the full hash). A key outside the standard names is listed by "
+                "its hash too.", "", "| table | key | chars | sha256 |", "|---|---|---|---|"]
+        for t in v["string_tables"]:
+            for s in t["strings"]:
+                key = s["key"] or f"(other, {s['key_sha256'][:16]})"
+                out.append(f"| {t['lang_codepage'] or '?'} | {key} | {s['chars']} | {s['sha256'][:16]} |")
+    return out
+
+
+def version_summary(r: dict) -> str | None:
+    """The stdout line for an image with a version block: numbers and counts only."""
+    res = r.get("resources") or {}
+    v = res.get("version")
+    if v is None:
+        return f"{r['file']}: resource directory problems: {len(res['problems'])}" if res.get("problems") else None
+    f = v["fixed"]
+    numbers = f"file {f['file_version']}, product {f['product_version']}" if f else "no fixed info"
+    return (f"{r['file']}: version block {numbers}, {v['string_count']} string keys (values not shown)"
+            + (f", problems: {len(res['problems'])}" if res["problems"] else ""))
 
 
 def same_output_path(first: str, second: str) -> bool:
@@ -498,6 +994,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--game-dir")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "pe"))
     a = ap.parse_args(argv)
+    if a.game_dir is not None and not os.path.isdir(a.game_dir):
+        print(f"ERROR: --game-dir {a.game_dir} does not exist or is not a directory", file=sys.stderr)
+        return 2
     missing = [img for img in a.image if not os.path.exists(img)]
     if missing:
         for img in missing:
@@ -514,6 +1013,7 @@ def main(argv: list[str] | None = None) -> int:
     rc = 0
     seen_paths: set[tuple[str, str]] = set()
     used_names: set[str] = set()
+    notes: list[str] = []
     for img in a.image:
         search_dir = a.game_dir or os.path.dirname(os.path.abspath(img))
         key = (os.path.normcase(os.path.realpath(img)), os.path.normcase(os.path.abspath(search_dir)))
@@ -558,14 +1058,24 @@ def main(argv: list[str] | None = None) -> int:
                 json.dump(r, f, indent=1)
             with open(md_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(to_markdown(r))
+            version = version_summary(r)  # numbers and counts only, never a value of the block
+            if version:
+                print(version)
         except OSError as e:
             print(f"{img}: cannot write report ({e.strerror or e})", file=sys.stderr)
             rc = 1
             continue
         enc = [s["name"] for s in r["sections"] if s["looks_encrypted"]]
         shim = sum(len(i["functions"]) for i in r["imports"] if i["where"] == "shim")
+        unverified = sum(len(i["functions"]) for i in r["imports"] if i["where"] == "unverified")
         print(f"{r['file']:<40} {r['machine']:<7} subsys={r['subsystem']!s:<7} pdata={r['pdata_functions']:<7} "
-              f"shim-imports={shim:<5} encrypted={','.join(enc) or '-'}")
+              f"shim-imports={shim:<5} encrypted={','.join(enc) or '-'}"
+              + (f" unverified-imports={unverified}" if unverified else ""))
+        note = system_dlls_note(r)
+        if note and note not in notes:
+            notes.append(note)
+    for note in notes:  # once per run, after the per-image lines; only on a host that isn't Windows
+        print(note.replace("`", ""))
     return rc
 
 

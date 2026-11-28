@@ -10,6 +10,7 @@
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
 #include "test_temp_dir.h"
+#include "d3d12_test_shaders.h"
 #include "vk_test_device.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
@@ -42,7 +43,6 @@ using XboxComputePipelineFn = HRESULT(WINAPI*)(void* device, const D3D12_COMPUTE
                                                std::uint64_t, const IID*, void**);
 // Device slot 67 as amd_fidelityfx_upscaler_xbox.dll calls it: (desc, riid, out).
 using XboxNativeComputePipelineFn = HRESULT(WINAPI*)(void* device, const void*, const IID*, void**);
-using SerializeFn = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
 
 template<class T>
 struct Ref {
@@ -103,19 +103,9 @@ std::vector<std::uint8_t> shader_container(const std::vector<std::uint8_t>& fssm
     return out;
 }
 
+// The shared helper: Windows 10's in-box d3d12.dll refuses the heap-directly-indexed flags at every version.
 std::vector<std::uint8_t> serialize(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc) {
-    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    const auto fn = d3d12 ? reinterpret_cast<SerializeFn>(
-                                reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12SerializeVersionedRootSignature")))
-                          : nullptr;
-    std::vector<std::uint8_t> out;
-    ID3DBlob* blob = nullptr;
-    if (fn && SUCCEEDED(fn(&desc, &blob, nullptr)) && blob) {
-        const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
-        out.assign(p, p + blob->GetBufferSize());
-        blob->Release();
-    }
-    return out;
+    return d3d12test::serialize_root_signature(desc);
 }
 
 D3D12_RESOURCE_DESC buffer_desc(UINT64 bytes, D3D12_RESOURCE_FLAGS flags) {
@@ -308,6 +298,7 @@ int main() {
         srv_struct_b(elements), srv_typed(elements), srv_null(elements);
     {
         rt::d3d12::VulkanDeviceInfo info{};
+        info.prepare_on_bind=d.prepare_on_bind;
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
         info.physical = d.physical;
@@ -321,7 +312,7 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
 
         // Root signature: [0] two constants (s4, s5), [1] a root UAV (s6:s7), [2] a one-CBV table (s8, its 32-bit VA):
@@ -494,6 +485,14 @@ int main() {
                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                             IID_PPV_ARGS(&inside.p))));
             EXPECT(inside->GetGPUVirtualAddress() + (1u << 20) <= capped_arena);
+            // The existing buffer and the reserved range prevent a contiguous arena-sized allocation.
+            // A valid default buffer can still use a dedicated allocation and report a usable relative VA.
+            const auto no_slice = buffer_desc(capped_arena, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            Ref<ID3D12Resource> dedicated;
+            EXPECT(SUCCEEDED(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &no_slice,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&dedicated.p))));
+            EXPECT(dedicated->GetGPUVirtualAddress() >= capped_arena);
             EXPECT(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &too_large, D3D12_RESOURCE_STATE_COMMON,
                                                   nullptr, IID_PPV_ARGS(&past.p)) == E_OUTOFMEMORY && !past.p);
             std::printf("arena: %llu MiB (device limits: maxBufferSize %llu MiB, maxMemoryAllocationSize %llu MiB); "
@@ -558,6 +557,127 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                                    IID_PPV_ARGS(&list.p))));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+
+        // Direct and indirect compute commands snapshot the bound shader heaps after s4..s8.
+        // Rebinding just the resource heap clears the sampler for the later command.
+        {
+            auto direct_desc = root_desc;
+            direct_desc.Desc_1_0.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                                         D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+            const auto direct_blob = serialize(direct_desc);
+            Ref<ID3D12RootSignature> direct_root;
+            EXPECT(SUCCEEDED(device->CreateRootSignature(0, direct_blob.data(), direct_blob.size(), IID_PPV_ARGS(&direct_root.p))));
+            auto pipeline_desc = pso_desc;
+            pipeline_desc.pRootSignature = direct_root.p;
+            Ref<ID3D12PipelineState> direct_pso;
+            EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&direct_pso.p))));
+            Ref<ID3D12DescriptorHeap> sampler;
+            auto sampler_desc = heap_desc;
+            sampler_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&sampler_desc, IID_PPV_ARGS(&sampler.p))));
+            const auto smp = reinterpret_cast<XboxHeapHandleFn>(slot(sampler.p, 10))(sampler.p);
+            const D3D12_INDIRECT_ARGUMENT_DESC arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
+            const D3D12_COMMAND_SIGNATURE_DESC signature_desc{12, 1, &arg, 0};
+            Ref<ID3D12CommandSignature> signature;
+            EXPECT(SUCCEEDED(device->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature.p))));
+            list->SetPipelineState(direct_pso.p);
+            list->SetComputeRootSignature(direct_root.p);
+            ID3D12DescriptorHeap* both[] = {sampler.p, heap.p};
+            list->SetDescriptorHeaps(2, both);
+            list->SetComputeRootDescriptorTable(2, {gpu + 32});
+            list->Dispatch(1, 1, 1);
+            Ref<ID3D12CommandAllocator> bundle_allocator;
+            Ref<ID3D12GraphicsCommandList> bundle;
+            EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle_allocator.p))));
+            EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.p, nullptr,
+                                                       IID_PPV_ARGS(&bundle.p))));
+            bundle->Dispatch(1, 1, 1);
+            EXPECT(SUCCEEDED(bundle->Close()));
+            list->ExecuteBundle(bundle.p);
+            list->SetDescriptorHeaps(1, &heap.p);
+            list->ExecuteIndirect(signature.p, 1, out_a.p, 0, nullptr, 0);
+            list->SetDescriptorHeaps(1, &sampler.p);
+            list->ExecuteIndirect(signature.p, 1, out_a.p, 0, nullptr, 0);
+            // 27 constants starting at s4 leave room for one heap. At 28, s31 is explicit too.
+            for (UINT count : {27u, 28u}) {
+                auto constants_param = params[0];
+                constants_param.Constants.Num32BitValues = count;
+                auto full_desc = direct_desc;
+                full_desc.Desc_1_0.NumParameters = 1;
+                full_desc.Desc_1_0.pParameters = &constants_param;
+                const auto blob = serialize(full_desc);
+                Ref<ID3D12RootSignature> full;
+                EXPECT(SUCCEEDED(device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&full.p))));
+                pipeline_desc.pRootSignature = full.p;
+                Ref<ID3D12PipelineState> full_pso;
+                EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&full_pso.p))));
+                list->SetPipelineState(full_pso.p);
+                list->SetComputeRootSignature(full.p);
+                list->SetComputeRoot32BitConstant(0, 123, count - 1);
+                list->SetDescriptorHeaps(2, both);
+                list->Dispatch(1, 1, 1);
+            }
+            EXPECT(SUCCEEDED(list->Close()));
+            std::vector<leonida::Command> commands;
+            EXPECT(rt::d3d12::recorded_commands(list.p, commands) && commands.size() == 6);
+            const auto& before = std::get<leonida::Dispatch>(commands[0]).user_data;
+            const auto& after = std::get<leonida::ExecuteIndirect>(commands[2]).user_data;
+            char setting[2]{};
+            const bool enabled = GetEnvironmentVariableA("LEONIDA_COMPUTE_DIRECT_HEAPS", setting, 2) != 1 ||
+                                 setting[0] != '0';
+            EXPECT(before[8] == gpu + 32 && before[9] == (enabled ? gpu : 0) && before[10] == (enabled ? smp : 0));
+            EXPECT(after[8] == gpu + 32 && after[9] == (enabled ? gpu : 0) && after[10] == 0);
+            EXPECT(std::get<leonida::Dispatch>(commands[1]).user_data == before);
+            const auto& sampler_only = std::get<leonida::ExecuteIndirect>(commands[3]).user_data;
+            EXPECT(sampler_only[9] == 0 && sampler_only[10] == (enabled ? smp : 0));
+            const auto& one_slot = std::get<leonida::Dispatch>(commands[4]).user_data;
+            EXPECT(one_slot[30] == 123 && one_slot[31] == (enabled ? gpu : 0));
+            EXPECT(std::get<leonida::Dispatch>(commands[5]).user_data[31] == 123);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            // The shader follows the V# at the heap index in s4. Slot 1 and the unrelated explicit table are null.
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = DXGI_FORMAT_R32_TYPELESS;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srv.Buffer.NumElements = 4;
+            srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            device->CreateShaderResourceView(nullptr, &srv, {cpu + 32});
+            device->CreateShaderResourceView(constants.p, &srv, {cpu + 2 * 32});
+            list->SetComputeRootSignature(direct_root.p);
+            list->SetPipelineState(direct_pso.p);
+            list->SetDescriptorHeaps(2, both);
+            list->SetComputeRootDescriptorTable(2, {gpu + 32});
+            list->SetComputeRootUnorderedAccessView(1, va_a);
+            for (UINT index = 1; index <= 2; ++index) {
+                const UINT inputs[] = {index, 0xfffffffcu};
+                list->SetComputeRoot32BitConstants(0, 2, inputs, 0);
+                list->Dispatch(1, 1, 1);
+                const auto copy = transition(out_a.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                             D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &copy);
+                list->CopyBufferRegion(readback.p, (index - 1) * bytes, out_a.p, 0, bytes);
+                const auto resume = transition(out_a.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                list->ResourceBarrier(1, &resume);
+            }
+            EXPECT(SUCCEEDED(list->Close()));
+            ID3D12CommandList* submitted[] = {list.p};
+            queue->ExecuteCommandLists(1, submitted);
+            Ref<ID3D12Fence> done;
+            EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done.p))));
+            EXPECT(SUCCEEDED(queue->Signal(done.p, 1)) && SUCCEEDED(done->SetEventOnCompletion(1, nullptr)));
+            void* results{};
+            EXPECT(SUCCEEDED(readback->Map(0, nullptr, &results)));
+            const auto* values = static_cast<const UINT*>(results);
+            for (UINT i = 0; i < elements; ++i) {
+                EXPECT(values[i] == 0);
+                EXPECT(values[elements + i] == (enabled ? table_values[i % 4] : 0));
+            }
+            readback->Unmap(0, nullptr);
+            std::puts(enabled ? "directly indexed compute heap: 64 buffer reads and 64 null controls matched"
+                              : "directly indexed compute heap disabled: 128 zero controls matched");
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        }
 
         // Misuse is reported by Close: a dispatch without a pipeline, a root view set on a constants parameter.
         list->Dispatch(1, 1, 1);
@@ -683,6 +803,8 @@ int main() {
             device->CreateConstantBufferView(&cbv_a, slot_cpu(1));
             device->CreateConstantBufferView(&cbv_b, slot_cpu(2));
 
+            wchar_t raw_env[2]{};
+            const bool raw_cbv = GetEnvironmentVariableW(L"LEONIDA_CBV_RAW", raw_env, 2) == 1 && raw_env[0] == L'1';
             // Decode the written V# in slots 1 and 2 and verify every field + zeroed trailing 16 bytes.
             for (const auto& [slot_idx, expected_va] :
                  {std::pair{1u, std::uint64_t(cb_va)}, std::pair{2u, std::uint64_t(cb_va + 256)}}) {
@@ -691,11 +813,16 @@ int main() {
                 leonida::gfx10::Buffer decoded{};
                 EXPECT(leonida::gfx10::decode(raw, decoded));
                 EXPECT(decoded.address == expected_va);
-                EXPECT(decoded.stride == 0);
-                EXPECT(decoded.num_records == 256);
-                EXPECT(decoded.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT));
-                EXPECT(decoded.swizzle == leonida::gfx10::identity_swizzle);
-                EXPECT(decoded.oob_select == leonida::gfx10::OobSelect::raw);
+                if (raw_cbv) {
+                    EXPECT(decoded.stride == 0 && decoded.num_records == 256);
+                    EXPECT(decoded.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT));
+                    EXPECT(decoded.swizzle == leonida::gfx10::identity_swizzle);
+                    EXPECT(decoded.oob_select == leonida::gfx10::OobSelect::raw);
+                } else {
+                    EXPECT(decoded.stride == 16 && decoded.num_records == 16);
+                    EXPECT(decoded.oob_select == leonida::gfx10::OobSelect::structured_with_offset);
+                    EXPECT(raw[3] == 0x0002403Cu);
+                }
                 EXPECT(std::memcmp(reinterpret_cast<const std::uint8_t*>(slot_cpu(slot_idx).ptr) + 16, zeros, 16) == 0);
             }
 
@@ -772,7 +899,7 @@ int main() {
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &deny_buf_desc,
                                                              D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                              IID_PPV_ARGS(&srv_deny.p))));
-            const auto srv_rb_desc = buffer_desc(6 * bytes, D3D12_RESOURCE_FLAG_NONE);
+            const auto srv_rb_desc = buffer_desc(8 * bytes, D3D12_RESOURCE_FLAG_NONE);
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &srv_rb_desc,
                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                              IID_PPV_ARGS(&srv_readback.p))));
@@ -848,10 +975,10 @@ int main() {
                 EXPECT(decode_slot(3, d3));
                 EXPECT(d3.address == srv_va && d3.stride == 16 && d3.num_records == 32 &&
                        d3.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT) &&
-                       d3.oob_select == leonida::gfx10::OobSelect::structured);
+                       d3.oob_select == leonida::gfx10::OobSelect::structured_with_offset);
                 EXPECT(decode_slot(4, d4));
                 EXPECT(d4.address == srv_va + 256 && d4.stride == 16 && d4.num_records == 32 &&
-                       d4.oob_select == leonida::gfx10::OobSelect::structured);
+                       d4.oob_select == leonida::gfx10::OobSelect::structured_with_offset);
                 EXPECT(decode_slot(5, d5));
                 const leonida::gfx10::Swizzle want_swz = {leonida::gfx10::select_z, leonida::gfx10::select_y,
                                                           leonida::gfx10::select_x, leonida::gfx10::select_one};
@@ -887,7 +1014,7 @@ int main() {
             EXPECT(expect_zero_srv(srv_default.p, &bad));             // out of bounds (70 * 16 > 1024)
             EXPECT(expect_zero_srv(nullptr, &raw_a));                 // null resource -> null V#
 
-            // Upload buffer contents to arena and dispatch 6 GPU passes through the shader-visible descriptor table.
+            // Upload buffer contents to arena and dispatch 8 GPU passes through the shader-visible descriptor table.
             // out_a is already in D3D12_RESOURCE_STATE_UNORDERED_ACCESS at the end of the CBV pass.
             EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
             list->CopyBufferRegion(srv_default.p, 0, srv_upload.p, 0, buf_bytes);
@@ -901,6 +1028,7 @@ int main() {
             const struct SrvDispatch {
                 UINT slot_idx;
                 UINT readback_offset;
+                UINT field_offset = 0;
             } srv_dispatches[] = {
                 {1, 0 * bytes},
                 {2, 1 * bytes},
@@ -908,10 +1036,12 @@ int main() {
                 {4, 3 * bytes},
                 {5, 4 * bytes},
                 {7, 5 * bytes},
+                {3, 6 * bytes, 16},  // first dword past the structured record
+                {5, 7 * bytes, 16},  // same offset with the typed index-only check
             };
-            const std::uint32_t srv_mode[2] = {0u, 0xFFFFFFFFu};  // s1 == 0xFFFFFFFF selects buffer SRV V# mode
-            list->SetComputeRoot32BitConstants(0, 2, srv_mode, 0);
             for (const auto& cfg : srv_dispatches) {
+                const std::uint32_t args[2] = {cfg.field_offset, 0xFFFFFFFFu};
+                list->SetComputeRoot32BitConstants(0, 2, args, 0);
                 list->SetComputeRootDescriptorTable(2, slot_gpu(cfg.slot_idx));
                 list->Dispatch(1, 1, 1);
                 const auto to_src =
@@ -937,6 +1067,11 @@ int main() {
             std::memcpy(srv_struct_b.data(), rb + 3 * bytes, bytes);
             std::memcpy(srv_typed.data(), rb + 4 * bytes, bytes);
             std::memcpy(srv_null.data(), rb + 5 * bytes, bytes);
+            const auto* cross_record = static_cast<const std::uint32_t*>(srv_res) + 6 * elements;
+            for (UINT i = 0; i < elements; ++i) {
+                EXPECT(cross_record[i] == 0u);
+                EXPECT(cross_record[elements + i] == (i < 24 ? 0x50000u + (9u + i) * 4u : 0u));
+            }
         }
 
         for (auto* r : {&out_a, &out_b, &out_c, &constants, &readback}) r->reset();

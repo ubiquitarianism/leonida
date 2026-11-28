@@ -227,7 +227,7 @@ std::vector<Case> cases() {
         // Enhanced barriers (ID3D12GraphicsCommandList7::Barrier). LayoutAfter UNDEFINED says the contents are no
         // longer needed; the retail title ends a depth buffer's use that way (sync DEPTH_STENCIL -> NONE, access
         // DEPTH_STENCIL_WRITE -> NO_ACCESS), and the layer failed the list's Close for it. The WARP column of these
-        // three rows was measured on Windows 11 26340 (#984), not on the build the header names.
+        // four rows was measured on Windows 11 26340 (#984), not on the build the header names.
         {"Barrier: depth DEPTH_STENCIL_WRITE -> COPY_SOURCE", true, match,
          [](Env& e) {
              return texture_barrier(e, e.depth.p, D3D12_BARRIER_SYNC_DEPTH_STENCIL, D3D12_BARRIER_SYNC_COPY,
@@ -245,6 +245,12 @@ std::vector<Case> cases() {
              return texture_barrier(e, e.tex.p, D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_SYNC_NONE,
                                     D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_NO_ACCESS,
                                     D3D12_BARRIER_LAYOUT_COMMON, D3D12_BARRIER_LAYOUT_UNDEFINED);
+         }},
+        {"Barrier: texture UNDEFINED -> UNDEFINED", true, match,
+         [](Env& e) {
+             return texture_barrier(e, e.tex.p, D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_SYNC_NONE,
+                                    D3D12_BARRIER_ACCESS_NO_ACCESS, D3D12_BARRIER_ACCESS_NO_ACCESS,
+                                    D3D12_BARRIER_LAYOUT_UNDEFINED, D3D12_BARRIER_LAYOUT_UNDEFINED);
          }},
         // CopyBufferRegion
         {"CopyBufferRegion of 0 bytes", true, match, CALLS(e.list->CopyBufferRegion(e.buffer.p, 0, e.upload.p, 0, 0))},

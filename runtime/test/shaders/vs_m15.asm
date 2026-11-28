@@ -2,9 +2,11 @@
 ; translated game VS that fetch without the driver's fetch program do. Run: d3d12_translated_draw_test (the VS through
 ; a D3D12 graphics PSO found by the SHA-256 of its FSSM program).
 ;
-; User data, from the root signature [0] descriptor table, [1] four 32-bit constants (docs/d3d12_vulkan.md 3.5):
-;   s[0:1] = console VA of the table's first slot: the 16 bytes of a V# (base VA, stride 32, 9 records)
-;   s2, s3 = the draw's clip-space offset (x, y) as floats;   s4, s5 = used by the pixel shader (s4: bias)
+; User data, from the root signature [0] descriptor table, [1] four 32-bit constants, in the console's graphics layout
+; (from s8, one dword per table: the heaps live below 4 GiB):
+;   s8 = console VA of the table's first slot: the 16 bytes of a V# (base VA, stride 32, 9 records)
+;   s9, s10 = the draw's clip-space offset (x, y) as floats;   s11, s12 = used by the pixel shader (s11: bias)
+; The first four instructions move them to s[0:1] (the high dword 0, as the game's shaders force s9 to 0), s2 and s3.
 ; v0 = VertexIndex. The draw has BaseVertex 0 and BaseInstance 0, so v0 is the same with and without the translator's
 ; zero-based ids (PR 436): both give 0, 1, 2, ... for DrawInstanced(n, 1, 0, 0). A non-zero StartVertexLocation would
 ; make the two differ (hardware: zero-based, base in an SGPR), so the test never uses one.
@@ -13,6 +15,10 @@
 ;   param0 = colour
 ; fssm-at: 0x10
 ; fssm-data: 0x35314d56 0x20535620
+s_mov_b32 s0, s8
+s_mov_b32 s1, 0
+s_mov_b32 s2, s9
+s_mov_b32 s3, s10
 s_load_dwordx4 s[8:11], s[0:1], 0x0
 s_waitcnt lgkmcnt(0)
 buffer_load_dwordx4 v[4:7], v0, s[8:11], 0 idxen

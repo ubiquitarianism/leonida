@@ -73,6 +73,14 @@ void fixed_cases() {
     index.insert(0x3000, 0, 4);
     check(index.size() == 2 && at(index, 0) == 0 && at(index, 0x3000) == 0, "a null VA or an empty range is not indexed");
 
+    // The padding of an old title window can contain the next index view's start.
+    // Replay needs one backing from that start through the last index, even when the view grows.
+    Index windows;
+    windows.insert(0x10000, 0x10000, 1);
+    check(windows.covers(0x1fff0, 16) && !windows.covers(0x1fff0, 18), "whole view must fit in its window");
+    windows.insert(0x10000, 0x20000, 2);
+    check(windows.covers(0x1fff0, 18) && !windows.covers(0x1fff0, UINT64_MAX), "grown window and an oversized view");
+
     // Aliasing placed buffers: a long one with two short ones inside it. The nearest start that holds the VA wins.
     Index alias;
     alias.insert(0x10000, 0x10000, 10);  // [0x10000, 0x20000)
@@ -321,8 +329,20 @@ void time_miss_after_free() {
 
 } // namespace
 
+void signed_id_cases() {
+    BufferVaIndex<int> index;
+    index.insert(0x1000, 0x100, 0);
+    index.insert(0x1000, 0x100, 7);
+    index.insert(0x2000, 0x100, -5);
+    BufferVaIndex<int>::Hit hit{};
+    check(index.find(0x1000, hit, 1) && hit.id == 7, "signed Id: exact start picks larger positive id");
+    check(index.find(0x1050, hit, 1) && hit.id == 7, "signed Id: interior lookup hits");
+    check(index.find(0x2000, hit, 1) && hit.id == -5, "signed Id: negative id at exact start hits");
+}
+
 int main(int argc, char** argv) {
     fixed_cases();
+    signed_id_cases();
     allocation_failures();
     random_tables();
     if (failures) {

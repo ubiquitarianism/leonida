@@ -1,0 +1,58 @@
+GPU:        NVIDIA GeForce RTX 4060 (Ada / AD107, 8 GB, PCI 10de:2882)
+Driver:     NVIDIA 621.14 (proprietary), Vulkan 1.4.357
+Subgroup:   32..32 (default 32)
+OS:         Windows 11 Pro 26H2, build 26300.9974
+Commit:     626d1281af490b0a888443d6b0b7cb5433b94abe (main, 2026-11-25)
+Tools:      llvm-mc 21.1.8 (built with scripts\build_llvm_mc.ps1, AMDGPU target),
+            Vulkan SDK 1.4.363.0 (SPIRV-Tools v2026.4, glslang 16.6.0),
+            CMake 3.31.6 + Ninja 1.12.1 (VS 2022 Build Tools),
+            MSVC 19.44 (toolset 14.44.35207), Windows SDK 10.0.26100.0, Python 3.14.5
+CPU:        13th Gen Intel Core i5-13600KF
+RAM:        31.84 GiB reported
+
+run_gpu_tests.py:
+            273/273 shaders translated and passed spirv-val in both modes.
+            Native: 209/263 passed, 53 skipped, 1 failed.
+            LEONIDA_W64_EMULATE=1: 243/263 passed, 19 skipped, 1 failed.
+
+Failed:     cs_imgatomic_ext in both modes: "6 of 64 sint words differ;
+            first word 32: got 0x0badf00d, expected 0x00000101". This is the
+            failure #1518 fixes; with #1518's change applied, cs_imgatomic,
+            cs_imgatomic3d and cs_imgatomic_ext pass 3/3 in both modes here.
+
+Skipped:    Native: 35 need a 64-wide subgroup (33 "no 64-wide compute
+            subgroup", 1 "no 64-wide subgroup", 1 "cannot require a 64-wide
+            fragment subgroup"), 18 cases run by other test programs
+            (d3d12_*_test, w64_graphics.py).
+            Emulated: the same 18, plus the 64-wide fragment one.
+
+Disasm subset (--disasm-dir tests/semantic/fixtures/disasm, no llvm-mc),
+same build, for comparison with the subset record in #1178:
+            102/102 shaders translated and passed spirv-val.
+            Native: 82/99 passed, 17 skipped, 0 failed.
+            LEONIDA_W64_EMULATE=1: 99/99 passed.
+
+Runtime:    RelWithDebInfo, Windows native build (ctest -j 6).
+            381 registered, 2 disabled (gameinput, gameinput_script: no SDL3);
+            368 passed, 11 skipped, 0 failed.
+
+Runtime skips (11; LEONIDA_GAME_DIR is unset and VK_LAYER_KHRONOS_validation
+is not enabled):
+  shader_library_corpus, bink_decode, bink_abi, bink_play_headless,
+  bink_audio, fsr_dispatch, bvh_builder, vk_sync_validation,
+  d3d12_rgb9e5_rtv, d3d12_boot_movie, d3d12_first_light.
+
+Notes:
+- Built with cmake -S runtime -B <build> -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+  -DLEONIDA_REQUIRE_VULKAN=ON from a VS 2022 vcvars64 prompt, with the Vulkan
+  SDK Bin folder on PATH and LLVM_MC set.
+- scripts\build_runtime.ps1 picks the newest Visual Studio; with VS 2026 Build
+  Tools 18.6 (MSVC 14.51) the linker crashed on the fixture targets
+  (LNK1000: Internal error during IncrCalcPtrs), which #1147 addresses.
+  VS 2022 builds cleanly.
+- xma_decoder not built (no cargo), GameInput shim not built (no SDL3).
+- No game files involved: run_gpu_tests.py assembles its own RDNA2 fixtures
+  with llvm-mc and runs the translated SPIR-V on the Vulkan device.
+- AI-assisted (Claude Code): built main and ran ctest and run_gpu_tests.py,
+  native and under LEONIDA_W64_EMULATE=1, on the owner's machine. The numbers
+  are the runners' own output. No game data.

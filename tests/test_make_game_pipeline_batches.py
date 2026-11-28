@@ -134,6 +134,18 @@ class PipelineBatchesTest(unittest.TestCase):
         self.assertEqual(json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8")), self.names)
         self.assertTrue(all(r["args"][r["args"].index("--jobs") + 1] == "2" for r in completed))
 
+    def test_bvh_pipelines_are_added_to_the_runtime_seed(self):
+        bvh = self.spirv / "bvh"
+        bvh.mkdir()
+        (bvh / "index.json").write_text('{"b_0": {}}', encoding="utf-8")
+        (bvh / "control.json").write_text("{}", encoding="utf-8")
+        code, _, err = self.invoke()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads((self.out / "pipeline_cache.bin").read_text(encoding="utf-8")),
+                         self.names + ["b_0"])
+        rows = [json.loads(line) for line in (bvh / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([row["selected"] for row in rows if row["event"] == "completed"], [["b_0"]])
+
     def test_collective_memory_crash_splits_without_skipping_healthy_modules(self):
         code, logs, err = self.invoke({"max_batch": 2})
         self.assertEqual(code, 0, err)

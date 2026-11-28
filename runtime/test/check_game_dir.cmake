@@ -1,7 +1,8 @@
 # Run the stand-in game from its own folder by bare name, as a player would (`gta6rt --run game.exe`), and again
 # with `--game-dir .`. In both, GAME: has to name that folder as an absolute path: the guest moves its current
 # directory away and then reads GAME:\tiny_game_probe.txt (argument game-file). Before, a bare name left GAME: with
-# an empty root (`console paths: GAME: -> , writes -> overlay`) and the open failed with ERROR_PATH_NOT_FOUND.
+# an empty root (`console paths: GAME: -> , writes -> overlay`) and the open failed with ERROR_PATH_NOT_FOUND. The line
+# also names T:'s folder, this process's own below <overlay>\.gta6rt-temp.
 # The verdict is checked from the output, as check_loaded_gdk.cmake does, because under Wine an exit status alone
 # can look successful.
 get_filename_component(guest_dir "${GUEST}" DIRECTORY)
@@ -23,7 +24,7 @@ foreach(variant "bare" "dot")
   # An absolute GAME: root: a drive letter (Windows, and Wine's Z:) or a leading slash, and an overlay inside it.
   if(NOT code STREQUAL "0" OR NOT output MATCHES "(^|\n)tiny_game: PASS GAME:"
       OR NOT output MATCHES "(^|\n)tiny_game: OK(\n|$)"
-      OR NOT output MATCHES "(^|\n)console paths: GAME: -> ([A-Za-z]:|[\\/])[^\n]*, writes -> ([A-Za-z]:|[\\/])[^\n]*overlay(\n|$)"
+      OR NOT output MATCHES "(^|\n)console paths: GAME: -> ([A-Za-z]:|[\\/])[^\n]*, writes -> ([A-Za-z]:|[\\/])[^\n]*overlay, T: -> ([A-Za-z]:|[\\/])[^\n]*overlay[\\/]\\.gta6rt-temp[\\/][0-9]+-[0-9]+-[0-9]+-pid[0-9]+(\n|$)"
       OR NOT output MATCHES "(^|\n)game exited with code 0(\n|$)")
     string(APPEND failures "--- ${variant}: returned ${code}\n${output}\n")
   endif()

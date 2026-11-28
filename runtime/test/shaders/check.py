@@ -100,14 +100,17 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
            ("cs_workgroup_yz", "2x3x4", "workgroup_yz")]
 COMPUTE += [("cs_bvh32", "1", "bvh")]   # TEST-184: image_bvh_intersect_ray, the 32-bit node pointer; same scene and words
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800, 0x40ff8000, 0x3ff00000]
+CS_SMEM_VCC = list(range(0x7210, 0x7218))
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 # -0, and NaN checks that need SignedZeroInfNanPreserve (cs_signed_zero_nan.asm); 0 in out[4..7] means it's missing
 SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007c00]
+CVT_F16_MODS_WORDS = [0xFFC4A000, 0x33800000, 0x36800000, 0xAAAA0001, 0xAAAA03FF, 0xAAAA0000, 0xAAAA0000, 0xAAAA0001]
 WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
+                "cs_w32_cvt_f16_mods",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
                 "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
-                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec",
+                "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_w32_andn2_exec",
                 "cs_mask_vgpr_exec", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi",
                 "cs_w32_exec_computed")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
@@ -116,7 +119,8 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
 # otherwise pick a narrower size and return different words (#774).
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const",
-                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_andn2_exec", "cs_mask_vgpr_exec", "cs_w32_permlane_fi",
+                     "cs_w32_cvt_f16_mods",
+                     "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_w32_andn2_exec", "cs_mask_vgpr_exec", "cs_w32_permlane_fi",
                      "cs_w32_exec_computed")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_row", [0, 0, 1, 2, 3, 4, 5, 6]),
@@ -127,10 +131,13 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_bank", [0xffffffff, 0xfffffffe, 0xfffffffd, 0xfffffffc, 7, 7, 7, 7]),
           ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777]),
           # a VOPC compare with a DPP src0: 1 for the pair compare, 2 for the dpp8 one (cs_dpp_cmp.asm header)
-          ("cs_dpp_cmp", [3, 2, 3, 2, 1, 0, 1, 0])]
+          ("cs_dpp_cmp", [3, 2, 3, 2, 1, 0, 1, 0]),
+          # v_cmpx with a DPP src0: 1 where the plain compare keeps the lane, 2 for the negated one (cs_dpp_cmpx.asm)
+          ("cs_dpp_cmpx", [1, 1, 0, 0, 3, 3, 2, 2])]
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
 WAVE32_LANE_DUMPS += tuple(n for n, _ in CS_DPP)
-CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
+CS_DUMPS = [*CS_DPP, ("cs_smem_vcc_base", CS_SMEM_VCC), ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
+            ("cs_w32_cvt_f16_mods", CVT_F16_MODS_WORDS),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
             # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
@@ -163,6 +170,12 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # ds_wrxchg*_rtn_b64, ds_or_rtn_b64, ds_min_f32, ds_max_rtn_f32 (cs_lds_xchg64_ext.asm header)
             ("cs_lds_xchg64_ext", [0x11110003, 0x33333333, 0xF00FF000, 0x04030201,
                                0x40302010, 0x70500705, 0x3FC00000, 0x80000000]),
+            # ds_wrxchg2_rtn_b32's pair cases and ds_wrxchg2st64_rtn_b32
+            # (cs_w32_wrxchg2_ext.asm / cs_w32_wrxchg2st64.asm headers)
+            ("cs_w32_wrxchg2_ext", [0x77777777, 0x88880008, 0x99990009, 0xDEADBEEF,
+                                    0xAAAAAAAA, 0xBBBBBBBB, 0x12341234, 0x56785678]),
+            ("cs_w32_wrxchg2st64", [0x33333333, 0x44444444, 0x55550005, 0x66660006,
+                                    0xB0B00084, 0xB0B00088, 0xB0B00140, 0xB0B002C0]),
             # ds_mskor, ds_and/xor_b64, ds_add_rtn_f32, ds_inc/dec/rsub_u32 (cs_lds_atomics_ext.asm header)
             ("cs_lds_atomics_ext", [0xF0F11234, 0xAB34CD78, 0x12345678, 0xF0F00F0F,
                                     0xA5A55A5A, 0x00AA00AA, 0x7FB00000, 0xFE090700]),
@@ -695,6 +708,33 @@ def frexp_ldexp_test(tools, spirv, env=None):
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
 USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
+# cs_w32_salu_ext.asm: the sixteen operand words vk_compute_test puts in s4..s19, and the 73 words the shader stores
+# (each derived in its header; tests/test_gpu_salu_ext.py recomputes them with the reference of tools/salu_diff.py).
+SALU_EXT_SGPRS = [0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x00000001, 0x12345678, 0xDEADBEEF, 0x0000FF80, 0x00000025,
+                  0x00000040, 0x00000000, 0x00000001, 0x80000001, 0xFFFF0000, 0xFFFFFFFF, 0x00000000, 0x00000047]
+SALU_EXT_WORDS = [
+    0xFFFFFFFF, 0x12345677, 0xCC89A887, 0x00000000, 0x33765778, 0x00000000, 0xCC99E897, 0x00000000,
+    0xFC000000, 0x00000000, 0x00000000, 0x12345680, 0x01F3266F, 0x00000011, 0x80000000, 0x00000001,
+    0x00000000, 0x12345678, 0x00000008, 0x00000000, 0x80000000, 0x1233D678, 0x7FFFFFFF, 0x0FD5BDEE,
+    0xBEEF5678, 0xDEAD1234, 0x1E6A2C48, 0x00000001, 0xFFFFFFFF, 0x0000001F, 0x00000010, 0xFFFFFFFF,
+    0x00000000, 0xFFFFFF80, 0x00000078, 0xFFFFFFDF, 0x00000020, 0xC962FC98, 0x12345678, 0xFFFF8000,
+    0x00000040, 0x00000000, 0x00000001, 0x80000001, 0xFFFF0000, 0xFFFFFFDF, 0xFFFFFF7F, 0xFFFFFFFF,
+    0x00000000, 0x00000020, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x02000000, 0xFF000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000020, 0x00000080, 0x00000080, 0x00000000, 0x00000000, 0x07FFFFFF,
+    0x00000000, 0x00000000, 0x00000000, 0x00000010, 0x00000000, 0x0056D555, 0x000D5555, 0x00555555,
+    0x0000015B]
+SALU_EXT_HEAP_WORDS = 80   # the 73 results, then words that must keep the harness's fill
+
+
+def salu_ext_test(tools, spirv, env=None):
+    """cs_w32_salu_ext: 38 scalar ALU ops on the operands of SALU_EXT_SGPRS, every destination and SCC stored. The
+    whole 80-word heap is compared: the 73 results and the untouched fill after them."""
+    child = dict(os.environ if env is None else env, VKC_SGPRS=",".join(f"{w:#x}" for w in SALU_EXT_SGPRS))
+    child.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_w32_salu_ext") or 32))
+    expected = SALU_EXT_WORDS + [0xEEEEEEEE] * (SALU_EXT_HEAP_WORDS - len(SALU_EXT_WORDS))
+    return dump_test(tools, spirv, "cs_w32_salu_ext", expected, SALU_EXT_HEAP_WORDS, child)
+
+
 # cs_fma_fused.asm: single-rounded f32 multiply-adds (and one f16). The operands arrive in s4..s7 so no driver can fold
 # them; FMA_FUSED are the exact single-rounded words and FMA_SPLIT are the exact split-rounded words (derivations in
 # the .asm header; out[7] is f16 round-to-odd, never GLSL Fma, so it is always 0x7351). Under --fma khr
@@ -715,6 +755,9 @@ CVT_F32_SAT_CASES = (
 CVT_PK_U8_WORDS = [0x1122330C, 0x11220E44, 0x11003344, 0xFE223344, 0x1122330D, 0x11220044, 0x11FF3344, 0x00223344]
 # v_pk_mul_lo_u16 with a constant operand (cs_pk_mul_lo_const.asm), measured natively on RDNA2 (gfx1036); lanes 0 and 1.
 PK_MUL_LO_WORDS = [0x00009E88, 0x03675433, 0x00230000, 0x00077F6C] * 2
+# Its 32 lanes store 16 bytes each, 128 words: more than the 64 vk_compute_test gives one group by default, so lanes
+# 16-31 wrote past the buffer through its device address (VUID-RuntimeSpirv-PhysicalStorageBuffer64-11819, GPU-AV).
+PK_MUL_LO_ENV = {"VKC_OUT_WORDS": "128"}
 # Wave64-only dump tests (mostly the x = cross-half checks): exact results need 64 lanes, or an emulation of them
 # on narrower subgroups. cs_dpp_w64 is not cross-half, but its lane id needs both halves.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
@@ -743,10 +786,13 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               # s_andn2_saveexec_b64 / s_andn2_wrexec_b64: EXEC = S0 & ~EXEC over both halves, D old / new EXEC, SCC
               ("cs_w64x_andn2_exec", [1, 16, 32, 4144, 2052, 3, 8, 1544]),
               # s_and/s_or_saveexec_b64 (VCC and SGPR-pair sources), s_andn2_saveexec/wrexec_b64 (SGPR pair): D, EXEC, SCC
-              ("cs_w64x_saveexec_b64", [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171])]
+              ("cs_w64x_saveexec_b64", [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171]),
+              # SHADER-W64-SDST-PAIR: v_cmp_* / carry-out SGPR destinations printed as one register (no mattr line)
+              ("cs_w64x_cmp_sdst", [10240, 6144, 2053, 8224, 7714, 6184, 4144, 5])]
 # A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
-                ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
+                ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0]),
+                ("cs_w64x_partial_swizzle", [508, 523, 0, 0, 528, 0, 531, 0])]
 PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               # exp mrt0 done (no vm) with every lane on, EXEC off afterwards: written (.asm header, measured on gfx1036)
               "ps_exp_color_mask": (0x40000000, 0x40800000, 0x40000000, 0x40800000),
@@ -760,6 +806,7 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_ops7": (0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003),
               "ps_ops8": (0x80000000, 0xbfffffff, 0x000f100e, 0x0f0f0f1f),
               "ps_f32_mods": (0xc0256a01, 0x3f800000, 0x41e00000, 0x3fc00000),
+              "ps_exp_f32_denorm": (0x01000000, 0x00800000, 0x00000000, 0x00000000),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xbffefff2, 0x3c003344, 0xbff70000),
               # 16-bit SDWA results with dst_sel:DWORD zero the high half (.asm header, measured on gfx1036)
               "ps_sdwa_dword_hi": (0x00004000, 0x00000003, 0x00004700, 0x0000c000),
@@ -773,7 +820,7 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_scc_logic32": (0x0fff0fff, 0x000f000f, 0xf00ff00f, 0x36),
               "ps_scc_logic64": (0x0fff0fff, 0xff000000, 0xff0000ff, 0x16),
               "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
-              "ps_f64_mods": (0x40040000, 0x3ff00000, 0x3fe40000, 0x3ff00000),
+              "ps_f64_mods": (0x3ff40000, 0x3ff00000, 0x3ff00000, 0x3fd00000),
               "ps_f64_round": (0xc12af665, 0x3fe7ffff, 0xbfffffff, 0xc12af666),
               "ps_outmods_f16": (0xaaaa3c00, 0xaaaa3e00, 0x7c000000, 0x3c000000),
               # f16 op_sel, partial writes, inline constants: words measured on RDNA2 hardware (.asm headers)
@@ -1086,7 +1133,7 @@ def fmt_sint32_test(tools, spirv, env=None):
 
 
 def fmt_all_test(tools, spirv, env=None):
-    """cs_fmt_all: 28 loads, the inputs, 15 stores, and the untouched words between (316 words in all). Wave32, one
+    """cs_fmt_all: 32 loads, the inputs, 20 stores, and the untouched words between (336 words in all). Wave32, one
     thread: the translator recorded 32 for it, so the run is pinned to a 32-wide subgroup like compute_test does."""
     env = dict(os.environ if env is None else env)
     env.setdefault("VKC_SUBGROUP_SIZE", str(subgroup_size(spirv, "cs_fmt_all") or 32))
@@ -2008,6 +2055,20 @@ def mandelbrot_counts(w):
     return counts
 
 
+def exp_f32_denorm_problem(px):
+    if len(px) != 4096:
+        return f"expected 4096 pixels, got {len(px)}"
+    for i, pixel in enumerate(px):
+        x = i % 64
+        result = (0x01000000, 0x00800000)[x] if x < 2 else 0
+        exponent = struct.unpack('<I', struct.pack('<f', -125.0 - x))[0]
+        column = struct.unpack('<I', struct.pack('<f', float(x)))[0]
+        expected = (result, exponent, column, result)
+        if tuple(pixel) != expected:
+            return f"pixel {i}: got {pixel}, expected {expected}"
+    return ''
+
+
 def mandelbrot_problem(px):
     """ps_mandelbrot: channel 3 is the lane's iteration count. A lane that leaves EXEC too early or late, or a loop
     that ends on the wrong branch, changes counts; the colour channels are only for looking at the frame."""
@@ -2121,6 +2182,8 @@ def pixel_test(tools, spirv, name):
         c = collections.Counter((a, b) for a, b, _, _ in px)
         fine = c[(8, 1)] and c[(8, 0)] and c[(7, 0)] and set(c) <= {(8, 1), (8, 0), (7, 0)}
         return "" if fine else f"(s5, bit) counts {dict(c)}"
+    if name == "ps_exp_f32_denorm_rt":
+        return exp_f32_denorm_problem(px)
     if name == "ps_mandelbrot":
         return mandelbrot_problem(px)
     return "no check written for this shader"
@@ -2152,6 +2215,32 @@ def clip_test(tools, spirv, name):
             if wrong:
                 return f"x={clip_x} y={clip_y}: {wrong} of 4096 pixels differ"
     return ""
+
+
+def texture_uav_test(tools, spv):
+    """The Windows D3D12 test compares every texel itself, through both Vulkan and WARP."""
+    if os.name != "nt":
+        return Skip("SKIP (needs the Windows D3D12 runtime)")
+    exe = os.path.join(tools, "d3d12_texture_uav_test" + EXE)
+    if not os.path.isfile(exe):
+        return f"missing {exe}"
+    code, out = run(exe, spv)
+    if code == UNSUPPORTED:
+        reason = next((line for line in out.splitlines() if line.startswith("SKIP:")), "unsupported device")
+        return Skip(reason)
+    return "" if code == 0 else failure(code, out, 8)
+
+
+IMAGE_STORE_CASES = {
+    "cs_imgstore": (),
+    "cs_imgstore_cube": ("cube",),   # GPU-CUBE-STORE: six-layer 2D-array views at bindings 11/12/13
+    "cs_imgload": ("load",),
+    "cs_imgload_tfe": ("load",),
+    "cs_imgload_d16": ("load-d16",),
+    "cs_imgload_d16_tfe": ("load-d16",),
+    "cs_sample_lz_int_d16": ("load-d16",),
+    "cs_imgload_mip": ("load-mip",),
+}
 
 
 def main():
@@ -2187,6 +2276,7 @@ def main():
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
+    results.append(("cs_w32_salu_ext", salu_ext_test(tools, spirv)))
     results.append(("cs_heap_init", compute_test(tools, spirv, "cs_heap_init", "1", "dump",
                                                  expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
     results.append(("cs_w32_shift64", shift64_test(tools, spirv)))
@@ -2198,7 +2288,7 @@ def main():
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
                                                  expected_words=CVT_PK_U8_WORDS)))
     results.append(("cs_pk_mul_lo_const", compute_test(tools, spirv, "cs_pk_mul_lo_const", "1", "dump",
-                                                       expected_words=PK_MUL_LO_WORDS)))
+                                                       expected_words=PK_MUL_LO_WORDS, env=PK_MUL_LO_ENV)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))
@@ -2208,10 +2298,7 @@ def main():
     results.append(("ms_wave_info_s3", mesh_w64x_test(tools, spirv, "ms_wave_info_s3")))
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
-    for name, args in (("cs_imgstore", []), ("cs_imgstore_cube", ["cube"]), ("cs_imgload", ["load"]),
-                       ("cs_imgload_tfe", ["load"]),
-                       ("cs_imgload_d16", ["load-d16"]), ("cs_imgload_d16_tfe", ["load-d16"]),
-                       ("cs_sample_lz_int_d16", ["load-d16"])):
+    for name, args in IMAGE_STORE_CASES.items():
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs
             m = re.search(r"unsupported: .*", out)
@@ -2219,6 +2306,9 @@ def main():
             continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
+    texture_uav_spv = os.path.join(spirv, "cs_texture_uav.spv")
+    if os.path.isfile(texture_uav_spv):
+        results.append(("cs_texture_uav", texture_uav_test(tools, texture_uav_spv)))
     for name in STORE_WORDS:   # TEST-184: image atomics and image_get_resinfo
         results.append((name, store_words_test(tools, spirv, name)))
     for name in GET_LOD_TESTS:   # TEST-184: image_get_lod, 2D and 2D array

@@ -10,7 +10,7 @@
 ;   out[2] b96 at 48, last reg    -> C 0x600DD00D   out[3] b32 at 60 (after b96) -> 0x00000000
 ;   out[4] b64 at 64, low reg     -> E 0x8BADF00D   out[5] b64 at 64, high reg   -> F 0xDEADC0DE
 ;   out[6] read2st64 offset0:0    -> G 0x12345678   out[7] read2st64 offset1:1   -> H 0x9ABCDEF0
-; Every lane writes the same dwords, so the result does not depend on lane order.
+; Lane zero owns the LDS words and writes the output, avoiding concurrent writes to the same addresses.
 ; group: 32,1,1
 ; Run: vk_compute_test cs_w32_lds_wide.spv 1 dump
 ;   -> out[0..7] = 0xCAFEF00D 0xFEEDFACE 0x600DD00D 0x00000000 0x8BADF00D 0xDEADC0DE 0x12345678 0x9ABCDEF0
@@ -24,6 +24,7 @@ v_mov_b32_e32 v34, 0x8badf00d
 v_mov_b32_e32 v35, 0xdeadc0de
 v_mov_b32_e32 v4, 0x12345678
 v_mov_b32_e32 v5, 0x9abcdef0
+v_cmpx_eq_u32_e32 0, v0
 ds_write_b128 v2, v[30:33] offset:16
 ds_write_b32 v2, v2 offset:60
 s_waitcnt lgkmcnt(0)
@@ -38,7 +39,6 @@ ds_read_b32 v47, v2 offset:60
 ds_read_b64 v[48:49], v2 offset:64
 ds_read2st64_b32 v[50:51], v2 offset1:1
 s_waitcnt lgkmcnt(0)
-v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v21, 0
 buffer_store_dword v40, v21, s[0:3], 0 offen
 v_mov_b32_e32 v21, 4

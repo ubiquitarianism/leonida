@@ -65,6 +65,28 @@ class CTestRegistrationTest(unittest.TestCase):
         self.assertEqual(len(skips), 3, f"expected three whole-test SKIP paths, got {len(skips)}")
         self.assertEqual(skips, [77, 77, 77], "SKIP paths must return 77 for SKIP_RETURN_CODE 77")
 
+    def test_xdxr_postbuild_readback_skips_with_the_ctest_skip_code(self):
+        self.assertIn(
+            "add_test(NAME vk_xdxr_postbuild_readback COMMAND vk_xdxr_postbuild_readback_test)",
+            self.cmake,
+            "vk_xdxr_postbuild_readback_test is built but not registered with ctest",
+        )
+        self.assertIn(
+            "set_tests_properties(vk_xdxr_postbuild_readback PROPERTIES SKIP_RETURN_CODE 77)",
+            self.cmake,
+            "vk_xdxr_postbuild_readback must skip with 77 on a runner without a Vulkan GPU",
+        )
+        src = (ROOT / "runtime" / "test" / "vk_xdxr_postbuild_readback_test.cpp").read_text(encoding="utf-8")
+        lines = src.splitlines()
+        skips = [
+            int(m.group(1))
+            for i, line in enumerate(lines)
+            if ": skipped (" in line and i + 1 < len(lines)
+            for m in [re.match(r"\s*return\s+(\d+)\s*;", lines[i + 1])]
+            if m
+        ]
+        self.assertEqual(skips, [77], "vk_xdxr_postbuild_readback skip path must return 77")
+
     def test_whole_test_skips_return_the_skip_code(self):
         # A test registered with SKIP_RETURN_CODE 77 that prints SKIP and returns 0 is counted as passed although it
         # checked nothing: bink_audio_test did that for a movie without audio tracks after #1580.
@@ -83,6 +105,15 @@ class CTestRegistrationTest(unittest.TestCase):
                 self.assertEqual(whole_test_skips_not_77(cmake, Path(tmp)), want, value)
             src.write_text('std::printf("SKIP: none\\n");\nreturn kUnknown;\n', encoding="utf-8", newline="\n")
             self.assertEqual(whole_test_skips_not_77(cmake, Path(tmp)), [("test/a_test.cpp:2", "kUnknown")])
+
+    def test_host_parity_and_storage_tests_have_timeouts(self):
+        for test_name in ("dstorage", "dxgi_host_parity", "dxgi_waitable_latency"):
+            m = re.search(
+                r"set_tests_properties\(\s*" + test_name + r"\b[^)]*TIMEOUT\s+[1-9]\d*",
+                self.cmake,
+                re.S,
+            )
+            self.assertIsNotNone(m, f"{test_name} must have an explicit TIMEOUT property")
 
 
 def whole_test_skips_not_77(cmake_text, runtime_dir):

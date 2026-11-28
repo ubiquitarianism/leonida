@@ -16,6 +16,7 @@
 #endif
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <windows.h>
+#include <sddl.h>
 
 #include "vk_presenter_capture_colour.h"
 #include "vk_test_device.h"
@@ -28,7 +29,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <set>
 #include <mutex>
 #include <string_view>
 #include <thread>
@@ -182,10 +186,14 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
 }
 }  // namespace driver
 
+#include "vk_presenter_sparse_capture.h"
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     using namespace leonida;
+    const bool sparse = argc==2 && std::string_view(argv[1])=="--sparse-capture";
+    if (argc!=1 && !sparse) return 2;
 
     vktest::Device d;
     if (!d.create(true)) {
@@ -202,7 +210,7 @@ int main() {
     constexpr std::uint32_t width = 128, height = 96;
     RECT fr{0, 0, LONG(width), LONG(height)};
     AdjustWindowRect(&fr, WS_OVERLAPPEDWINDOW, FALSE);
-    HWND window = CreateWindowExW(0, wc.lpszClassName, L"Leonida presenter sync test", WS_OVERLAPPEDWINDOW, 80, 80,
+    HWND window = CreateWindowExW(sparse ? WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW : 0, wc.lpszClassName, L"Leonida presenter sync test", WS_OVERLAPPEDWINDOW, 80, 80,
                                   fr.right - fr.left, fr.bottom - fr.top, nullptr, nullptr, wc.hInstance, nullptr);
     EXPECT(window);
     ShowWindow(window, SW_SHOWNOACTIVATE);
@@ -210,6 +218,12 @@ int main() {
     pump();
 
     driver::install(d.instance_proc, d.instance, d.device);
+    if (sparse) {  // positive-only: never enter the failure/concurrency regressions below
+        const int result = sparse_test::run(d, window);
+        DestroyWindow(window);
+        UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        return result || d.validation_errors() ? 1 : 0;
+    }
     {
         VulkanContext context(driver::get_device, d.device, true);
         EXPECT(context.loaded());
