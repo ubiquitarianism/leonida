@@ -170,6 +170,25 @@ class AuditShader4RegsTests(unittest.TestCase):
             self.assertEqual(report["rbw_vgpr_counts"], {"v2": 3, "v4": 3})
             self.assertEqual(report["s3_rbw_op_patterns"], {})
 
+    def test_short_form_carry_in_reads_s3_in_the_audit(self) -> None:
+        # The short form v_add_co_ci_u32 vD, src0, src1 has VCC as its carry-out and carry-in: s3 is src0, read
+        # before any write, so it is reported, and the read does not count as a write of s3.
+        with tempfile.TemporaryDirectory() as disasm:
+            for op in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32"):
+                path = os.path.join(disasm, f"cs_{op}_short.s")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(f"\t{op}_e32 v1, s3, v2\n"
+                            "\ts_mov_b32 s9, s3\n\ts_endpgm\n")
+
+            report = audit_mod.audit(disasm)["cs"]
+            self.assertEqual(report["count"], 3)
+            self.assertEqual(report["rbw_sgpr_counts"], {"s3": 3})
+            self.assertEqual(report["rbw_vgpr_counts"], {"v2": 3})
+            # s3 is never written, so the s_mov_b32 after it reads s3 before a write too.
+            self.assertEqual(report["s3_rbw_op_patterns"], {
+                "v_add_co_ci_u32 D, s3, vN": 1, "v_sub_co_ci_u32 D, s3, vN": 1, "v_subrev_co_ci_u32 D, s3, vN": 1,
+                "s_mov_b32 D, s3": 3})
+
     def test_limit_below_one_is_rejected_before_output(self):
         # --limit 0 used to audit nothing and still print a full zero report with exit 0.
         with tempfile.TemporaryDirectory() as tmp:

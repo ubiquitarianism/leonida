@@ -44,6 +44,8 @@ import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# subprocess uses poll on Linux, whose timeout is a signed int in milliseconds.
+MAX_TIMEOUT_SECONDS = (2**31 - 1) // 1_000
 
 
 def _make_parent(path: str) -> None:
@@ -425,15 +427,13 @@ def stop_running_tests() -> None:
 
 
 def positive_seconds(text: str) -> float:
-    """--timeout: a finite value greater than 0, so subprocess.run never gets a bad timeout to raise on."""
+    """Parse a positive timeout that fits the subprocess wait on all supported hosts."""
     try:
         value = float(text)
     except ValueError:
         raise argparse.ArgumentTypeError(f"invalid float value: {text!r}") from None
-    if not math.isfinite(value):
-        raise argparse.ArgumentTypeError("must be a finite number")
-    if value <= 0:
-        raise argparse.ArgumentTypeError("must be greater than 0")
+    if not 0 < value <= MAX_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError(f"must be positive and no greater than {MAX_TIMEOUT_SECONDS} seconds")
     return value
 
 
@@ -547,7 +547,8 @@ def main() -> int:
                     help="Wine command (default: $WINE or wine)")
     ap.add_argument("--require", action="append", default=[], help="a test name whose entries must all pass (repeatable)")
     ap.add_argument("--timeout", type=positive_seconds, default=120.0,
-                    help="maximum seconds per test; a shorter CTest TIMEOUT applies (default 120)")
+                    help=f"maximum seconds per test (default 120, upper limit {MAX_TIMEOUT_SECONDS}). "
+                    "A shorter CTest TIMEOUT applies.")
     ap.add_argument("--jobs", type=positive_int, default=1,
                     help="tests run at a time; RUN_SERIAL and RESOURCE_LOCK are kept (default 1)")
     ap.add_argument("--summary", help="append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")

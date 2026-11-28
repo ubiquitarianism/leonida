@@ -171,6 +171,18 @@ class TestCliErrors(unittest.TestCase):
         self.assertEqual(len(err.strip().splitlines()), 1)
         self.assertTrue(err.startswith("ERROR:"))
 
+    def test_scene_output_cannot_replace_placements(self):
+        from pathlib import Path
+        original = Path(self.entities).read_bytes()
+        alias = os.path.join(self.tmp.name, "scene.bin")
+        os.link(self.entities, alias)
+        for out in (alias, self.entities):
+            with self.subTest(out=out):
+                rc, err = self._run(self.entities, out)
+                self.assertEqual(rc, 2)
+                self.assertIn("--entities", err)
+                self.assertEqual(Path(self.entities).read_bytes(), original)
+
     def test_missing_entities_is_one_error_line(self):
         rc, err = self._run(os.path.join(self.tmp.name, "nope.jsonl"),
                             os.path.join(self.tmp.name, "o.bin"))

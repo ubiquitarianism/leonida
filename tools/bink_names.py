@@ -126,7 +126,8 @@ def read_mount_lists(paths):
     for data in mount_documents(paths):
         if LIST_MARKER not in data.lower():
             continue
-        text = data.decode("utf-8", errors="replace")
+        # Filename-shaped text in comments, CDATA or processing instructions is not an element.
+        text = gamedata_xml.COMMENT_MARKUP.sub(b" ", data).decode("utf-8", errors="replace")
         for name in LIST_ENTRY.findall(text):
             name = name.strip().replace("\\", "/")
             if name.lower() not in seen:
@@ -184,6 +185,10 @@ def load_streams(source, skip_report=None):
         out[-1]["source"] = out[-1]["source"].replace("\\", "/")  # an older Windows index wrote "\"
     # A directory of carved files sorts by file name; carves name files by archive offset.
     out.sort(key=lambda r: (r["source"], r["offset"]))
+    for i in range(1, len(out)):
+        prev, curr = out[i - 1], out[i]
+        if prev["source"] == curr["source"] and prev["offset"] == curr["offset"]:
+            raise ValueError(f"duplicate stream location: {curr['source']} at offset {curr['offset']}")
     return out
 
 
