@@ -71,10 +71,17 @@ def split_command(raw: str) -> list[str]:
         return []
     if os.path.isfile(raw):
         return [raw]                    # a plain path, spaces and all
-    if ("/" in raw or "\\" in raw) and shutil.which(raw):
+    if "/" in raw or "\\" in raw:
         # A path whose extension is left out (C:\Program Files\LLVM\bin\llvm-mc): Windows finds llvm-mc.exe
         # for it, but it is no file under that exact name, so it used to be split at its spaces.
-        return [raw]
+        # Fallback for interpreters before Python 3.12 on Windows, where shutil.which() does not apply PATHEXT
+        # when a directory component is present.
+        if shutil.which(raw):
+            return [raw]
+        if os.name == "nt":
+            for ext in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep):
+                if ext and os.path.isfile(raw + ext):
+                    return [raw]
     try:
         return split_windows_command(raw) if os.name == "nt" else shlex.split(raw)
     except ValueError as e:

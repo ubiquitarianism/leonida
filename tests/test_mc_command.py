@@ -86,6 +86,16 @@ class SplitCommandTest(unittest.TestCase):
             self.assertEqual(mc_command.split_command(raw), [raw])
             which.assert_called_once_with(raw)
 
+    def test_pathext_fallback_when_which_misses(self):
+        raw = "C:\\Program Files\\LLVM\\bin\\llvm-mc"
+        with mock.patch.object(mc_command.os, "name", "nt"), \
+                mock.patch.object(mc_command.os, "pathsep", ";"), \
+                mock.patch.dict(mc_command.os.environ, {"PATHEXT": ".COM;.EXE"}, clear=False), \
+                mock.patch.object(mc_command.shutil, "which", return_value=None) as which, \
+                mock.patch.object(mc_command.os.path, "isfile", side_effect=lambda p: p == raw + ".EXE"):
+            self.assertEqual(mc_command.split_command(raw), [raw])
+            which.assert_called_once_with(raw)
+
     @unittest.skipUnless(os.name == "nt", "Windows resolves a missing .exe")
     def test_real_path_with_spaces_and_no_extension(self):
         with tempfile.TemporaryDirectory() as tmp:
