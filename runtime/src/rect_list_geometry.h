@@ -15,11 +15,16 @@
 // the vertex stage: a pre-pass over the vertex buffers is wrong for any shader that is not linear in its inputs (and
 // the translated vertex shaders fetch by V# themselves, so there is no vertex buffer to expand). The pipeline gets a
 // small geometry stage instead, built here from the vertex shader's own SPIR-V: it takes the triangle (v1, v2, v3)
-// the list draws, finds the corner between the other two as the one opposite the longest side (from the positions'
-// x and y; a degenerate triangle takes v1), makes the fourth corner v4 = the other two's sum minus that corner, and
-// emits the rectangle as two triangles with the winding of (v1, v2, v3) that both start at v1, so a flat input
-// (taken from a triangle's first vertex) is v1's over the whole rectangle:
-//   corner v1: (v1, v2, v4) (v1, v4, v3);  corner v2: (v1, v2, v3) (v1, v3, v4);  corner v3: (v1, v2, v3) (v1, v4, v2). Every Location output of the vertex stage is a vec4 float in the translator's output (rdna2spirv.py),
+// the list draws, finds the corner between the other two in post-divide NDC (x/w, y/w) via the minimum signed dot
+// product of the two edges meeting at each vertex (algebraically identical to opposite the longest side by the law of
+// cosines, without squared-length tie-break loss on thin axis-aligned strips or pre-divide overflow/distortion when w
+// differs or is large; a degenerate or w == 0 triangle takes v1), makes the fourth corner v4 = other_a + other_b -
+// corner with bit-exact selection whenever a component matches the corner (zero ULP drift on axis-aligned grid
+// coordinates and constant/flat attributes, keeping the clip-space v2 + v3 - v1 rule for both position and
+// interpolants), and emits the rectangle as two triangles with the winding of (v1, v2, v3) that both start at v1, so a
+// flat input (taken from a triangle's first vertex) is v1's over the whole rectangle:
+//   corner v1: (v1, v2, v4) (v1, v4, v3);  corner v2: (v1, v2, v3) (v1, v3, v4);  corner v3: (v1, v2, v3) (v1, v4, v2).
+// Every Location output of the vertex stage is a vec4 float in the translator's output (rdna2spirv.py),
 // and so is the stage's Position; the generated stage reads and writes exactly those.
 //
 // Not covered, and refused with a reason: a vertex stage that writes ClipDistance, CullDistance, Layer or
@@ -49,10 +54,12 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
     enum : std::uint32_t {
         op_entry_point = 15, op_type_void = 19, op_type_int = 21, op_type_float = 22,
         op_type_vector = 23, op_type_array = 28, op_type_pointer = 32, op_type_function = 33, op_constant = 43,
-        op_type_bool = 20, op_composite_construct = 80, op_composite_extract = 81, op_fmul = 133,
-        op_logical_and = 167, op_logical_not = 168, op_select = 169, op_ford_greater_than_equal = 190,
+        op_type_bool = 20, op_composite_construct = 80, op_composite_extract = 81, op_bitcast = 124,
+        op_fadd = 129, op_fsub = 131, op_fmul = 133, op_fdiv = 136,
+        op_logical_and = 167, op_logical_not = 168, op_select = 169, op_iequal = 170,
+        op_funord_greater_than_equal = 191,
         op_function = 54, op_function_end = 56, op_variable = 59, op_load = 61, op_store = 62, op_access_chain = 65,
-        op_decorate = 71, op_fadd = 129, op_fsub = 131, op_emit_vertex = 218, op_end_primitive = 219, op_label = 248, op_return = 253,
+        op_decorate = 71, op_emit_vertex = 218, op_end_primitive = 219, op_label = 248, op_return = 253,
         op_capability = 17, op_memory_model = 14, op_execution_mode = 16,
         deco_builtin = 11, deco_location = 30, builtin_position = 0, builtin_point_size = 1,
         storage_input = 1, storage_output = 3
@@ -126,6 +133,7 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
         to.insert(to.end(), args.begin(), args.end());
     };
     const std::uint32_t t_void = id(), t_fn = id(), t_uint = id(), t_float = id(), t_v4 = id(),
+                        t_uv4 = id(), t_bool = id(), t_bv4 = id(),
                         c3 = id(), t_arr = id(), t_pin_arr = id(), t_pin_v4 = id(),
                         t_pout_v4 = id(), c0 = id(), c1 = id(), c2 = id();
     emit(globals, op_type_void, {t_void});
@@ -133,6 +141,9 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
     emit(globals, op_type_int, {t_uint, 32, 0});
     emit(globals, op_type_float, {t_float, 32});
     emit(globals, op_type_vector, {t_v4, t_float, 4});
+    emit(globals, op_type_vector, {t_uv4, t_uint, 4});
+    emit(globals, op_type_bool, {t_bool});
+    emit(globals, op_type_vector, {t_bv4, t_bool, 4});
     emit(globals, op_constant, {t_uint, c3, 3});
     emit(globals, op_constant, {t_uint, c0, 0});
     emit(globals, op_constant, {t_uint, c1, 1});
@@ -177,59 +188,81 @@ inline std::vector<std::uint32_t> rect_list_geometry(const std::vector<std::uint
         }
         corners.push_back(c);
     }
-    // The corner between the other two, opposite the longest side: squared lengths from the positions' x and y.
-    const std::uint32_t t_bool = id(), t_bv4 = id();
-    emit(globals, op_type_bool, {t_bool});
-    emit(globals, op_type_vector, {t_bv4, t_bool, 4});
+    // The corner between the other two, from post-divide NDC (x/w, y/w): the vertex with the smallest signed dot
+    // product of its two incident edges (equivalently the largest negated dot s_k = dot(e_in, e_out)). By the law of
+    // cosines this matches opposite-the-longest-side for all triangles, while avoiding squared-length tie-break loss
+    // on thin axis-aligned strips and pre-divide overflow/distortion when w differs or is large.
     const auto extract = [&](std::uint32_t vector, std::uint32_t component) {
         const std::uint32_t r = id();
         emit(body, op_composite_extract, {t_float, r, vector, component});
         return r;
     };
-    const auto length2 = [&](std::uint32_t a, std::uint32_t b) {
-        const std::uint32_t d = id(), xx = id(), yy = id(), sum = id();
-        emit(body, op_fsub, {t_v4, d, a, b});
-        const std::uint32_t x = extract(d, 0), y = extract(d, 1);
-        emit(body, op_fmul, {t_float, xx, x, x});
-        emit(body, op_fmul, {t_float, yy, y, y});
-        emit(body, op_fadd, {t_float, sum, xx, yy});
-        return sum;
-    };
-    const auto at_least = [&](std::uint32_t a, std::uint32_t b) {
+    const auto bin = [&](std::uint32_t op, std::uint32_t type, std::uint32_t a, std::uint32_t b) {
         const std::uint32_t r = id();
-        emit(body, op_ford_greater_than_equal, {t_bool, r, a, b});
+        emit(body, op, {type, r, a, b});
         return r;
+    };
+    const auto unord_ge = [&](std::uint32_t a, std::uint32_t b) {
+        return bin(op_funord_greater_than_equal, t_bool, a, b);
     };
     const auto both = [&](std::uint32_t a, std::uint32_t b) {
-        const std::uint32_t r = id();
-        emit(body, op_logical_and, {t_bool, r, a, b});
-        return r;
+        return bin(op_logical_and, t_bool, a, b);
     };
     const auto splat = [&](std::uint32_t b) {  // OpSelect on vectors takes a vector condition before SPIR-V 1.4
         const std::uint32_t r = id();
         emit(body, op_composite_construct, {t_bv4, r, b, b, b, b});
         return r;
     };
-    const std::uint32_t* p = corners[0].v;  // vars[0] is the Position
-    const std::uint32_t l12 = length2(p[0], p[1]), l23 = length2(p[1], p[2]), l31 = length2(p[2], p[0]);
-    const std::uint32_t at_v1 = both(at_least(l23, l12), at_least(l23, l31)), not_v1 = id();
-    emit(body, op_logical_not, {t_bool, not_v1, at_v1});
-    const std::uint32_t at_v2 = both(not_v1, at_least(l31, l12));
-    const std::uint32_t c_v1 = splat(at_v1), c_v2 = splat(at_v2);
     const auto pick = [&](std::uint32_t condition, std::uint32_t yes, std::uint32_t no) {
         const std::uint32_t r = id();
         emit(body, op_select, {t_v4, r, condition, yes, no});
         return r;
     };
-    // Per variable: the fourth corner, v1 + v2 + v3 - 2 * corner, and the six vertices of the two triangles.
+    const std::uint32_t* p = corners[0].v;  // vars[0] is the Position
+    std::uint32_t nx[3], ny[3];
+    for (int k = 0; k < 3; ++k) {
+        const std::uint32_t w = extract(p[k], 3);
+        nx[k] = bin(op_fdiv, t_float, extract(p[k], 0), w);
+        ny[k] = bin(op_fdiv, t_float, extract(p[k], 1), w);
+    }
+    const std::uint32_t e01x = bin(op_fsub, t_float, nx[1], nx[0]), e01y = bin(op_fsub, t_float, ny[1], ny[0]);
+    const std::uint32_t e12x = bin(op_fsub, t_float, nx[2], nx[1]), e12y = bin(op_fsub, t_float, ny[2], ny[1]);
+    const std::uint32_t e20x = bin(op_fsub, t_float, nx[0], nx[2]), e20y = bin(op_fsub, t_float, ny[0], ny[2]);
+    const auto dot2 = [&](std::uint32_t ax, std::uint32_t ay, std::uint32_t bx, std::uint32_t by) {
+        return bin(op_fadd, t_float, bin(op_fmul, t_float, ax, bx), bin(op_fmul, t_float, ay, by));
+    };
+    const std::uint32_t s0 = dot2(e01x, e01y, e20x, e20y);
+    const std::uint32_t s1 = dot2(e12x, e12y, e01x, e01y);
+    const std::uint32_t s2 = dot2(e20x, e20y, e12x, e12y);
+    // Unordered >= makes NaN (e.g. w == 0) fall through deterministically to v1.
+    const std::uint32_t at_v1 = both(unord_ge(s0, s1), unord_ge(s0, s2)), not_v1 = id();
+    emit(body, op_logical_not, {t_bool, not_v1, at_v1});
+    const std::uint32_t at_v2 = both(not_v1, unord_ge(s1, s2)), not_v2 = id();
+    emit(body, op_logical_not, {t_bool, not_v2, at_v2});
+    const std::uint32_t at_v3 = both(not_v1, not_v2);
+    const std::uint32_t c_v1 = splat(at_v1), c_v2 = splat(at_v2), c_v3 = splat(at_v3);
+
+    // Exact per-component fourth corner (other_a + other_b - corner): when either non-corner vertex shares bits with
+    // the corner (axis-aligned grid coordinates, constant/flat attributes, packed bits), return the other vertex
+    // bit-exact; otherwise compute (other_a + other_b) - corner.
+    const auto exact_fourth = [&](std::uint32_t oa, std::uint32_t ob, std::uint32_t c) {
+        const std::uint32_t ua = id(), ub = id(), uc = id();
+        emit(body, op_bitcast, {t_uv4, ua, oa});
+        emit(body, op_bitcast, {t_uv4, ub, ob});
+        emit(body, op_bitcast, {t_uv4, uc, c});
+        const std::uint32_t a_eq_c = bin(op_iequal, t_bv4, ua, uc);
+        const std::uint32_t b_eq_c = bin(op_iequal, t_bv4, ub, uc);
+        const std::uint32_t lin = bin(op_fsub, t_v4, bin(op_fadd, t_v4, oa, ob), c);
+        return pick(a_eq_c, ob, pick(b_eq_c, oa, lin));
+    };
+
+    // Per variable: the fourth corner, other_a + other_b - corner, and the six vertices of the two triangles.
     std::vector<std::array<std::uint32_t, 6>> emitted;
     for (const Corners& c : corners) {
         const std::uint32_t corner = pick(c_v1, c.v[0], pick(c_v2, c.v[1], c.v[2]));
-        const std::uint32_t s12 = id(), s123 = id(), less = id(), fourth = id();
-        emit(body, op_fadd, {t_v4, s12, c.v[0], c.v[1]});
-        emit(body, op_fadd, {t_v4, s123, s12, c.v[2]});
-        emit(body, op_fsub, {t_v4, less, s123, corner});
-        emit(body, op_fsub, {t_v4, fourth, less, corner});
+        const std::uint32_t other_a = pick(c_v1, c.v[1], c.v[0]);
+        const std::uint32_t other_b = pick(c_v3, c.v[1], c.v[2]);
+        const std::uint32_t fourth = exact_fourth(other_a, other_b, corner);
         emitted.push_back({c.v[0], c.v[1], pick(c_v1, fourth, c.v[2]),
                            c.v[0], pick(c_v2, c.v[2], fourth), pick(c_v1, c.v[2], pick(c_v2, fourth, c.v[1]))});
     }
