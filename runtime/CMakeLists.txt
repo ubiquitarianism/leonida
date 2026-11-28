@@ -4751,6 +4751,13 @@ if(TARGET Vulkan::Headers)
       target_compile_options(frame_pacer_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME frame_pacer COMMAND frame_pacer_test)
+    # Which failed presents get a log line, and the names of their results (src/present_failure_log.h); no GPU,
+    # no Vulkan.
+    add_executable(present_failure_log_test test/present_failure_log_test.cpp)
+    if(MSVC)
+      target_compile_options(present_failure_log_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME present_failure_log COMMAND present_failure_log_test)
 
     # Replay refuses a list whose whole-view or implicit zero-clear needs an unset vkCmdClear*Image (no GPU).
     add_executable(replay_clear_gate_test test/replay_clear_gate_test.cpp)

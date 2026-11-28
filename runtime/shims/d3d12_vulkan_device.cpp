@@ -76,6 +76,7 @@
 #include "../src/console_heap_slot_records.h"
 #include "../src/title_window_plan.h"
 #include "../src/vulkan_present.h"
+#include "../src/present_failure_log.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/host_image_copy_policy.h"
 #include "../src/vulkan13_features.h"
@@ -22315,9 +22316,32 @@ WindowPresenter::~WindowPresenter() {
 }
 
 namespace {
+// present_failure_log.h names these by number so that it needs no Vulkan header; keep the two in step.
+static_assert(int(VK_SUBOPTIMAL_KHR) == 1000001003 && int(VK_ERROR_OUT_OF_HOST_MEMORY) == -1 &&
+              int(VK_ERROR_OUT_OF_DEVICE_MEMORY) == -2 && int(VK_ERROR_INITIALIZATION_FAILED) == -3 &&
+              int(VK_ERROR_DEVICE_LOST) == -4 && int(VK_ERROR_FORMAT_NOT_SUPPORTED) == -11 &&
+              int(VK_ERROR_UNKNOWN) == -13 && int(VK_ERROR_SURFACE_LOST_KHR) == -1000000000 &&
+              int(VK_ERROR_NATIVE_WINDOW_IN_USE_KHR) == -1000000001 &&
+              int(VK_ERROR_OUT_OF_DATE_KHR) == -1000001004,
+              "present_result_name's numbers are VkResult values");
+
+// A presenter that fails every frame is reported at its 1st, 10th, 100th, ... failure, not once per frame
+// (src/present_failure_log.h). One log for the process: presents from several presenters share the sequence, and a
+// different result always gets its own line.
+void log_present_result(VkResult result) {
+    static std::mutex mutex;
+    static leonida::PresentFailureLog log;
+    std::vector<std::string> lines;
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        lines = log.note(std::int32_t(result));
+    }
+    for (const std::string& line : lines) std::fprintf(stderr, "%s\n", line.c_str());
+}
+
 HRESULT present_result(VkResult result) {
+    log_present_result(result);
     if (result == VK_SUCCESS) return S_OK;
-    std::fprintf(stderr, "[rt] d3d12: present failed (VkResult %d)\n", int(result));
     if (result == VK_ERROR_DEVICE_LOST) return DXGI_ERROR_DEVICE_REMOVED;
     if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return DXGI_ERROR_UNSUPPORTED;
     return E_FAIL;

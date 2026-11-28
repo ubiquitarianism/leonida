@@ -1592,9 +1592,12 @@ and any validation error fails them.
   desktop never shows the swapchain, so the test prints the pixel, does not assert it and says why. Under Wine's macOS driver it can't: `GetPixel` on the screen DC returns `CLR_INVALID` even
   for a pixel GDI painted itself, and the window's own DC holds Wine's GDI surface (white), not the image
   presented through the Metal layer. There the capture checks are what confirms the colour.
-  - The injected failures below make the runtime log `[rt] d3d12: present failed` three times (VkResult
-    -1000001004 twice, then -1, `VK_ERROR_OUT_OF_HOST_MEMORY`). The test announces them on stderr first; they
-    are expected and are not out-of-date presents from the driver (the closing line counts those).
+  - The injected failures below make the runtime log `[rt] d3d12: present failed` three times
+    (`VK_ERROR_OUT_OF_DATE_KHR`, VkResult -1000001004, twice, then `VK_ERROR_OUT_OF_HOST_MEMORY`, VkResult -1).
+    The test announces them on stderr first; they are expected and are not out-of-date presents from the driver
+    (the closing line counts those). The line names the result, and a run of the same result in a row is logged
+    at its 1st, 10th, 100th, ... failure with a closing count when it ends, so a presenter that fails every frame
+    leaves a few lines instead of one per frame (`src/present_failure_log.h`, `present_failure_log_test`).
   - The device and the presenter get their Vulkan functions through a driver double in the test. It forwards to
     the real driver, counts the presents the driver reports out of date (the frame counts allow for them), and
     tracks the binary semaphores alive.

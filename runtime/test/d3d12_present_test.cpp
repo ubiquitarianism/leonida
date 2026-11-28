@@ -490,8 +490,8 @@ int main() {
 
         // Three of the failures below make the runtime log "[rt] d3d12: present failed"; say so first, so the log is
         // not read as a fault.
-        std::fprintf(stderr, "injecting presenter failures: the next three \"present failed\" lines (VkResult "
-                             "-1000001004 twice, then -1) are expected\n");
+        std::fprintf(stderr, "injecting presenter failures: the next three \"present failed\" lines "
+                             "(VK_ERROR_OUT_OF_DATE_KHR twice, then VK_ERROR_OUT_OF_HOST_MEMORY) are expected\n");
 
         // Failures injected by the driver double (VictorJulianiR's review of the presenter):
         // 1. Present statuses: OUT_OF_DATE was not shown, so it is not counted; SUBOPTIMAL was, so it is.
