@@ -10,7 +10,7 @@ method, scope and caveats. No game data is included.
 |---|---|
 | [design.md](design.md) | Overall project design, asset status, translator contract and open blockers. |
 | [related_projects.md](related_projects.md) | Prior art we may read and the licence boundaries on it. |
-| [boot_leads.md](boot_leads.md) | Open leads that may move the retail boot further (TLS at module index 0, feature level at device creation, command-list replay, descriptor words, shader corpus count, frame pacing), each with where it lands, how to implement it and how to test it. Hypotheses, not measurements. |
+| [boot_leads.md](boot_leads.md) | Open leads that may move the retail boot further (TLS at module index 0, feature level at device creation, command-list replay, descriptor words, shader corpus count, frame pacing), each with where it lands, how to implement it and how to test it, and a status table: BL-2, BL-5 and BL-6 are done, BL-3 and BL-4 have open pull requests, BL-1 waits for a retail confirmation. |
 | [rpf.md](rpf.md) | RPF9 archive layout, the carve tools and the unreadable encrypted TOC. |
 | [linux.md](linux.md) | Linux in one page: what runs natively and what runs under Wine or Proton, the Ubuntu packages, `Build.sh`, the runtime cross-build, and why there is no native Linux `gta6rt`. |
 | [running.md](running.md) | Running the game per platform and GPU (Linux/Wine with AMD, Linux/Proton and Windows with NVIDIA, Windows with AMD, Intel, macOS): build, shaders, pipeline pre-compile, driver settings, environment, what to expect; each value measured by us, reported by others (linked) or TBD. |
