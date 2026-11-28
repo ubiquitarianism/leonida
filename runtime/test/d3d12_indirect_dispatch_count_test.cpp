@@ -172,11 +172,13 @@ std::array<UINT, 2> expected(UINT count, bool update, UINT second_count = 3) {
 // 1, and the direct Dispatch(1, 1, 1) gives 1/1 in slot 2 (the bundle's pipeline stays on the parent, the parent's
 // root signature and arguments stay as they were). `same_root`: the bundle sets the parent's root signature before the call,
 // which keeps the parent's root arguments (docs/d3d12_vulkan.md, bundles).
+// --bundle-direct (`direct`): the same bundle records Dispatch(3, 1, 1) instead of the indirect call, so slots 0 and
+// 1 hold 3/6 (groups 0, 1 and 2 add 1, 2 and 3) and slot 2 still holds 1/1.
 constexpr UINT kSlot = 64;  // bytes between the slots' counters
 using BundleResult = std::array<UINT, 6>;
 
 bool run_bundle(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, bool same_root, BundleResult& result,
-                bool shim) {
+                bool shim, bool direct = false) {
     Ref<ID3D12RootSignature> root;
     D3D12_ROOT_PARAMETER param{};
     param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -241,7 +243,8 @@ bool run_bundle(ID3D12Device* dev, const std::vector<std::uint8_t>& shader, bool
         FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
         return false;
     if (same_root) bundle->SetComputeRootSignature(root.p);
-    bundle->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, nullptr, 0);
+    if (direct) bundle->Dispatch(kMaximum, 1, 1);
+    else bundle->ExecuteIndirect(signature.p, kMaximum, args.p, kArgsOffset, nullptr, 0);
     if (FAILED(bundle->Close())) return false;
 
     list->CopyBufferRegion(args.p, kArgsOffset, source.p, kArgsOffset, kMaximum * kStride);
@@ -375,7 +378,8 @@ int make_host(Ref<ID3D12Device>& host, std::vector<std::uint8_t>& native_code) {
 
 int main(int argc, char** argv) {
     const bool clamp = argc == 2 && !std::strcmp(argv[1], "--clamp");
-    const bool bundle = argc == 2 && !std::strcmp(argv[1], "--bundle");
+    const bool direct = argc == 2 && !std::strcmp(argv[1], "--bundle-direct");
+    const bool bundle = direct || (argc == 2 && !std::strcmp(argv[1], "--bundle"));
     if (argc != 1 && !clamp && !bundle) return 2;
     // Wine has no WARP (its host is vkd3d on the GPU); the layer is still checked against expected().
     const bool compare_host = !hostwine::host_is_wine();
@@ -384,8 +388,10 @@ int main(int argc, char** argv) {
     if (!clamp && compare_host) {
         if (const int status = make_host(host, native_code)) return status;
     }
-    // --bundle runs on WARP and, outside Wine, on the default adapter too: both are held to the same values.
-    const BundleResult bundle_want{6, 10, 6, 10, 1, 1};
+    // --bundle and --bundle-direct run on WARP and, outside Wine, on the default adapter too: both are held to the
+    // same values.
+    const BundleResult bundle_want = direct ? BundleResult{3, 6, 3, 6, 1, 1} : BundleResult{6, 10, 6, 10, 1, 1};
+    const char* const want_text = direct ? "3/6 3/6 1/1" : "6/10 6/10 1/1";
     unsigned bundle_hosts = 0;
     if (bundle && compare_host) {
         Ref<ID3D12Device> adapter_default;
@@ -395,16 +401,19 @@ int main(int argc, char** argv) {
             devices[1] = adapter_default.p;
         for (int i = 0; i < 2; ++i) {
             if (!devices[i]) continue;
-            HRESULT with_count = S_OK, with_constant = S_OK;
-            if (!bundle_refusals(devices[i], with_count, with_constant)) return 1;
-            std::printf("%s: bundle ExecuteIndirect Close with a count buffer 0x%08lx, with a root constant 0x%08lx\n",
-                        names[i], static_cast<unsigned long>(with_count), static_cast<unsigned long>(with_constant));
-            if (SUCCEEDED(with_count) || SUCCEEDED(with_constant)) return 1;
+            if (!direct) {
+                HRESULT with_count = S_OK, with_constant = S_OK;
+                if (!bundle_refusals(devices[i], with_count, with_constant)) return 1;
+                std::printf("%s: bundle ExecuteIndirect Close with a count buffer 0x%08lx, with a root constant "
+                            "0x%08lx\n", names[i], static_cast<unsigned long>(with_count),
+                            static_cast<unsigned long>(with_constant));
+                if (SUCCEEDED(with_count) || SUCCEEDED(with_constant)) return 1;
+            }
             for (const bool same_root : {false, true}) {
                 BundleResult got{};
-                if (!run_bundle(devices[i], native_code, same_root, got, false) || got != bundle_want) {
-                    std::fprintf(stderr, "%s same_root=%d: %u/%u %u/%u %u/%u, expected 6/10 6/10 1/1\n", names[i],
-                                 int(same_root), got[0], got[1], got[2], got[3], got[4], got[5]);
+                if (!run_bundle(devices[i], native_code, same_root, got, false, direct) || got != bundle_want) {
+                    std::fprintf(stderr, "%s same_root=%d: %u/%u %u/%u %u/%u, expected %s\n", names[i],
+                                 int(same_root), got[0], got[1], got[2], got[3], got[4], got[5], want_text);
                     return 1;
                 }
             }
@@ -444,8 +453,8 @@ int main(int argc, char** argv) {
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&layer.p)))) return 1;
 
     if (bundle) {
-        HRESULT with_count = S_OK, with_constant = S_OK;
-        if (!bundle_refusals(layer.p, with_count, with_constant) || with_count != E_INVALIDARG ||
+        HRESULT with_count = E_INVALIDARG, with_constant = E_INVALIDARG;
+        if ((!direct && !bundle_refusals(layer.p, with_count, with_constant)) || with_count != E_INVALIDARG ||
             with_constant != E_INVALIDARG) {
             std::fprintf(stderr, "layer: bundle ExecuteIndirect Close with a count buffer 0x%08lx, with a root "
                          "constant 0x%08lx, expected E_INVALIDARG for both\n",
@@ -454,9 +463,9 @@ int main(int argc, char** argv) {
         }
         for (const bool same_root : {false, true}) {
             BundleResult got{};
-            if (!run_bundle(layer.p, container, same_root, got, true) || got != bundle_want) {
-                std::fprintf(stderr, "layer same_root=%d: %u/%u %u/%u %u/%u, expected 6/10 6/10 1/1\n",
-                             int(same_root), got[0], got[1], got[2], got[3], got[4], got[5]);
+            if (!run_bundle(layer.p, container, same_root, got, true, direct) || got != bundle_want) {
+                std::fprintf(stderr, "layer same_root=%d: %u/%u %u/%u %u/%u, expected %s\n",
+                             int(same_root), got[0], got[1], got[2], got[3], got[4], got[5], want_text);
                 return 1;
             }
         }
@@ -464,8 +473,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "validation errors: %u\n", vk.validation_errors());
             return 1;
         }
-        std::printf("bundle ExecuteIndirect(DISPATCH): layer and %u host adapter(s) gave 6/10 6/10 1/1 in both "
-                    "cases; count buffer and root constant refused\n", bundle_hosts);
+        if (direct)
+            std::printf("bundle Dispatch: layer and %u host adapter(s) gave 3/6 3/6 1/1 in both cases\n", bundle_hosts);
+        else
+            std::printf("bundle ExecuteIndirect(DISPATCH): layer and %u host adapter(s) gave 6/10 6/10 1/1 in both "
+                        "cases; count buffer and root constant refused\n", bundle_hosts);
         return 0;
     }
     if (clamp) {
