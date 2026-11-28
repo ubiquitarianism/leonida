@@ -1550,6 +1550,10 @@ if(BUILD_TESTING)
   endif()
   add_executable(command_list_test test/command_list_test.cpp)
   add_test(NAME command_list COMMAND command_list_test)
+  # BL-3: the console list's inline records replay as the vtable calls they stand for (src/console_list_records.h).
+  add_executable(console_list_records_test test/console_list_records_test.cpp)
+  target_include_directories(console_list_records_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME console_list_records COMMAND console_list_records_test)
   # Which SPIR-V modules declare a storage image or buffer they may write (src/spirv_stores.h), on hand-built words.
   add_executable(spirv_stores_test test/spirv_stores_test.cpp)
   add_test(NAME spirv_stores COMMAND spirv_stores_test)

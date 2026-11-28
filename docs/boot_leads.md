@@ -74,6 +74,11 @@ your own copy or with a synthetic test before you build on it, and record the re
   the same Vulkan command stream. Add a GPU case only once the stream matches.
 - **Record it in:** [d3d12_vulkan.md](d3d12_vulkan.md), with the measured call order.
 - **Needs:** game files (call traces) to find which calls read results back; a GPU for the final check.
+- **Status:** the record decoder is in `runtime/src/console_list_records.h`. It turns the measured inline records
+  (§3.5a of [d3d12_command_objects.md](d3d12_command_objects.md)) back into their vtable calls, and
+  `console_list_records_test` checks that the inline path and the vtable path give the same call stream. Open: wiring
+  it into the list proxy (`runtime/shims/d3d12_xs_device.cpp`, which today keeps the cursor at its limit); the
+  pipeline-record bytes our PSOs expose; and widening the 32-bit table address (BL-4).
 
 ## BL-4: descriptor words are 32-bit GPU addresses
 
