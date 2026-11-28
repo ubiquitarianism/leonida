@@ -24,6 +24,7 @@
 #pragma once
 
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <atomic>
 #include <cerrno>
@@ -34,6 +35,8 @@
 #include <initializer_list>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "shims.h"
 
@@ -363,6 +366,64 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     in_handler = false;
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+inline void log_thread_stack(DWORD tid, const CONTEXT& c) {
+    event("thread_stack", "\"tid\":" + std::to_string(tid) + ",\"stack\":" + stack_from(c));
+}
+
+// No C++ objects here, so the SEH frame is allowed under /EHsc (as in handler()).
+inline void log_thread_stack_guarded(DWORD tid, const CONTEXT* c) {
+#ifdef _MSC_VER
+    __try {
+        log_thread_stack(tid, *c);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // A stack that changed under the walk: skip that thread.
+    }
+#else
+    log_thread_stack(tid, *c);
+#endif
+}
+
+// LEONIDA_HANG_DUMP: one thread_stack event per thread of this process except the caller. Each thread is suspended
+// only while its context is read; the stack is walked after it resumes, so no lock it holds can block the walk. A
+// thread that is really hung waits where it is, so its stack does not change in between.
+inline void dump_thread_stacks() {
+    const DWORD self = GetCurrentThreadId();
+    const DWORD pid = GetCurrentProcessId();
+    std::vector<std::pair<DWORD, CONTEXT>> contexts;
+    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof entry;
+    for (BOOL more = Thread32First(snap, &entry); more; more = Thread32Next(snap, &entry)) {
+        if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) continue;
+        const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, entry.th32ThreadID);
+        if (!thread) continue;
+        CONTEXT c{};
+        c.ContextFlags = CONTEXT_FULL;
+        if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+            const BOOL ok = GetThreadContext(thread, &c);
+            ResumeThread(thread);
+            if (ok) contexts.emplace_back(entry.th32ThreadID, c);
+        }
+        CloseHandle(thread);
+    }
+    CloseHandle(snap);
+    std::fprintf(stderr, "[rt] LEONIDA_HANG_DUMP: %zu thread stack(s) written to the trace\n", contexts.size());
+    for (const auto& [tid, c] : contexts) log_thread_stack_guarded(tid, &c);
+}
+
+inline void start_hang_dump() {
+    wchar_t value[32] = {};
+    if (!GetEnvironmentVariableW(L"LEONIDA_HANG_DUMP", value, 32)) return;
+    const long seconds = std::wcstol(value, nullptr, 10);
+    if (seconds <= 0) return;
+    std::fprintf(stderr, "[rt] LEONIDA_HANG_DUMP: thread stacks in %ld s\n", seconds);
+    std::thread([seconds] {
+        Sleep(static_cast<DWORD>(seconds) * 1000);
+        if (enabled()) dump_thread_stacks();
+    }).detach();
+}
 }  // namespace detail
 
 inline void close();
@@ -389,6 +450,7 @@ inline bool open(const wchar_t* path, int* error = nullptr) {
     detail::veh = AddVectoredExceptionHandler(1, &detail::handler);
     detail::on.store(true, std::memory_order_release);
     event("trace_open", "\"pid\":" + std::to_string(GetCurrentProcessId()));
+    detail::start_hang_dump();
     return true;
 }
 
