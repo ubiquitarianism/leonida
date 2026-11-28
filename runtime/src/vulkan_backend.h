@@ -3207,12 +3207,18 @@ private:
         if (context_.input_probe_)
             context_.input_probe_(lists, execute_call, kind_ == QueueKind::direct ? "direct" :
                                                       kind_ == QueueKind::compute ? "compute" : "copy");
-        if (kind_ != QueueKind::direct)
-            for (const auto* list : lists)
-                for (const auto& command : list->commands())
-                    if (std::holds_alternative<ClearRenderTarget>(command) ||
-                        std::holds_alternative<ClearDepthStencil>(command))
-                        return queue_unsupported(__LINE__);
+        std::uint64_t captures = 0;
+        bool runs_shaders = false;
+        for (const auto* list : lists) {
+            for (const auto& command : list->commands()) {
+                if (kind_ != QueueKind::direct && (std::holds_alternative<ClearRenderTarget>(command) ||
+                                                   std::holds_alternative<ClearDepthStencil>(command)))
+                    return queue_unsupported(__LINE__);
+                if (const auto* p = std::get_if<Predication>(&command); p && p->buffer) ++captures;
+                runs_shaders |= std::holds_alternative<Dispatch>(command) || draw_command(command).state ||
+                                std::holds_alternative<ExecuteIndirect>(command);
+            }
+        }
         VkCommandBuffer command_buffer = VK_NULL_HANDLE;
         struct KhrGuard {
             VulkanQueue* queue;
@@ -3271,10 +3277,6 @@ private:
         ReplayFunctions replay{};
         unsigned mesh_draws = 0;
         std::vector<VulkanContext::GeometryUpload> geometry;
-        std::uint64_t captures = 0;
-        for (const auto* list : lists)
-            for (const auto& command : list->commands())
-                if (const auto* p = std::get_if<Predication>(&command); p && p->buffer) ++captures;
         std::unique_ptr<PredicateReducer::Batch> batch;
         std::unique_ptr<PredicatedBufferCopier::Batch> copy_batch;
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_batch;
@@ -3672,11 +3674,6 @@ private:
         } tracker_transaction{next_tracker};
         // Bindless images that may already be visible to shaders are initialized on a submission that runs shaders.
         // initialize() zeroes committed storage images and only transitions sparse images.
-        bool runs_shaders = false;
-        for (const CommandList* list : lists)
-            for (const auto& command : list->commands())
-                runs_shaders |= std::holds_alternative<Dispatch>(command) || draw_command(command).state ||
-                                std::holds_alternative<ExecuteIndirect>(command);
         std::vector<ResourceId> storage_images;
         std::vector<VulkanContext::PendingZero> zero_buffers;
         {
