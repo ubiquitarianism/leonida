@@ -5,7 +5,8 @@
 //   - large builds keep within the heavy count, and large and speculative ones together leave one worker free;
 //   - demanded jobs go first, in the order they came, then warm-ups by size, and a checkpoint only when nothing runs;
 //   - a checkpoint's second look sees a demanded build that started on another worker meanwhile;
-//   - one job of a PSO at a time, also with one worker plus the graphics-only one;
+//   - one job of a PSO at a time, also with one worker plus the graphics-only one, and a PSO's job held back there goes
+//     on the general worker once that PSO's build on the graphics-only one returns;
 //   - the last release with jobs running and queued: the queued ones are dropped, the running ones finish, the
 //     workers are joined; a device's cancel waits for its running jobs; stop_for_exit does not wait past its limit.
 #include "../shims/d3d12_pipeline_compile.h"
@@ -229,6 +230,33 @@ void test_one_worker_and_the_graphics_worker_build_one_job_of_a_pso() {
     pool.wait_idle();
     EXPECT(deleted.load() && !variant_running_at_delete.load());
     EXPECT(!log.has_started("variant 2"));
+    pool.release();
+}
+
+// One general worker plus the graphics-only one: a PSO's job that only the general worker can take (not graphics)
+// waits while a graphics build of that PSO runs on the graphics-only worker, and goes when that build returns. The
+// general worker is asleep by then (it found nothing it could take), so the graphics-only worker that finished is the
+// one that must wake it: it cannot take the job itself.
+void test_the_graphics_worker_wakes_the_general_one_for_its_psos_job() {
+    auto& pool = make_pool(1, 1);
+    Log log;
+    Gate busy, graphics_build;
+    Owners owner;
+    submit(pool, log, &busy, owner[1], "general busy");  // not graphics: only the general worker takes it
+    EXPECT(log.wait_started(1));
+    EXPECT(pool.submit(owner[0], device, 0, [&log, &graphics_build] {
+        log.start("graphics build", false);
+        graphics_build.wait();
+        log.finish("graphics build", false);
+    }, true));
+    EXPECT(log.wait_started(2));  // on the graphics-only worker: the general one is busy
+    submit(pool, log, nullptr, owner[0], "same pso, not graphics");
+    busy.release();
+    EXPECT(log.wait_finished(1));  // the general worker is free now, and this PSO's build still runs
+    std::this_thread::sleep_for(100ms);
+    EXPECT(!log.has_started("same pso, not graphics"));
+    graphics_build.release();
+    EXPECT(log.wait_finished(3, 3s));  // not left waiting for the next submission
     pool.release();
 }
 
@@ -519,6 +547,7 @@ int main() {
     test_long_build_does_not_hold_up_a_small_demanded_one();
     test_one_worker_keeps_the_old_order();
     test_one_worker_and_the_graphics_worker_build_one_job_of_a_pso();
+    test_the_graphics_worker_wakes_the_general_one_for_its_psos_job();
     test_heavy_count_and_the_free_worker();
     test_one_warm_up_at_a_time();
     test_demanded_builds_go_before_warm_ups();
