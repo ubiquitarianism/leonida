@@ -11,12 +11,10 @@ use windows::core::{PCSTR, s};
 use crate::host::Host;
 
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
 SamplerState smooth_ : register(s0);
 struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
-[RootSignature(RS)]
 V vs(uint id : SV_VertexID) {
     V v;
     v.uv = float2((id << 1) & 2, id & 2);
@@ -58,7 +56,6 @@ float clean1(float x) {
 float3 clean(float3 x) {
     return float3(clean1(x.r), clean1(x.g), clean1(x.b));
 }
-[RootSignature(RS)]
 float4 ps(V v) : SV_Target {
     float3 s = sharpened(v.uv);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
@@ -137,11 +134,41 @@ impl Composer {
         );
         // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {
-            let bytes = |b: &ID3DBlob| {
-                std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
-            };
             let device = &host.device;
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
+            let ranges = [D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 2,
+                BaseShaderRegister: 0,
+                RegisterSpace: 0,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
+                OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+            }];
+            let parameters = [D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                        NumDescriptorRanges: ranges.len() as u32,
+                        pDescriptorRanges: ranges.as_ptr(),
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            }];
+            let samplers = [D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 16,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+                BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+                MinLOD: 0.0,
+                MaxLOD: f32::MAX,
+                ShaderRegister: 0,
+                RegisterSpace: 0,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            }];
+            let root = crate::host::root_signature(device, &parameters, &samplers)?;
             let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: b.GetBufferPointer(),
                 BytecodeLength: b.GetBufferSize(),

@@ -1686,6 +1686,33 @@ pub(crate) fn compile(
     Ok(bytes.to_vec())
 }
 
+pub(crate) fn root_signature(
+    device: &ID3D12Device,
+    parameters: &[D3D12_ROOT_PARAMETER1],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+) -> windows::core::Result<ID3D12RootSignature> {
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: parameters.len() as u32,
+                pParameters: if parameters.is_empty() { std::ptr::null() } else { parameters.as_ptr() },
+                NumStaticSamplers: samplers.len() as u32,
+                pStaticSamplers: if samplers.is_empty() { std::ptr::null() } else { samplers.as_ptr() },
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            },
+        },
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    unsafe {
+        D3D12SerializeVersionedRootSignature(&desc, &mut blob, None)?;
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
+}
+
 impl PlanePass {
     /// The root signature and pipeline for a twin of 16-bit steps (`steps`)
     /// or of floats and the depth format `format`.

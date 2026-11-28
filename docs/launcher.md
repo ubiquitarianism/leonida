@@ -15,16 +15,23 @@ Standard library only (`tools/leonida_launcher.py`).
 
 ## Pages
 
-- **Play**: PLAY runs `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\play-d3d12.ps1 -Game <folder>
-  -Data <folder>` plus the switches chosen in Settings (on Linux `scripts/play-linux.sh <folder>/game_scarlett_master.exe`,
-  with `--series-x` if chosen). The script's output goes into the log box. The state line reads a few of the script's
-  own messages: Starting, Building the runtime, Preparing shaders, Running, Exited with code N (a guess from the text;
-  the log is the truth). Only one thing runs at a time: while it runs PLAY is replaced by Stop, which, after a
-  confirmation, ends the process and everything it started (`taskkill /T /F`; on Linux the process group).
+- **Play**: PLAY runs `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\play-d3d12.ps1 -Game <folder> -Data
+  <folder>` plus the switches chosen in Settings (on Linux `scripts/play-linux.sh <folder>/game_scarlett_master.exe`
+  with `--series-x` and `--log` if chosen; without a usable Proton or Wine, PLAY opens Settings). The script's output
+  goes into the log box. The state line reads a few of the script's own messages: Starting, Building the runtime,
+  Preparing shaders, Running, Exited with code N (a guess from the text; the log is the truth). Only one thing runs at a
+  time: while it runs PLAY is replaced by Stop, which, after a confirmation, ends the process and everything it started
+  (`taskkill /T /F`; on Linux the process group).
 - **Settings**: the game folder (a picker, and a check that `game_scarlett_master.exe` is in it), the data folder
-  (empty = the script's default), the mods folder, and the options of `play-d3d12.ps1`: DLSS (off is `-NoDlss`),
+  (empty = the script's default), the mods folder and the options of `play-d3d12.ps1`: DLSS (off is `-NoDlss`),
   `-RayTracing`, `-SmoothMotion`, shader preparation (off is `-NoPrecompile`), `-SeriesX`, `-Quality`, `-Resolution`
-  (default = none), `-Capture`, `-Log`. On Linux only the game folder and Series X are used.
+  (default = none), `-Capture`, `-Log`. Log to a file (`-Log`, on Linux `--log`) writes the runtime's error output to
+  `play-<MMdd-HHmmss>.log` in the logs folder and keeps the five newest.
+- **Settings on Linux**: only the game folder, Proton or Wine, Series X and Log to a file are used. The Proton or Wine
+  list shows the usable Proton builds (highest version first) and "System Wine" when `wine` is on `PATH`. The first
+  entry is the default; Browse picks another Proton folder. A line below the list appears only when a folder picked with
+  Browse cannot be used. How the script picks and runs a Proton or Wine:
+  [linux.md](linux.md#the-d3d12-runtime-leonidaexe-under-wine).
 - **Mods**: the `mods\*\mod.json` of the mods folder (this repository's `mods` unless changed), with the enabled flag
   written back as the mod manager does it (`tools/leonida_mods.py`); a button opens that manager.
 - **Saves**: the D3D12 runtime's saves under the data folder, `<data>\data\7952987A\saves\<user id>\<configuration>\<Name>~<FNV-1a 64
@@ -35,8 +42,9 @@ Standard library only (`tools/leonida_launcher.py`).
   export and import a single blob, and a read-only hex and strings viewer. All of them are refused while the game
   is running.
 - **Tools**: fetch NVIDIA's DLSS files (`d3d12\Get-NVIDIA-DLSS.cmd`, after a confirmation: about 70 MB from NVIDIA's
-  GitHub), rebuild the runtime (`d3d12\scripts\build-nvidia.ps1`), open the logs folder
-  (`%LOCALAPPDATA%\Leonida\logs`) and the screenshots folder. The two scripts are Windows only.
+  GitHub), rebuild the runtime (`d3d12\scripts\build-nvidia.ps1`; on Linux `scripts/build-d3d12-linux.sh` after
+  accepting Microsoft's SDK licence, see [linux.md](linux.md)), open the logs folder (`%LOCALAPPDATA%\Leonida\logs`,
+  on Linux `~/.local/share/leonida/logs`) and the screenshots folder. The DLSS download is Windows only.
 - **About**: what the port is, that it runs your own copy, the credits (see `d3d12/README.md`) and the licence.
 
 ## Settings file
@@ -48,7 +56,9 @@ window. Unknown or mistyped keys are ignored.
 
 `python -I tests/test_leonida_saves.py` does the same for the Saves page on fake save trees. `python -I tests/test_leonida_launcher.py` covers the parts without a window: reading and writing the settings, the
 command line each option produces (checked against the switch names in `scripts/play-d3d12.ps1`), the mod list and
-the newest-picture search.
+the newest-picture search, and the Proton or Wine setting. `python -I tests/test_play_linux.py` runs
+`scripts/play-linux.sh` against Proton folders and a Wine the test creates itself and checks which one it picks,
+where DXVK's `dxgi.dll` comes from, how it sets up the prefix and where it writes its logs.
 
 ## Saves: what the bytes are, and what is not edited
 

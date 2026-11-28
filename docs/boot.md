@@ -177,7 +177,8 @@ and the one line that names the cause is
 `CreateRootSignature`.
 
 Copying the DLLs a Proton prefix installs is not enough on its own: Wine keeps preferring its own copy next to
-them. Name them in the overrides.
+them. Name them in the overrides. For the D3D12 runtime (`leonida.exe`), `scripts/play-linux.sh` does both itself,
+under a Proton or the system's Wine ([linux.md](linux.md#the-d3d12-runtime-leonidaexe-under-wine)).
 
 ```bash
 GE=$HOME/GE-Proton11-13-x86_64/files/lib/wine

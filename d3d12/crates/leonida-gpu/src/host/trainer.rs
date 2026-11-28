@@ -36,11 +36,9 @@ use leonida_menu::paint::{LEFT, TOP};
 use super::{Host, HostList, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), DescriptorTable(SRV(t0))"
 cbuffer Place : register(b0) { float2 target; float2 origin; float2 size; float band_top; float band_bottom; };
 Texture2D<float4> menu : register(t0);
 struct V { float4 pos : SV_Position; };
-[RootSignature(RS)]
 V vs(uint id : SV_VertexID) {
     float2 corner = float2(id & 1, id >> 1);
     float2 px = origin + corner * size;
@@ -48,7 +46,6 @@ V vs(uint id : SV_VertexID) {
     v.pos = float4(px / target * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
     return v;
 }
-[RootSignature(RS)]
 float4 ps(V v) : SV_Target {
     float2 p = v.pos.xy - origin;
     int layer = (p.y >= band_top && p.y < band_bottom) ? 1 : 0;
@@ -105,13 +102,6 @@ fn compile(
     code.ok_or_else(windows::core::Error::empty)
 }
 
-fn bytes(blob: &ID3DBlob) -> &[u8] {
-    // SAFETY: the blob's own bytes, alive as long as it is.
-    unsafe {
-        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
-    }
-}
-
 /// The pipeline for one target format.
 struct Pipeline {
     root: ID3D12RootSignature,
@@ -122,10 +112,36 @@ struct Pipeline {
 fn pipeline(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Pipeline> {
     let vs = compile(windows::core::s!("vs"), windows::core::s!("vs_5_1"))?;
     let ps = compile(windows::core::s!("ps"), windows::core::s!("ps_5_1"))?;
-    // SAFETY: the blobs' own bytes (the root signature is inside them);
-    // plain object creation.
+    // SAFETY: the blobs' own bytes; plain object creation.
     unsafe {
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
+        let ranges = [D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
+            OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+        }];
+        let parameters = [
+            D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 8 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                        NumDescriptorRanges: ranges.len() as u32,
+                        pDescriptorRanges: ranges.as_ptr(),
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let root = super::root_signature(device, &parameters, &[])?;
         let mut blend = D3D12_BLEND_DESC::default();
         blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
             BlendEnable: true.into(),

@@ -10,8 +10,13 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+SYSTEM_TOOLS = (Path("/usr/share/steam/compatibilitytools.d"), Path("/usr/local/share/steam/compatibilitytools.d"))
 sys.path.insert(0, str(ROOT / "tools"))
 import leonida_launcher as launcher  # noqa: E402
+
+
+def system_proton_installed():
+    return any(tools.is_dir() and any(tools.iterdir()) for tools in SYSTEM_TOOLS)
 
 
 def settings(**changes):
@@ -48,6 +53,21 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(got["log"])
         self.assertNotIn("extra", got)
         self.assertEqual(launcher.normalise([1]), launcher.DEFAULTS)
+
+    def test_linux_keeps_logs_in_the_leonida_data_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = (launcher.WINDOWS, os.environ.get("XDG_DATA_HOME"))
+            launcher.WINDOWS = False
+            os.environ["XDG_DATA_HOME"] = tmp
+            try:
+                self.assertEqual(launcher.logs_dir(), os.path.join(tmp, "leonida", "logs"))
+                self.assertEqual(launcher.captures_dir(), os.path.join(tmp, "leonida", "captures"))
+            finally:
+                launcher.WINDOWS = saved[0]
+                if saved[1] is None:
+                    os.environ.pop("XDG_DATA_HOME", None)
+                else:
+                    os.environ["XDG_DATA_HOME"] = saved[1]
 
     def test_game_folder_check(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -111,6 +131,109 @@ class CommandTests(unittest.TestCase):
                                         windows=False)
         self.assertEqual(command, ["sh", os.path.join("/r", "scripts", "play-linux.sh"),
                                    os.path.join("/g", launcher.EXPECTED_EXE), "--series-x"])
+        command = launcher.play_command(settings(game_dir="/g", log=True), repo="/r", windows=False)
+        self.assertEqual(command[2:], [os.path.join("/g", launcher.EXPECTED_EXE), "--log"])
+
+    def test_the_proton_folder_goes_to_play_linux_sh(self):
+        base = {"PATH": "/bin", "LEONIDA_PROTON": "/from/the/shell"}
+        self.assertEqual(launcher.play_environment(settings(proton_dir=" /p "), base)["LEONIDA_PROTON"], "/p")
+        self.assertEqual(launcher.play_environment(settings(), base), base)
+        self.assertNotIn("LEONIDA_PROTON", launcher.play_environment(settings(), {"PATH": "/bin"}))
+        self.assertEqual(launcher.proton_command(repo="/r"),
+                         ["sh", os.path.join("/r", "scripts", "play-linux.sh"), "--find-proton"])
+        self.assertIn('"--find-proton"', (ROOT / "scripts" / "play-linux.sh").read_text(encoding="utf-8"))
+
+    def test_system_wine_goes_to_play_linux_sh_as_leonida_wine(self):
+        base = {"PATH": "/bin", "LEONIDA_PROTON": "/from/the/shell"}
+        env = launcher.play_environment(settings(proton_dir=launcher.SYSTEM_WINE), base)
+        self.assertEqual(env["LEONIDA_WINE"], "wine")
+        self.assertNotIn("LEONIDA_PROTON", env)
+        self.assertEqual(base["LEONIDA_PROTON"], "/from/the/shell")
+        self.assertIn("LEONIDA_WINE", (ROOT / "scripts" / "play-linux.sh").read_text(encoding="utf-8"))
+
+    @unittest.skipIf(os.name == "nt" or not os.path.exists("/bin/sh"), "POSIX shell script")
+    def test_find_proton_names_the_system_wine_when_it_is_chosen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp, "bin")
+            bin_dir.mkdir()
+            wine = bin_dir / "wine"
+            wine.write_text('#!/bin/sh\n[ "$1" = --version ] && echo wine-99.0\nexit 0\n', encoding="utf-8")
+            wine.chmod(0o755)
+            dxvk = Path(tmp, "dxvk")
+            dxvk.mkdir()
+            (dxvk / "dxgi.dll").write_bytes(b"x")
+            base = {"PATH": os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"]), "HOME": tmp,
+                    "LEONIDA_DXVK": str(dxvk)}
+            self.assertEqual(launcher.find_proton(settings(proton_dir=launcher.SYSTEM_WINE), repo=str(ROOT),
+                                                  base=base), (True, "Wine 99.0", str(wine)))
+            if not system_proton_installed():
+                self.assertEqual(launcher.list_protons(repo=str(ROOT), base=dict(base, LEONIDA_WINE="nowhere")), [])
+
+    @unittest.skipIf(os.name == "nt" or not os.path.exists("/bin/sh"), "POSIX shell script")
+    def test_find_proton_reports_what_play_linux_sh_uses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proton = Path(tmp, "GE-Proton99-4")
+            (proton / "files" / "bin").mkdir(parents=True)
+            (proton / "files" / "bin" / "wine").write_text("#!/bin/sh\n", encoding="utf-8")
+            (proton / "files" / "bin" / "wine").chmod(0o755)
+            dxvk = proton / "files" / "lib" / "wine" / "dxvk" / "x86_64-windows"
+            dxvk.mkdir(parents=True)
+            (dxvk / "dxgi.dll").write_bytes(b"x")
+            base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tmp}
+            found, name, folder = launcher.find_proton(settings(proton_dir=str(proton)), repo=str(ROOT), base=base)
+            self.assertEqual((found, name, folder), (True, "GE-Proton99-4", str(proton.resolve())))
+            found, message, folder = launcher.find_proton(settings(proton_dir=os.path.join(tmp, "missing")),
+                                                          repo=str(ROOT), base=base)
+            self.assertFalse(found)
+            self.assertIn("is not a Proton build", message)
+            self.assertEqual(folder, "")
+
+    @unittest.skipIf(os.name == "nt" or not os.path.exists("/bin/sh"), "POSIX shell script")
+    @unittest.skipIf(system_proton_installed(), "a Proton is installed system-wide on this machine")
+    def test_list_protons_reports_every_build_play_linux_sh_finds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = Path(tmp, ".local", "share", "Steam", "compatibilitytools.d")
+            partial = tools / "Proton-Wineland Latest"
+            (partial / "files" / "bin").mkdir(parents=True)
+            (partial / "files" / "bin" / "wine").write_text("#!/bin/sh\n", encoding="utf-8")
+            (partial / "files" / "bin" / "wine").chmod(0o755)
+            (partial / "version").write_text("1 wineland-99.0\n", encoding="utf-8")
+            for name in ("GE-Proton98-1", "GE-Proton99-2"):
+                proton = tools / name
+                (proton / "files" / "lib" / "wine").mkdir(parents=True)
+                (proton / "files" / "bin").mkdir(parents=True)
+                (proton / "files" / "bin" / "wine").write_text("#!/bin/sh\n", encoding="utf-8")
+                (proton / "files" / "bin" / "wine").chmod(0o755)
+                dxvk = proton / "files" / "lib" / "wine" / "dxvk" / "x86_64-windows"
+                dxvk.mkdir(parents=True)
+                (dxvk / "dxgi.dll").write_bytes(b"x")
+            base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tmp, "LEONIDA_PROTON": "/elsewhere"}
+            self.assertEqual(launcher.list_protons(repo=str(ROOT), base=base),
+                             [("GE-Proton99-2", str((tools / "GE-Proton99-2").resolve())),
+                              ("GE-Proton98-1", str((tools / "GE-Proton98-1").resolve()))])
+            self.assertEqual(launcher.list_protons(repo=os.path.join(tmp, "nowhere"), base=base), [])
+
+    def test_the_newest_proton_is_the_default_entry_of_the_list(self):
+        found = [("GE-Proton99-2", "/p/99"), ("GE-Proton98-1", "/p/98")]
+        choices = launcher.proton_choices(found, "/usr/bin/wine")
+        self.assertEqual(choices, [("GE-Proton99-2  (/p/99)", "", "/p/99"),
+                                   ("GE-Proton98-1  (/p/98)", "/p/98", "/p/98"),
+                                   ("System Wine  (/usr/bin/wine)", launcher.SYSTEM_WINE, launcher.SYSTEM_WINE)])
+        self.assertEqual(launcher.proton_label(choices, ""), "GE-Proton99-2  (/p/99)")
+        self.assertEqual(launcher.proton_label(choices, "/p/99"), "GE-Proton99-2  (/p/99)")
+        self.assertEqual(launcher.proton_label(choices, "/p/98"), "GE-Proton98-1  (/p/98)")
+        self.assertEqual(launcher.proton_label(choices, launcher.SYSTEM_WINE), "System Wine  (/usr/bin/wine)")
+        self.assertEqual(launcher.proton_label(choices, "/my/proton"), "/my/proton")
+        self.assertFalse(any(label.startswith("Newest") for label, _value, _target in choices))
+
+    def test_without_a_proton_the_system_wine_is_the_default_entry(self):
+        choices = launcher.proton_choices([], "/usr/bin/wine")
+        self.assertEqual(choices, [("System Wine  (/usr/bin/wine)", "", launcher.SYSTEM_WINE)])
+        self.assertEqual(launcher.proton_label(choices, ""), "System Wine  (/usr/bin/wine)")
+        self.assertEqual(launcher.proton_label(choices, launcher.SYSTEM_WINE), "System Wine  (/usr/bin/wine)")
+        nothing = launcher.proton_choices([], None)
+        self.assertEqual(nothing, [("No Proton or Wine found", "", "")])
+        self.assertEqual(launcher.proton_label(nothing, launcher.SYSTEM_WINE), "System Wine  (not found)")
 
     def test_no_game_folder_is_refused(self):
         with self.assertRaises(ValueError):
@@ -119,8 +242,13 @@ class CommandTests(unittest.TestCase):
     def test_tools(self):
         self.assertEqual(launcher.tool_command("get_dlss", repo="R", windows=True)[:2], ["cmd", "/c"])
         self.assertTrue(launcher.tool_command("build", repo="R", windows=True)[-1].endswith("build-nvidia.ps1"))
+        self.assertEqual(launcher.tool_command("build", repo="/r", windows=False),
+                         ["sh", os.path.join("/r", "scripts", "build-d3d12-linux.sh")])
+        self.assertEqual(launcher.tool_command("build", repo="/r", windows=False, accept_sdk_licence=True)[:2],
+                         ["env", "XWIN_ACCEPT_LICENSE=1"])
+        self.assertTrue((ROOT / "scripts" / "build-d3d12-linux.sh").is_file())
         with self.assertRaises(ValueError):
-            launcher.tool_command("build", windows=False)
+            launcher.tool_command("get_dlss", windows=False)
         with self.assertRaises(ValueError):
             launcher.tool_command("nope", windows=True)
 

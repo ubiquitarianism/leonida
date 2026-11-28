@@ -100,6 +100,47 @@ unless you add the `x86_64-pc-windows-msvc` Rust target or pass a prebuilt stati
 `-DLEONIDA_XMA2_DECODER_LIB=<path>`, built yourself from this checkout's `runtime/xma_decoder` with the command in
 [runtime/xma_decoder/README.md](../runtime/xma_decoder/README.md).
 
+### The D3D12 runtime (`leonida.exe`) under Wine
+
+`scripts/play-linux.sh` and PLAY in the launcher start `leonida.exe`, the D3D12 runtime in `d3d12/`. `./Build.sh`
+does not build it. On Linux:
+
+```sh
+cargo install --locked cargo-xwin                       # once; also needs clang and lld
+XWIN_ACCEPT_LICENSE=1 sh scripts/build-d3d12-linux.sh   # leonida.exe, VKD3D-Proton and DXVK's dxgi.dll
+sh scripts/play-linux.sh /path/to/game_scarlett_master.exe
+```
+
+cargo-xwin downloads Microsoft's CRT and Windows SDK on its first run. `XWIN_ACCEPT_LICENSE=1` accepts their licence;
+without it the script stops before downloading. The runtime lands in `d3d12/target/x86_64-pc-windows-msvc/diag/`,
+VKD3D-Proton in `d3d12/target/vkd3d-proton/` (fetching it needs Python 3.14 or newer), DXVK's `dxgi.dll` in
+`d3d12/target/dxvk/` (`scripts/fetch_dxvk.py`, which fetches it on its own too). `play-linux.sh` looks for
+`leonida.exe` beside itself, then under `d3d12/target/`. `LEONIDA_RUNTIME` and `LEONIDA_VKD3D` select other files.
+
+The script takes `LEONIDA_PROTON` (a Proton folder or its `files/bin/wine`), else `LEONIDA_WINE` (a Wine program, such
+as `wine`), else the usable Proton build with the highest version, else `wine` on `PATH`. Every folder with
+`files/bin/wine` counts as a Proton build, whatever its name, in Steam's `compatibilitytools.d` and `steamapps/common`
+(all libraries, Flatpak and Snap too), `STEAM_EXTRA_COMPAT_TOOLS_PATHS` and the system's `compatibilitytools.d`; it is
+usable when it also has `files/lib/wine` or `files/lib64/wine`; others are left out. Builds are ranked by the numbers
+in their version. `--find-proton` prints the Proton or Wine the script would use, `--list-protons` every usable build;
+neither changes anything.
+
+The game needs DXVK's `dxgi.dll`: with Wine's own (on `wined3d`) it crashes when it creates its swap chain, and Wine's
+own `d3d12.dll` (vkd3d) creates no device for it. The `dxgi.dll` comes from the Proton; if it has none, or under the
+system's Wine, from `LEONIDA_DXVK` (a folder with a 64-bit `dxgi.dll`), else the package (`dxvk/` beside the script,
+then `d3d12/target/dxvk/`), else the distribution's DXVK (under `/usr/share/dxvk` or `/usr/lib/dxvk`), else another
+Proton. Without any, the script stops and names `fetch_dxvk.py`. It copies that dxgi.dll and the bundled VKD3D-Proton
+into its own prefix (`LEONIDA_WINEPREFIX`, made and updated with the Wine in use) and sets
+`WINEDLLOVERRIDES=d3d12,d3d12core,dxgi=n` ([boot.md](boot.md#under-wine-on-linux)). Under a Proton it puts the build's
+libraries first in `WINEDLLPATH` and `LD_LIBRARY_PATH`, as Proton's own `proton` script does. VKD3D-Proton's shader
+cache goes to `<LEONIDA_CACHE_DIR>/vkd3d-proton`.
+
+VKD3D-Proton releases without dxil-spirv's new structurizer turn some of the title's compute shaders into invalid
+SPIR-V, and the Vulkan driver crashes on them (`vkCreateComputePipelines`, exception `0xc0000005`). When the bundled
+`d3d12core.dll` lacks it, `play-linux.sh` takes the VKD3D-Proton of the Proton in use, else of another Proton found that
+has it (highest version first), also when `LEONIDA_PROTON` chose the Proton. If none has it, the script warns and uses
+the bundled one. `LEONIDA_VKD3D` selects a VKD3D-Proton and skips this check.
+
 ### Why there is no native Linux `gta6rt`
 
 A native (ELF) loader is not a matter of build flags:

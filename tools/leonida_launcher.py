@@ -35,6 +35,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Switches of scripts/play-d3d12.ps1 that the Settings page offers, with the value they have by default.
 RESOLUTIONS = ("", "2160", "1440", "1080", "720", "540", "480")
+SYSTEM_WINE = "system-wine"
 DLSS_MODES = ("", "quality", "balanced", "performance", "ultra")
 FRAME_GEN = (0, 2, 3, 4, 5, 6)
 PRESENT_SCALES = ("", "fit", "stretch")
@@ -60,6 +61,7 @@ DEFAULTS: dict = {
     "present_scale": "",     # -PresentScale, with -Aspect; empty = the script's default (fit)
     "adapter": "",           # -Adapter <part of the card's name, or #index>
     "background": "",        # the picture behind PLAY in launcher/; "" = background.* in config_dir()
+    "proton_dir": "",
 }
 # The options with a fixed set of values, and the others whose text has to match a pattern.
 CHOICES: dict = {"resolution": RESOLUTIONS, "dlss_mode": DLSS_MODES, "frame_gen": FRAME_GEN,
@@ -178,13 +180,88 @@ def play_command(settings: dict, repo: str = REPO, windows: bool = WINDOWS) -> l
     command = ["sh", os.path.join(repo, "scripts", "play-linux.sh"), os.path.join(game, EXPECTED_EXE)]
     if settings["series_x"]:
         command.append("--series-x")
+    if settings["log"]:
+        command.append("--log")
     return command
 
 
-def tool_command(name: str, repo: str = REPO, windows: bool = WINDOWS) -> list[str]:
-    """The command of a Tools button: `get_dlss` or `build`. Both are Windows scripts."""
+def play_environment(settings: dict, base: dict | None = None) -> dict:
+    env = dict(os.environ if base is None else base)
+    proton = settings.get("proton_dir", "").strip()
+    if proton == SYSTEM_WINE:
+        env.pop("LEONIDA_PROTON", None)
+        env["LEONIDA_WINE"] = "wine"
+    elif proton:
+        env["LEONIDA_PROTON"] = proton
+    return env
+
+
+def proton_command(repo: str = REPO) -> list[str]:
+    return ["sh", os.path.join(repo, "scripts", "play-linux.sh"), "--find-proton"]
+
+
+def list_protons(repo: str = REPO, base: dict | None = None) -> list[tuple[str, str]]:
+    env = dict(os.environ if base is None else base)
+    env.pop("LEONIDA_PROTON", None)
+    env.pop("LEONIDA_WINE", None)
+    try:
+        done = subprocess.run(["sh", os.path.join(repo, "scripts", "play-linux.sh"), "--list-protons"], env=env,
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if done.returncode != 0:
+        return []
+    found = []
+    for line in done.stdout.splitlines():
+        name, _, folder = line.partition("\t")
+        if name and folder:
+            found.append((name, folder))
+    return found
+
+
+def proton_choices(found: list[tuple[str, str]], wine: str | None) -> list[tuple[str, str, str]]:
+    choices = [(f"{name}  ({folder})", "" if index == 0 else folder, folder)
+               for index, (name, folder) in enumerate(found)]
+    if wine:
+        choices.append((f"System Wine  ({wine})", SYSTEM_WINE if found else "", SYSTEM_WINE))
+    if not choices:
+        choices.append(("No Proton or Wine found", "", ""))
+    return choices
+
+
+def proton_label(choices: list[tuple[str, str, str]], setting: str) -> str:
+    for label, value, _target in choices:
+        if value == setting:
+            return label
+    for label, _value, target in choices:
+        if setting and target == setting:
+            return label
+    return "System Wine  (not found)" if setting == SYSTEM_WINE else setting
+
+
+def find_proton(settings: dict, repo: str = REPO, base: dict | None = None) -> tuple[bool, str, str]:
+    try:
+        done = subprocess.run(proton_command(repo), env=play_environment(settings, base), stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"Could not look for Proton or Wine: {exc}", ""
+    if done.returncode == 0:
+        line = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ""
+        name, _, folder = line.partition("\t")
+        if name and folder:
+            return True, name, folder
+    return False, (done.stderr.strip() or done.stdout.strip() or "No Proton or Wine found."), ""
+
+
+def tool_command(name: str, repo: str = REPO, windows: bool = WINDOWS, accept_sdk_licence: bool = False) -> list[str]:
+    """The command of a Tools button: `get_dlss` or `build`."""
     if not windows:
-        raise ValueError("This tool is a Windows script; on Linux see docs/linux.md.")
+        if name == "build":
+            command = ["sh", os.path.join(repo, "scripts", "build-d3d12-linux.sh")]
+            return (["env", "XWIN_ACCEPT_LICENSE=1"] + command) if accept_sdk_licence else command
+        if name == "get_dlss":
+            raise ValueError("This tool is a Windows script; on Linux see docs/linux.md.")
+        raise ValueError(f"unknown tool {name}")
     runtime = os.path.join(repo, "d3d12")
     if name == "get_dlss":
         return ["cmd", "/c", os.path.join(runtime, "Get-NVIDIA-DLSS.cmd")]
@@ -216,17 +293,22 @@ def local_data_dir() -> str:
     return os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
 
 
+def leonida_data_dir() -> str:
+    return os.path.join(local_data_dir(), "Leonida" if WINDOWS else "leonida")
+
+
 def logs_dir() -> str:
-    return os.path.join(local_data_dir(), "Leonida", "logs")
+    return os.path.join(leonida_data_dir(), "logs")
 
 
 def captures_dir() -> str:
-    return os.path.join(local_data_dir(), "Leonida", "captures")
+    return os.path.join(leonida_data_dir(), "captures")
 
 
 def screenshot_dirs(repo: str = REPO) -> list[str]:
     """Where the runtime saves pictures: the F4 menu's screenshots (next to the exe) and F9 captures."""
-    return [os.path.join(repo, "d3d12", "target", "diag", "screenshots"), captures_dir()]
+    return [os.path.join(repo, "d3d12", "target", "diag", "screenshots"),
+            os.path.join(repo, "d3d12", "target", "x86_64-pc-windows-msvc", "diag", "screenshots"), captures_dir()]
 
 
 def newest_picture(folders: list[str], limit: int = 2000) -> str | None:
@@ -320,13 +402,13 @@ def stop_tree(process: subprocess.Popen) -> None:
             process.terminate()
 
 
-def spawn(command: list[str], cwd: str) -> subprocess.Popen:
+def spawn(command: list[str], cwd: str, env: dict | None = None) -> subprocess.Popen:
     kwargs: dict = {}
     if WINDOWS:
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     else:
         kwargs["start_new_session"] = True
-    return subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    return subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, **kwargs)
 
 
@@ -578,9 +660,17 @@ def run_gui() -> int:
             except ValueError as exc:
                 messagebox.showwarning("Play", str(exc))
                 return
-            self.run(command, "the game", "Starting")
+            env = None
+            if not WINDOWS:
+                found, name, _folder = find_proton(self.settings)
+                if not found:
+                    messagebox.showerror("Proton or Wine", name)
+                    self.show("Settings")
+                    return
+                env = play_environment(self.settings)
+            self.run(command, "the game", "Starting", env)
 
-        def run(self, command, what, state):
+        def run(self, command, what, state, env=None):
             if self.process is not None:
                 messagebox.showinfo("Leonida", "Something is already running. Stop it first.")
                 return
@@ -589,7 +679,7 @@ def run_gui() -> int:
             self.log.configure(state="disabled")
             self.append("> " + " ".join(f'"{c}"' if " " in c else c for c in command) + "\n")
             try:
-                self.process = spawn(command, REPO)
+                self.process = spawn(command, REPO, env)
             except OSError as exc:
                 self.append(f"Could not start: {exc}\n")
                 self.set_state("Could not start")
@@ -657,6 +747,38 @@ def run_gui() -> int:
             ttk.Label(parent, text=note, style="Muted.TLabel", wraplength=640).grid(
                 row=row + 1, column=1, sticky="w", padx=8)
 
+        def proton_row(self, parent, row):
+            ttk.Label(parent, text="Proton or Wine").grid(row=row, column=0, sticky="w", pady=(10, 0))
+            var = tk.StringVar(value=self.settings["proton_dir"])
+            self.vars["proton_dir"] = var
+            self.proton_choice = tk.StringVar()
+            self.proton_folders: dict[str, str] = {}
+            self.proton_choices: list[tuple[str, str, str]] = []
+            self.proton_box = ttk.Combobox(parent, textvariable=self.proton_choice, state="readonly",
+                                           postcommand=self.refresh_protons)
+            self.proton_box.grid(row=row, column=1, sticky="ew", padx=8, pady=(10, 0))
+            self.proton_box.bind("<<ComboboxSelected>>",
+                                 lambda _event: var.set(self.proton_folders.get(self.proton_choice.get(), "")))
+            ttk.Button(parent, text="Browse ...", command=lambda: self.browse(var)).grid(row=row, column=2,
+                                                                                         pady=(10, 0))
+            self.refresh_protons()
+
+        def refresh_protons(self):
+            self.proton_choices = proton_choices(list_protons(), shutil.which("wine"))
+            self.show_proton_choice()
+
+        def show_proton_choice(self):
+            setting = self.vars["proton_dir"].get().strip()
+            label = proton_label(self.proton_choices, setting)
+            self.proton_folders = {choice: value for choice, value, _target in self.proton_choices}
+            self.proton_folders.setdefault(label, setting)
+            self.proton_box["values"] = list(self.proton_folders)
+            self.proton_choice.set(label)
+
+        def proton_changed(self):
+            self.show_proton_choice()
+            self.schedule_proton_check()
+
         def build_settings(self):
             page = self.pages["Settings"]
             page.columnconfigure(0, weight=1)
@@ -673,18 +795,30 @@ def run_gui() -> int:
             self.folder_row(inner, 4, "Data folder", "data_dir",
                             "Shader caches and saves. Empty: the default (%LOCALAPPDATA%\\Leonida\\d3d12).")
             self.folder_row(inner, 6, "Mods folder", "mods_dir", "Empty: the mods folder of this repository.")
+            if not WINDOWS:
+                self.proton_row(inner, 8)
+                self.proton_check = tk.StringVar()
+                ttk.Label(inner, textvariable=self.proton_check, wraplength=720).grid(
+                    row=9, column=1, sticky="w", padx=8)
+                self.proton_after = None
+                self.vars["proton_dir"].trace_add("write", lambda *_: self.proton_changed())
+                ttk.Label(inner, text="On Linux only the game folder, Proton or Wine, the Series X profile and "
+                          f"Log to a file are used. Log files go to {logs_dir()} (the five newest are kept).",
+                          style="Muted.TLabel", wraplength=720).grid(row=11, column=0, columnspan=3, sticky="w",
+                                                                     pady=(10, 0))
             options = ttk.LabelFrame(inner, text="Options (the switches of scripts\\play-d3d12.ps1)", padding=12)
-            options.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(20, 0))
+            options.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(20, 0))
             options.columnconfigure(0, weight=1)
             options.columnconfigure(1, weight=1)
             checks = (("dlss", "DLSS (off = -NoDlss: the picture is stretched)"),
                       ("ray_tracing", "Ray tracing (-RayTracing, slower)"),
                       ("smooth_motion", "Smooth Motion (-SmoothMotion, RTX 40 and 50)"),
                       ("precompile", "Prepare shaders before starting (off = -NoPrecompile)"),
-                      ("series_x", "Series X profile (-SeriesX, much slower)"),
+                      ("series_x", "Series X profile (-SeriesX, much slower)" if WINDOWS
+                       else "Series X profile (--series-x, much slower)"),
                       ("quality", "Quality (-Quality, slower)"),
                       ("capture", "Capture: F9 saves a frame (-Capture)"),
-                      ("log", "Log to a file (-Log)"))
+                      ("log", "Log to a file (-Log)" if WINDOWS else "Log to a file (--log)"))
             for index, (key, text) in enumerate(checks):
                 var = tk.BooleanVar(value=self.settings[key])
                 self.vars[key] = var
@@ -696,17 +830,13 @@ def run_gui() -> int:
             ttk.Combobox(options, textvariable=res, state="readonly", width=12,
                          values=["default"] + [r for r in RESOLUTIONS if r]).grid(row=4, column=1, sticky="w",
                                                                                   pady=(10, 0))
-            if not WINDOWS:
-                ttk.Label(inner, text="On Linux the launcher starts scripts/play-linux.sh, which takes the "
-                          "game folder and the Series X profile; the other options are for Windows.",
-                          style="Muted.TLabel", wraplength=720).grid(row=9, column=0, columnspan=3, sticky="w",
-                                                                     pady=(10, 0))
             buttons = ttk.Frame(inner)
-            buttons.grid(row=10, column=0, columnspan=3, sticky="w", pady=(18, 0))
+            buttons.grid(row=13, column=0, columnspan=3, sticky="w", pady=(18, 0))
             ttk.Button(buttons, text="Save", command=self.save).pack(side="left")
             self.saved_var = tk.StringVar()
             ttk.Label(buttons, textvariable=self.saved_var, style="Muted.TLabel").pack(side="left", padx=12)
             self.check_game()
+            self.check_proton()
 
         def browse(self, var):
             chosen = filedialog.askdirectory(initialdir=var.get() or os.path.expanduser("~"))
@@ -721,6 +851,19 @@ def run_gui() -> int:
                 self.game_check.set(f"Found {EXPECTED_EXE}.")
             else:
                 self.game_check.set(f"{EXPECTED_EXE} is not in this folder.")
+
+        def schedule_proton_check(self):
+            if self.proton_after is not None:
+                self.root.after_cancel(self.proton_after)
+            self.proton_after = self.root.after(400, self.check_proton)
+
+        def check_proton(self):
+            if WINDOWS:
+                return
+            self.proton_after = None
+            self.collect_settings()
+            found, name, _folder = find_proton(self.settings)
+            self.proton_check.set("" if found else name)
 
         def collect_settings(self):
             for key, var in self.vars.items():
@@ -737,6 +880,7 @@ def run_gui() -> int:
                 self.saved_var.set("Saved to " + config_path())
             except OSError as exc:
                 self.saved_var.set(f"Could not save: {exc}")
+            self.check_proton()
             self.refresh_hint()
 
         # ---- Mods
@@ -1020,7 +1164,9 @@ def run_gui() -> int:
                                                                                 sticky="w", pady=(0, 10))
             items = (("Fetch NVIDIA DLSS files", "Downloads about 70 MB from NVIDIA's GitHub, once.",
                       self.fetch_dlss),
-                     ("Rebuild the runtime", "d3d12\\scripts\\build-nvidia.ps1 (a few minutes).", self.rebuild),
+                     ("Rebuild the runtime", ("d3d12\\scripts\\build-nvidia.ps1" if WINDOWS
+                                              else "scripts/build-d3d12-linux.sh") + " (a few minutes).",
+                      self.rebuild),
                      ("Open the logs folder", logs_dir(), lambda: self.open(logs_dir())),
                      ("Open the screenshots folder", "The F4 menu's screenshots, else the F9 captures.",
                       self.open_screenshots))
@@ -1037,11 +1183,19 @@ def run_gui() -> int:
             self.run_tool("get_dlss", "the DLSS download")
 
         def rebuild(self):
-            self.run_tool("build", "the runtime build")
+            accept = False
+            if not WINDOWS:
+                accept = messagebox.askokcancel(
+                    "Rebuild the runtime",
+                    "The build uses cargo-xwin, which downloads Microsoft's CRT and Windows SDK on its first run "
+                    "(https://go.microsoft.com/fwlink/?LinkId=2086102). OK accepts Microsoft's licence for them.")
+                if not accept:
+                    return
+            self.run_tool("build", "the runtime build", accept_sdk_licence=accept)
 
-        def run_tool(self, name, what):
+        def run_tool(self, name, what, **options):
             try:
-                command = tool_command(name)
+                command = tool_command(name, **options)
             except ValueError as exc:
                 messagebox.showinfo("Tools", str(exc))
                 return
