@@ -437,6 +437,47 @@ void check_run_time_load() {
         check(reported == S_OK && seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
               "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
         reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
+        // Re-entrancy: invoking XErrorReport and XErrorSetCallback from inside the callback must not deadlock.
+        struct Reentrant {
+            void* err_obj = nullptr;
+            Report report_fn = nullptr;
+            SetCallback set_cb_fn = nullptr;
+            int calls = 0;
+            HRESULT nested_hr = S_OK;
+        };
+        static Reentrant reentrant{};
+        reentrant = {e, reinterpret_cast<Report>(slot(e, 3)), reinterpret_cast<SetCallback>(slot(e, 4)), 0, S_OK};
+        Callback on_reentrant = [](HRESULT, const char*, void* ctx) {
+            auto* r = static_cast<Reentrant*>(ctx);
+            const int n = ++r->calls;
+            if (n == 1) {
+                r->nested_hr = r->report_fn(r->err_obj, E_ABORT, "nested report");
+                r->set_cb_fn(r->err_obj, nullptr, nullptr);
+            }
+            return true;
+        };
+        reentrant.set_cb_fn(e, on_reentrant, &reentrant);
+        HANDLE th = CreateThread(
+            nullptr, 0,
+            [](LPVOID param) -> DWORD {
+                auto* r = static_cast<Reentrant*>(param);
+                return r->report_fn(r->err_obj, E_FAIL, "outer report") == S_OK ? 0u : 1u;
+            },
+            &reentrant, 0, nullptr);
+        const DWORD waited = th ? WaitForSingleObject(th, 2000) : WAIT_FAILED;
+        DWORD thread_rc = 1;
+        if (waited == WAIT_OBJECT_0) GetExitCodeThread(th, &thread_rc);
+        if (th) CloseHandle(th);
+        const HRESULT after_clear =
+            (waited == WAIT_OBJECT_0) ? reentrant.report_fn(e, E_FAIL, "after clear") : E_FAIL;
+        check(waited == WAIT_OBJECT_0 && thread_rc == 0 && reentrant.calls == 2 && reentrant.nested_hr == S_OK &&
+                  after_clear == S_OK,
+              "XErrorReport invokes callback without holding g_error_mutex (re-entrant report + set_callback)");
+        if (waited != WAIT_OBJECT_0) {
+            std::printf("xgameruntime_test: %d of %d checks failed (deadlock in XErrorReport)\n", g_failures, g_checks);
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
         using SetOptions = void(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);  // void, per Microsoft's page
         reinterpret_cast<SetOptions>(slot(e, 5))(e, 0x01, 0x00);  // OutputDebugStringOnError / None
         release(e);

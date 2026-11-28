@@ -249,8 +249,14 @@ HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
     if (s_logged.fetch_add(1) < 64)
         std::fprintf(stderr, "[rt] xgameruntime: XErrorReport(0x%08lx, %s)\n", static_cast<unsigned long>(hr),
                      message ? message : "(null)");
-    std::lock_guard<std::mutex> lock(g_error_mutex);
-    if (XErrorCallback cb = g_error_callback.load()) cb(hr, message, g_error_context.load());
+    XErrorCallback cb = nullptr;
+    void* ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_error_mutex);
+        cb = g_error_callback.load();
+        ctx = g_error_context.load();
+    }
+    if (cb) cb(hr, message, ctx);
     return S_OK;
 }
 
