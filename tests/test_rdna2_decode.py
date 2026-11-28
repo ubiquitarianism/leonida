@@ -339,6 +339,47 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(info["insns"][4]["args"][2]["t"], "off")
         self.assertEqual(info["insns"][4]["mods"], ["offset:-4"])
 
+    def test_ds_condxchg32_single_offset_and_swizzle_modes_match_llvm(self):
+        # ds_condxchg32_rtn_b64 uses a single 16-bit offset (not offset0/offset1); "2_" substring in "32_" must not
+        # classify it as a 2-address DS instruction (LLVM gfx10_ds.txt).
+        cases = [
+            (bytes([0x04, 0x00, 0xF8, 0xD9, 0x01, 0x02, 0x00, 0x05]),
+             "ds_condxchg32_rtn_b64", ["offset:4"]),
+            (bytes([0xFF, 0xFF, 0xF8, 0xD9, 0x01, 0x02, 0x00, 0x05]),
+             "ds_condxchg32_rtn_b64", ["offset:65535"]),
+            (bytes([0xFF, 0xFF, 0xFA, 0xD9, 0x01, 0x02, 0x00, 0x05]),
+             "ds_condxchg32_rtn_b64", ["offset:65535", "gds"]),
+            # Control: true 2-address DS instruction keeps offset0 / offset1.
+            (bytes([0x04, 0x08, 0xDC, 0xD8, 0x01, 0x00, 0x00, 0x05]),
+             "ds_read2_b32", ["offset0:4", "offset1:8"]),
+            # ds_swizzle_b32: LLVM AMDGPUInstPrinter::printSwizzle omits offset when 0, prints ROTATE for
+            # 0xC000..0xDFFF, and prints FFT for 0xE000..0xFFFF.
+            (bytes([0x00, 0x00, 0xD4, 0xD8, 0x01, 0x00, 0x00, 0x05]),
+             "ds_swizzle_b32", []),
+            (bytes([0x00, 0xC0, 0xD4, 0xD8, 0x01, 0x00, 0x00, 0x05]),
+             "ds_swizzle_b32", ["offset:swizzle(ROTATE,0,0)"]),
+            (bytes([0x20, 0xC4, 0xD4, 0xD8, 0x01, 0x00, 0x00, 0x05]),
+             "ds_swizzle_b32", ["offset:swizzle(ROTATE,1,1)"]),
+            (bytes([0xE0, 0xC7, 0xD4, 0xD8, 0x01, 0x00, 0x00, 0x05]),
+             "ds_swizzle_b32", ["offset:swizzle(ROTATE,1,31)"]),
+            (bytes([0x00, 0xE0, 0xD4, 0xD8, 0x01, 0x00, 0x00, 0x05]),
+             "ds_swizzle_b32", ["offset:swizzle(FFT,0)"]),
+            (bytes([0x10, 0xE0, 0xD4, 0xD8, 0x01, 0x00, 0x00, 0x05]),
+             "ds_swizzle_b32", ["offset:swizzle(FFT,16)"]),
+            (bytes([0xFF, 0xFF, 0xD6, 0xD8, 0x01, 0x00, 0x00, 0x05]),
+             "ds_swizzle_b32", ["offset:swizzle(FFT,31)", "gds"]),
+        ]
+        for raw, expected_op, expected_mods in cases:
+            with self.subTest(op=expected_op, mods=expected_mods):
+                info = rdna2_decode.decode_bytes(raw)
+                self.assertEqual(info["invalid"], 0)
+                ins = info["insns"][0]
+                self.assertEqual(ins["op"], expected_op)
+                self.assertEqual(ins["mods"], expected_mods)
+                reparsed = shader_ir.parse_line(rdna2_decode.format_insn(ins))
+                self.assertEqual(reparsed["op"], expected_op)
+                self.assertEqual(reparsed["mods"], expected_mods)
+
     def test_sdwa_inline_sources(self):
         values = list(range(65)) + list(range(-1, -17, -1))
         floats = [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 0.15915494]

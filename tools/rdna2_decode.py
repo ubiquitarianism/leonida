@@ -372,7 +372,15 @@ def _format_dpp16_ctrl(ctrl: int) -> str:
     return f"dpp_ctrl:0x{ctrl:x}"
 
 
-def _format_ds_swizzle(offset16: int) -> str:
+def _format_ds_swizzle(offset16: int) -> str | None:
+    if offset16 == 0:
+        return None
+    if offset16 >= 0xE000:
+        return f"offset:swizzle(FFT,{offset16 & 0x1F})"
+    if offset16 >= 0xC000:
+        direction = (offset16 >> 10) & 1
+        size = (offset16 >> 5) & 0x1F
+        return f"offset:swizzle(ROTATE,{direction},{size})"
     if (offset16 & 0x8000) == 0:
         # Bitmask mode: bits [4:0] = and_mask, [9:5] = or_mask, [14:10] = xor_mask.
         # Match LLVM's canonical aliases (SWAP, REVERSE, BROADCAST) before general BITMASK_PERM.
@@ -1105,9 +1113,11 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             elif fn == "DATA1":
                 args.append(_vreg(data1, w))
         mods = []
-        is_2addr = ("2_" in name or "2st64_" in name)
+        is_2addr = name.startswith(("ds_read2", "ds_write2", "ds_wrxchg2"))
         if name == "ds_swizzle_b32":
-            mods.append(_format_ds_swizzle(offset0 | (offset1 << 8)))
+            swz = _format_ds_swizzle(offset0 | (offset1 << 8))
+            if swz:
+                mods.append(swz)
         elif is_2addr:
             if offset0:
                 mods.append(f"offset0:{offset0}")
