@@ -28,8 +28,15 @@ DllMain/TLS results, exceptions with their stack frames, the exit, and the D3D12
 per method. When `XboxPresentation` logs its teardown `[rt] present: pacing summary ...` line (BL-6), the D3D12
 summary also reports the frame count, interval count, target interval, mean and drift against target, `p50`/`p95`/`p99`
 frame times, and `p50`/`p95`/`p99` origin-to-present latencies (and includes the numeric `frame_pacing` object in
-`--json` and `--counts-only`). The remaining `[rt]` lines in the same stderr log carry the device parameters, feature
-ids and warnings; the summary leaves them as a count, so grep `^\[rt\]` for those.
+`--json` and `--counts-only`).
+
+The same report counts shader translation lookup failures by stage. For builds with `LEONIDA_STUB_PIPELINES`,
+the highest logged creation milestone gives a lower bound on stub pipelines created. The runtime can create a
+pipeline without ever drawing with it. If the presenter logged capture measurements, the report counts black and
+nonblack readbacks. On older builds, a positive mean establishes color, while three rounded zero means leave the
+capture inconclusive. A successful `PresentX` call alone gives no pixel measurement. To share just the counters,
+run `python -I tools/boot_trace.py --d3d12 d3d12.log --counts-only`. For device parameters, feature IDs and other
+warnings, inspect the original stderr locally.
 
 For `xmem_physical_pages`, the shim records the first request for each distinct attribute word. The text and
 JSON summaries list the API, raw attribute word, requested page count and caller for the first `--limit`

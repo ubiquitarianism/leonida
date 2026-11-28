@@ -4,7 +4,8 @@ The loader writes the startup trace with `gta6rt --trace FILE` (one JSON object 
 survives a crash; `runtime/README.md`, "Startup trace"), and the D3D12 proxy writes one `[d3d12-trace] #<seq>
 <method> <outcome>` line to stderr with `--trace-d3d12`. This tool turns both into the small report a first-boot
 triage needs: modules, unimplemented calls and their callers, DllMain/TLS results, exceptions and the exit, then
-the D3D12 calls by outcome and the first call per method.
+the D3D12 calls by outcome and the first call per method. The stderr summary also recognizes missing shader
+translations, stub pipeline creation milestones and presenter readback measurements when the runtime emits them.
 
 With LEONIDA_TRACE_PIPELINE_COMPILE=1, the D3D12 log also reports time spent building and waiting for Vulkan
 pipelines. Builds with a recorded start and no matching end are counted separately.
@@ -56,6 +57,18 @@ PIPELINE_USE = re.compile(PIPELINE_PREFIX + r"use trigger=\S+ tid=\d+ us=(\d+) r
 PIPELINE_ID = ("tid", "trigger", "variant", "key")
 D3D12_PROBLEMS = ("failed", "unsupported", "refused", "partial")
 D3D12_OUTCOMES = frozenset((*D3D12_PROBLEMS, "called", "ok", "ignored"))
+CAPTURE_LINE = re.compile(
+    r"\[rt\] present: capture frame_[0-9]{5,20}\.ppm \(([1-9][0-9]{0,9})x([1-9][0-9]{0,9}), mean rgb "
+    r"([0-9]{1,3}\.\d{2}) ([0-9]{1,3}\.\d{2}) ([0-9]{1,3}\.\d{2})(?:, nonzero_rgb_pixels ([0-9]{1,20}))?\)"
+)
+SHADER_MISS = re.compile(
+    r"\[rt\] d3d12: no translated (?:(vs|gs|ps|ms) for FSSM|compute shader for "
+    r"(?:FSSM|FSPX kind-6(?: and kind-0)?)) sha256 [0-9a-f]{64}"
+)
+STUB_MILESTONE = re.compile(
+    r"\[rt\] d3d12: LEONIDA_STUB_PIPELINES: (?:graphics|compute) pipeline without a translated shader "
+    r"is a no-op stub \(([1-9][0-9]{0,9}) so far\)"
+)
 
 
 class TraceError(ValueError):
@@ -232,6 +245,41 @@ def parse_startup(path: str, limit: int = 10) -> dict:
     return trace
 
 
+def _record_render(line: str, counts: dict) -> bool:
+    """Record only measurements and fixed categories emitted by the render diagnostics."""
+    if not line.startswith("[rt] "):
+        _, _, line = line.partition(" : ")  # PowerShell native stderr prefix
+    if match := CAPTURE_LINE.fullmatch(line):
+        width, height, red, green, blue, pixels = match.groups()
+        peak = max(float(red), float(green), float(blue))
+        if peak > 255:
+            return False
+        if pixels is None:
+            # Legacy means are rounded to two decimals. Sparse color can round to zero.
+            key = "nonblack_captures" if peak else "inconclusive_captures"
+        else:
+            nonzero = int(pixels)
+            if nonzero > int(width) * int(height) or (not nonzero and peak):
+                return False
+            key = "nonblack_captures" if nonzero else "black_captures"
+    elif match := SHADER_MISS.fullmatch(line):
+        key = f"missing_{match.group(1) or 'cs'}_messages"
+    elif line == "[rt] d3d12: no translated shaders: set LEONIDA_SHADERS to <work>/shaders/spirv":
+        key = "shader_directory_unset_messages"
+    elif match := STUB_MILESTONE.fullmatch(line):
+        # The diagnostic shares one counter across graphics/compute and logs powers of two.
+        n = int(match.group(1))
+        if n & (n - 1):
+            return False
+        key = "stub_pipelines_at_least"
+        counts[key] = max(counts.get(key, 0), n)
+        return True
+    else:
+        return False
+    counts[key] = counts.get(key, 0) + 1
+    return True
+
+
 def _record_pipeline_timing(line: str, timing: dict, active: dict) -> bool:
     if match := PIPELINE_BEGIN.match(line):
         key = match.group(*PIPELINE_ID)
@@ -261,7 +309,7 @@ def _record_pipeline_timing(line: str, timing: dict, active: dict) -> bool:
 
 
 def parse_d3d12(path: str, limit: int = 10) -> dict:
-    """Read D3D12 calls and selected runtime diagnostics from stderr."""
+    """Read D3D12 calls and selected runtime diagnostics (pipeline timing, rendering) from stderr."""
     trace = {
         "path": path,
         "calls": 0,
@@ -279,15 +327,16 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
         "sequence_breaks": [],
         "frame_pacing": None,
     }
+    render = {}
     timing = dict.fromkeys(("started", "completed", "completions_without_start", "non_success_results",
                             "cache_hits", "max_compile_us", "logged_waits", "waits_not_ready", "max_wait_us"), 0)
     active = {}
     with _open_text(path) as fh:
         for line in fh:
-            stripped = line.rstrip("\n")
-            if _record_pipeline_timing(stripped, timing, active):
+            record = line.rstrip("\n")
+            if _record_pipeline_timing(record, timing, active):
                 continue
-            pacing_match = PACING_LINE.match(stripped)
+            pacing_match = PACING_LINE.match(record)
             if pacing_match:
                 trace["frame_pacing"] = {
                     "frames": int(pacing_match.group(1)),
@@ -304,11 +353,11 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
                     "latency_p99_us": int(pacing_match.group(12)),
                 }
                 continue
-            match = D3D12_LINE.match(stripped)
+            match = D3D12_LINE.match(record)
             # A crash can truncate the final outcome. A known complete outcome is
             # still usable when the trace ends just before the newline.
             if not match or (not line.endswith("\n") and match.group(3) not in D3D12_OUTCOMES):
-                if line.strip():
+                if line.strip() and not _record_render(record, render):
                     trace["ignored_lines"] += 1
                 continue
             seq, method, outcome = int(match.group(1)), match.group(2), match.group(3)
@@ -329,12 +378,15 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
                 bucket = trace[outcome]
                 if len(bucket) < limit:
                     bucket.append({"seq": seq, "method": method})
-    if trace["calls"] == 0:
+    if render:
+        trace["render"] = render
+    if trace["calls"]:
+        trace["last_call"] = {"seq": seq, "method": method, "outcome": outcome}
+    elif not render:
         raise TraceError(
             f"{path} has no [d3d12-trace] line among {trace['ignored_lines']} line(s); "
             "is it the stderr log of a --trace-d3d12 run, with the Vulkan device enabled?"
         )
-    trace["last_call"] = {"seq": seq, "method": method, "outcome": outcome}
     if timing["started"] or timing["completed"] or timing["logged_waits"]:
         timing["starts_without_completion"] = sum(active.values())
         trace["pipeline_timing"] = timing
@@ -376,6 +428,8 @@ def counts_only(summary: dict) -> dict:
         }
         if d3d12.get("frame_pacing") is not None:
             counters["d3d12"]["frame_pacing"] = dict(d3d12["frame_pacing"])
+        if "render" in d3d12:
+            counters["d3d12"]["render"] = d3d12["render"]
         if "pipeline_timing" in d3d12:
             counters["d3d12"]["pipeline_timing"] = dict(d3d12["pipeline_timing"])
     return counters
@@ -519,6 +573,11 @@ def format_text(summary: dict, limit: int) -> str:
                     f"{fp['latency_p50_us']}/{fp['latency_p95_us']}/{fp['latency_p99_us']} us"
                 )
             out.append(line)
+        for key, count in sorted(d3d12.get("render", {}).items()):
+            if key == "stub_pipelines_at_least":
+                out.append(f"  at least {count} stub pipelines created")
+            else:
+                out.append(f"  {key.replace('_', ' ')}: {count}")
         if last_call := d3d12.get("last_call"):
             out.append(f"  last recorded call: #{last_call['seq']} {last_call['method']} {last_call['outcome']}")
         if d3d12["sequence_break_count"]:
@@ -556,7 +615,7 @@ def main(argv=None) -> int:
         description="Summarize gta6rt's startup and D3D12 first-boot traces."
     )
     ap.add_argument("startup", nargs="?", help="the JSONL written by gta6rt --trace")
-    ap.add_argument("--d3d12", help="the stderr log written with --trace-d3d12")
+    ap.add_argument("--d3d12", help="runtime stderr with D3D12 calls or rendering diagnostics")
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
     ap.add_argument("--counts-only", action="store_true", help="print aggregate JSON without paths or event details")
     ap.add_argument(

@@ -396,6 +396,7 @@ class BootTraceTests(unittest.TestCase):
         self.assertIn("refused: #6 MapTiles", text)
         self.assertIn("#5 SetMarker/BeginEvent with unknown metadata", text)
         self.assertIn("ID3D12CommandQueue::ExecuteCommandLists", text)
+        self.assertIn("1 other line(s)", text)
         self.assertIn("[rt] diagnostics are not summarized", text)
         self.assertNotIn("sequence breaks", text)
 
@@ -456,6 +457,53 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(data["startup"]["events"], 4)
         self.assertEqual(data["d3d12"]["outcomes"], {"failed": 1, "other": 1})
         self.assertEqual(data["d3d12"]["calls"], 2)
+
+    def test_render_log_without_call_tracing(self):
+        capture = "[rt] present: capture frame_00001.ppm (128x96, mean rgb "
+        self.write_lines(self.d3d12, [
+            capture + "0.00 0.00 0.00, nonzero_rgb_pixels 0)",
+            capture + "0.00 0.00 0.00, nonzero_rgb_pixels 1)",
+            capture + "0.00 0.00 0.00)",
+            capture + "0.00 255.00 0.00)",
+            capture + "0.00 0.00 0.00, nonzero_rgb_pixels 12289)",
+            capture + "0.00 0.00 0.00, nonzero_rgb_pixels 0",  # truncated
+        ])
+        trace = bt.parse_d3d12(self.d3d12)
+        self.assertEqual(trace["calls"], 0)
+        self.assertNotIn("last_call", trace)
+        self.assertEqual(trace["ignored_lines"], 2)
+        self.assertEqual(trace["render"], {
+            "black_captures": 1, "nonblack_captures": 2, "inconclusive_captures": 1,
+        })
+
+    def test_shader_diagnostics_and_calls_share_a_log(self):
+        stub = "[rt] d3d12: LEONIDA_STUB_PIPELINES: {} pipeline without a translated shader is a no-op stub ({} so far)"
+        digest = "abc0" * 16
+        with open(self.d3d12, "w", encoding="utf-16", newline="\r\n") as log:
+            log.write("\n".join([
+                "private.exe : [rt] d3d12: no translated shaders: set LEONIDA_SHADERS to <work>/shaders/spirv",
+                f"[rt] d3d12: no translated vs for FSSM sha256 {digest}",
+                f"[rt] d3d12: no translated compute shader for FSPX kind-6 and kind-0 sha256 {digest}",
+                f"[rt] d3d12: no translated compute shader for FSSM sha256 {digest}",
+                stub.format("graphics", 1), stub.format("compute", 8), stub.format("graphics", 4),
+                f"[rt] d3d12: no translated private-stage for FSSM sha256 {digest}",
+                "[d3d12-trace] #1 PresentX ok",
+            ]))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bt.main(["--d3d12", self.d3d12, "--counts-only"]), 0)
+        counters = json.loads(out.getvalue())["d3d12"]
+        self.assertEqual(counters["calls"], 1)
+        self.assertEqual(counters["ignored_lines"], 1)
+        self.assertEqual(counters["render"], {
+            "shader_directory_unset_messages": 1, "missing_vs_messages": 1, "missing_cs_messages": 2,
+            "stub_pipelines_at_least": 8,
+        })
+        self.assertNotIn(digest, out.getvalue())
+        self.assertNotIn("private", out.getvalue())
+        text = bt.format_text(bt.summarize(None, bt.parse_d3d12(self.d3d12)), 10)
+        self.assertIn("at least 8 stub pipelines created", text)
+        self.assertIn("last recorded call: #1 PresentX ok", text)
 
     def test_counts_only_redacts_missing_input_paths_from_stderr(self):
         err = io.StringIO()
