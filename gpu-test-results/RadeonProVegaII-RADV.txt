@@ -1,0 +1,48 @@
+GPU:        AMD Radeon Pro Vega II (Vega 20 / gfx906, PCI 1002:66a3, 32 GiB HBM2 per GPU)
+Driver:     Mesa RADV 26.0.8-1ubuntu0.3, Vulkan 1.4.335; deviceName: AMD Radeon Graphics (RADV VEGA20)
+Subgroup:   default/min/max 64/64/64, native64_compute=true. Geometry shaders: yes.
+            No VK_EXT_mesh_shader or VK_KHR_fragment_shader_barycentric; per_vertex_inputs=false.
+OS/host:    Ubuntu 26.04 LTS x86_64, kernel 7.0.0-43-generic, Intel Xeon W-3245, 373 GiB OS-visible RAM.
+Commit:     a73a57e1339be072baf5522351c8ec7f1482b56b (upstream main)
+Tools:      GCC 15.2.0, CMake 4.2.3, Ninja 1.13.2, Vulkan headers 1.4.341,
+            LLVM/llvm-mc 21.1.8 (AMDGPU), SPIRV-Tools 2026.1, Python 3.14.4.
+
+Three identical Vulkan devices enumerated, not pooled. All runs pinned one physical GPU at a time
+with the RADV ICD and DRI_PRIME=pci-<slot>!; llvmpipe excluded. The full suite and pipeline check
+used PCI 0000:1e:00.0; the dedicated wave64 graphics suite used 0000:0b:00.0. Release harnesses
+and scripts came from the same commit. LEONIDA_W64_EMULATE=0; no forced 32-wide subgroup.
+
+run_gpu_tests.py --require-pass --assembler spirv-as (unfiltered):
+  277 inputs; 276 translated, all 276 passed spirv-val. The f16 fallback refused ps_ij_computed.
+  209/268 passed, 58 skipped, 1 failed (exit 1).
+  Skips: 27 require 32 lanes on request; 19 delegated to or require Windows D3D12; 6 mesh;
+  4 require native fragment barycentrics; 1 computed I/J; 1 delegated to w64_graphics.py.
+
+vk_pipeline_check on that synthetic index (--jobs 4 --large-parallel 1):
+  276 modules created, 0 failed. 266 pipelines created, 10 skipped, 0 failed (exit 0).
+  CS 139/139, GS 1/1, VS 12/12, PS 114/118 (4 barycentric skips), MS 0/6 (6 mesh skips).
+  Pipeline creation is not shader execution and does not establish wave32 semantics on this GPU.
+
+LEONIDA_BARY_FALLBACK=1, same unfiltered run on 0000:1e:00.0:
+  All four fixtures skipped above for native barycentrics passed through the geometry fallback:
+  ps_bary, ps_persp_bary, ps_uniform_branch and ps_scc_mask32.
+  213/268 passed, 54 skipped, 1 failed (exit 1). Translation and spirv-val stayed at 276/277;
+  ps_ij_computed was still skipped on this main commit. The only failure was still cs_imgatomic_ext.
+
+check.py on the full run_gpu_tests.py output, with the same harness build and f16 fallback:
+  159/234 passed, 74 skipped, 1 failed (exit 1), the same cs_imgatomic_ext readback.
+  Standalone, unfiltered build.py stopped earlier: llvm-mc cannot encode the text-only cs_dpp_cmp
+  DPP compare. The check.py counts above use the combined runner's output, not this partial build.
+
+w64_graphics.py on the dedicated fixtures assembled by build.py:
+  18/30 passed (10 tier A, 8 tier B), 12 tier C skipped, 0 failed. This fixed-64 adapter cannot
+  provide both widths for the partition comparison; no external W64G_REF was supplied.
+
+Failure control: cs_imgatomic_ext reported six incorrect SINT words in its 3D cases. On the same
+GPU, changing only the synthetic input to the corrected volume descriptor from #1518 (1bbf8a9b),
+without changing the translator, harness or expectations, passed 1/1: all 64 words of each of the
+UINT image, SINT image and volume matched. The original failure is included above; it is a fixture
+descriptor mismatch, not evidence of a Vega wave64 execution bug.
+
+Hand-written repository fixtures only; no game files used for this record.
+AI-assisted: yes
