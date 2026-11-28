@@ -846,6 +846,11 @@ if(BUILD_TESTING)
 
   add_executable(xbox_present_readback_size_test test/xbox_present_readback_size_test.cpp)
   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
+  # XboxPresentation's SDR white level: the first HDR10 present wakes its reader at once (src/display_white_cache.h).
+  add_executable(display_white_cache_test test/display_white_cache_test.cpp)
+  find_package(Threads REQUIRED)
+  target_link_libraries(display_white_cache_test PRIVATE Threads::Threads)
+  add_test(NAME display_white_cache COMMAND display_white_cache_test)
 
   # The title's own window, where PresentX shows its frames (shims/title_window.h): user32 only, no device.
   if(WIN32)

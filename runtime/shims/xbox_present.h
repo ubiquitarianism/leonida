@@ -28,6 +28,7 @@
 // the present is submitted after the work already executed on it.
 
 #include "d3d12_com.h"
+#include "../src/display_white_cache.h"
 #include "../src/frame_pacer.h"
 #include "../src/vulkan_present.h"
 
@@ -180,7 +181,6 @@ private:
     // PresentX without its `[d3d12-trace]` line.
     HRESULT present_x(UINT plane_count, const XboxPresentPlaneParameters* planes, const XboxPresentParameters* params);
     float effective_sdr_white_nits();  // override, else the cached Windows setting while HDR10, else 203
-    void display_white_worker();       // refreshes display_white_ off the present path
     std::unique_ptr<WindowPresenter> presenter_;
     std::unique_ptr<leonida::FrameClock> own_clock_;
     leonida::FramePacer pacer_;
@@ -191,14 +191,9 @@ private:
     std::atomic<float> sdr_white_override_{0.0f};  // > 0: set_sdr_white_nits
     std::atomic<leonida::PresentPlanes::SdrEotf> sdr_eotf_{leonida::PresentPlanes::SdrEotf::srgb};
     std::atomic<float> hdr_peak_nits_{1000.0f};
-    // The last good Windows SDR white level (nits, 0: none yet), refreshed by display_white_thread_ about once a second while
-    // an HDR10 swapchain is in use (white_wanted_); a failed query keeps the previous value.
-    std::atomic<float> display_white_{0.0f};
-    std::atomic<bool> white_wanted_{false};
-    std::mutex worker_mutex_;
-    std::condition_variable worker_wake_;
-    bool worker_stop_ = false;
-    std::thread display_white_thread_;
+    // The last good Windows SDR white level, read on its own thread: at the first HDR10 present, then about once a
+    // second (src/display_white_cache.h). Made last in the constructor and dropped first in the destructor.
+    std::unique_ptr<leonida::DisplayWhiteCache> display_white_;
     bool logged_null_token_ = false, logged_stale_token_ = false, logged_repeated_token_ = false;
 };
 

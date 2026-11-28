@@ -66,17 +66,12 @@ XboxPresentation::XboxPresentation(std::unique_ptr<WindowPresenter> presenter, l
             std::free(value);
         }
     }
-    display_white_thread_ = std::thread([this] { display_white_worker(); });
+    display_white_ = std::make_unique<leonida::DisplayWhiteCache>([this] { return presenter_->display_sdr_white_nits(); });
 }
 
 XboxPresentation::~XboxPresentation() {
     if (presents_.load() > 0) log_pacing_summary();
-    {
-        std::lock_guard lock(worker_mutex_);
-        worker_stop_ = true;
-    }
-    worker_wake_.notify_all();
-    display_white_thread_.join();
+    display_white_.reset();  // stops and joins its thread before the presenter it reads from goes
     presenter_->set_abort(nullptr);
 }
 
@@ -100,30 +95,11 @@ void XboxPresentation::log_pacing_summary() const {
                  static_cast<unsigned long long>(s.latency_p99_us));
 }
 
-// Windows' SDR white level costs a QueryDisplayConfig and two DisplayConfigGetDeviceInfo calls (measured in
-// xbox_present_test, docs section 4.5): too much for the present path, which would hitch once a second and feed the pacer.
-// So it is read here, about once a second while an HDR10 swapchain is in use, and PresentX reads the cached value.
-void XboxPresentation::display_white_worker() {
-    std::unique_lock lock(worker_mutex_);
-    while (!worker_stop_) {
-        if (white_wanted_.load()) {
-            lock.unlock();
-            const float nits = presenter_->display_sdr_white_nits();
-            if (nits > 0.0f) display_white_ = nits;  // a failed query keeps the last good value
-            lock.lock();
-        }
-        worker_wake_.wait_for(lock, std::chrono::seconds(1), [this] { return worker_stop_; });
-    }
-}
-
 float XboxPresentation::effective_sdr_white_nits() {
     if (sdr_white_override_ > 0.0f) return sdr_white_override_;
     if (!presenter_->hdr_active()) return 203.0f;  // the Windows setting belongs to HDR mode
-    if (!white_wanted_.exchange(true)) {  // first HDR10 present: have it read now
-        std::lock_guard lock(worker_mutex_);
-        worker_wake_.notify_all();
-    }
-    const float cached = display_white_;
+    // The first HDR10 present has it read now (src/display_white_cache.h); until that read lands, 203.
+    const float cached = display_white_->get();
     return cached > 0.0f ? cached : 203.0f;
 }
 
