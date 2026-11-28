@@ -131,6 +131,7 @@ void expand(const Geometry& g, std::uint32_t geometry, std::vector<Tri>& out) {
 struct Built {
     std::uint64_t address = 0;
     std::size_t size = 0;              // as the header gives it
+    const void* header = nullptr;      // the structure's mapped bytes, to read its header again later
     std::vector<Tri> tris;
 };
 
@@ -195,7 +196,8 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         return recorded;
     }));
     built.address = base;
-    built.size = header_size(static_cast<const char*>(dst.map) + (base - dst.address));
+    built.header = static_cast<const char*>(dst.map) + (base - dst.address);
+    built.size = header_size(built.header);
     auto dump = [&](const std::string& case_name, const Buffer& buffer, std::uint64_t at, const std::vector<Tri>& tris) {
         const auto* bytes = static_cast<const char*>(buffer.map) + (at - buffer.address);
         const std::string json = "{\"kind\": \"blas\", \"address\": " + std::to_string(at) +
@@ -613,6 +615,15 @@ int main(int argc, char** argv) {
         std::memcpy(&compacted, info.map, 8);
         std::memcpy(&clone_size, static_cast<char*>(info.map) + 8, 8);
         // a build is already as small as it gets: the size its header gives, within the layout's room
+        if (compacted != random.size || compacted > blas_layout.size) {
+            // the values tell a postbuild write that never landed (0xabab...) from a header that changed since the
+            // build (TEST-2033: this check failed on an Apple M4 with MoltenVK 1.4.2 and nothing before it did)
+            std::fprintf(stderr,
+                         "compacted size: postbuild 0x%016llx, clone postbuild 0x%016llx, header at build %zu, "
+                         "header now %zu, layout %u\n",
+                         static_cast<unsigned long long>(compacted), static_cast<unsigned long long>(clone_size),
+                         random.size, header_size(random.header), blas_layout.size);
+        }
         EXPECT(compacted == random.size && compacted <= blas_layout.size);
         EXPECT(clone_size == compacted);
         auto dump_blas = [&](const std::string& name, const Buffer& b, std::uint64_t at, std::size_t bytes) {
