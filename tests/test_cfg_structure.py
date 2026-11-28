@@ -146,10 +146,17 @@ def _check_random_graphs():
         loops += '"loop"' in repr(tree).replace("'", '"')
         placed = blocks_in(tree)
         assert len(placed) == len(set(placed)), f"a block is placed twice: {succ}"
+        out_pcs = {b: (set(succ[b]) if succ[b] else {S.END}) for b in range(len(succ))}
+        utree = S.unwrap_known_pc_guards(tree, out_pcs)
+        uplaced = blocks_in(utree)
+        assert len(uplaced) == len(set(uplaced)) and set(uplaced) == set(placed), (
+            f"unwrap changed block set for {succ}: {placed} vs {uplaced}")
         for seed in range(6):
             want = walk(succ, chooser(succ, seed), 200)
             got = S.run(tree, chooser(succ, seed), 200)
             assert got == want, f"graph {succ} seed {seed}: tree ran {got}, graph runs {want}"
+            ugot = S.run(utree, chooser(succ, seed), 200)
+            assert ugot == want, f"unwrapped graph {succ} seed {seed}: tree ran {ugot}, graph runs {want}"
     assert structured > 5000 and refused > 1000 and loops > 2000, (structured, refused, loops)
     assert split_ok > 1000 and split_ok + split_cap == refused, (split_ok, split_cap, refused)
     return structured, refused, loops, split_ok, split_cap
@@ -247,10 +254,42 @@ def test_deep_sequential_chains_stay_flat_and_iterative():
         assert got == want
 
 
+def test_unwrap_known_pc_guards():
+    def unwrap(succ, out_pcs=None):
+        if out_pcs is None:
+            out_pcs = {b: (set(succ[b]) if succ[b] else {S.END}) for b in range(len(succ))}
+        tree = S.structure(succ, out_pcs=out_pcs)
+        assert tree is not None
+        return S.unwrap_known_pc_guards(tree, out_pcs)
+
+    # Single-arm if-then (ms_wave_info_s3 shape: 0 -> {2, 1}, 1 -> {2}, 2 -> []): join block 2 unwraps to top level.
+    assert unwrap([[2, 1], [2], []]) == [("block", 0), ("guard", 1, [("block", 1)]), ("block", 2)]
+    # Diamond (0 -> {1, 2}, 1 -> {3}, 2 -> {3}, 3 -> []): join block 3 unwraps to top level.
+    assert unwrap([[1, 2], [3], [3], []]) == [("block", 0), ("guard", 2, [("block", 2)]),
+                                              ("guard", 1, [("block", 1)]), ("block", 3)]
+    # Loop exit (0 -> {0, 1}, 1 -> []): block 1 unwraps to top level because exiting loop 0 proves pc == 1.
+    assert unwrap([[0, 1], []]) == [("loop", 0, [("block", 0)]), ("block", 1)]
+    # Early exit in arm 1 (0 -> {1, 2}, 1 -> [], 2 -> []): both arms MUST remain guarded (pc may be END).
+    assert unwrap([[1, 2], [], []]) == [("block", 0), ("guard", 2, [("block", 2)]), ("guard", 1, [("block", 1)])]
+    # Conditional branch in the last block with no s_endpgm after it (fallthrough writes END):
+    # loop body block 2 has succ [0] but out_pcs {0, END}, so exiting loop 0 leaves pc in {1, END};
+    # guard 1 MUST stay so falling off the end does not execute block 1.
+    assert unwrap([[2, 1], [], [0]], out_pcs={0: {2, 1}, 1: {S.END}, 2: {0, S.END}}) == [
+        ("loop", 0, [("block", 0), ("guard", 2, [("block", 2)])]),
+        ("guard", 1, [("block", 1)]),
+    ]
+    # Non-loop conditional branch falling off the end whose single explicit target is immediately dominated by it:
+    # block 2 has succ [1] and out_pcs {1, END}, so structure() and unwrap MUST both keep guard 1.
+    assert unwrap([[2], [], [1]], out_pcs={0: {2}, 1: {S.END}, 2: {1, S.END}}) == [
+        ("block", 0), ("block", 2), ("guard", 1, [("block", 1)]),
+    ]
+
+
 if __name__ == "__main__":
     test_depth()
     test_shapes()
     test_deep_sequential_chains_stay_flat_and_iterative()
+    test_unwrap_known_pc_guards()
     structured, refused, loops, split_ok, split_cap = _check_random_graphs()
     print(f"ok: {structured} graphs structured and run, {refused} irreducible "
           f"({split_ok} split-structured, {split_cap} capped), {loops} with loops")

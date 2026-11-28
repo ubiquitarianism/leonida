@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -202,6 +203,115 @@ class TestCli(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, f"--limit {value}: {result.stdout}")
                 self.assertIn("--limit", result.stderr)
                 self.assertIn("at least 1", result.stderr)
+
+    def test_corrupt_xbch_zlib_records_error_row_instead_of_crashing(self):
+        corrupt_zlib = b"\x78\x9c\xff\xff\xff\xff"
+        bad_xbch = b"XBCH" + struct.pack("<IIIII", 0, len(corrupt_zlib), 0, 0x300, 0) + corrupt_zlib
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "a_bad.dxbc"), "wb") as f:
+                f.write(make_dxbc([bad_xbch]))
+            with open(os.path.join(folder, "b_ok.fssm"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            rows = pal_stages.blob_rows(folder)
+            self.assertEqual(len(rows), 2)
+            self.assertIn("error", rows[0])
+            self.assertEqual(rows[1]["payload"], "fssm")
+            result = subprocess.run([sys.executable, "-I", TOOL, folder, "--json"],
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        doc = json.loads(result.stdout)
+        self.assertEqual(doc["tally"]["blobs"], 1)
+        self.assertEqual(doc["tally"]["errors"], 1)
+
+    def test_case_insensitive_extensions_and_deduplication(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "alpha.FSSM"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            with open(os.path.join(folder, "alpha.dxbc"), "wb") as f:
+                f.write(make_dxbc([make_xbch(blob([(3, 6)]))]))
+            with open(os.path.join(folder, "beta.DXBC"), "wb") as f:
+                f.write(make_dxbc([make_xbch(blob([(6, 7)]))]))
+            rows = pal_stages.blob_rows(folder)
+        self.assertEqual([(r["name"], r["payload"]) for r in rows], [
+            ("alpha.FSSM", "fssm"),
+            ("beta.DXBC", "xdat0"),
+        ])
+
+    def test_deeply_nested_index_json_does_not_crash_main(self):
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "shader.fssm"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("[]")
+            out = io.StringIO()
+            with unittest.mock.patch.object(pal_stages.fssm_header.json, "load",
+                                            side_effect=RecursionError("deep nesting")), \
+                    contextlib.redirect_stdout(out):
+                rc = pal_stages.main([folder, "--json"])
+        self.assertEqual(rc, 0)
+        doc = json.loads(out.getvalue())
+        self.assertIsNone(doc["blobs"][0]["stage"])
+
+    def test_case_folded_stage_lookup_and_ambiguous_case_collision(self):
+        self.assertEqual(pal_stages.lookup_stage({"Shader": "ps"}, "shader"), "ps")
+        self.assertIsNone(pal_stages.lookup_stage({"Shader": "ps", "shader": "vs"}, "SHADER"))
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "shader.fssm"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump([{"file": "Shader.dxbc", "stage": "ps"}], f)
+            result = subprocess.run([sys.executable, "-I", TOOL, folder, "--json"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        doc = json.loads(result.stdout)
+        self.assertEqual(doc["blobs"][0]["stage"], "ps")
+        self.assertEqual(doc["tally"]["stage_matches"], 1)
+
+    def test_distinguishes_no_inspected_blob_in_index_from_missing_index(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "shader.fssm"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            out_no_idx = io.StringIO()
+            with contextlib.redirect_stdout(out_no_idx):
+                rc1 = pal_stages.main([folder])
+            self.assertEqual(rc1, 0)
+            self.assertIn("no index.json found", out_no_idx.getvalue())
+
+            with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump([{"file": "other.dxbc", "stage": "vs"}], f)
+            out_mismatch = io.StringIO()
+            with contextlib.redirect_stdout(out_mismatch):
+                rc2 = pal_stages.main([folder])
+            self.assertEqual(rc2, 0)
+            self.assertIn("no inspected blob in index.json", out_mismatch.getvalue())
+
+    def test_stage_index_oserror_falls_back_to_empty_and_non_file_or_dir_exits_2(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "shader.fssm"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            out = io.StringIO()
+            with unittest.mock.patch.object(pal_stages.fssm_header, "stage_index", side_effect=OSError("io fail")), \
+                    contextlib.redirect_stdout(out):
+                rc = pal_stages.main([folder, "--json"])
+            self.assertEqual(rc, 0)
+            self.assertIsNone(json.loads(out.getvalue())["blobs"][0]["stage"])
+
+            special = os.path.join(folder, "special")
+            with open(special, "wb") as f:
+                f.write(b"x")
+            err = io.StringIO()
+            with unittest.mock.patch.object(pal_stages.os.path, "exists", return_value=True), \
+                    unittest.mock.patch.object(pal_stages.os.path, "isfile", return_value=False), \
+                    unittest.mock.patch.object(pal_stages.os.path, "isdir", return_value=False), \
+                    contextlib.redirect_stderr(err):
+                rc_bad = pal_stages.main([special])
+            self.assertEqual(rc_bad, 2)
+            self.assertIn("not a file or directory", err.getvalue())
 
 
 if __name__ == "__main__":

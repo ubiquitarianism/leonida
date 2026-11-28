@@ -12,9 +12,9 @@ hardware wave, the reference) and to 32 (the halves) through VKH_SUBGROUP_SIZE o
   tier C      the words the header names differ between the two sizes, which shows the translator's detector is
               right to flag the shader (the other words stay equal)
 
-A device that can require only one size (NVIDIA: 32 only) cannot run the comparison. There the default-size image is
-checked against the derived words (tiers A, B), the tier C check is skipped, and two environment variables let a
-second device stand in for the missing size: W64G_SAVE_REF=<dir> stores the 64-lane run after its available checks
+A device that can require only one size (NVIDIA: 32 only) still checks the words with a known value in every tier.
+Tier C skips the comparison between sizes if the other width is unavailable. Two environment variables let a second
+device stand in for the missing size: W64G_SAVE_REF=<dir> stores the 64-lane run after its available checks
 pass, including on devices with 64 as their only size (AMD GCN). W64G_REF=<dir> compares every run of the other
 device with those files (equal for A and B, different for C).
 
@@ -30,8 +30,15 @@ The vs_w64_* fixtures (TEST-251) are vertex shaders: Vulkan cannot require a ver
 come from RADV, which runs the VS stage as wave64 by default and as wave32 with RADV_PERFTEST=gewave32 (GFX10+).
 Each draws 960 vertices with zero area (VKH_VERTICES) and stores four words per vertex to the heap; vs_w64_c_lane_id
 doubles as the probe that the wave size really changed, and without RADV only the default-size checks run. RADV packs
-62 or 64 vertices into a wave64 and 30 or 32 into a wave32, so the 32-lane run is a repacking, not the two halves of
-the 64-lane waves: a stricter test of tiers A and B, which key every word on the vertex index.
+62 or 64 vertices into a wave64 and 30 or 32 into a wave32, and the wave32 waves are the two halves of the wave64 ones:
+waves of 64, 62, 64, 62 ... vertices starting at vertices 0, 64, 126, 190 ... at wave64, and of 32, 32, 32, 30 ...
+starting at 0, 32, 64, 96, 126 ... at wave32 (a period of 126 vertices both ways). Each vertex's wave32 lane is its
+wave64 lane & 31 (vs_w64_c_lane_id, all 960 vertices; RADV Mesa 26.3.1 on a gfx1036 iGPU (Raphael) and an RX 7900 XTX
+(NAVI31, RDNA3); TEST-1700). GFX12 gives the same waves and starts, with every wave32 wave inside one half of a wave64
+wave (RX 9070 XT, GFX1201, RDNA4, RADV Mesa 26.2.6; from sperm's old upstream PR 7354). So the 32-lane run is the
+cut into halves the tiers describe, not a repacking: it does not move a vertex into another wave or lane group. Mind
+it when writing a VS fixture: waves start at even vertices that are not all multiples of 4 (126, 252, ...), so the
+lane ^ 1 of a vertex v holds vertex v ^ 1, but lane ^ 2, ^ 3 or ^ 16 need not hold v ^ 2, v ^ 3 or v ^ 16.
 
 The gs_w64_* fixtures are legacy geometry shaders, switched the same way (gewave32 covers the whole NGG stage). Each is
 drawn after vs_ids with VKH_GS, finds its triangle from the vertex number vs_ids passes in TEXCOORD0, and stores four
@@ -187,6 +194,8 @@ FIXTURES = {
     "ps_w64_a_swizzle": ("A", _a_swizzle, {}),
     "ps_w64_a_bpermute": ("A", _a_bpermute, {}),
     "ps_w64_a_uniform_vote": ("A", _a_uniform_vote, {"VKH_SGPRS": "0,0,0,0,9"}),
+    # SHADER-W64-WQM-UVOTE: the same votes on compares of scalars under s_wqm_b64 exec, exec (the same words)
+    "ps_w64_a_wqm_uniform_vote": ("A", _a_uniform_vote, {"VKH_SGPRS": "0,0,0,0,9"}),
 
     "ps_w64_a_discard": ("A", _a_discard, {}),
     "ps_w64_b_waterfall": ("B", _b_waterfall, {}),
@@ -348,6 +357,8 @@ def expected_problem(name, words, heap):
             wrong.append((i, w, want))
     if wrong:
         i, w, want = wrong[0]
+        if tier == "C":
+            return f"a partition-invariant word differs in {len(wrong)} of {len(words)} records, first at {i}: got {w}, want {want}"
         return f"{len(wrong)} of {len(words)} pixels differ from the derived words, first ({_x(i)},{_y(i)}): got {w}, want {want}"
     if name.endswith("_b_ballot_atomic"):
         want = sorted(i + 1 for i in range(len(words)) if _x(i) % 4 == 1)
@@ -411,13 +422,13 @@ def check(tools, spirv, name):
             if live is not None and live < need:
                 return Skip(f"SKIP (the fragment stage has {live} live lanes per subgroup here, measured with "
                             f"ps_live_width; this fixture needs {need})")
+        for size, (words, heap) in runs.items():
+            if tier != "C" and size is None and len(runs) > 1:
+                continue                          # the default draw repeats one of the forced sizes for tiers A and B
+            p = expected_problem(name, words, heap)
+            if p:
+                return f"{size or 'default size'}: {p}"
         if tier in ("A", "B"):
-            for size, (words, heap) in runs.items():
-                if size is None and len(runs) > 1:
-                    continue                      # the default draw repeats one of the forced sizes
-                p = expected_problem(name, words, heap)
-                if p:
-                    return f"{size or 'default size'}: {p}"
             if 64 in runs and 32 in runs and comparable(name, *runs[64]) != comparable(name, *runs[32]):
                 return "the images at required subgroup size 64 and 32 differ"
         elif 64 in runs and 32 in runs:

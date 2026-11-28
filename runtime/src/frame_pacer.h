@@ -1,4 +1,6 @@
 #pragma once
+#include <utility>
+#include <memory>
 
 // Frame pacing for the Xbox presentation path (docs/d3d12_vulkan.md section 4.5): what SetFrameIntervalX,
 // ScheduleFrameEventX, WaitFrameEventX and GetFrameStatisticsX do, and the token check and flip bookkeeping that
@@ -17,6 +19,10 @@
 //   * A frame is "in flight" from PresentX until the vblank that shows it. Frames show one per vblank, in order.
 //     WaitFrameEventX does not return while `latency` frames are in flight. A frame presented while the origin event
 //     is not armed is not paced (PresentX does not hold it for a vblank): it shows at once and is never in flight.
+//   * At most `latency` frames are in flight. A present into a full queue (several presents with no wait between
+//     them) replaces the newest queued frame and takes its vblank, like a mailbox: the replaced frame is never shown,
+//     and the older ones keep their vblanks. So the queue, and the next wait, never reach further than `latency`
+//     vblanks ahead, however many presents came in between.
 //   * A wait that comes late (after the next origin already passed) returns at once with the newest passed origin;
 //     the missed origins are skipped, not queued.
 //   * Tokens are 1, 2, 3, ... (0 is the null token), one per successful wait, never reused, across suspend/resume.
@@ -39,7 +45,9 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace leonida {
@@ -113,6 +121,7 @@ inline constexpr std::uint32_t frame_event_flip = 2;
 inline constexpr std::uint32_t frame_event_count = 3;
 // Issue a consecutive frame token even when WaitFrameEventX(origin, ...) times out (returns S_FALSE).
 inline constexpr std::uint32_t frame_wait_flag_token_on_timeout = 2;
+inline constexpr std::uint32_t wait_flag_current_token = frame_wait_flag_token_on_timeout;
 // Statistics types (bit mask). Interval and render entries are never produced here.
 inline constexpr std::uint32_t stat_frame_interval = 0x01;
 inline constexpr std::uint32_t stat_frame_event = 0x02;
@@ -171,9 +180,21 @@ struct FramePacingSummary {
     std::uint64_t latency_p99_us = 0;     // nearest-rank 99th percentile origin-to-present latency in us
 };
 
+class FrameTokenSource {
+public:
+    std::uint64_t issue() { return last_.fetch_add(1, std::memory_order_acq_rel) + 1; }
+    std::uint64_t issued() const { return last_.load(std::memory_order_acquire); }
+
+private:
+    std::atomic<std::uint64_t> last_{0};
+};
+
 class FramePacer {
 public:
-    explicit FramePacer(FrameClock& clock) : clock_(clock) {
+    explicit FramePacer(FrameClock& clock, std::shared_ptr<FrameTokenSource> tokens = nullptr,
+                        bool current_origin_poll = false)
+        : clock_(clock), tokens_(tokens ? std::move(tokens) : std::make_shared<FrameTokenSource>()),
+          current_origin_poll_(current_origin_poll) {
         clock_.set_wake([this] {
             { std::lock_guard guard(mutex_); }
             cv_.notify_all();
@@ -195,15 +216,25 @@ public:
     // SetFrameIntervalX(output, interval, latency, flags). `period_us` is the interval as a period; `latency` is
     // the number of frames allowed in flight (0 counts as 1). The vblank grid is re-based: its epoch is now. A
     // scheduled origin event stays armed (with its offset, kept below the new period) and its next origin is one
-    // new period from now; waiters blocked on the old grid pick the new one up.
+    // new period from now. When the period changes, pending frames receive consecutive vblanks on that grid in
+    // their original order. Reapplying the same period preserves their display deadlines.
     std::int32_t set_frame_interval(std::uint32_t period_us, std::uint32_t latency, std::uint32_t flags) {
         (void)flags;
         if (period_us == 0) return pacer_hr::invalid_arg;
         std::lock_guard guard(mutex_);
         if (suspended_) return pacer_hr::invalid_state;
+        const auto now = clock_.now_us();
+        if (period_us_ != period_us) {
+            retire_locked(now);
+            auto next_flip = now;
+            for (Pending& frame : pending_) {
+                next_flip += period_us;
+                frame.flip_us = next_flip;
+            }
+        }
         period_us_ = period_us;
         latency_ = std::max(latency, 1u);
-        epoch_us_ = clock_.now_us();
+        epoch_us_ = now;
         interval_set_ = true;
         for (std::uint32_t k = 0; k < frame_event_count; ++k) {
             event_offset_us_[k] = std::min(event_offset_us_[k], period_us - 1);
@@ -239,6 +270,8 @@ public:
         if (event >= frame_event_count) return pacer_hr::invalid_arg;
         if (event == frame_event_origin && !token) return pacer_hr::invalid_arg;
         std::unique_lock lock(mutex_);
+        if (current_origin_poll_ && event == frame_event_origin && timeout_ms == 0 && (flags & wait_flag_current_token))
+            return current_token_locked(token);
         ++waiters_;
         const std::int32_t result = wait_locked(lock, event, timeout_ms, flags, token);
         if (--waiters_ == 0) cv_.notify_all();
@@ -247,8 +280,9 @@ public:
 
     // GetFrameStatisticsX(token, type_mask, &count, array). `count` is the room in `out` on entry and the number of
     // entries written on return. S_OK when every producible requested type was written (event, present, display),
-    // S_FALSE with count 0 or fewer when they are not (there yet, or the token is unknown or has aged out of the
-    // last 64). With a null `out`, count only receives how many entries are available.
+    // S_FALSE with count 0 or fewer when they are not (there yet, the frame was replaced in a full queue and never
+    // shown, or the token is unknown or has aged out of the last 64). With a null `out`, count only receives how many
+    // entries are available.
     std::int32_t get_frame_statistics(std::uint64_t token, std::uint32_t type_mask, std::uint32_t* count,
                                       FrameStatistic* out) {
         if (!count) return pacer_hr::invalid_arg;
@@ -295,7 +329,7 @@ public:
         std::lock_guard guard(mutex_);
         if (issue) *issue = TokenIssue::none;
         if (suspended_) return pacer_hr::invalid_state;
-        if (token > issued_) return pacer_hr::invalid_arg;
+        if (token > tokens_->issued()) return pacer_hr::invalid_arg;
         if (issue) {
             if (token == 0) *issue = TokenIssue::null_token;
             else if (token == last_presented_) *issue = TokenIssue::repeated;
@@ -340,12 +374,10 @@ public:
                 if (r.token == token) { r.presented = r.displayed = true; r.present_us = r.display_us = now; }
             return;
         }
-        // The vblank after now, and not before the one after the previous queued frame.
-        const std::uint64_t since = now > epoch_us_ ? now - epoch_us_ : 0;
-        std::uint64_t flip = epoch_us_ + (since / period_us_ + 1) * period_us_;
-        if (!pending_.empty()) flip = std::max(flip, pending_.back().flip_us + period_us_);
+        const bool queued_before = !pending_.empty();
+        std::uint64_t flip = queue_flip_locked(now);
         float percent = 0.0f;
-        if (sync == PresentSync::immediate && pending_.empty()) {
+        if (sync == PresentSync::immediate && !queued_before) {
             flip = now;
             std::uint64_t late_us = 0;
             for (const Record& r : records_)
@@ -367,9 +399,7 @@ public:
         record_present_timing_locked(now, 0);
         if (!interval_set_ || !any_armed_locked() || uncapped_) return;
         retire_locked(now);
-        const std::uint64_t since = now > epoch_us_ ? now - epoch_us_ : 0;
-        std::uint64_t flip = epoch_us_ + (since / period_us_ + 1) * period_us_;
-        if (!pending_.empty()) flip = std::max(flip, pending_.back().flip_us + period_us_);
+        const std::uint64_t flip = queue_flip_locked(now);
         pending_.push_back(Pending{0, flip, 0.0f});
         cv_.notify_all();
     }
@@ -394,7 +424,8 @@ public:
     }
 
     bool suspended() const { std::lock_guard guard(mutex_); return suspended_; }
-    std::uint64_t tokens_issued() const { std::lock_guard guard(mutex_); return issued_; }
+    std::uint64_t tokens_issued() const { return tokens_->issued(); }
+    const std::shared_ptr<FrameTokenSource>& token_source() const { return tokens_; }
     std::uint32_t frames_in_flight() {
         std::lock_guard guard(mutex_);
         retire_locked(clock_.now_us());
@@ -464,6 +495,25 @@ private:
         bool presented = false, displayed = false;
     };
 
+    // The vblank a frame presented now is queued for: the vblank after now, and not before the one after the previous
+    // queued frame. At most `latency_` frames are in flight, so with the queue full the newest queued frame is
+    // replaced (dropped: never shown) and the new one takes its vblank; the older ones keep theirs. A queue longer
+    // than the latency (after SetFrameIntervalX lowered it) is cut back the same way, from the newest end.
+    std::uint64_t queue_flip_locked(std::uint64_t now) {
+        if (pending_.size() >= latency_) {  // latency_ is at least 1, so the queue is not empty
+            std::uint64_t flip = 0;
+            while (pending_.size() >= latency_) {
+                flip = pending_.back().flip_us;
+                pending_.pop_back();
+            }
+            return flip;
+        }
+        const std::uint64_t since = now > epoch_us_ ? now - epoch_us_ : 0;
+        std::uint64_t flip = epoch_us_ + (since / period_us_ + 1) * period_us_;
+        if (!pending_.empty()) flip = std::max(flip, pending_.back().flip_us + period_us_);
+        return flip;
+    }
+
     void record_present_timing_locked(std::uint64_t now, std::uint64_t token) {
         ++presents_recorded_;
         if (has_last_present_ && now >= last_present_us_) {
@@ -500,12 +550,31 @@ private:
         }
     }
 
+    std::int32_t current_token_locked(std::uint64_t* token) {
+        if (shutdown_ || suspended_) return pacer_hr::invalid_state;
+        if (!interval_set_ || !event_armed_[frame_event_origin]) {
+            *token = tokens_->issue();
+            return pacer_hr::ok;
+        }
+        const auto now = clock_.now_us();
+        retire_locked(now);
+        const auto offset = event_offset_us_[frame_event_origin];
+        const auto first = epoch_us_ + offset;
+        const auto newest = now >= first ? static_cast<std::int64_t>((now - first) / period_us_) : 0;
+        auto& tick = last_event_tick_[frame_event_origin];
+        tick = std::max(tick, newest);
+        const auto origin = first + static_cast<std::uint64_t>(tick) * period_us_;
+        // The current token can be polled before the first configured origin.
+        *token = issue_token_locked(std::min(origin, now), origin - offset + period_us_);
+        return pacer_hr::ok;
+    }
+
     bool any_armed_locked() const {
         return event_armed_[0] || event_armed_[1] || event_armed_[2];
     }
 
     std::uint64_t issue_token_locked(std::uint64_t origin_us, std::uint64_t due_us) {
-        const std::uint64_t tok = ++issued_;
+        const std::uint64_t tok = tokens_->issue();  // the shared token source (the device proxy and PresentX pace with it)
         Record record;
         record.token = tok;
         record.origin_us = origin_us;
@@ -580,7 +649,8 @@ private:
     std::uint32_t event_offset_us_[frame_event_count] = {0, 0, 0};
     std::uint64_t epoch_us_ = 0;
     std::int64_t last_event_tick_[frame_event_count] = {0, 0, 0};  // tick 0 is the epoch itself, which has passed
-    std::uint64_t issued_ = 0;
+    std::shared_ptr<FrameTokenSource> tokens_;
+    bool current_origin_poll_ = false;
     std::uint64_t last_presented_ = 0;
     std::uint64_t immediate_presents_ = 0;
     std::uint64_t presents_recorded_ = 0;

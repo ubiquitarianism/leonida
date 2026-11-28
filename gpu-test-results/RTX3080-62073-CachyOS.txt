@@ -1,0 +1,28 @@
+GPU:        NVIDIA GeForce RTX 3080 (Ampere / GA102, PCI 10de:2206), subgroup 32..32
+Driver:     NVIDIA 620.73.04 (proprietary, Linux), Vulkan 1.4.357
+Subgroup:   32..32 (the run_gpu_tests.py device line shows subgroup 32..32)
+OS:         CachyOS, kernel 7.3.5-2-cachyos
+Commit:     3aa97542 (main, 2026-11-24)
+Tools:      llvm-mc 23.1.5 (native, distribution package), SPIRV-Tools v2026.4, CMake 4.5.1 + Ninja 1.13.2,
+            GCC 16.2.1, Python 3.14.10
+run_gpu_tests.py: 261 shaders: 261 translated, 261 pass spirv-val
+            native:                 203/252 passed, 49 skipped, 0 failed
+            LEONIDA_W64_EMULATE=1:  235/252 passed, 17 skipped, 0 failed
+Failed:     none. cs_imgload_tfe and cs_imgload_d16_tfe, which fail in the earlier NVIDIA records, pass here
+            in both runs; this commit is after #892.
+Skipped:    native: 31 "no 64-wide compute subgroup on this device" and 1 "no 64-wide subgroup on this
+            device" (the wave64 compute fixtures, which the emulated run runs), 1 "this device cannot
+            require a 64-wide fragment subgroup: subgroup 32..32" (ps_w64x_readlane, skipped in the
+            emulated run too), plus 16 "run by d3d12_*_test / w64_graphics.py" cases: cs_buf_counter,
+            cs_buf_typed, cs_m4_fill, cs_m4_indirect, ps_live_width, ps_m15, ps_m2, ps_m2_array,
+            ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post, ps_m3_query, vs_m15, vs_m2, vs_m3.
+            Emulated: those 16 plus the 64-wide fragment one, 17 in all.
+Notes:
+- A second RTX 3080 Linux record next to #415 (Ubuntu 26.04, NVIDIA 580.178.04, main d2cd6c0): a
+  different driver branch and a later commit, hence the driver in the file name.
+- Built with cmake -S runtime -B runtime/build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+  -DLEONIDA_VULKAN_HEADERS_FETCH=ON -DLEONIDA_REQUIRE_VULKAN=ON -DLEONIDA_CARGO= (the Linux portable
+  subset). Device picked with LEONIDA_VK_DEVICE=3080; the machine also has a Radeon 610M iGPU.
+- One full run per mode; no reruns. build.py and check.py were not run separately.
+- AI-assisted (Claude Code built main and ran run_gpu_tests.py native and emulated). No game files,
+  nothing online.

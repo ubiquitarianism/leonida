@@ -105,6 +105,17 @@ class F64DiffTests(unittest.TestCase):
         # the translator now gives the ISA's signed infinity for NaN(S0) too (#4536 was written when it kept the NaN)
         self.assertEqual(known[0], "match")
 
+    def test_div_fixup_reference_agrees_with_the_translator_at_the_cutoffs(self):
+        # biased exponents (S1, S2) around the underflow cutoff and past the old overflow one
+        for e1, e2 in ((1075, 1), (1076, 1), (1077, 1), (1, 1024), (1, 1025), (520, 1736), (1, 2046)):
+            with self.subTest(e1=e1, e2=e2), tempfile.TemporaryDirectory() as tmp:
+                status, reason, want, got = fd.run_one([
+                    "v_mov_b32 v12, 0x22d1754f", "v_mov_b32 v13, 0x7ee2a522",
+                    "v_mov_b32 v14, 0", f"v_mov_b32 v15, {e1 << 20:#x}",
+                    "v_mov_b32 v16, 0", f"v_mov_b32 v17, {e2 << 20:#x}",
+                    "v_div_fixup_f64 v[8:9], v[12:13], v[14:15], v[16:17]"], "ps_f64_fixup_cutoff", tmp)
+                self.assertEqual(status, "match", (reason, want, got))
+
     def test_compare_reference_does_not_write_v8_without_cndmask(self):
         for op in ("v_cmp_eq_f64_e64 s20, v[12:13], 0.0",
                    "v_cmp_class_f64_e64 s20, v[12:13], 0x3ff"):
@@ -147,9 +158,14 @@ class F64DiffTests(unittest.TestCase):
         normal = self.command("--ops", "v_add_f64", "--programs", "0")
         known = self.command("--ops", "v_add_f64", "--programs", "0", "--no-sweep", "--known", "--all-failures")
         self.assertNotIn("KNOWN_DIVERGENCE", normal.stdout)
-        # the known NaN(S0) case runs and, since the translator follows the ISA there, matches
-        self.assertEqual(known.returncode, 0, known.stdout)
-        self.assertNotIn("MISMATCH:", known.stdout)
+        # The known cases run with --known. The NaN(S0) one matches, since the translator follows the ISA there.
+        # The f64 omod one does not and is not expected to: the reference applies the omod the ISA text describes,
+        # the translator emits only `clamp` because RDNA2 leaves an f64 VALU result alone while f64 denormals are
+        # kept, the MODE this translator assumes (docs/design.md "v_add_f64 output modifiers", SHADER-721, measured
+        # with tools/hw_oracle on a gfx1036 iGPU). This case is the one MODE the hardware does apply it in.
+        self.assertEqual(known.returncode, 1, known.stdout)
+        self.assertEqual(known.stdout.count("MISMATCH:"), 1, known.stdout)
+        self.assertIn(" mul:2", known.stdout)
 
     def test_sabotaged_translator_mismatch_and_shrinking(self):
         lines = ["v_mov_b32 v12, 0x00000000", "v_mov_b32 v13, 0x3ff80000",
@@ -226,9 +242,9 @@ class F64DiffTests(unittest.TestCase):
             ("sign_out_negative_from_s1", three, self.NEG2, one, three | self.NZ),
             ("sign_out_positive_both_negative", self.NEG3, self.NEG2, self.NEG1, three),
             ("sign_out_clears_s0_sign", self.NEG3, one, one, three),
-            ("nan_s2_quiets_s2", one, one, self.SNAN, 0x7FF8000000000001),
+            ("nan_s2_passes_unquieted", one, one, self.SNAN, self.SNAN),
             ("nan_s2_beats_nan_s1", one, self.SNAN, qn2, qn2),
-            ("nan_s1_quiets_s1", one, self.SNAN, one, 0x7FF8000000000001),
+            ("nan_s1_passes_unquieted", one, self.SNAN, one, self.SNAN),
             ("nan_s2_beats_zero_over_zero", one, self.PZ, qn2, qn2),
             ("zero_over_zero", one, self.PZ, self.NZ, 0xFFF8000000000000),
             ("inf_over_inf", one, self.PINF, self.NINF, 0xFFF8000000000000),
@@ -239,11 +255,11 @@ class F64DiffTests(unittest.TestCase):
             ("inf_over_y", one, self.NEG2, self.NINF, self.PINF),
             ("nan_s0_to_signed_inf_isa_rule", self.QNAN, one, one, self.PINF),
             ("nan_s0_to_signed_inf_negative", self.QNAN, self.NEG2, one, self.NINF),
-            ("underflow_edge_still_passes_s0", three, e(1075), e(1), three),
-            ("underflow_to_zero", three, e(1076), e(1), self.PZ),
-            ("underflow_beats_nan_s0", self.QNAN, e(1076), e(1), self.PZ),
-            ("overflow_edge_still_passes_s0", three, e(1), e(1024), three),
-            ("overflow_to_inf", three, e(1), e(1025), self.PINF),
+            ("underflow_edge_still_passes_s0", three, e(1076), e(1), three),
+            ("underflow_to_zero", three, e(1077), e(1), self.PZ),
+            ("underflow_beats_nan_s0", self.QNAN, e(1077), e(1), self.PZ),
+            ("no_overflow_cutoff_at_1024", three, e(1), e(1025), three),
+            ("no_overflow_cutoff_at_the_widest", three, e(1), e(2046), three),
         ]
         for name, s0, s1, s2, want in table:
             with self.subTest(case=name):
@@ -411,6 +427,68 @@ class F64DiffTests(unittest.TestCase):
             fd.translate = original
         self.assertEqual(code, 1)
         self.assertIn("minimal program:", stdout.getvalue())
+
+    def test_empty_malformed_cli_and_deduped_ops_and_zero_case_guard(self):
+        for bad in ("", "   ", ",", "v_trunc_f64,", ",v_trunc_f64", "v_trunc_f64,,v_add_f64"):
+            with self.subTest(ops=bad):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(fd.main(["--ops", bad, "--programs", "0"]), 2)
+                self.assertIn("--ops must be a comma-separated list of opcodes", stderr.getvalue())
+
+        for flag in ("--hw-arch", "--exe"):
+            for bad in ("", "   "):
+                with self.subTest(flag=flag, bad=bad):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr):
+                        self.assertEqual(fd.main([flag, bad, "--list-ops"]), 2)
+                    self.assertIn("must not be empty", stderr.getvalue())
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(fd.main(["--no-sweep", "--programs", "0"]), 2)
+        self.assertIn("nothing to run", stderr.getvalue())
+
+        # Duplicate --ops entries are deduplicated so sweep runs once, not twice.
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(fd.main(["--ops", "v_trunc_f64,v_trunc_f64", "--programs", "0"]), 0)
+        self.assertIn("1 total", stdout.getvalue())
+
+    def test_hw_oracle_result_count_word_length_and_shrink_harness_error(self):
+        class BadHW:
+            device = "fake-bad"
+
+            def __init__(self, responses):
+                self._responses = list(responses)
+                self.closed = False
+
+            def run(self, kernels):
+                return self._responses.pop(0)
+
+            def close(self):
+                self.closed = True
+
+        # Batch result count mismatch -> exit 2, oracle closed.
+        short_hw = BadHW([[[0, 0, 0, 0]]])
+        code, _, err, _ = self.run_main(short_hw, "--ops", "v_trunc_f64", "--programs", "1")
+        self.assertEqual(code, 2, err)
+        self.assertIn("harness error", err)
+        self.assertTrue(short_hw.closed)
+
+        # Malformed word count (<4 words) -> exit 2 (not a false mismatch!), oracle closed.
+        bad_words_hw = BadHW([[[0, 1]]])
+        code, _, err, _ = self.run_main(bad_words_hw, "--ops", "v_trunc_f64", "--programs", "0")
+        self.assertEqual(code, 2, err)
+        self.assertIn("expected 4 words", err)
+        self.assertTrue(bad_words_hw.closed)
+
+        # Empty oracle response during shrink must propagate HarnessError -> exit 2, oracle closed.
+        shrink_fail_hw = BadHW([[[0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF]], []])
+        code, _, err, _ = self.run_main(shrink_fail_hw, "--ops", "v_trunc_f64", "--programs", "0")
+        self.assertEqual(code, 2, err)
+        self.assertIn("harness error", err)
+        self.assertTrue(shrink_fail_hw.closed)
 
 
 if __name__ == "__main__":

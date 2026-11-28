@@ -710,7 +710,8 @@ bool build_dataset(std::uint32_t entry_count, TableDataset& out) {
 
     for (std::uint32_t i = 0; i < out.t_count; ++i) {
         t_keys[i] = make_bench_tsharp(i + 1u);
-        table.insert(t_keys[i], 1u + i);
+        // The T#s name sampled 2D images (the tagged contract's kind word): a bench entry carries the same word.
+        table.insert(t_keys[i], 1u + i, leonida::kind_sampled_bit(0));
     }
     for (std::uint32_t i = 0; i < out.s_count; ++i) {
         s_keys[i] = make_bench_ssharp(i + 1u);

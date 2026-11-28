@@ -6,7 +6,7 @@
 //     with a POINT filter (the 16-byte S#);
 //   - a root signature of two descriptor tables, [0] one SRV and [1] one sampler, and SetDescriptorHeaps,
 //     SetGraphicsRootDescriptorTable and DrawIndexedInstanced of a quad (a vertex-index-driven vs_m2.asm, six indices).
-// test/shaders/ps_m2.asm s_loads the T# from the table in s[0:1] and the S# from the table in s[2:3] and image_samples
+// test/shaders/ps_m2.asm s_loads the T# from the table in s8 and the S# from the table in s9 and image_samples
 // with them; the translated shader hashes both and finds their bindless indices in the descriptor hash table (set 0,
 // binding 2), so the pipeline layout holds set 0 and every draw binds it. The PSO is found by the SHA-256 of the FSSM
 // program in the DXBC container, as in the M1.5 test.
@@ -25,6 +25,8 @@
 // pixels are predicted on the CPU, error 0, and 1536 of them differ from the plain reflection.
 // The control also keeps one unbounded SRV table bound and selects its two entries by a root constant.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
+#include "../src/gfx10_tiling.h"
+#include "../src/title_va_alias.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -34,6 +36,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -64,10 +67,26 @@ constexpr UINT target_size = 64;  // the target: each texel covers 8x8 pixels
 constexpr UINT target_pitch = target_size * 4;  // 256
 
 // The synthetic gradient: red rises with x, green with y, blue falls along the diagonal.
-Texel gradient(UINT x, UINT y) {
+struct RawPages {
+    std::byte* data = nullptr;
+    ~RawPages() {
+        if (!data) return;
+        leonida::title_va_aliases().remove_title_memory(reinterpret_cast<UINT64>(data));
+        VirtualFree(data, 0, MEM_RELEASE);
+    }
+};
+bool large_raw_surface() { return std::getenv("LEONIDA_TEST_LARGE_RAW_TEXTURE") != nullptr; }
+bool test_raw_surface() { return large_raw_surface() || std::getenv("LEONIDA_TEST_RAW_TEXTURE") != nullptr; }
+bool test_packed4444(){return std::getenv("LEONIDA_TEST_FIXED4")!=nullptr;}
+Texel raw_gradient(UINT x, UINT y) {
     return {std::uint8_t(x * 36), std::uint8_t(y * 36), std::uint8_t(255 - (x + y) * 16), 255};
 }
 // The second texture: the first one point-reflected, so no texel of it is in the same place.
+Texel gradient(UINT x,UINT y) {
+    auto value=raw_gradient(x,y);
+    if(test_packed4444())for(auto& c:value)c=static_cast<std::uint8_t>(std::nearbyint(double(c)*15.0/255.0)*17.0);
+    return value;
+}
 Texel reflected(UINT x, UINT y) { return gradient(texture_size - 1 - x, texture_size - 1 - y); }
 
 Texel linear_clamp(UINT col, UINT row) {
@@ -92,7 +111,10 @@ Texel linear_clamp(UINT col, UINT row) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool unbounded = argc == 2 && std::strcmp(argv[1], "--refresh-unbounded-samplers") == 0;
+    const bool disabled = argc == 2 && std::strcmp(argv[1], "--refresh-samplers-off") == 0;
+    const bool refresh = unbounded || disabled || (argc == 2 && std::strcmp(argv[1], "--refresh-samplers") == 0);
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
@@ -127,7 +149,10 @@ int main() {
     std::vector<std::uint8_t> pixels(std::size_t(target_pitch) * target_size), control_pixels = pixels, linear_pixels = pixels;
     unsigned image_hits = 0, sampler_hits = 0;
     {
+        const bool direct_views = std::getenv("LEONIDA_TEST_VISIBLE_VIEWS") != nullptr;
+        const bool staged_views = direct_views || std::getenv("LEONIDA_TEST_STAGED_VIEWS") != nullptr;
         rt::d3d12::VulkanDeviceInfo info{};
+        info.prepare_on_bind = staged_views;
         info.get_instance_proc = d.instance_proc;
         info.instance = d.instance;
         info.physical = d.physical;
@@ -139,17 +164,20 @@ int main() {
         info.bindless_partially_bound = d.partially_bound;
         info.image_view_min_lod = d.image_view_min_lod;
         info.shader_dir = (root_dir / "spirv").string();
+        RawPages raw_pages[2];
+        RawPages placed_pages[4];
+        const bool placed = staged_views || std::getenv("LEONIDA_TEST_PLACED_FIRST_USE") != nullptr;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
         EXPECT(rt::d3d12::bindless_set(device.p) != VK_NULL_HANDLE);
 
-        // Root signature: [0] a table of one SRV (s0:s1), [1] a table of one sampler (s2:s3).
+        // Root signature: [0] a table of one SRV (s8), [1] a table of one sampler (s9): the console's graphics layout.
         D3D12_DESCRIPTOR_RANGE srv_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
-        D3D12_DESCRIPTOR_RANGE sampler_range{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0, 0};
+        D3D12_DESCRIPTOR_RANGE sampler_range{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, unbounded ? UINT_MAX : 1u, 0, 0, 0};
         D3D12_ROOT_PARAMETER params[2] = {};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[0].DescriptorTable = {1, &srv_range};
@@ -186,7 +214,7 @@ int main() {
         indexed_params[0].DescriptorTable = {1, &indexed_range};
         indexed_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         indexed_params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        indexed_params[2].Constants = {0, 0, 2};  // s4 = SRV index, s5 = SRV stride in bytes
+        indexed_params[2].Constants = {0, 0, 2};  // s10 = SRV index, s11 = SRV stride in bytes
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC indexed_desc = root_desc;
         indexed_desc.Desc_1_0.NumParameters = 3;
         indexed_desc.Desc_1_0.pParameters = indexed_params;
@@ -221,18 +249,47 @@ int main() {
         texture_desc.Width = texture_desc.Height = texture_size;
         texture_desc.DepthOrArraySize = 1;
         texture_desc.MipLevels = 1;
-        texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texture_desc.Format = test_packed4444()?static_cast<DXGI_FORMAT>(115):DXGI_FORMAT_R8G8B8A8_UNORM;
+        if(test_packed4444())texture_desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        const auto initial_state=test_packed4444()?D3D12_RESOURCE_STATE_RENDER_TARGET:D3D12_RESOURCE_STATE_COPY_DEST;
         texture_desc.SampleDesc.Count = 1;
+        const auto size=device->GetResourceAllocationInfo(0,1,&texture_desc);
+        EXPECT(size.SizeInBytes && size.SizeInBytes!=~UINT64{0});
         Ref<ID3D12Resource> textures[2], upload, readback, readback2, target;
-        for (auto& texture : textures)
-            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
-                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                             IID_PPV_ARGS(&texture.p))));
+        const auto at_address = [&](RawPages& pages, const D3D12_RESOURCE_DESC& desc, D3D12_BARRIER_LAYOUT layout,
+                                    ID3D12Resource** result) {
+            const auto required = inner->GetResourceAllocationInfo(0,1,&desc);
+            if (!required.SizeInBytes || required.SizeInBytes == UINT64_MAX) return E_FAIL;
+            pages.data = static_cast<std::byte*>(VirtualAlloc(nullptr, SIZE_T(required.SizeInBytes), MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE));
+            if (!pages.data) return E_OUTOFMEMORY;
+            const auto va = reinterpret_cast<UINT64>(pages.data);
+            leonida::title_va_aliases().add_title_memory(va, required.SizeInBytes);
+            using Place = HRESULT(WINAPI*)(void*, UINT64, const D3D12_RESOURCE_DESC*, UINT, const D3D12_CLEAR_VALUE*, const IID*, void**);
+            return reinterpret_cast<Place>(slot(device.p,133))(device.p,va,&desc,UINT(layout),nullptr,&__uuidof(ID3D12Resource),
+                                                              reinterpret_cast<void**>(result));
+        };
+        for (UINT i=0; i<2; ++i) {
+            if (placed) {
+                EXPECT(SUCCEEDED(at_address(placed_pages[i],texture_desc,D3D12_BARRIER_LAYOUT_COPY_DEST,&textures[i].p)));
+                // A placed sampled texture waits for its memory only where views are prepared at bind time
+                // (prepare_on_bind); otherwise it is backed when it is made, like every other title image.
+                EXPECT((rt::d3d12::vulkan_memory_flags(textures[i].p) == 0) == staged_views);
+            } else {
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
+                                                                  initial_state, nullptr, IID_PPV_ARGS(&textures[i].p))));
+            }
+        }
         auto rt_desc = texture_desc;
+        rt_desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
         rt_desc.Width = rt_desc.Height = target_size;
         rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
-                                                         D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target.p))));
+        if (placed) {
+            EXPECT(SUCCEEDED(at_address(placed_pages[2],rt_desc,D3D12_BARRIER_LAYOUT_COMMON,&target.p)));
+            EXPECT(rt::d3d12::vulkan_memory_flags(target.p) == 0);
+        } else {
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target.p))));
+        }
         // The upload buffer: texture A at 0, texture B at 2048 (8 rows of the 256-byte pitch), the indices at 4096.
         constexpr UINT64 b_offset = 2048, index_offset = 4096;
         const auto upload_desc = buffer_desc(8192);
@@ -261,13 +318,20 @@ int main() {
         std::memcpy(up + index_offset, indices, sizeof(indices));
 
         // The two heaps; their start handles come back in RAX (heap slots 9 and 10).
-        const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+        const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, direct_views ? 5u : 4u,
                                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-        const D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 3,
+        const UINT sampler_slots = unbounded ? D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE : 3u;
+        const D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, sampler_slots,
                                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
         Ref<ID3D12DescriptorHeap> srv_heap, sampler_heap;
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&srv_heap_desc, IID_PPV_ARGS(&srv_heap.p))));
+        if (refresh) {
+            rt::d3d12_xs::set_descriptor_heap_allocator(
+                [](std::size_t n, std::uint64_t) -> void* { return std::calloc(1, n); },
+                [](void* p, std::uint64_t) { std::free(p); });
+        }
         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&sampler_heap_desc, IID_PPV_ARGS(&sampler_heap.p))));
+        if (refresh) rt::d3d12_xs::set_descriptor_heap_allocator(nullptr, nullptr);
         const std::uint64_t srv_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(srv_heap.p, 9))(srv_heap.p);
         const std::uint64_t srv_gpu = reinterpret_cast<XboxHeapHandleFn>(slot(srv_heap.p, 10))(srv_heap.p);
         const std::uint64_t sampler_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(sampler_heap.p, 9))(sampler_heap.p);
@@ -276,14 +340,56 @@ int main() {
         EXPECT(srv_cpu && sampler_cpu && srv_gpu >= 0x10000 && sampler_gpu >= 0x10000);
         EXPECT(srv_gpu < (1ull << 32) && sampler_gpu < (1ull << 32) && step >= 32);
 
+        Ref<ID3D12DescriptorHeap> staging_heap;
+        Ref<ID3D12Resource> unused_texture;
+        D3D12_CPU_DESCRIPTOR_HANDLE staging_start{};
+        if (staged_views) {
+            D3D12_DESCRIPTOR_HEAP_DESC staging{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,3,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+            EXPECT(SUCCEEDED(inner->CreateDescriptorHeap(&staging,IID_PPV_ARGS(&staging_heap.p))));
+            staging_start = staging_heap->GetCPUDescriptorHandleForHeapStart();
+            EXPECT(SUCCEEDED(at_address(placed_pages[3],texture_desc,D3D12_BARRIER_LAYOUT_COMMON,&unused_texture.p)));
+        }
         // The SRVs go into slots 0 and 1 (offset by the increment size), the POINT sampler into the sampler heap.
         for (UINT i = 0; i < 2; ++i) {
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-            srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            srv.Format = texture_desc.Format;
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.Texture2D = {0, 1, 0, 0.0f};
-            device->CreateShaderResourceView(textures[i].p, &srv, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(srv_cpu + i * step)});
+            const D3D12_CPU_DESCRIPTOR_HANDLE handle{SIZE_T(srv_cpu + i * step)};
+            if (test_raw_surface()) {
+                const UINT raw_size = large_raw_surface() ? 1024 : texture_size;
+                leonida::gfx10::TiledSurface2D layout;
+                EXPECT(leonida::gfx10::TiledSurface2D::make(leonida::gfx10::TileMode::sw_4kb_s, 4, raw_size, raw_size, layout));
+                raw_pages[i].data = static_cast<std::byte*>(VirtualAlloc(nullptr,layout.tiled_size(),MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+                EXPECT(raw_pages[i].data);
+                const auto addr = reinterpret_cast<UINT64>(raw_pages[i].data);
+                leonida::title_va_aliases().add_title_memory(addr,layout.tiled_size());
+                std::vector<Texel> source(raw_size*raw_size);
+                for (UINT y=0; y<raw_size; ++y) for (UINT x=0; x<raw_size; ++x) {
+                    const UINT tx=x*texture_size/raw_size,ty=y*texture_size/raw_size;
+                    source[y*raw_size+x] = i ? reflected(tx,ty) : gradient(tx,ty);
+                }
+                EXPECT(layout.tile(std::as_bytes(std::span(source)), {raw_pages[i].data,layout.tiled_size()},raw_size*4));
+                auto raw=texture_desc; raw.Width=raw.Height=raw_size; raw.Layout=static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+                struct Shape { D3D12_SHADER_RESOURCE_VIEW_DESC view; UINT64 va; } shape{srv,addr};
+                static_assert(offsetof(Shape,va)==sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC));
+                using RawView = void(WINAPI*)(void*, const D3D12_RESOURCE_DESC*, const Shape*, D3D12_CPU_DESCRIPTOR_HANDLE);
+                reinterpret_cast<RawView>(slot(device.p,70))(device.p,&raw,&shape,handle);
+                leonida::gfx10::ImageWords words{};
+                std::memcpy(words.data(),reinterpret_cast<const void*>(handle.ptr),sizeof(words));
+                EXPECT(leonida::gfx10::is_image(words));
+            } else if (direct_views) {
+                device->CreateShaderResourceView(textures[i].p,&srv,handle);
+                if (!i) device->CreateShaderResourceView(unused_texture.p,&srv,{SIZE_T(srv_cpu+4*step)});
+            } else if (staged_views) {
+                const D3D12_CPU_DESCRIPTOR_HANDLE cpu{staging_start.ptr + i*step};
+                device->CreateShaderResourceView(textures[i].p,&srv,cpu);
+                if (!i) device->CreateShaderResourceView(unused_texture.p,&srv,{staging_start.ptr + 2*step});
+                device->CopyDescriptorsSimple(1,handle,cpu,D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            } else {
+                device->CreateShaderResourceView(textures[i].p, &srv, handle);
+            }
         }
         D3D12_SAMPLER_DESC sampler_desc{};
         sampler_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -302,6 +408,13 @@ int main() {
         device->CreateSampler(&sampler_desc, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(sampler_cpu + 2 * sampler_step)});
 
 
+        // Seed the game backing directly so the submission test is independent of API write-through.
+        const auto sampler_real = rt::d3d12_xs::translate_cpu_descriptor_handle(device.p, {SIZE_T(sampler_cpu)});
+        if (refresh) {
+            EXPECT(sampler_real.ptr && sampler_real.ptr != sampler_cpu);
+            std::memcpy(reinterpret_cast<void*>(sampler_cpu), reinterpret_cast<const void*>(sampler_real.ptr), 3 * sampler_step);
+        }
+
         // The hash table, after the descriptors were created and before anything has run: a T# is 8 dwords of the
         // heap slot, an S# 4 dwords followed by 0xFFFFFFFF x4. Each of the three has an index, they differ, and
         // bytes nothing was created for have none.
@@ -313,11 +426,13 @@ int main() {
         for (unsigned i = 0; i < 8; ++i) key_unknown[i] = 0x5a5a0000u + i;
         EXPECT(std::memcmp(key_a, key_b, 32) != 0);
         EXPECT(std::any_of(key_a, key_a + 8, [](std::uint32_t w) { return w != 0; }));
-        const std::uint32_t index_a = rt::d3d12::bindless_hash_lookup(device.p, key_a);
-        const std::uint32_t index_b = rt::d3d12::bindless_hash_lookup(device.p, key_b);
+        std::uint32_t index_a = rt::d3d12::bindless_hash_lookup(device.p, key_a);
+        std::uint32_t index_b = rt::d3d12::bindless_hash_lookup(device.p, key_b);
         const std::uint32_t index_s = rt::d3d12::bindless_hash_lookup(device.p, key_s);
         std::fprintf(stderr, "hash table: T# A -> %u, T# B -> %u, S# -> %u\n", index_a, index_b, index_s);
-        EXPECT(index_a && index_b && index_s && index_a != index_b);
+        EXPECT(index_s);
+        if (staged_views) EXPECT(index_a == 0 && index_b == 0);
+        else EXPECT(index_a && index_b && index_a != index_b);
         std::uint32_t key_wrap[8];
         std::memcpy(key_wrap, reinterpret_cast<const void*>(sampler_cpu + sampler_step), 16);
         std::fill(key_wrap + 4, key_wrap + 8, 0xffffffffu);
@@ -333,6 +448,10 @@ int main() {
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv{
             SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(rtv_heap.p, 9))(rtv_heap.p))};
         device->CreateRenderTargetView(target.p, nullptr, rtv);
+        if (placed) {
+            EXPECT(rt::d3d12::vulkan_memory_flags(target.p) == 0);
+            for (const auto& texture : textures) EXPECT((rt::d3d12::vulkan_memory_flags(texture.p) == 0) == staged_views);
+        }
 
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
@@ -346,20 +465,38 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
         // Upload both textures, then make them shader resources and the target a render target.
-        for (UINT i = 0; i < 2; ++i) {
-            D3D12_TEXTURE_COPY_LOCATION dst{};
-            dst.pResource = textures[i].p;
-            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            D3D12_TEXTURE_COPY_LOCATION src{};
-            src.pResource = upload.p;
-            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            src.PlacedFootprint = footprint;
-            src.PlacedFootprint.Offset = i ? b_offset : 0;
-            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        Ref<ID3D12DescriptorHeap> packed_rtv;
+        if(test_packed4444()){
+            D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,2,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&desc,IID_PPV_ARGS(&packed_rtv.p))));
+            const auto first=reinterpret_cast<XboxHeapHandleFn>(slot(packed_rtv.p,9))(packed_rtv.p);
+            const auto stride=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            for(unsigned i=0;i<2;++i){
+                const D3D12_CPU_DESCRIPTOR_HANDLE dest{SIZE_T(first+i*stride)};
+                device->CreateRenderTargetView(textures[i].p,nullptr,dest);
+                for(unsigned y=0;y<texture_size;++y)for(unsigned x=0;x<texture_size;++x) {
+                    const auto color=i?raw_gradient(texture_size-1-x,texture_size-1-y):raw_gradient(x,y);
+                    float channels[4]{};for(unsigned k=0;k<4;++k)channels[k]=color[k]/255.0f;
+                    const D3D12_RECT area{LONG(x),LONG(y),LONG(x+1),LONG(y+1)};
+                    list->ClearRenderTargetView(dest,channels,1,&area);
+                }
+            }
+        } else {
+            for (UINT i = 0; i < 2; ++i) {
+                D3D12_TEXTURE_COPY_LOCATION dst{};
+                dst.pResource = textures[i].p;
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                D3D12_TEXTURE_COPY_LOCATION src{};
+                src.pResource = upload.p;
+                src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                src.PlacedFootprint = footprint;
+                src.PlacedFootprint.Offset = i ? b_offset : 0;
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
         }
         D3D12_RESOURCE_BARRIER barriers[3] = {
-            transition(textures[0].p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-            transition(textures[1].p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            transition(textures[0].p, initial_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            transition(textures[1].p, initial_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
             transition(target.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)};
         list->ResourceBarrier(3, barriers);
         const FLOAT clear[4] = {1.0f, 0.0f, 1.0f, 1.0f};  // magenta: a pixel the draws missed shows
@@ -409,6 +546,7 @@ int main() {
         EXPECT(list->Close() == S_OK);
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
+        if (staged_views) EXPECT(rt::d3d12::vulkan_memory_flags(unused_texture.p)==0);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
@@ -460,10 +598,65 @@ int main() {
         EXPECT(SUCCEEDED(readback2->Map(0, nullptr, &mapped2)));
         std::memcpy(control_pixels.data(), mapped2, control_pixels.size());
 
+        if (refresh) {
+            // Only CPU stores reach the game's backing after the control list has closed. Both samplers
+            // already have hash entries. The offset texture coordinates distinguish their address modes.
+            auto* title = reinterpret_cast<std::uint8_t*>(sampler_cpu);
+            const auto* mapped_heap = reinterpret_cast<const std::uint8_t*>(sampler_real.ptr);
+            const std::vector<std::uint8_t> original(mapped_heap, mapped_heap + 3 * sampler_step);
+            EXPECT(std::memcmp(original.data(), original.data() + sampler_step, sampler_step) != 0);
+            readback2->Unmap(0, nullptr);
+            const SIZE_T last = SIZE_T(sampler_slots - 1) * sampler_step;
+            bool extent_matches = true;
+            unsigned matches[2]{};
+            for (unsigned pass = 0; pass < 2; ++pass) {
+                const bool swapped = pass == 0;
+                for (unsigned slot = 0; slot < 2; ++slot)
+                    std::memcpy(title + slot * sampler_step, original.data() + (swapped ? 1 - slot : slot) * sampler_step,
+                                sampler_step);
+                // An unbounded table reaches the heap's last slot. For one-slot tables this is a guard slot.
+                std::memcpy(title + last, original.data() + pass * sampler_step, sampler_step);
+                queue->ExecuteCommandLists(1, lists2);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                EXPECT(SUCCEEDED(queue->Signal(fence.p, 3 + pass)));
+                EXPECT(SUCCEEDED(fence->SetEventOnCompletion(3 + pass, nullptr)));
+                const auto* expected_last = original.data() + (unbounded ? pass : 2u) * sampler_step;
+                extent_matches &= std::memcmp(mapped_heap + last, expected_last, sampler_step) == 0;
+                EXPECT(SUCCEEDED(readback2->Map(0, nullptr, &mapped2)));
+                for (UINT y = 0; y < target_size; ++y) {
+                    for (UINT x = 0; x < target_size; ++x) {
+                        const bool left = x < target_size / 2;
+                        const bool wraps = (swapped && !disabled) ? !left : left;
+                        const UINT tx = wraps ? x * texture_size / target_size : texture_size - 1;
+                        const UINT ty = y * texture_size / target_size;
+                        const Texel want = left ? gradient(tx, ty) : reflected(tx, ty);
+                        const auto* pixel = static_cast<const std::uint8_t*>(mapped2) + y * target_pitch + 4 * x;
+                        matches[pass] += std::memcmp(pixel, want.data(), 4) == 0;
+                    }
+                }
+                readback2->Unmap(0, nullptr);
+            }
+            std::printf("resubmitted sampler tables: %u/%u swapped, %u/%u restored\n", matches[0],
+                        target_size * target_size, matches[1], target_size * target_size);
+            std::printf("sampler slot %u: %s\n", sampler_slots - 1, extent_matches ? "matched" : "mismatch");
+            EXPECT(extent_matches && matches[0] == target_size * target_size && matches[1] == target_size * target_size);
+        }
+
+        if (staged_views) {
+            index_a = rt::d3d12::bindless_hash_lookup(device.p,key_a);
+            index_b = rt::d3d12::bindless_hash_lookup(device.p,key_b);
+            EXPECT(index_a && index_b && index_a!=index_b);
+            // The control pass declares an unbounded SRV table. Its entire visible heap becomes reachable,
+            // including the extra slot; the source-only staging heap does not.
+            EXPECT((rt::d3d12::vulkan_memory_flags(unused_texture.p)!=0) == direct_views);
+            EXPECT(rt::d3d12::vulkan_memory_flags(textures[0].p)!=0 && rt::d3d12::vulkan_memory_flags(target.p)!=0);
+        }
         // The entries are still there after the draws.
         EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key_a) == index_a);
         EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key_s) == index_s);
 
+        unused_texture.reset();
+        staging_heap.reset();
         for (auto& texture : textures) texture.reset();
         for (auto* r : {&upload, &readback, &readback2, &target}) r->reset();
         pso.reset();
@@ -479,6 +672,7 @@ int main() {
         allocator.reset();
         queue.reset();
         fence.reset();
+        packed_rtv.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
 
@@ -489,7 +683,7 @@ int main() {
             const UINT tx = col / (target_size / texture_size), ty = row / (target_size / texture_size);
             const Texel want = col < target_size / 2 ? gradient(tx, ty) : reflected(tx, ty);
             const std::uint8_t* got = &pixels[std::size_t(row) * target_pitch + col * 4];
-            const Texel filtered = linear_clamp(col, row);
+            const Texel filtered = large_raw_surface() ? want : linear_clamp(col, row);
             const auto* linear = &linear_pixels[std::size_t(row) * target_pitch + col * 4];
             for (unsigned k = 0; k < filtered.size(); ++k) {
                 const int error = std::abs(int(linear[k]) - filtered[k]);

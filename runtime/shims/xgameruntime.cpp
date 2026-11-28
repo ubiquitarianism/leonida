@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -28,12 +29,14 @@
 #include <string>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
 
+#include "console_identity.h"
 #include "file_system.h"
 #include "shims.h"
 
@@ -62,6 +65,8 @@ std::atomic<int> g_runtime_refs{0};
 // (no caller in the shipped DLLs to measure), and the classes of the other xgameruntime_*.cpp files through their
 // query functions; for any other class QueryApiImpl logs the class and interface id and refuses it, so the first boot
 // with the executable lists the interfaces to implement next.
+//
+// The thunks look up a sixth name, XErrorReport (served below GetApiVersionImpl), and refuse the runtime without it.
 
 struct ApiImplOptions {    // InitializeApiImplEx2's fourth argument
     uint32_t unknown;      // documented as always 1
@@ -344,6 +349,7 @@ using HintChangedCallback = void(CALLBACK*)(void* context, const ConnectivityHin
 struct NetRegistration {
     bool running = false;
     bool unregistered = false;
+    DWORD thread = 0;  // the thread running its callback: an unregister from inside it must not wait on itself
 };
 std::mutex g_net_mu;
 std::condition_variable g_net_cv;
@@ -373,13 +379,18 @@ template <class Callback> struct InitialNotification {
             const auto it = g_net_registrations.find(n->token);
             if (canceled || it == g_net_registrations.end()) return;
             it->second.running = true;
+            it->second.thread = GetCurrentThreadId();
         }
         notify(n->callback, n->context);
         {
             std::lock_guard lock(g_net_mu);
             const auto it = g_net_registrations.find(n->token);
-            if (it->second.unregistered) g_net_registrations.erase(it);
-            else it->second.running = false;
+            if (it->second.unregistered) {
+                g_net_registrations.erase(it);
+            } else {
+                it->second.running = false;
+                it->second.thread = 0;
+            }
         }
         g_net_cv.notify_all();
     }
@@ -401,9 +412,10 @@ HRESULT STDMETHODCALLTYPE net_register(void*, XTaskQueueHandle queue, void* cont
         g_net_registrations.emplace(id, NetRegistration{});
     }
     token->token = id;
-    auto* initial = new InitialNotification<Callback>{id, context, callback};
-    const HRESULT hr = XTaskQueueSubmitCallback(queue, XTaskQueuePort::Completion, initial,
-                                                &InitialNotification<Callback>::run);
+    auto* initial = new (std::nothrow) InitialNotification<Callback>{id, context, callback};  // nothing may unwind
+    const HRESULT hr = initial ? XTaskQueueSubmitCallback(queue, XTaskQueuePort::Completion, initial,
+                                                          &InitialNotification<Callback>::run)
+                               : E_OUTOFMEMORY;
     if (process_queue) XTaskQueueCloseHandle(process_queue);
     if (FAILED(hr)) {
         delete initial;
@@ -422,6 +434,9 @@ bool STDMETHODCALLTYPE net_unregister(void*, XTaskQueueRegistrationToken token, 
         return true;
     }
     it->second.unregistered = true;
+    // From inside its own callback: the registration ends when the callback returns, which waiting here would never
+    // let happen. As a wait would, report it done.
+    if (it->second.thread == GetCurrentThreadId()) return true;
     if (wait) g_net_cv.wait(lock, [&] { return !g_net_registrations.contains(token.token); });
     return wait;
 }
@@ -655,6 +670,7 @@ HRESULT WINAPI GetApiVersionImpl(uint64_t* first, uint64_t* second) {
     return S_OK;
 }
 
+
 // HRESULT XGameRuntimeInitialize(). Reference counted, as in the GDK: each call needs an XGameRuntimeUninitialize.
 HRESULT __stdcall XGameRuntimeInitialize() {
     if (g_runtime_refs.fetch_add(1) == 0) std::fprintf(stderr, "[rt] xgameruntime: initialized (offline)\n");
@@ -677,16 +693,9 @@ enum class XSystemDeviceType : uint32_t {
 };
 
 // XSystemDeviceType XSystemGetDeviceType(). The package is the Xbox Series build, so report Series X (Anaconda).
-// LEONIDA_DEVICE_TYPE=<0..8> overrides it, for trying other code paths on day one.
-uint32_t __stdcall XSystemGetDeviceType() {
-    char s[16];
-    const DWORD n = GetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", s, sizeof(s));
-    if (n > 0 && n < sizeof(s)) {
-        int v = std::atoi(s);
-        if (v >= 0 && v <= 8) return static_cast<uint32_t>(v);
-    }
-    return static_cast<uint32_t>(XSystemDeviceType::XboxScarlettAnaconda);
-}
+// LEONIDA_DEVICE_TYPE=<0..8> overrides it, for trying other code paths on day one. The title's registry read of
+// ConsoleMode (console_registry.cpp) is answered from the same setting (console_identity.h), so the two agree.
+uint32_t __stdcall XSystemGetDeviceType() { return rt::shims::console_identity::configured_device_type(); }
 
 // HRESULT XSystemGetConsoleId(size_t consoleIdSize, char* consoleId, size_t* consoleIdUsed).
 // XSystemConsoleIdBytes is 39 (including the terminator). An offline PC has no console id, so this returns a
@@ -703,8 +712,22 @@ HRESULT __stdcall XSystemGetConsoleId(size_t size, char* out, size_t* used) {
     return S_OK;
 }
 
-// uint64_t XSystemGetAppMemoryUsageLimit(). Reports total physical RAM, or 12 GB fallback for Series X.
+// uint64_t XSystemGetAppMemoryUsageLimit(). Reports total physical RAM (or 12 GB fallback for Series X),
+// optionally overridden by LEONIDA_TITLE_MEMORY_MB (clamped to 2048..65536 MiB) so constrained hosts can prevent
+// the title from sizing pools above what the machine can hold.
 uint64_t __stdcall XSystemGetAppMemoryUsageLimit() {
+    char env[32]{};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", env, sizeof(env));
+    if (n > 0 && n < sizeof(env) && env[0] != '-' && env[0] != '+') {
+        errno = 0;
+        char* end = nullptr;
+        unsigned long long mib = std::strtoull(env, &end, 10);
+        if (errno == 0 && end != env && *end == '\0' && mib > 0) {
+            if (mib < 2048ULL) mib = 2048ULL;
+            if (mib > 65536ULL) mib = 65536ULL;
+            return static_cast<uint64_t>(mib) * 1024ULL * 1024ULL;
+        }
+    }
     MEMORYSTATUSEX ms{sizeof(ms)};
     if (GlobalMemoryStatusEx(&ms)) return ms.ullTotalPhys;
     return 12ULL * 1024 * 1024 * 1024;
@@ -990,21 +1013,27 @@ bool __stdcall XPackageIsPackagedProcess() {
     return true;
 }
 
-// ---- XPackageImpl (asked for as IXPackageImpl3), offline ----
+// ---- XPackageImpl (asked for as IXPackageImpl3 and IXPackageImpl4), offline ----
 //
 // libHttpClient.GDK.dll asks QueryApiImpl for XPackageImpl with IXPackageImpl3's id through 30 thunks (slots 3-19,
 // 22, 24-27, 30, 32-34, 37-40), each in the argument shape of the method at that position of xgameruntime-docs'
 // IXPackageImpl (slots 3-34), IXPackageImpl2 (35-38) and IXPackageImpl3 (39-40) lists (docs/runtime_imports.md).
+// The retail executable asks with IXPackageImpl4's id (tools/gdk_runtime_calls.py: 18 thunks, slots 3-7, 9, 12, 14,
+// 16-19, 25, 26, 34, 37-39; VIctory's xpackage.rs serves the same id), which adds slot 41, XPackageGetPackageKind.
 // The slots with an offline answer forward to the XPackage functions above (the package identifier, whether the
-// process is packaged, the mount path and its size, the user's locale); every other slot logs its number once and
-// returns E_NOTIMPL, so the first boot shows which ones the title needs.
+// process is packaged, the mount path and its size, the user's locale) or answer for the fully installed package
+// (slots 5-19, the installation monitor and the chunks; 39, no content packages to enumerate) or mount a mapped
+// content package (37-38); every other slot logs its number once and returns E_NOTIMPL, so the first boot shows which
+// ones the title needs.
 
 constexpr GUID kPackageClass = {0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}};
-// IXPackageImpl3 : IXPackageImpl2 : IXPackageImpl (xgameruntime include/xpackage.idl); the class id is its own.
+// IXPackageImpl4 : IXPackageImpl3 : IXPackageImpl2 : IXPackageImpl (xgameruntime include/xpackage.idl; IXPackageImpl4
+// per tools/gdk_runtime_classes.json); the class id is its own.
 constexpr GUID kPackage1 = {0x3720de07, 0xe8e4, 0x44a3, {0xad, 0x32, 0xb3, 0x59, 0xe8, 0xad, 0xbe, 0x55}};
 constexpr GUID kPackage2 = {0xf92d8712, 0x2b27, 0x4d8a, {0xbf, 0x01, 0x11, 0xa6, 0xf8, 0xe3, 0xeb, 0x42}};
 constexpr GUID kPackage3 = {0xe2a4734b, 0x2f4a, 0x456d, {0xaa, 0x8f, 0xd0, 0x65, 0xe0, 0x4f, 0xb2, 0x09}};
-const GUID* const kPackageIids[] = {&kPackage1, &kPackage2, &kPackage3, nullptr};
+constexpr GUID kPackage4 = {0x0b9d556e, 0xab70, 0x43f4, {0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40}};
+const GUID* const kPackageIids[] = {&kPackage1, &kPackage2, &kPackage3, &kPackage4, nullptr};
 
 template <int Slot> HRESULT STDMETHODCALLTYPE package_not_implemented(void*) {
     static std::atomic<bool> s_logged{false};
@@ -1016,13 +1045,17 @@ HRESULT STDMETHODCALLTYPE pkg_identifier(void*, size_t size, char* buffer) {
     return XPackageGetCurrentProcessPackageIdentifier(size, buffer);
 }
 bool STDMETHODCALLTYPE pkg_is_packaged(void*) { return XPackageIsPackagedProcess(); }
-// The package's MicrosoftGame.Config as text, from the game folder (LEONIDA_GAME_DIR, else --game-dir); empty when
-// there is no folder or no config. Wide on purpose: a game folder named outside the ANSI code page must reach the file
-// intact.
-std::string package_config() {
+// The package's folder, the game folder (LEONIDA_GAME_DIR, else --game-dir); empty when neither is set. Wide on
+// purpose: a game folder named outside the ANSI code page must reach its files intact.
+std::filesystem::path package_dir() {
     wchar_t env[MAX_PATH] = {};
     const DWORD n = GetEnvironmentVariableW(L"LEONIDA_GAME_DIR", env, MAX_PATH);
-    const std::filesystem::path dir = (n > 0 && n < MAX_PATH) ? std::filesystem::path(env) : rt::fs::game_dir();
+    return (n > 0 && n < MAX_PATH) ? std::filesystem::path(env) : rt::fs::game_dir();
+}
+
+// The package's MicrosoftGame.Config as text, from the package folder; empty when there is no folder or no config.
+std::string package_config() {
+    const std::filesystem::path dir = package_dir();
     if (dir.empty()) return {};
     std::ifstream f(dir / L"MicrosoftGame.Config", std::ios::binary);
     if (!f) return {};
@@ -1115,24 +1148,443 @@ HRESULT STDMETHODCALLTYPE pkg_mount_path(void*, XPackageMountHandle mount, size_
 }
 void STDMETHODCALLTYPE pkg_close_mount(void*, XPackageMountHandle mount) { XPackageCloseMountHandle(mount); }
 
+// ---- Slots 5-19: the installation monitor and the package's chunks ----
+//
+// Offline the title's own package is fully installed: every chunk is present, nothing is pending, nothing needs a
+// download. The title reads a failure from any of these as "chunk not installed" (its chunk check, its chunk manager
+// and its monitor setup all take the failure path), so each one answers for the installed package. The answers are
+// ported from VIctory's crates/victory-hle/src/modules/xpackage.rs (Marvisak/VIctory, GPL-3.0-or-later, commit
+// 2849477), which runs this title into its world with them; slots 13 and 15, which VIctory leaves out, follow the same
+// rule. Signatures are Microsoft's public XPackage reference pages: each slot takes the function's arguments after
+// `this`, as slots 3-4, 7-8, 11 and 23-26 do. A package identifier other than the process's own (or a content package
+// LEONIDA_CONTENT_PACKAGES maps) is E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER, as VIctory answers it. Each slot writes one
+// "[rt] xgameruntime: XPackage <name> first call" line, with its arguments and answer, so a boot log shows which ones
+// the title uses.
+
+// E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER: no installed package has the identifier (VIctory's value).
+constexpr HRESULT kNoPackage = static_cast<HRESULT>(0x89245208);
+
+// XPackageChunkSelector: XPackageChunkSelectorType (Language 0, Tag 1, Chunk 2, Feature 3), then a union of the
+// language, tag or feature string and the u32 chunk id.
+struct ChunkSelector {
+    uint32_t type;
+    union {
+        const char* text;
+        uint32_t chunk_id;
+    };
+};
+static_assert(sizeof(ChunkSelector) == 16, "XPackageChunkSelector layout");
+constexpr uint32_t kSelectorLanguage = 0, kSelectorChunk = 2, kSelectorFeature = 3;
+
+// XPackageChunkAvailability: Ready 0, Pending 1, Installable 2, Unavailable 3.
+constexpr uint32_t kChunkReady = 0;
+
+const char* text_or_null(const char* s) { return s ? s : "(null)"; }
+
+// `package "id", 2 selectors: chunk 1000, tag "x"`, the first four selectors at most, for the first-call lines.
+std::string describe_request(const char* id, uint32_t count, const ChunkSelector* selectors) {
+    std::string out = std::string("package \"") + text_or_null(id) + "\", ";
+    if (!count) return out + "no selectors (the whole package)";
+    out += std::to_string(count) + (count == 1 ? " selector" : " selectors");
+    if (!selectors) return out + " (null array)";
+    static const char* const kTypes[] = {"language", "tag", "chunk", "feature"};
+    const uint32_t shown = (std::min)(count, 4u);
+    for (uint32_t i = 0; i < shown; ++i) {
+        const ChunkSelector& s = selectors[i];
+        out += i ? ", " : ": ";
+        if (s.type == kSelectorChunk) out += "chunk " + std::to_string(s.chunk_id);
+        else if (s.type <= kSelectorFeature) out += std::string(kTypes[s.type]) + " \"" + text_or_null(s.text) + "\"";
+        else out += "type " + std::to_string(s.type);
+    }
+    if (count > shown) out += ", ...";
+    return out;
+}
+
+// S_OK when `id` names an installed package: the process's own (XPackageGetCurrentProcessPackageIdentifier) or a
+// content package LEONIDA_CONTENT_PACKAGES maps.
+HRESULT check_package(const char* id) {
+    if (!id) return E_INVALIDARG;
+    char own[XPACKAGE_IDENTIFIER_MAX_LENGTH] = {};
+    if (SUCCEEDED(XPackageGetCurrentProcessPackageIdentifier(sizeof(own), own)) && std::strcmp(id, own) == 0)
+        return S_OK;
+    HRESULT found = S_OK;
+    const std::string path = resolve_package_path(id, found);  // main's form: the path, and the HRESULT through `found`
+    return SUCCEEDED(found) && !path.empty() ? S_OK : kNoPackage;
+}
+
+// Bytes in the package folder, counted once (VIctory counts its package folder the same way). 1 when there is no
+// folder, so the total is never zero and installed == total still reads as a finished installation.
+uint64_t package_bytes() {
+    static const uint64_t bytes = [] {
+        namespace fs = std::filesystem;
+        uint64_t sum = 0;
+        const fs::path dir = package_dir();
+        std::error_code ec;
+        if (!dir.empty())
+            for (fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
+                 !ec && it != end; it.increment(ec)) {
+                std::error_code file_ec;
+                if (!it->is_regular_file(file_ec)) continue;
+                const uintmax_t size = it->file_size(file_ec);
+                if (!file_ec) sum += size;
+            }
+        return sum ? sum : uint64_t{1};
+    }();
+    return bytes;
+}
+
+// XPackageInstallationMonitorHandle: a small heap object the title holds until slot 6 closes it. Every monitor watches
+// the same finished installation, so it carries only a serial number for the log. The open ones are kept in a set, so
+// closing a handle that is not ours (or closing one twice) frees nothing.
+struct InstallationMonitor {
+    uint64_t serial;
+};
+std::mutex g_monitor_mu;
+std::unordered_set<InstallationMonitor*> g_monitors;
+std::atomic<uint64_t> g_monitor_serials{0};
+std::atomic<uint64_t> g_progress_tokens{0};
+
+InstallationMonitor* open_monitor() {
+    auto* monitor = new InstallationMonitor{g_monitor_serials.fetch_add(1) + 1};
+    std::lock_guard lock(g_monitor_mu);
+    g_monitors.insert(monitor);
+    return monitor;
+}
+
+const char* hr_name(HRESULT hr) {
+    switch (hr) {
+    case S_OK: return "S_OK";
+    case E_INVALIDARG: return "E_INVALIDARG";
+    case E_POINTER: return "E_POINTER";
+    case E_PENDING: return "E_PENDING";
+    case kNoPackage: return "E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER";
+    default: return "failure";
+    }
+}
+
+// Slot 5: HRESULT XPackageCreateInstallationMonitor(const char* packageIdentifier, uint32_t selectorCount,
+// XPackageChunkSelector* selectors, uint32_t minimumUpdateIntervalMs, XTaskQueueHandle queue,
+// XPackageInstallationMonitorHandle* installationMonitor). A monitor of the finished installation.
+HRESULT STDMETHODCALLTYPE pkg_create_monitor(void*, const char* id, uint32_t count, const ChunkSelector* selectors,
+                                            uint32_t interval_ms, XTaskQueueHandle, void** monitor) {
+    HRESULT hr = monitor ? check_package(id) : E_POINTER;
+    if (monitor) *monitor = SUCCEEDED(hr) ? open_monitor() : nullptr;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage CreateInstallationMonitor first call: %s, interval %u ms -> %s (0x%08lx), monitor %p\n",
+                     describe_request(id, count, selectors).c_str(), interval_ms, hr_name(hr),
+                     static_cast<unsigned long>(hr), monitor ? *monitor : nullptr);
+    return hr;
+}
+
+// Slot 6: void XPackageCloseInstallationMonitorHandle(XPackageInstallationMonitorHandle installationMonitor).
+void STDMETHODCALLTYPE pkg_close_monitor(void*, void* handle) {
+    auto* monitor = static_cast<InstallationMonitor*>(handle);
+    bool ours = false;
+    {
+        std::lock_guard lock(g_monitor_mu);
+        ours = monitor && g_monitors.erase(monitor) == 1;
+    }
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage CloseInstallationMonitorHandle first call: monitor %p (%s)\n",
+                     handle, ours ? "closed" : "not an open monitor, nothing freed");
+    if (ours) delete monitor;
+}
+
 // XPackageInstallationProgress: totalBytes, installedBytes, launchBytes (u64), launchable, completed (bool).
 struct InstallationProgress {
     uint64_t total_bytes, installed_bytes, launch_bytes;
     bool launchable, completed;
 };
 static_assert(sizeof(InstallationProgress) == 32, "XPackageInstallationProgress layout");
-// void XPackageGetInstallationProgress(monitor, XPackageInstallationProgress*): an offline package is installed,
-// launchable and completed, every byte present.
-void STDMETHODCALLTYPE pkg_installation_progress(void*, void*, InstallationProgress* progress) {
-    if (progress) *progress = {0, 0, 0, true, true};
+// Slot 7: void XPackageGetInstallationProgress(monitor, XPackageInstallationProgress*): an offline package is
+// installed, launchable and completed, every byte of the package folder present (as VIctory reports it).
+void STDMETHODCALLTYPE pkg_installation_progress(void*, void* monitor, InstallationProgress* progress) {
+    const uint64_t bytes = package_bytes();
+    if (progress) *progress = {bytes, bytes, bytes, true, true};
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage GetInstallationProgress first call: monitor %p -> %llu of "
+                             "%llu bytes installed, launchable, completed\n",
+                     monitor, static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(bytes));
 }
 // The bool methods with no offline work, as Microsoft documents them: XPackageUpdateInstallationMonitor is false
 // (nothing changed), the two Unregister* calls are true (nothing pending), XPackageUninstallPackage is false (not
 // uninstalled). A generic E_NOTIMPL stub would read as true in al.
-bool STDMETHODCALLTYPE pkg_update_monitor(void*, void*) { return false; }
-bool STDMETHODCALLTYPE pkg_unregister_progress(void*, void*, XTaskQueueRegistrationToken, bool) { return true; }
+bool STDMETHODCALLTYPE pkg_update_monitor(void*, void* monitor) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage UpdateInstallationMonitor first call: monitor %p -> false "
+                             "(no change)\n", monitor);
+    return false;
+}
+
+// Slot 9: HRESULT XPackageRegisterInstallationProgressChanged(XPackageInstallationMonitorHandle installationMonitor,
+// void* context, XPackageInstallationProgressCallback* callback, XTaskQueueRegistrationToken* token). The installation
+// is finished, so progress never changes and the callback is never called (as in VIctory); the token is a fresh
+// non-zero number that slot 10 accepts.
+HRESULT STDMETHODCALLTYPE pkg_register_progress(void*, void* monitor, void*, void* callback,
+                                               XTaskQueueRegistrationToken* token) {
+    HRESULT hr = S_OK;
+    if (!token) hr = E_POINTER;
+    else if (!callback) hr = E_INVALIDARG;
+    if (token) token->token = SUCCEEDED(hr) ? g_progress_tokens.fetch_add(1) + 1 : 0;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage RegisterInstallationProgressChanged first call: monitor %p "
+                             "-> %s (0x%08lx), token %llu, callback never called (installation complete)\n",
+                     monitor, hr_name(hr), static_cast<unsigned long>(hr),
+                     static_cast<unsigned long long>(token ? token->token : 0));
+    return hr;
+}
+bool STDMETHODCALLTYPE pkg_unregister_progress(void*, void* monitor, XTaskQueueRegistrationToken token, bool) {
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage UnregisterInstallationProgressChanged first call: monitor %p, "
+                             "token %llu -> true\n", monitor, static_cast<unsigned long long>(token.token));
+    return true;
+}
 bool STDMETHODCALLTYPE pkg_unregister_installed(void*, XTaskQueueRegistrationToken, bool) { return true; }
 bool STDMETHODCALLTYPE pkg_uninstall_package(void*, const char*) { return false; }
+
+// Slots 29/36/40 (IXPackageImpl / IXPackageImpl2 / IXPackageImpl3): HRESULT XPackageRegisterPackageInstalled(
+// XTaskQueueHandle queue, void* context, XPackageInstalledCallback* callback, XTaskQueueRegistrationToken* token).
+// Nothing installs offline, so the callback never fires; returns a fresh non-zero token accepted by slot 22.
+HRESULT STDMETHODCALLTYPE pkg_register_installed(void*, XTaskQueueHandle, void*, void* callback,
+                                                 XTaskQueueRegistrationToken* token) {
+    HRESULT hr = S_OK;
+    if (!token) hr = E_POINTER;
+    else if (!callback) hr = E_INVALIDARG;
+    if (token) token->token = SUCCEEDED(hr) ? g_progress_tokens.fetch_add(1) + 1 : 0;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage RegisterPackageInstalled first call -> %s (0x%08lx), "
+                             "token %llu, callback never called (offline)\n",
+                     hr_name(hr), static_cast<unsigned long>(hr),
+                     static_cast<unsigned long long>(token ? token->token : 0));
+    return hr;
+}
+
+// Slots 28/35/39 (IXPackageImpl / IXPackageImpl2 / IXPackageImpl3): HRESULT XPackageEnumeratePackages(
+// XPackageKind kind, XPackageEnumerationScope scope, void* context, XPackageEnumerationCallback* callback),
+// the callback a `bool CALLBACK (void* context, const XPackageDetails* details)` that is called once per package.
+// The title enumerates content packages (kind 1) and the offline install has none to list, so this is S_OK without a
+// callback, as VIctory's xpackage.rs answers the same slot (0x138) for this title. Shortcut: a console would also list
+// this installation for kind 0 (Game); no caller seen asks for it. A content package LEONIDA_CONTENT_PACKAGES maps is
+// mounted by its identifier (slots 23, 37), not listed here.
+HRESULT STDMETHODCALLTYPE pkg_enumerate_packages(void*, uint32_t kind, uint32_t scope, void* context, void* callback) {
+    const HRESULT hr = callback ? S_OK : E_INVALIDARG;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage EnumeratePackages first call: kind %u, scope %u, context %p "
+                             "-> %s (0x%08lx), no packages listed\n",
+                     kind, scope, context, hr_name(hr), static_cast<unsigned long>(hr));
+    return hr;
+}
+
+// Slot 12: HRESULT XPackageFindChunkAvailability(const char* packageIdentifier, uint32_t selectorCount,
+// XPackageChunkSelector* selectors, XPackageChunkAvailability* availability). Ready for every selector of an installed
+// package. Like VIctory this does not check that the selectors name chunks the package's layout has (the console would
+// answer an unknown one with E_GAMEPACKAGE_INVALID_SELECTOR); the title asks only about its own chunks.
+HRESULT STDMETHODCALLTYPE pkg_find_chunk_availability(void*, const char* id, uint32_t count,
+                                                     const ChunkSelector* selectors, uint32_t* availability) {
+    const HRESULT hr = availability ? check_package(id) : E_POINTER;
+    if (SUCCEEDED(hr)) *availability = kChunkReady;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage FindChunkAvailability first call: %s -> %s (0x%08lx)%s\n",
+                     describe_request(id, count, selectors).c_str(), hr_name(hr), static_cast<unsigned long>(hr),
+                     SUCCEEDED(hr) ? ", Ready" : "");
+    return hr;
+}
+
+// Slot 13: HRESULT XPackageEnumerateChunkAvailability(const char* packageIdentifier, XPackageChunkSelectorType type,
+// void* context, XPackageChunkAvailabilityCallback* callback), the callback being
+// bool (void* context, const XPackageChunkSelector* selector, XPackageChunkAvailability availability), true to go on.
+// Nothing is pending: every reported selector is Ready. Languages are the ones MicrosoftGame.Config declares; tags,
+// chunk ids and features come from the package's layout, which is not read offline, so none are reported.
+using ChunkAvailabilityCallback = bool(CALLBACK*)(void* context, const ChunkSelector* selector, uint32_t availability);
+HRESULT STDMETHODCALLTYPE pkg_enumerate_chunk_availability(void*, const char* id, uint32_t type, void* context,
+                                                          ChunkAvailabilityCallback callback) {
+    HRESULT hr = callback ? check_package(id) : E_INVALIDARG;
+    if (SUCCEEDED(hr) && type > kSelectorFeature) hr = E_INVALIDARG;
+    size_t reported = 0;
+    if (SUCCEEDED(hr) && type == kSelectorLanguage) {
+        const std::vector<std::string> locales = package_locales();
+        for (const std::string& locale : locales) {
+            ChunkSelector selector{};
+            selector.type = kSelectorLanguage;
+            selector.text = locale.c_str();
+            ++reported;
+            if (!callback(context, &selector, kChunkReady)) break;
+        }
+    }
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage EnumerateChunkAvailability first call: package \"%s\", "
+                             "selector type %u -> %s (0x%08lx), %zu selectors reported Ready\n",
+                     text_or_null(id), type, hr_name(hr), static_cast<unsigned long>(hr), reported);
+    return hr;
+}
+
+// Slot 14: HRESULT XPackageChangeChunkInstallOrder(const char* packageIdentifier, uint32_t selectorCount,
+// XPackageChunkSelector* selectors). Nothing is queued, so any order is the order.
+HRESULT STDMETHODCALLTYPE pkg_change_chunk_install_order(void*, const char* id, uint32_t count,
+                                                        const ChunkSelector* selectors) {
+    const HRESULT hr = check_package(id);
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage ChangeChunkInstallOrder first call: %s -> %s (0x%08lx)\n",
+                     describe_request(id, count, selectors).c_str(), hr_name(hr), static_cast<unsigned long>(hr));
+    return hr;
+}
+
+// Slot 15: HRESULT XPackageInstallChunks(const char* packageIdentifier, uint32_t selectorCount,
+// XPackageChunkSelector* selectors, uint32_t minimumUpdateIntervalMs, bool suppressUserConfirmation,
+// XTaskQueueHandle queue, XPackageInstallationMonitorHandle* installationMonitor). Everything is installed already:
+// S_OK and a monitor of the finished installation.
+HRESULT STDMETHODCALLTYPE pkg_install_chunks(void*, const char* id, uint32_t count, const ChunkSelector* selectors,
+                                            uint32_t, bool, XTaskQueueHandle, void** monitor) {
+    const HRESULT hr = monitor ? check_package(id) : E_POINTER;
+    if (monitor) *monitor = SUCCEEDED(hr) ? open_monitor() : nullptr;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage InstallChunks first call: %s -> %s (0x%08lx), already "
+                             "installed, monitor %p\n",
+                     describe_request(id, count, selectors).c_str(), hr_name(hr), static_cast<unsigned long>(hr),
+                     monitor ? *monitor : nullptr);
+    return hr;
+}
+
+// Slot 16: HRESULT XPackageInstallChunksAsync(const char* packageIdentifier, uint32_t selectorCount,
+// XPackageChunkSelector* selectors, uint32_t minimumUpdateIntervalMs, bool suppressUserConfirmation,
+// XAsyncBlock* asyncBlock). Everything is installed already: the block completes on its queue straight away, through
+// XAsyncRun like the other offline *Async slots, with S_OK (E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER for a package that is
+// not installed, as VIctory completes it).
+HRESULT STDMETHODCALLTYPE pkg_install_chunks_async(void*, const char* id, uint32_t count,
+                                                  const ChunkSelector* selectors, uint32_t, bool, XAsyncBlock* async) {
+    const HRESULT package = check_package(id);
+    HRESULT hr = S_OK;
+    if (!async) hr = E_POINTER;
+    else if (package == E_INVALIDARG) hr = E_INVALIDARG;
+    else if (SUCCEEDED(package)) hr = XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return S_OK; });
+    else hr = XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return kNoPackage; });
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage InstallChunksAsync first call: %s -> %s (0x%08lx), "
+                             "completes with %s\n",
+                     describe_request(id, count, selectors).c_str(), hr_name(hr), static_cast<unsigned long>(hr),
+                     FAILED(hr) ? "nothing (not started)" : hr_name(package));
+    return hr;
+}
+
+// Slot 17: HRESULT XPackageInstallChunksResult(XAsyncBlock* asyncBlock,
+// XPackageInstallationMonitorHandle* installationMonitor). The block's status, and on success a monitor of the
+// finished installation.
+HRESULT STDMETHODCALLTYPE pkg_install_chunks_result(void*, XAsyncBlock* async, void** monitor) {
+    HRESULT hr = (async && monitor) ? XAsyncGetStatus(async, false) : E_POINTER;
+    if (monitor) *monitor = SUCCEEDED(hr) ? open_monitor() : nullptr;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage InstallChunksResult first call: block %p -> %s (0x%08lx), "
+                             "monitor %p\n",
+                     static_cast<void*>(async), hr_name(hr), static_cast<unsigned long>(hr),
+                     monitor ? *monitor : nullptr);
+    return hr;
+}
+
+// Slot 18: HRESULT XPackageEstimateDownloadSize(const char* packageIdentifier, uint32_t selectorCount,
+// XPackageChunkSelector* selectors, uint64_t* downloadSize, bool* shouldPresentUserConfirmation). Nothing to download,
+// so nothing to confirm.
+HRESULT STDMETHODCALLTYPE pkg_estimate_download_size(void*, const char* id, uint32_t count,
+                                                    const ChunkSelector* selectors, uint64_t* download_size,
+                                                    bool* confirm) {
+    const HRESULT hr = download_size ? check_package(id) : E_POINTER;
+    if (SUCCEEDED(hr)) {
+        *download_size = 0;
+        if (confirm) *confirm = false;
+    }
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage EstimateDownloadSize first call: %s -> %s (0x%08lx)%s\n",
+                     describe_request(id, count, selectors).c_str(), hr_name(hr), static_cast<unsigned long>(hr),
+                     SUCCEEDED(hr) ? ", 0 bytes, no user confirmation" : "");
+    return hr;
+}
+
+// Slot 19: HRESULT XPackageUninstallChunks(const char* packageIdentifier, uint32_t selectorCount,
+// XPackageChunkSelector* selectors). Accepted, but nothing is removed (the package folder is the user's), so the
+// chunks stay Ready, as in VIctory.
+HRESULT STDMETHODCALLTYPE pkg_uninstall_chunks(void*, const char* id, uint32_t count, const ChunkSelector* selectors) {
+    const HRESULT hr = check_package(id);
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage UninstallChunks first call: %s -> %s (0x%08lx), nothing "
+                             "removed\n",
+                     describe_request(id, count, selectors).c_str(), hr_name(hr), static_cast<unsigned long>(hr));
+    return hr;
+}
+
+// Slots 37/38: HRESULT XPackageMountWithUiAsync(const char* packageIdentifier, XAsyncBlock* async) and
+// HRESULT XPackageMountWithUiResult(XAsyncBlock* async, XPackageMountHandle* mount). The retail executable calls both
+// once IXPackageImpl4 is served. A content package LEONIDA_CONTENT_PACKAGES maps is mounted as slot 23 mounts it and
+// the result hands out its handle; any other identifier completes with E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER, as
+// VIctory's mount_async answers (no content package is installed). The block completes through XAsyncRun.
+std::mutex g_ui_mount_mu;
+std::unordered_map<XAsyncBlock*, uint64_t> g_ui_mounts;   // a finished mount's handle until its result is read
+
+HRESULT STDMETHODCALLTYPE pkg_mount_with_ui_async(void*, const char* id, XAsyncBlock* async) {
+    HRESULT hr = S_OK;
+    HRESULT mounted = kNoPackage;
+    if (!async) hr = E_POINTER;
+    else if (!id) hr = E_INVALIDARG;
+    else {
+        XPackageMountHandle mount{};
+        mounted = SUCCEEDED(XPackageMount(id, &mount)) ? S_OK : kNoPackage;
+        if (SUCCEEDED(mounted)) {
+            std::lock_guard lock(g_ui_mount_mu);
+            g_ui_mounts[async] = mount.handle;
+        }
+        hr = SUCCEEDED(mounted) ? XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return S_OK; })
+                                : XAsyncRun(async, [](XAsyncBlock*) -> HRESULT { return kNoPackage; });
+        if (FAILED(hr) && SUCCEEDED(mounted)) {
+            std::lock_guard lock(g_ui_mount_mu);
+            g_ui_mounts.erase(async);
+            XPackageCloseMountHandle(mount);
+        }
+    }
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage MountWithUiAsync first call: package \"%s\" -> %s (0x%08lx), "
+                             "completes with %s\n",
+                     text_or_null(id), hr_name(hr), static_cast<unsigned long>(hr),
+                     FAILED(hr) ? "nothing (not started)" : hr_name(mounted));
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE pkg_mount_with_ui_result(void*, XAsyncBlock* async, XPackageMountHandle* mount) {
+    HRESULT hr = (async && mount) ? XAsyncGetStatus(async, false) : E_POINTER;
+    if (mount) mount->handle = 0;
+    if (async && mount && hr != E_PENDING) {
+        std::lock_guard lock(g_ui_mount_mu);
+        const auto it = g_ui_mounts.find(async);
+        if (it != g_ui_mounts.end()) {
+            if (SUCCEEDED(hr)) mount->handle = it->second;
+            else XPackageCloseMountHandle(XPackageMountHandle{it->second});
+            g_ui_mounts.erase(it);
+        } else if (SUCCEEDED(hr)) {
+            hr = E_UNEXPECTED;   // the result was read already
+        }
+    }
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage MountWithUiResult first call: block %p -> %s (0x%08lx), "
+                             "mount %llu\n",
+                     static_cast<void*>(async), hr_name(hr), static_cast<unsigned long>(hr),
+                     static_cast<unsigned long long>(mount ? mount->handle : 0));
+    return hr;
+}
 
 #define PN(n) reinterpret_cast<const void*>(&package_not_implemented<n>)
 const void* const kPackageVtable[] = {
@@ -1140,34 +1592,77 @@ const void* const kPackageVtable[] = {
     reinterpret_cast<const void*>(&object_release),
     reinterpret_cast<const void*>(&pkg_identifier),   // 3  XPackageGetCurrentProcessPackageIdentifier
     reinterpret_cast<const void*>(&pkg_is_packaged),  // 4  XPackageIsPackagedProcess
-    PN(5), PN(6),                                     // 5-6 installation monitor: create, close
+    reinterpret_cast<const void*>(&pkg_create_monitor),         // 5  XPackageCreateInstallationMonitor
+    reinterpret_cast<const void*>(&pkg_close_monitor),          // 6  XPackageCloseInstallationMonitorHandle (void)
     reinterpret_cast<const void*>(&pkg_installation_progress),  // 7  XPackageGetInstallationProgress (void, writes)
     reinterpret_cast<const void*>(&pkg_update_monitor),         // 8  XPackageUpdateInstallationMonitor (bool)
-    PN(9),                                                      // 9  XPackageRegisterInstallationProgressChanged
+    reinterpret_cast<const void*>(&pkg_register_progress),      // 9  XPackageRegisterInstallationProgressChanged
     reinterpret_cast<const void*>(&pkg_unregister_progress),    // 10 ...UnregisterInstallationProgressChanged (bool)
     reinterpret_cast<const void*>(&pkg_user_locale),  // 11 XPackageGetUserLocale
-    PN(12), PN(13), PN(14), PN(15), PN(16), PN(17),   // 12-19 chunks: find / enumerate availability, change order,
-    PN(18), PN(19),                                   //       install (+ async, result), estimate size, uninstall
+    reinterpret_cast<const void*>(&pkg_find_chunk_availability),       // 12 XPackageFindChunkAvailability
+    reinterpret_cast<const void*>(&pkg_enumerate_chunk_availability),  // 13 XPackageEnumerateChunkAvailability
+    reinterpret_cast<const void*>(&pkg_change_chunk_install_order),    // 14 XPackageChangeChunkInstallOrder
+    reinterpret_cast<const void*>(&pkg_install_chunks),                // 15 XPackageInstallChunks
+    reinterpret_cast<const void*>(&pkg_install_chunks_async),          // 16 XPackageInstallChunksAsync
+    reinterpret_cast<const void*>(&pkg_install_chunks_result),         // 17 XPackageInstallChunksResult
+    reinterpret_cast<const void*>(&pkg_estimate_download_size),        // 18 XPackageEstimateDownloadSize
+    reinterpret_cast<const void*>(&pkg_uninstall_chunks),              // 19 XPackageUninstallChunks
     PN(20), PN(21),                                   // 20-21 _unknown_ (older enumerate / register installed)
     reinterpret_cast<const void*>(&pkg_unregister_installed),  // 22 XPackageUnregisterPackageInstalled (bool)
     reinterpret_cast<const void*>(&pkg_mount),            // 23 XPackageMount
     reinterpret_cast<const void*>(&pkg_mount_path_size),  // 24 XPackageGetMountPathSize
     reinterpret_cast<const void*>(&pkg_mount_path),       // 25 XPackageGetMountPath
     reinterpret_cast<const void*>(&pkg_close_mount),      // 26 XPackageCloseMountHandle
-    PN(27), PN(28), PN(29), PN(30), PN(31),           // 27 _unknown_, 28 EnumeratePackages, 29 RegisterPackageInstalled,
-                                                      // 30 GetWriteStats, 31 _unknown_
+    PN(27),                                           // 27 _unknown_
+    reinterpret_cast<const void*>(&pkg_enumerate_packages),    // 28 XPackageEnumeratePackages (IXPackageImpl)
+    reinterpret_cast<const void*>(&pkg_register_installed),    // 29 XPackageRegisterPackageInstalled (IXPackageImpl)
+    PN(30), PN(31),                                   // 30 GetWriteStats, 31 _unknown_
     PN(32), PN(33),                                   // 32 UninstallUWPInstance, 33 EnumerateFeatures
     reinterpret_cast<const void*>(&pkg_uninstall_package),     // 34 XPackageUninstallPackage (bool)
-    PN(35), PN(36), PN(37), PN(38),                   // IXPackageImpl2: EnumeratePackages, RegisterPackageInstalled,
-                                                      //   MountWithUiAsync, MountWithUiResult
-    PN(39), PN(40),                                   // IXPackageImpl3: EnumeratePackages, RegisterPackageInstalled
+    reinterpret_cast<const void*>(&pkg_enumerate_packages),    // 35 XPackageEnumeratePackages (IXPackageImpl2)
+    reinterpret_cast<const void*>(&pkg_register_installed),    // 36 XPackageRegisterPackageInstalled (IXPackageImpl2)
+    reinterpret_cast<const void*>(&pkg_mount_with_ui_async),   // 37 XPackageMountWithUiAsync
+    reinterpret_cast<const void*>(&pkg_mount_with_ui_result),  // 38 XPackageMountWithUiResult
+    reinterpret_cast<const void*>(&pkg_enumerate_packages),    // 39 XPackageEnumeratePackages (IXPackageImpl3)
+    reinterpret_cast<const void*>(&pkg_register_installed),    // 40 XPackageRegisterPackageInstalled (IXPackageImpl3)
+    PN(41),                                           // IXPackageImpl4: XPackageGetPackageKind
 };
 #undef PN
-static_assert(std::size(kPackageVtable) == 41, "IUnknown + IXPackageImpl's 32 + IXPackageImpl2's 4 + IXPackageImpl3's 2");
+static_assert(std::size(kPackageVtable) == 42,
+              "IUnknown + IXPackageImpl's 32 + IXPackageImpl2's 4 + IXPackageImpl3's 2 + IXPackageImpl4's 1");
 
 RuntimeObject& package_object() {
     static RuntimeObject object{kPackageVtable, &kPackageClass, kPackageIids};
     return object;
+}
+
+// Flat C XPackage exports forwarding to the offline COM implementation above.
+HRESULT __stdcall XPackageEnumeratePackages(uint32_t kind, uint32_t scope, void* context, void* callback) {
+    return pkg_enumerate_packages(nullptr, kind, scope, context, callback);
+}
+HRESULT __stdcall XPackageCreateInstallationMonitor(const char* id, uint32_t count, const ChunkSelector* selectors,
+                                                    uint32_t interval_ms, XTaskQueueHandle queue, void** monitor) {
+    return pkg_create_monitor(nullptr, id, count, selectors, interval_ms, queue, monitor);
+}
+void __stdcall XPackageCloseInstallationMonitorHandle(void* handle) { pkg_close_monitor(nullptr, handle); }
+void __stdcall XPackageGetInstallationProgress(void* monitor, InstallationProgress* progress) {
+    pkg_installation_progress(nullptr, monitor, progress);
+}
+bool __stdcall XPackageUpdateInstallationMonitor(void* monitor) { return pkg_update_monitor(nullptr, monitor); }
+HRESULT __stdcall XPackageRegisterInstallationProgressChanged(void* monitor, void* context, void* callback,
+                                                              XTaskQueueRegistrationToken* token) {
+    return pkg_register_progress(nullptr, monitor, context, callback, token);
+}
+bool __stdcall XPackageUnregisterInstallationProgressChanged(void* monitor, XTaskQueueRegistrationToken token,
+                                                             bool wait) {
+    return pkg_unregister_progress(nullptr, monitor, token, wait);
+}
+HRESULT __stdcall XPackageRegisterPackageInstalled(XTaskQueueHandle queue, void* context, void* callback,
+                                                   XTaskQueueRegistrationToken* token) {
+    return pkg_register_installed(nullptr, queue, context, callback, token);
+}
+bool __stdcall XPackageUnregisterPackageInstalled(XTaskQueueRegistrationToken token, bool wait) {
+    return pkg_unregister_installed(nullptr, token, wait);
 }
 
 // ---- XGameImpl (asked for as IXGameImpl3), offline ----
@@ -1369,7 +1864,7 @@ SHIM_TABLE(xgameruntime,
     XGR(InitializeApiImplEx2),
     XGR(UninitializeApiImpl),
     XGR(QueryApiImpl),
-    XGR(XErrorReport),
+    XGR(XErrorReport),  // looked up with the five above; without it the thunks refuse the runtime
     // the same runtime through gameplatformservices.dll, which XCurl.dll loads from System32 (GetApiVersionImpl above)
     {"gameplatformservices.dll", "QueryApiImpl", reinterpret_cast<void*>(&QueryApiImpl)},
     {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},
@@ -1386,6 +1881,15 @@ SHIM_TABLE(xgameruntime,
     XGR(XPackageGetMountPathSize),
     XGR(XPackageGetMountPath),
     XGR(XPackageIsPackagedProcess),
+    XGR(XPackageEnumeratePackages),
+    XGR(XPackageCreateInstallationMonitor),
+    XGR(XPackageCloseInstallationMonitorHandle),
+    XGR(XPackageGetInstallationProgress),
+    XGR(XPackageUpdateInstallationMonitor),
+    XGR(XPackageRegisterInstallationProgressChanged),
+    XGR(XPackageUnregisterInstallationProgressChanged),
+    XGR(XPackageRegisterPackageInstalled),
+    XGR(XPackageUnregisterPackageInstalled),
     // XTaskQueue (third_party/xtaskqueue)
     XGR(XTaskQueueCreate),
     XGR(XTaskQueueCreateComposite),

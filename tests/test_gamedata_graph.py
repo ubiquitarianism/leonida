@@ -7,12 +7,16 @@ content definition that includes the first, a missing set id, all four documente
 unknown ``common:/`` scheme, two parent locators, a tail-only document and a malformed document.
 No game data is used.
 """
+import contextlib
+import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "gamedata_graph.py")
@@ -422,6 +426,57 @@ class GamedataGraphTest(unittest.TestCase):
         self.assertEqual(gg.classify_target("../Item[@key='X']"),
                          ("relative/locator", "../Item[@key='X']", "relative_locator"))
 
+    def test_unparsed_manifest_and_rootless_payloads_keep_summary_totals_consistent(self):
+        docs = [
+            {"data": ALPHA, "complete": False},
+            {"data": b"<Item/></CDataFileMgr__ContentChangeSetDef>",
+             "complete": False, "root_hint": "CDataFileMgr__ContentChangeSetDef"},
+            {"data": b"not-xml", "complete": False, "root_hint": ""},
+        ]
+        s = gg.build_graph(docs)["summary"]
+        self.assertEqual(s["parsed"], 1)
+        self.assertEqual(s["documents"], 1)
+        self.assertEqual(s["manifest_documents"], 1)
+        self.assertEqual(s["categories"]["mount / content manifests"]["manifest_documents"], 1)
+        self.assertEqual(s["roots"]["CDataFileMgr__ContentChangeSetDef"]["manifest_documents"], 1)
+        self.assertEqual(s["root_count"], 1)
+        self.assertEqual(s["rootless"], 1)
+        self.assertEqual(s["categories"]["uncatalogued"]["roots"], 0)
+        self.assertEqual(sum(c["roots"] for c in s["categories"].values()), s["root_count"])
+
+    def test_empty_and_whitespace_json_path_is_refused(self):
+        self.finish()
+        for bad in ("", "   "):
+            with self.subTest(bad=bad):
+                r = self.run_tool(self.carve, "--json", bad)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("must not be empty", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+
+    def test_directory_mode_allows_existing_bin_report_and_carve_refuses_bk2(self):
+        directory = os.path.join(self.root, "dir_bin")
+        os.makedirs(directory)
+        with open(os.path.join(directory, "a.xml"), "wb") as f:
+            f.write(PLAIN)
+        existing_bin = os.path.join(directory, "out.bin")
+        with open(existing_bin, "wb") as f:
+            f.write(b"old")
+        r = self.run_tool(directory, "--json", existing_bin)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(existing_bin, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["summary"]["parsed"], 1)
+
+        self.add(ALPHA)
+        self.finish()
+        bk2 = os.path.join(self.carve, "000000002000.bk2")
+        with open(bk2, "wb") as f:
+            f.write(b"bk2-stream")
+        r2 = self.run_tool(self.carve, "--json", bk2)
+        self.assertEqual(r2.returncode, 2, r2.stderr)
+        self.assertIn("would overwrite an input file", r2.stderr)
+        with open(bk2, "rb") as f:
+            self.assertEqual(f.read(), b"bk2-stream")
+
 
 INHERIT = (
     b'<Root><Sets>'
@@ -471,6 +526,48 @@ class ParentPathInheritanceTest(unittest.TestCase):
         text = json.dumps(self.graph(INHERIT))
         for word in ("base", "leaf", "twin", "loopa", "far"):
             self.assertNotIn(word, text)
+
+
+    def test_large_sibling_container_resolves_linearly(self):
+        import xml.etree.ElementTree as ET
+        root = ET.Element("Items")
+        ET.SubElement(root, "Item", key="k0")
+        for i in range(1, 2000):
+            ET.SubElement(root, "Item", key=f"k{i}", parentPath=f"../Item[@key='k{i - 1}']")
+        res = gg.resolve_parent_paths(root)
+        self.assertEqual(res["sites"], 1999)
+        self.assertEqual(res["resolved"], 1999)
+        self.assertEqual(res["ambiguous"], 0)
+        self.assertEqual(len(res["links"]), 1999)
+
+    def test_main_handles_recursion_error_and_atomic_json_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with mock.patch.object(gg.gx, "load_documents", side_effect=RecursionError("too deep")):
+                with contextlib.redirect_stderr(err):
+                    rc = gg.main([tmp])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR: too deep", err.getvalue())
+
+            out = os.path.join(tmp, "graph.json")
+            with open(out, "w", encoding="utf-8") as f:
+                f.write("previous\n")
+            if os.name != "nt":
+                os.chmod(out, 0o640)
+            with mock.patch.object(gg, "replace_retry", side_effect=OSError("busy")):
+                with self.assertRaises(OSError):
+                    gg.write_json(out, {"summary": {"ok": True}})
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "previous\n")
+            self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".gamedata_graph_")], [])
+
+            gg.write_json(out, {"summary": {"ok": True}})
+            with open(out, "rb") as f:
+                raw = f.read()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertEqual(json.loads(raw.decode("utf-8")), {"summary": {"ok": True}})
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o640)
 
 
 if __name__ == "__main__":

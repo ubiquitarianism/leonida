@@ -18,9 +18,11 @@ drift) and fails on the three ways a test goes missing without CI turning red --
   ``grep -q '__main__'``, which a comment satisfies), or whose guard is inverted
   (``if __name__ != "__main__":``) and runs nothing;
 * a semantic file with only module-level ``test*`` functions: ``unittest discover`` collects nothing
-  there, even though pytest would; and
+  there, even though pytest would;
 * a nested ``tests/*/test_*.cjs`` file that ``fnmatch`` matches across ``/`` but the non-recursive
-  ``node --test tests/test_*.cjs`` command never runs.
+  ``node --test tests/test_*.cjs`` command never runs; and
+* a test that reads README.md or a docs/*.md as it is in the repository but is left out of the docs-only step,
+  so a pull request that changes only that document skips it along with ``check``.
 
 It also runs the ``check`` loop itself, taken from the workflow, under bash on a synthetic tree: the loop has
 to run every file and then fail, since stopping at the first failure hides the files sorted after it.
@@ -213,15 +215,88 @@ def document_tests_not_run_for_docs_only(root, files):
     return missing, stale
 
 
+# What `change-scope` calls documentation: a diff of only these skips `check` and the other Python jobs.
+DOCUMENT_PATH = re.compile(r"^(?:README|CONTRIBUTING|AGENTS)\.md$|^docs/.+\.md$")
+# Tests outside DOCUMENT_TESTS that reach the documents through a tool, which a scan of the test's own source
+# cannot see: exe_checklist.collect(ROOT) reads every docs/*.md, and test_this_repository expects the UNVERIFIED and
+# ASSUMPTION notes of three of them.
+INDIRECT_DOCUMENT_READERS = ("tests/test_exe_checklist.py",)
+
+
+def repository_document_reads(source):
+    """Documents a test opens as they are in the repository: os.path.join(<root>, "docs", "design.md") and the like,
+    where <root> is an expression with __file__ in it or a module-level name assigned from one (ROOT). A path joined
+    to a temporary folder is a synthetic tree and does not count."""
+    tree = ast.parse(source)
+
+    roots = {"__file__"}
+
+    def has_file(node):
+        return any(isinstance(n, ast.Name) and n.id in roots for n in ast.walk(node))
+
+    for node in tree.body:                         # HERE = dirname(abspath(__file__)); ROOT = dirname(HERE)
+        if isinstance(node, ast.Assign) and has_file(node.value):
+            roots.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    found = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and node.args):
+            continue
+        func = node.func
+        if (func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")) != "join":
+            continue
+        base, parts = node.args[0], node.args[1:]
+        if not (isinstance(base, ast.Name) and base.id in roots or not isinstance(base, ast.Name) and has_file(base)):
+            continue
+        if parts and all(isinstance(p, ast.Constant) and isinstance(p.value, str) for p in parts):
+            rel = "/".join(p.value for p in parts)
+            if DOCUMENT_PATH.match(rel):
+                found.add(rel)
+    return found
+
+
+def document_readers_not_run_for_docs_only(root, files):
+    """{test file: documents} for the tests outside DOCUMENT_TESTS that read a document and that the docs-only step
+    does not run. A docs-only pull request skips `check`, so such a test only fails on main after the merge."""
+    patterns = docs_only_patterns(root)
+    missing = {}
+    for rel in files:
+        if not rel.endswith(".py") or any(matches_nonrecursive_glob(rel, p) for p in DOCUMENT_TESTS):
+            continue
+        reads = repository_document_reads(read(root, rel))
+        if rel in INDIRECT_DOCUMENT_READERS:
+            reads.add("docs/*.md")
+        if reads and not any(matches_nonrecursive_glob(rel, p) for p in patterns):
+            missing[rel] = sorted(reads)
+    return missing
+
+
 def defines_a_test(source, require_test_case=False):
     """Would the runner find a test here? TestCase subclasses (through local bases) and test* functions.
 
     ``unittest discover`` only collects TestCase subclasses, so the semantic job passes
     ``require_test_case=True``: a module with only ``def test_x(): ...`` runs zero cases there even
     though pytest would collect it.
+
+    A TestCase runs the ``test*`` methods it inherits as well as its own (the loader lists them with ``dir()``),
+    so a TestCase with none of its own counts when a class of this module that it derives from defines one: the
+    mixin of ``tests/semantic/test_sub_co_same_operand.py``, shared by one TestCase per wave size.
     """
+    def has_test_method(cls):
+        # unittest calls getattr on the class and checks callability. A property and its accessors
+        # yield a descriptor on the class, even if the underlying function is named test_*.
+        properties = {}
+        for item in cls.body:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            outer = item.decorator_list[0] if item.decorator_list else None
+            getter = isinstance(outer, ast.Name) and outer.id == "property"
+            accessor = (isinstance(outer, ast.Attribute) and outer.attr in ("getter", "setter", "deleter")
+                        and isinstance(outer.value, ast.Name) and properties.get(outer.value.id, False))
+            properties[item.name] = getter or accessor
+        return any(name.startswith("test") and not prop for name, prop in properties.items())
+
     tree = ast.parse(source)
-    bases, case_aliases = {}, set()
+    bases, own_tests, case_aliases = {}, {}, set()
     # Recognize bare aliases introduced by a direct import; this is not a general name resolver.
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
@@ -229,6 +304,7 @@ def defines_a_test(source, require_test_case=False):
                 "TestCase" if isinstance(b, ast.Name) and b.id in case_aliases else ast.unparse(b).rsplit(".", 1)[-1]
                 for b in node.bases
             ]
+            own_tests[node.name] = has_test_method(node)
             case_aliases.discard(node.name)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for item in node.names:
@@ -258,13 +334,28 @@ def defines_a_test(source, require_test_case=False):
                 stack.append(base)
         return False
 
+    def local_ancestors(name):
+        """The classes of this module `name` derives from, directly or through other classes of this module."""
+        seen, stack = [], [name]
+        while stack:
+            for base in bases[stack.pop()]:
+                if base in bases and base not in seen:
+                    seen.append(base)
+                    stack.append(base)
+        return seen
+
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and is_test_case(node.name):
-            if any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test")
-                   for item in node.body):
+            if has_test_method(node):
                 return True
-            # a mixin imported from another module (tests/semantic/f16_unary_cases.py's UnaryF16) brings its tests
-            if any(b not in bases and b not in ("TestCase", "object") for b in bases[node.name]):
+            # the test* methods of the classes of this module it derives from are its tests too
+            ancestors = local_ancestors(node.name)
+            if any(own_tests[name] for name in ancestors):
+                return True
+            # a mixin imported from another module (tests/semantic/f16_unary_cases.py's UnaryF16) brings its tests,
+            # to the class that names it and to the classes of this module that derive from that one
+            if any(b not in bases and b not in ("TestCase", "object")
+                   for name in [node.name] + ancestors for b in bases[name]):
                 return True
         if not require_test_case and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
                 and node.name.startswith("test"):
@@ -393,6 +484,47 @@ class RepositoryRegistrationTest(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertEqual(defines_a_test(source, require_test_case=True), expected)
 
+    def test_inherited_tests_count_where_unittest_discover_collects_them(self):
+        # The expectations are the runner's: unittest discover is run on these modules, and the scan has to find a
+        # test in exactly the ones it collects one from.
+        mixin = "class Mixin:\n    def test_one(self): pass\n"
+        cases = (
+            ("mixin_above", "import unittest\n" + mixin + "class Example(Mixin, unittest.TestCase): pass\n", True),
+            ("mixin_two_classes_up", "import unittest\n" + mixin + "class Middle(Mixin): pass\n"
+             "class Example(Middle, unittest.TestCase): pass\n", True),
+            ("mixin_beside_an_empty_case", "import unittest\n" + mixin + "class Base(unittest.TestCase): pass\n"
+             "class Example(Mixin, Base): pass\n", True),
+            ("imported_mixin", "import unittest\nfrom shared_cases import Cases\n"
+             "class Example(Cases, unittest.TestCase): pass\n", True),
+            ("imported_mixin_through_a_local_class", "import unittest\nfrom shared_cases import Cases\n"
+             "class Middle(Cases): pass\nclass Example(Middle, unittest.TestCase): pass\n", True),
+            ("base_without_tests", "import unittest\nclass Helper:\n    def helper(self): pass\n"
+             "class Example(Helper, unittest.TestCase): pass\n", False),
+            ("mixin_no_case_derives_from", "import unittest\n" + mixin
+             + "class Example(unittest.TestCase): pass\n", False),
+            ("mixin_without_a_case", mixin + "class Example(Mixin): pass\n", False),
+            ("property_only_mixin", "import unittest\nclass Mixin:\n"
+             "    @property\n    def test_label(self): return 'ready'\n"
+             "    @test_label.setter\n    def test_label(self, value): pass\n"
+             "class Example(Mixin, unittest.TestCase): pass\n", False),
+            ("staticmethod_in_mixin", "import unittest\nclass Mixin:\n"
+             "    @staticmethod\n    def test_one(): pass\n"
+             "class Example(Mixin, unittest.TestCase): pass\n", True),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            sources = [("shared_cases.py", "class Cases:\n    def test_one(self): pass\n")]
+            sources += [(f"test_{kind}.py", source) for kind, source, _ in cases]
+            for name, source in sources:
+                with open(os.path.join(tmp, name), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(source)
+            result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", ".", "-v"],
+                                    cwd=tmp, capture_output=True, text=True, timeout=30, check=True)
+        for kind, source, expected in cases:
+            with self.subTest(kind=kind):
+                self.assertEqual(f"(test_{kind}.Example" in result.stderr, expected, result.stderr)
+                self.assertEqual(defines_a_test(source, require_test_case=True), expected)
+        self.assertIn("Ran 6 tests", result.stderr)
+
     def test_every_selected_file_exposes_a_test_to_its_runner(self):
         # Selection is not execution: pytest imports a file it is handed and reports zero items without
         # failing, and unittest discover ignores a module with no TestCase.
@@ -503,6 +635,54 @@ class RepositoryRegistrationTest(unittest.TestCase):
             self.assertEqual(document_tests_not_run_for_docs_only(tmp, files),
                              (["tests/test_docs_design_rows.py", "tests/test_i18n_index.py"], []))
 
+    def test_a_docs_only_pull_request_runs_every_test_that_reads_a_document(self):
+        # A test outside tests/test_docs_*.py that reads README.md or docs/*.md as it is in the repository (the clone
+        # address the README gives, the design.md contract rows, the notes the exe checklist collects) is skipped
+        # with `check` too, so a pull request that only edits that document is green and main fails after it.
+        found = {rel: sorted(repository_document_reads(read(ROOT, rel))) for rel in self.files if rel.endswith(".py")}
+        self.assertEqual(found["tests/test_design_contract_rows.py"], ["docs/design.md"])
+        self.assertEqual(found["tests/test_make_game_preflight.py"], ["README.md"])
+        self.assertEqual(found["tests/test_progress_dashboard.py"], ["README.md"])
+        for rel in INDIRECT_DOCUMENT_READERS:
+            self.assertIn(rel, self.files)
+        missing = document_readers_not_run_for_docs_only(ROOT, self.files)
+        self.assertEqual(missing, {}, f"the '{DOCS_ONLY_STEP}' step in ci.yml does not run these tests, which read "
+                         "documents a docs-only pull request can change:\n" +
+                         "\n".join(f"  {rel}: {', '.join(docs)}" for rel, docs in sorted(missing.items())))
+
+    def test_the_scan_flags_a_document_reader_the_docs_only_step_leaves_out(self):
+        reader = ('import os\nHERE = os.path.dirname(os.path.abspath(__file__))\nROOT = os.path.dirname(HERE)\n'
+                  'def test_readme():\n    open(os.path.join(ROOT, "README.md")).read()\n'
+                  'DESIGN = os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs", "design.md")\n')
+        self.assertEqual(repository_document_reads(reader), {"README.md", "docs/design.md"})
+        # A synthetic tree under a temporary folder, a code file under docs/ and a non-document are not reads.
+        synthetic = ('import os, tempfile\nROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n'
+                     'tmp = tempfile.mkdtemp()\nos.path.join(tmp, "docs", "notes.md")\n'
+                     'os.path.join(ROOT, "docs", "example.py")\nos.path.join(ROOT, "tools", "README.md")\n')
+        self.assertEqual(repository_document_reads(synthetic), set())
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".github", "workflows"))
+            os.makedirs(os.path.join(tmp, "tests"))
+            for rel, text in (("tests/test_reader.py", reader), ("tests/test_docs_links.py", reader),
+                              ("tests/test_other.py", synthetic)):
+                with open(os.path.join(tmp, rel), "w", encoding="utf-8") as f:
+                    f.write(text)
+            files = ["tests/test_docs_links.py", "tests/test_other.py", "tests/test_reader.py"]
+
+            def workflow(run_lines):
+                with open(os.path.join(tmp, WORKFLOW), "w", encoding="utf-8") as f:
+                    f.write("jobs:\n  change-scope:\n    steps:\n"
+                            f"      - name: {DOCS_ONLY_STEP}\n        run: |\n"
+                            + "".join(f"          {line}\n" for line in run_lines))
+
+            workflow(["for t in tests/test_docs_*.py; do python3 -I \"$t\" || exit 1; done"])
+            self.assertEqual(document_readers_not_run_for_docs_only(tmp, files),
+                             {"tests/test_reader.py": ["README.md", "docs/design.md"]})
+            # Running only the reading case, by name, is enough.
+            workflow(["for t in tests/test_docs_*.py; do python3 -I \"$t\" || exit 1; done",
+                      "python3 -I tests/test_reader.py Reader.test_readme || exit 1"])
+            self.assertEqual(document_readers_not_run_for_docs_only(tmp, files), {})
+
     def test_the_scan_flags_an_unlisted_file_and_a_file_pytest_cannot_collect(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, ".github", "workflows"))
@@ -589,9 +769,16 @@ class StdlibLoopTest(unittest.TestCase):
         markers = ci_rules(ROOT)[0]
         failing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(1)\n"
         passing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(0)\n"
+        # In the old shell loop a child could consume the find stream from stdin,
+        # silently preventing subsequent test files from running.
+        reading_stdin = "import sys\nif __name__ == \"__main__\":\n    assert sys.stdin.read() == ''\n"
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "tests", "semantic"))
+            os.makedirs(os.path.join(tmp, "scripts"))
+            shutil.copyfile(os.path.join(ROOT, "scripts", "run_standalone_tests.py"),
+                            os.path.join(tmp, "scripts", "run_standalone_tests.py"))
             files = {
+                "tests/test_0_reads_stdin.py": reading_stdin,
                 "tests/test_a_fails.py": failing,
                 "tests/test_b_passes.py": passing,
                 "tests/test_c_fails.py": failing,
@@ -617,13 +804,14 @@ class StdlibLoopTest(unittest.TestCase):
         out = result.stdout + result.stderr
         self.assertNotEqual(result.returncode, 0, out)
         ran = re.findall(r"^== (\S+)$", out, re.M)
-        self.assertEqual(ran, ["tests/test_a_fails.py", "tests/test_b_passes.py", "tests/test_c_fails.py"], out)
+        self.assertCountEqual(ran, ["tests/test_0_reads_stdin.py", "tests/test_a_fails.py",
+                                    "tests/test_b_passes.py", "tests/test_c_fails.py"], out)
         errors = re.findall(r"^::error file=(\S+)::", out, re.M)
         self.assertEqual(errors, ["tests/test_a_fails.py", "tests/test_c_fails.py"], out)
 
     def test_step_script_reads_the_check_loop(self):
         script = step_script(ROOT, STDLIB_STEP)
-        self.assertIn('python -I "$t"', script)
+        self.assertIn('python -I scripts/run_standalone_tests.py -j 2', script)
         self.assertIn("-name 'test_*.py'", script)
 
 

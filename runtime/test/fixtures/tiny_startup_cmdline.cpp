@@ -43,10 +43,26 @@ bool capture(Snapshot& s) {
            copy(s.wline, GetCommandLineW());
 }
 
+// Wine's ucrtbase (11.20 measured) builds both argv widths while it loads, so a process-attach callback already
+// sees the final argc, __argv and __wargv, and a narrow main still has __wargv. Microsoft's UCRT configures neither
+// before CRT startup and only the narrow one for main. Only under Wine is that accepted, so on Windows a loader that
+// configures argv early still fails.
+bool host_is_wine() {
+    static const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+    return wine;
+}
+
 bool matches(const Snapshot& a, const Snapshot& b) {
     // Native UCRT has not configured either argv width at process attach. GetCommandLine is already complete.
-    return a.argc == 0 && !a.has_argv && !a.has_wargv &&
-           std::strcmp(a.line, b.line) == 0 && std::wcscmp(a.wline, b.wline) == 0;
+    bool argv_ok = a.argc == 0 && !a.has_argv && !a.has_wargv;
+    if (!argv_ok && host_is_wine()) {
+        // Wine: argv may already be configured at attach, but then it must be the final one.
+        argv_ok = a.argc == b.argc && a.has_argv == b.has_argv && a.has_wargv == b.has_wargv;
+        for (int i = 0; argv_ok && i < a.argc; ++i)
+            argv_ok = (!a.has_argv || std::strcmp(a.argv[i], b.argv[i]) == 0) &&
+                      (!a.has_wargv || std::wcscmp(a.wargv[i], b.wargv[i]) == 0);
+    }
+    return argv_ok && std::strcmp(a.line, b.line) == 0 && std::wcscmp(a.wline, b.wline) == 0;
 }
 
 }  // namespace
@@ -83,7 +99,7 @@ extern "C" __declspec(allocate(".CRT$XLB")) PIMAGE_TLS_CALLBACK g_startup_callba
 int main(int argc, char** argv) {
     Snapshot entry{};
     bool ok = capture(entry) && g_captured && matches(g_startup, entry) && startup_cmdline_matches(&entry);
-    ok = ok && argc == entry.argc && entry.has_argv && !entry.has_wargv;
+    ok = ok && argc == entry.argc && entry.has_argv && (!entry.has_wargv || host_is_wine());
     for (int i = 0; ok && i < argc; ++i) ok = std::strcmp(argv[i], entry.argv[i]) == 0;
     std::printf("tiny_startup_cmdline: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

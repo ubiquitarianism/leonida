@@ -1,7 +1,7 @@
 // A mapped program that reaches the GDK runtime the way xgameruntime.lib's thunks do: it has no import of
-// xgameruntime.dll, loads it with LoadLibraryW and looks the five run-time entry points up with GetProcAddress
-// (measured in the package's libHttpClient.GDK.dll and XCurl.dll, docs/runtime_imports.md "Run-time loaded
-// modules"). Run under `gta6rt --run`, its own kernel32 imports are bound by the loader, so LoadLibraryW and
+// xgameruntime.dll, loads it with LoadLibraryW and looks the five run-time entry points and XErrorReport up with
+// GetProcAddress (measured in the package's libHttpClient.GDK.dll and XCurl.dll, docs/runtime_imports.md "Run-time
+// loaded modules"). Run under `gta6rt --run`, its own kernel32 imports are bound by the loader, so LoadLibraryW and
 // GetProcAddress must reach runtime/shims/library_loader.cpp and the offline xgameruntime shim. Run on its own,
 // LoadLibraryW goes to Windows and either fails or loads the PC's Gaming Services runtime, and this never prints
 // PASS. Ordinary test code; no game data.
@@ -23,6 +23,9 @@ struct Options {        // InitializeApiImplEx2's fourth argument (xodus-gaming/
 using InitEx2 = HRESULT(WINAPI*)(ULONG, ULONG, char, const Options*);
 using Query = HRESULT(WINAPI*)(const GUID*, REFIID, void**);
 using Uninit = HRESULT(WINAPI*)();
+using Report = HRESULT(WINAPI*)(HRESULT, const char*);
+
+HRESULT g_reported = S_OK;  // what the XErrorSetCallback callback last received
 
 int fail(const char* stage, unsigned long value) {
     std::printf("tiny_gdk_load: FAIL %s (0x%08lx)\n", stage, value);
@@ -66,8 +69,9 @@ int main() {
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"xgameruntime.dll", &host_view) && host_view == runtime)
         return fail("xgameruntime.dll came from the host loader, not the shims", 0);
 
+    // XErrorReport too: the thunks look it up with the five entry points and refuse the runtime when it is missing.
     const char* names[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2", "UninitializeApiImpl",
-                           "QueryApiImpl"};
+                           "QueryApiImpl", "XErrorReport"};
     for (const char* name : names)
         if (!GetProcAddress(runtime, name)) return fail(name, GetLastError());
     SetLastError(0);
@@ -97,6 +101,27 @@ int main() {
     if (hr != S_OK || !queue) return fail("XThreadingImpl slot 12 (XTaskQueueCreate)", static_cast<unsigned long>(hr));
     reinterpret_cast<Close>(vtable[17])(obj, queue);
     reinterpret_cast<Release>(vtable[2])(obj);
+
+    // The XErrorReport export and XErrorImpl's slot 3 are one function: a report through the export reaches the
+    // callback XErrorImpl's slot 4 (XErrorSetCallback) set.
+    const GUID error_class = {0x8ca467f7, 0x22e8, 0x4096, {0x84, 0x56, 0xbb, 0x8a, 0xa1, 0x3f, 0x79, 0xd8}};
+    void* error = nullptr;
+    hr = query(&error_class, error_class, &error);
+    if (hr != S_OK || !error) return fail("QueryApiImpl hands out XErrorImpl", static_cast<unsigned long>(hr));
+    void* const* error_vtable = *static_cast<void* const* const*>(error);
+    using Callback = bool(CALLBACK*)(HRESULT, const char*, void*);
+    using SetCallback = void(STDMETHODCALLTYPE*)(void*, Callback, void*);
+    const Callback on_error = [](HRESULT reported, const char*, void*) {
+        g_reported = reported;
+        return true;
+    };
+    reinterpret_cast<SetCallback>(error_vtable[4])(error, on_error, nullptr);
+    auto report = reinterpret_cast<Report>(GetProcAddress(runtime, "XErrorReport"));
+    hr = report(E_FAIL, "tiny_gdk_load");
+    reinterpret_cast<SetCallback>(error_vtable[4])(error, nullptr, nullptr);
+    reinterpret_cast<Release>(error_vtable[2])(error);
+    if (hr != S_OK || g_reported != E_FAIL)
+        return fail("the XErrorReport export reaches the XErrorSetCallback callback", static_cast<unsigned long>(hr));
 
     // A class not served (an id no runtime class has, made up for this test) is refused, with the out pointer
     // cleared.

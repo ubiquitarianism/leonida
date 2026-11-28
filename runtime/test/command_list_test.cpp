@@ -99,15 +99,19 @@ int main() {
     CHECK(!list.barrier(BufferBarrier{y::copy, y::vertex_shading, a::copy_dest, a::vertex_buffer, 0}));
     CHECK(list.barrier(TextureBarrier{y::none, y::render_target, a::no_access, a::render_target, l::undefined,
                                       l::render_target, 9, all, texture_barrier_discard}));
-    CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, l::common, l::undefined, 9, all, 0}));
+    // Into UNDEFINED: the contents are no longer needed (WARP closes such a list, d3d12_close_parity_test).
+    CHECK(list.barrier(TextureBarrier{y::depth_stencil, y::none, a::depth_stencil_write, a::no_access,
+                                      l::depth_stencil_write, l::undefined, 9, all, 0}));
     CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, l::common, l::common, 9, all, 0x2}));
     CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, l::common, l::common, 9,
                                        {0, 1, 0, 0, 0, 1}, 0}));  // zero layers
     CHECK(list.close());
-    CHECK(list.commands().size() == 4);
+    CHECK(list.commands().size() == 5);
     CHECK(std::get<GlobalBarrier>(list.commands()[1]).sync_before == y::split);
     CHECK(std::get<BufferBarrier>(list.commands()[2]).resource == 7);
     CHECK(std::get<TextureBarrier>(list.commands()[3]).flags == texture_barrier_discard);
+    CHECK(std::get<TextureBarrier>(list.commands()[4]).layout_before == l::depth_stencil_write &&
+          std::get<TextureBarrier>(list.commands()[4]).layout_after == l::undefined);
 
     // Copies: D3D12's own call rules (aligned footprints; degenerate boxes and DEFAULT-heap
     // CopyResource self-copies are accepted as no-ops and must not record Vulkan commands).

@@ -205,14 +205,14 @@ struct ShaderParams {
     std::uint32_t mode;
     std::uint32_t width;
     std::uint32_t height;
-    std::uint32_t pad;
+    std::uint32_t slice;
 };
 
 bool run_bindless_roundtrip(vktest::Device& d, VkDescriptorSet set0, VkDescriptorSetLayout set0_layout,
                             const g::ImageWords& uav_words, const g::ImageWords& srv_words,
                             const g::SamplerWords& sampler_words, bool do_uint_write,
                             const std::array<std::uint32_t, 16>& input_words,
-                            std::array<float, 64>& out_rgba) {
+                            std::array<float, 64>& out_rgba, int z = -1, bool sliced = false) {
     std::vector<std::uint32_t> code;
     if (!read_spirv(LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV, code)) return false;
 
@@ -320,7 +320,8 @@ bool run_bindless_roundtrip(vktest::Device& d, VkDescriptorSet set0, VkDescripto
             ShaderParams wp{};
             std::memcpy(wp.tsharp, uav_words.data(), sizeof(wp.tsharp));
             std::memcpy(wp.ssharp, sampler_words.data(), sizeof(wp.ssharp));
-            wp.mode = 0;
+            wp.mode = z < 0 ? 0u : 2u;
+            wp.slice = sliced ? 1u : 0u;
             wp.width = 4;
             wp.height = 4;
             push(cb, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(wp), &wp);
@@ -336,7 +337,8 @@ bool run_bindless_roundtrip(vktest::Device& d, VkDescriptorSet set0, VkDescripto
         ShaderParams sp{};
         std::memcpy(sp.tsharp, srv_words.data(), sizeof(sp.tsharp));
         std::memcpy(sp.ssharp, sampler_words.data(), sizeof(sp.ssharp));
-        sp.mode = 1;
+        sp.mode = z < 0 ? 1u : 3u;
+        sp.slice = z < 0 ? 0u : UINT(z);
         sp.width = 4;
         sp.height = 4;
         push(cb, pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(sp), &sp);
@@ -358,7 +360,7 @@ bool run_bindless_roundtrip(vktest::Device& d, VkDescriptorSet set0, VkDescripto
 
 int main() {
     vktest::Device d;
-    const auto status = d.initialize();
+    const auto status = d.initialize(true, true);  // exercise sliced RGB9E5 volumes when the driver supports them
     if (status == vktest::DeviceStatus::unavailable) return 77;
     if (status != vktest::DeviceStatus::ready) return 1;
 
@@ -368,6 +370,16 @@ int main() {
     const bool native_storage = (e5_props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
     const bool native_attach = (e5_props.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
     const bool rect_clears_supported = !native_storage || native_attach;
+    // An R9G9B9E5 texture that allows render targets is created as B10G11R11 when the GPU cannot attach E5B9G9R9
+    // natively: the layer's console format stand-ins (fa83b2825) render and store in that format instead, so the host
+    // accepts the resource and GetResourceAllocationInfo sizes it.
+    VkFormatProperties b10_props{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+        d.physical, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &b10_props);
+    const bool target_stand_in = !native_attach &&
+                                 (b10_props.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0 &&
+                                 (b10_props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0 &&
+                                 (b10_props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
 
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -381,10 +393,14 @@ int main() {
         info.bindless_partially_bound = d.partially_bound;
         info.image_view_min_lod = d.image_view_min_lod;
         info.host_image_copy = d.host_image_copy;
+        info.robust_image_access = d.robust_image_access;
+        info.sliced_3d_uav = d.sliced_3d_uav;
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
 
         // 1. CheckFeatureSupport(FORMAT_SUPPORT): typed UAV is advertised; render target and depth-stencil stay off.
+        // The render-target bit is the format's own native support: a texture that allows render targets is still
+        // created where the B10G11R11 stand-in can render it (see the creation loop below).
         D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{DXGI_FORMAT_R9G9B9E5_SHAREDEXP};
         EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))));
         if (!(fs.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)) {
@@ -441,7 +457,7 @@ int main() {
                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                          IID_PPV_ARGS(&tex_1d.p))));
 
-        const auto desc_3d = tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 8, 8, 4, 2,
+        const auto desc_3d = tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 8, 8, 8, 2,
                                       DXGI_FORMAT_R9G9B9E5_SHAREDEXP, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         Ref<ID3D12Resource> tex_3d;
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &desc_3d,
@@ -465,7 +481,12 @@ int main() {
                                  D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
             const auto desc = tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 16, 16, 1, 1,
                                        DXGI_FORMAT_R9G9B9E5_SHAREDEXP, flags);
-            const bool supported = native_attach && (!(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || native_storage);
+            // Creation follows the backing the layer found, not the format's native bits alone: a render target needs
+            // a native attachment or the B10G11R11 stand-in, and unordered access needs a storage image or the
+            // mutable R32_UINT emulation the format support above advertises.
+            const bool supported = (native_attach || target_stand_in) &&
+                                   (!(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+                                    (fs.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0);
             Ref<ID3D12Resource> target;
             const HRESULT hr = device->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target.p));
@@ -785,27 +806,77 @@ int main() {
             std::array<float, 64> sampled{};
             EXPECT(run_bindless_roundtrip(d, set0, set0_layout, rt_uav_words, rt_srv_words, smp_words,
                                           !native_storage, input_words, sampled));
-            for (UINT i = 0; i < 16; ++i) {
-                const std::uint32_t want_word = native_storage ? 0x94010040u : input_words[i];
-                leonida::uav_clear::Element elem{};
-                elem.size = 4;
-                std::memcpy(elem.bytes.data(), &want_word, 4);
-                VkClearColorValue want{};
-                EXPECT(leonida::uav_clear::decode(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, elem, want));
-                for (UINT c = 0; c < 4; ++c) {
-                    const float got = sampled[i * 4 + c];
-                    const float exp_v = want.float32[c];
-                    const float tol = std::max(1e-6f, std::fabs(exp_v) * 1e-5f);
-                    if (std::fabs(got - exp_v) > tol) {
-                        std::fprintf(stderr, "bindless sample texel %u ch %u: got %g, want %g (word 0x%08x)\n",
-                                     i, c, got, exp_v, want_word);
-                        return 1;
+            const auto check_samples = [&](bool seed_only) {
+                for (UINT i = 0; i < 16; ++i) {
+                    const std::uint32_t want_word = seed_only ? 0x94010040u : input_words[i];
+                    leonida::uav_clear::Element elem{};
+                    elem.size = 4;
+                    std::memcpy(elem.bytes.data(), &want_word, 4);
+                    VkClearColorValue want{};
+                    if (!leonida::uav_clear::decode(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, elem, want)) return false;
+                    for (UINT c = 0; c < 4; ++c) {
+                        const float got = sampled[i * 4 + c];
+                        const float exp_v = want.float32[c];
+                        const float tol = std::max(1e-6f, std::fabs(exp_v) * 1e-5f);
+                        if (!(std::fabs(got - exp_v) <= tol)) {
+                            std::fprintf(stderr, "bindless sample texel %u ch %u: got %g, want %g (word 0x%08x)\n",
+                                         i, c, got, exp_v, want_word);
+                            return false;
+                        }
                     }
                 }
-            }
+                return true;
+            };
+            EXPECT(check_samples(native_storage));
             std::printf("Bindless set-0 GPU round-trip: 16/16 HDR RGB9E5 texels matched (%s)\n",
                         native_storage ? "clear -> sampled E5B9G9R9"
                                        : "storage R32_UINT [bindings 9 & 4] -> sampled E5B9G9R9 [binding 0]");
+
+            if (!native_storage && d.robust_image_access) {
+                // Mip 1 of tex_3d is 4x4x4. Seed it through the logical RGB9E5 clear, then write packed data
+                // through R32_UINT. A sliced view selects only absolute Z=1; relative Z=1 must not write Z=2.
+                D3D12_UNORDERED_ACCESS_VIEW_DESC volume_uav{};
+                volume_uav.Format = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+                volume_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                volume_uav.Texture3D = {1, 0, ~0u};
+                device->CreateUnorderedAccessView(tex_3d.p, nullptr, &volume_uav, slot(10));
+                const auto whole = words_at(10);
+                EXPECT(g::decode(whole, decoded) && decoded.first_mip == 1 && decoded.format == 132 &&
+                       (whole[7] & g::packed_uav_flag) && !g::partial_volume_uav(whole, decoded));
+                volume_uav.Texture3D.FirstWSlice = 1;
+                volume_uav.Texture3D.WSize = 1;
+                device->CreateUnorderedAccessView(tex_3d.p, nullptr, &volume_uav, slot(11));
+                const auto partial = words_at(11);
+                if (d.sliced_3d_uav) {
+                    EXPECT(g::decode(partial, decoded) && g::partial_volume_uav(partial, decoded));
+                } else {
+                    EXPECT(all_zero(partial.data(), sizeof(partial)));
+                }
+                D3D12_SHADER_RESOURCE_VIEW_DESC volume_srv{};
+                volume_srv.Format = volume_uav.Format;
+                volume_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+                volume_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                volume_srv.Texture3D = {1, 1, 0};
+                device->CreateShaderResourceView(tex_3d.p, &volume_srv, slot(12));
+                const auto volume_sampled = words_at(12);
+                EXPECT(g::decode(volume_sampled, decoded) && decoded.format == 132 && volume_sampled[7] == 0);
+
+                EXPECT(SUCCEEDED(alloc->Reset()) && SUCCEEDED(list->Reset(alloc.p, nullptr)));
+                list->ClearUnorderedAccessViewFloat({0}, slot(10), tex_3d.p, seed, 0, nullptr);
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
+                const auto& write_key = d.sliced_3d_uav ? partial : whole;
+                EXPECT(run_bindless_roundtrip(d, set0, set0_layout, write_key, volume_sampled, smp_words,
+                                               true, input_words, sampled, d.sliced_3d_uav ? 1 : 0, d.sliced_3d_uav));
+                EXPECT(check_samples(false));
+                EXPECT(run_bindless_roundtrip(d, set0, set0_layout, write_key, volume_sampled, smp_words,
+                                               false, input_words, sampled, 2));
+                EXPECT(check_samples(true));
+                std::printf("RGB9E5 volume: 16/16 raw-store samples and 16/16 untouched neighbor texels (%s)\n",
+                            d.sliced_3d_uav ? "sliced" : "whole-mip; partial view refused");
+            }
         }
 #endif
     }

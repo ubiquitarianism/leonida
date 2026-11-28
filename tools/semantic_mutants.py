@@ -3,6 +3,12 @@
     python -I tools/semantic_mutants.py tests/semantic/test_valu_sad_u8_hw.py --op v_sad_u8
     python -I tools/semantic_mutants.py tests/semantic/test_x.py --op ds_swizzle_b32 --function swizzle
     python -I tools/semantic_mutants.py tests/semantic/test_x.py --lines 8375-8414
+    python -I tools/semantic_mutants.py tests/test_cfg_structure.py --source tools/cfg_structure.py --function depth
+
+`--source` picks another file under tools/ to mutate (default tools/rdna2spirv.py). A test file in tests/semantic runs
+in place against the mutated copy through LEONIDA_TOOLS_DIR; any other test of the repository runs from a copy of
+its tracked files with the mutant in that copy's tools/, as a script when it has a `__main__` block, because those
+tests import tools/ by path rather than through LEONIDA_TOOLS_DIR.
 
 The tool finds the code in tools/rdna2spirv.py that translates the op: the `if op == "..."` / `elif op in (...)`
 branch naming it (--op), a whole method (--function), or an explicit line range (--lines). It then makes one-line
@@ -426,18 +432,75 @@ def run_test(test_file: str, tools_dir: str, timeout: int) -> tuple[bool, str]:
     return p.returncode == 0, tail[-1] if tail else ""
 
 
+COPY_IGNORE = shutil.ignore_patterns("__pycache__", "rpf9dump")
+MAIN_BLOCK = re.compile(r"""^if\s+__name__\s*==\s*['"]__main__['"]\s*:""", re.M)
+
+
+def resolve_source(arg: str) -> tuple[str, str]:
+    """(absolute path, path inside tools/) of --source: a .py file under the repository's tools/."""
+    path = os.path.normpath(arg if os.path.isabs(arg) else os.path.join(ROOT, arg))
+    rel = os.path.relpath(path, os.path.join(ROOT, "tools"))
+    if rel.startswith(os.pardir) or os.path.isabs(rel) or not path.endswith(".py") or not os.path.isfile(path):
+        raise LookupError(f"--source {arg} is not a .py file under tools/")
+    return path, rel
+
+
+def inside(path: str, folder: str) -> bool:
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(folder)]) == os.path.abspath(folder)
+    except ValueError:                            # another drive on Windows
+        return False
+
+
+def mirror_repository(dst: str) -> None:
+    """Copy the repository's tracked files (git ls-files) to dst, then tools/ and tests/ whole so that untracked
+    work in them comes along. A test outside tests/semantic runs from this copy: those tests import from the
+    repository's own tools/ rather than LEONIDA_TOOLS_DIR, so the mutant has to be in the tools/ next to them.
+    Only tracked files are copied from the rest of the tree, so a work folder kept inside the clone never is."""
+    out = subprocess.run(["git", "-C", ROOT, "ls-files", "-z"], capture_output=True, check=True).stdout
+    for rel in out.decode("utf-8", "surrogateescape").split("\0"):
+        src = os.path.join(ROOT, rel)
+        if rel and os.path.isfile(src):          # a submodule is a directory entry: skipped
+            target = os.path.join(dst, rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(src, target)
+    for sub in ("tools", "tests"):
+        shutil.copytree(os.path.join(ROOT, sub), os.path.join(dst, sub), ignore=COPY_IGNORE, dirs_exist_ok=True)
+
+
+def run_script(test_file: str, timeout: int) -> tuple[bool, str]:
+    """A test file outside tests/semantic, run as `python -I <file>` from the mirror: several of them
+    (test_cfg_structure.py, test_lane_masks.py) are plain scripts with no unittest class for run_test to find."""
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    try:
+        p = subprocess.run([sys.executable, "-I", test_file], cwd=os.path.dirname(test_file), env=env,
+                           capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout} s"
+    if p.returncode == 5:                         # unittest.main found no tests (Python 3.12+)
+        return False, "no tests ran"
+    tail = ((p.stdout or "") + (p.stderr or "")).strip().splitlines()
+    return p.returncode == 0, tail[-1] if tail else ""
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("test_file")
     where = ap.add_mutually_exclusive_group(required=True)
     where.add_argument("--op", help="mutate the if/elif branch that names this op")
-    where.add_argument("--function", help="mutate this method of the translator")
+    where.add_argument("--function", help="mutate this function or method of the source")
     where.add_argument("--lines", help="mutate this 1-based line range, e.g. 8375-8414")
+    ap.add_argument("--source", default=os.path.join("tools", TRANSLATOR),
+                    help="the tools/ file to mutate (default tools/rdna2spirv.py), e.g. tools/cfg_structure.py")
     ap.add_argument("--timeout", type=int, default=300, help="seconds per test run (default 300)")
     ap.add_argument("--list", action="store_true", help="only list the mutants")
     args = ap.parse_args(argv)
 
-    src_path = os.path.join(ROOT, "tools", TRANSLATOR)
+    try:
+        src_path, source = resolve_source(args.source)
+    except LookupError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     with open(src_path, encoding="utf-8", newline="") as f:
         raw = f.read()
     sep = "\r\n" if "\r\n" in raw else "\n"
@@ -464,7 +527,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     mutants = (mutants_for(lines, first, last) if first >= 0 else []) + table
     where = f"lines {first + 1}-{last + 1}" if first >= 0 else "no branch"
-    print(f"{TRANSLATOR} {where}" + (f" + {len(table)} table-entry mutants" if table else "") +
+    print(f"{source.replace(os.sep, '/')} {where}" + (f" + {len(table)} table-entry mutants" if table else "") +
           f": {len(mutants)} mutants")
     if args.op and first >= 0:
         named = branch_ops(lines, first)
@@ -480,11 +543,28 @@ def main(argv: list[str] | None = None) -> int:
 
     with tempfile.TemporaryDirectory(prefix="semantic-mutants-") as tmp:
         tools = os.path.join(tmp, "tools")
-        shutil.copytree(os.path.join(ROOT, "tools"), tools, ignore=shutil.ignore_patterns("__pycache__", "rpf9dump"))
-        target = os.path.join(tools, TRANSLATOR)
-        ok, last_line = run_test(args.test_file, tools, args.timeout)
+        test_file = args.test_file
+        if inside(test_file, ROOT) and not inside(test_file, os.path.join(ROOT, "tests", "semantic")):
+            try:
+                mirror_repository(tmp)
+            except (OSError, subprocess.CalledProcessError) as e:
+                print(f"error: cannot copy the repository for a test outside tests/semantic ({e})", file=sys.stderr)
+                return 2
+            test_file = os.path.join(tmp, os.path.relpath(os.path.abspath(test_file), ROOT))
+            with open(test_file, encoding="utf-8", errors="replace") as f:
+                as_script = MAIN_BLOCK.search(f.read()) is not None
+        else:
+            shutil.copytree(os.path.join(ROOT, "tools"), tools, ignore=COPY_IGNORE)
+            as_script = False
+
+        def run() -> tuple[bool, str]:
+            return run_script(test_file, args.timeout) if as_script else run_test(test_file, tools, args.timeout)
+
+        target = os.path.join(tools, source)
+        ok, last_line = run()
         if not ok:
-            print(f"error: the test file fails on the unmutated translator ({last_line})", file=sys.stderr)
+            print(f"error: the test file fails on the unmutated {os.path.basename(source)} ({last_line})",
+                  file=sys.stderr)
             return 2
         survived = 0
         t0 = time.time()
@@ -493,7 +573,7 @@ def main(argv: list[str] | None = None) -> int:
             mutated[m.line - 1] = m.new
             with open(target, "w", encoding="utf-8", newline="") as f:
                 f.write(sep.join(mutated))
-            ok, last_line = run_test(args.test_file, tools, args.timeout)
+            ok, last_line = run()
             if ok:
                 survived += 1
             print(f"  {'SURVIVED' if ok else 'caught  '}  line {m.line}: {m.label}"

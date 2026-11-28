@@ -411,6 +411,14 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                     memory[p[1]] = v & MASK32
                 else:
                     p[0][p[1]] = v
+            elif op == "OpAtomicStore":   # pointer, scope, semantics, value: a store with no result
+                p = ptrs[a[0]]
+                v = vals[a[3]]
+                if p[0] == "psb":
+                    assert p[1] % 4 == 0, f"unaligned PSB store {p[1]:#x}"
+                    memory[p[1]] = v & MASK32
+                else:
+                    p[0][p[1]] = v
             elif op in ("OpAtomicOr", "OpAtomicIAdd", "OpAtomicAnd", "OpAtomicXor", "OpAtomicExchange"):
                 p = ptrs[a[1]]
                 old = memory.get(p[1], 0) if p[0] == "psb" else p[0][p[1]]
@@ -429,6 +437,28 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                     memory[p[1]] = new & MASK32
                 else:
                     p[0][p[1]] = new & MASK32
+                vals[res] = old
+            elif op in ("OpAtomicUMin", "OpAtomicUMax", "OpAtomicSMin", "OpAtomicSMax", "OpAtomicISub"):
+                # ds_min_u32 / ds_max_u32 / ds_min_i32 / ds_max_i32 / ds_sub_u32 and their buffer_atomic forms.
+                p = ptrs[a[1]]
+                old = (memory.get(p[1], 0) if p[0] == "psb" else p[0][p[1]]) & MASK32
+                v = vals[a[4]] & MASK32
+                s_old = old - (1 << 32) if old >> 31 else old
+                s_v = v - (1 << 32) if v >> 31 else v
+                if op == "OpAtomicUMin":
+                    new = min(old, v)
+                elif op == "OpAtomicUMax":
+                    new = max(old, v)
+                elif op == "OpAtomicSMin":
+                    new = old if s_old <= s_v else v
+                elif op == "OpAtomicSMax":
+                    new = old if s_old >= s_v else v
+                else:
+                    new = (old - v) & MASK32
+                if p[0] == "psb":
+                    memory[p[1]] = new
+                else:
+                    p[0][p[1]] = new
                 vals[res] = old
             elif op == "OpSelect":
                 vals[res] = vals[a[2]] if vals[a[1]] else vals[a[3]]
@@ -470,6 +500,12 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
             elif op == "OpShiftRightLogical":
                 bits = types[a[0]][1]
                 vals[res] = (vals[a[1]] & ((1 << bits) - 1)) >> vals[a[2]]
+            elif op == "OpShiftRightArithmetic":
+                bits = types[a[0]][1]
+                operand = vals[a[1]]
+                if operand >> (bits - 1):
+                    operand -= 1 << bits
+                vals[res] = (operand >> vals[a[2]]) & ((1 << bits) - 1)
             elif op == "OpIAdd":
                 bits = types[a[0]][1]
                 vals[res] = (vals[a[1]] + vals[a[2]]) & ((1 << bits) - 1)
@@ -1269,7 +1305,10 @@ class StructuredEmulationTests(unittest.TestCase):
 
     def test_single_wave_inline_all_zero_switch_and_loop_carried_war(self):
         # 64-thread and partial 40-thread shaders with live-out scalars, loop-carried store->load->store WAR/RAW,
-        # and v_readfirstlane emit 0 OpSwitch cases and 0 x_spills while staying bit-exact.
+        # and v_readfirstlane emit 0 OpSwitch cases and 0 x_spills while staying bit-exact on both scheduling
+        # orders. Their exchange barriers sit under `%pc`-only guards, which a single wave takes as one, so the
+        # barrier fallback of translate() does not apply to them (docs/design.md, "Wave64 emulation:
+        # single-wave barrier fallback").
         insns = [
             ("s_mov_b64 exec, -1", 4),
             ("s_mov_b32 s16, 10", 4),
@@ -1416,8 +1455,8 @@ class StructuredEmulationTests(unittest.TestCase):
                 want = isa_v4_before_sbar(l) + isa_v4_before_sbar(l ^ 64)
                 self.assertEqual(mem_new[1024 + l * 4], want, f"lane {l} rev={rev}")
 
-    def test_multiwave_divergent_sbarrier_falls_back_to_rounds(self):
-        # Wave 0 hits s_barrier in one arm while Wave 1 hits s_barrier in another -> MUST keep global rounds.
+    def test_multiwave_divergent_sbarrier_stays_in_tail_rounds(self):
+        # Wave 0 hits s_barrier in one arm while Wave 1 hits s_barrier in another -> both arms MUST keep the rounds.
         insns = [
             ("s_mov_b64 exec, -1", 4),
             ("v_lshlrev_b32_e32 v2, 2, v0", 4),
@@ -1435,11 +1474,49 @@ class StructuredEmulationTests(unittest.TestCase):
             ("s_endpgm", 4),
         ]
         spv, gen = _translate_encoded("cs_div_sbar_w64", insns, (128, 1, 1), emulate=True, rsrc2=0x20088)
-        self.assertEqual(gen.control_flow, "emulated wave64 rounds")
-        self.assertIsNone(gen.emulate_plan)
-        mem, _ = run_emulated_workgroup(spv, (128, 1, 1), push_constants=VSHARP + [0] * 28)
-        for lane in range(64):
-            self.assertEqual(mem[lane * 4], lane + 64, f"lane {lane}")
+        self.assertEqual(gen.control_flow, "emulated wave64 structured")
+        plan = gen.emulate_plan
+        self.assertEqual(plan["inline_blocks"], {0})
+        self.assertEqual(plan["tail_blocks"], {1, 2})  # both s_barrier arms
+        for rev in (False, True):
+            mem, _ = run_emulated_workgroup(spv, (128, 1, 1), push_constants=VSHARP + [0] * 28, reverse_order=rev)
+            for lane in range(64):
+                self.assertEqual(mem[lane * 4], lane + 64, f"lane {lane}, reverse={rev}")
+
+    def test_multiwave_guarded_sbarrier_epilogue_keeps_body_structured(self):
+        # The shape of an NGG mesh epilogue: a body with a wave vote, then a guarded s_barrier both waves skip or
+        # reach (s_cbranch_vccnz), then a top-level s_barrier. Only the part from the guard on stays in rounds.
+        def insns(vcc):
+            return [
+                ("s_mov_b64 exec, -1", 4),
+                ("v_lshlrev_b32_e32 v2, 2, v0", 4),
+                ("v_add_nc_u32_e32 v5, 7, v0", 4),
+                ("v_readfirstlane_b32 s5, v0", 4),
+                ("v_add_nc_u32_e32 v5, s5, v5", 4),
+                ("ds_write_b32 v2, v5", 8),
+                (f"s_mov_b64 vcc, {vcc}", 4),
+                ("s_cbranch_vccnz 1", 4),
+                ("s_barrier", 4),
+                ("s_barrier", 4),
+                ("v_xor_b32_e32 v3, 64, v0", 4),
+                ("v_lshlrev_b32_e32 v3, 2, v3", 4),
+                ("ds_read_b32 v4, v3", 8),
+                ("buffer_store_dword v4, v2, s[0:3], 0 offen", 8),
+                ("s_endpgm", 4),
+            ]
+        for vcc in ("0", "-1"):
+            spv, gen = _translate_encoded("cs_sbar_epilogue_w64", insns(vcc), (128, 1, 1), emulate=True,
+                                          rsrc2=0x20088)
+            self.assertEqual(gen.control_flow, "emulated wave64 structured")
+            plan = gen.emulate_plan
+            self.assertEqual(plan["inline_blocks"], {0})
+            self.assertEqual(plan["tail_blocks"], {1, 2})
+            for rev in (False, True):
+                mem, _ = run_emulated_workgroup(spv, (128, 1, 1), push_constants=VSHARP + [0] * 28,
+                                                reverse_order=rev)
+                for lane in range(128):
+                    other = lane ^ 64
+                    self.assertEqual(mem[lane * 4], other + 7 + (other & 64), f"lane {lane}, vcc={vcc}, rev={rev}")
 
     def test_monotone_dirty_transfer_no_phantom_clear_after_x_round(self):
         # Regression: an x_round (v_readlane_b32) clears g.x_dirty in codegen before a subsequent
@@ -1752,6 +1829,58 @@ class StructuredEmulationTests(unittest.TestCase):
         # s_barrier cleared ("lds", "w"), and folded block 1 added ("mem", "r") after it.
         self.assertEqual(plan["dirty_in"][3], frozenset({("mem", "r")}))
         self.assertEqual(plan["dirty_in"][4], frozenset({("mem", "r")}))
+
+
+class SharedWordStoresTests(unittest.TestCase):
+    """The emulation resets %x_buf words every round. Lanes with nothing to reset aim the same store at one sink
+    word, and the prologue clamps its zeroing index, so several invocations write one word at once. A plain OpStore
+    there is a data race (GPU-assisted validation reports it in every emulated shader); OpAtomicStore is not."""
+
+    INSNS = [
+        ("v_cmp_lt_u32_e64 s[6:7], 20, v0", 8),
+        ("s_and_saveexec_b64 s[8:9], s[6:7]", 4),
+        ("s_cselect_b32 s14, 111, 222", 4),
+        ("s_mov_b64 exec, -1", 4),
+        ("v_mov_b32_e32 v5, s14", 4),
+        ("v_lshlrev_b32_e32 v6, 2, v0", 4),
+        ("buffer_store_dword v5, v6, s[0:3], 0 offen", 8),
+        ("s_endpgm", 4),
+    ]
+
+    @staticmethod
+    def shared_word_stores(spv):
+        """(plain, atomic) stores into %x_buf whose index is not one invocation's own: it comes from an OpSelect
+        (the sink) or from the prologue's UMin clamp."""
+        defined_by, element = {}, {}
+        for line in spv.splitlines():
+            m = re.match(r"\s*(%\w+) = (\w+) (.*)", line)
+            if not m:
+                continue
+            defined_by[m.group(1)] = m.group(2)
+            chain = re.match(r"%_ptr_WG_uint_x %x_buf (%\w+)$", m.group(3)) if m.group(2) == "OpAccessChain" else None
+            if chain:
+                element[m.group(1)] = chain.group(1)
+        plain, atomic = [], []
+        for line in spv.splitlines():
+            m = re.match(r"\s*(OpStore|OpAtomicStore) (%\w+) ", line)
+            if m and defined_by.get(element.get(m.group(2))) in ("OpSelect", "OpExtInst"):
+                (plain if m.group(1) == "OpStore" else atomic).append(line.strip())
+        return plain, atomic
+
+    def test_stores_several_invocations_aim_at_one_word_are_atomic(self):
+        for threads in (64, 128):   # one wave, and two (the per-wave and per-workgroup resets differ)
+            with self.subTest(threads=threads):
+                spv, _ = _translate_encoded(f"cs_shared_words_{threads}", self.INSNS, (threads, 1, 1), emulate=True)
+                plain, atomic = self.shared_word_stores(spv)
+                self.assertEqual(plain, [])
+                self.assertTrue(atomic, "the emulated translation has no shared-word resets to check")
+                # Workgroup scope, relaxed semantics, value 0: the same operands as the OpAtomicOr on this buffer.
+                for line in atomic:
+                    self.assertRegex(line, r"^OpAtomicStore %\w+ %c2 %c0 %c0$")
+
+    def test_native_wave64_translation_is_unchanged(self):
+        spv, _ = _translate_encoded("cs_shared_words_native", self.INSNS, (64, 1, 1), emulate=False)
+        self.assertNotIn("OpAtomicStore", spv)
 
 
 if __name__ == "__main__":

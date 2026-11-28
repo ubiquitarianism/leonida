@@ -18,10 +18,10 @@ s_mov_b32 s16, 0x5000
 s_mov_b32 s17, 0x1400000
 s_mov_b32 s18, 0x55
 s_mov_b32 s19, 0x55
-s_mov_b32 s20, 0x55
+s_mov_b32 s20, 0x80000055
 s_mov_b32 s21, 0x55
 s_mov_b32 s22, 0x55
-s_mov_b32 s23, 0x55
+s_mov_b32 s23, 0xd7801800
 s_mov_b32 s24, 0x3000
 s_mov_b32 s25, 0x1500000
 s_mov_b32 s26, 0x33

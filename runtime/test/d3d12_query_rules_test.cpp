@@ -230,6 +230,20 @@ std::string all_cases(ID3D12Device* device) {
     return heap_cases(device) + list_cases(e) + timestamp_runs(e);
 }
 
+bool check_copy_timestamp_capability(ID3D12Device* device, bool expected, const char* queue_pool) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS3 options{};
+    const auto desc = D3D12_QUERY_HEAP_DESC{D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP, 2, 0};
+    Ref<ID3D12QueryHeap> heap;
+    const HRESULT hr = device->CreateQueryHeap(&desc, IID_PPV_ARGS(&heap.p));
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof(options))) &&
+        bool(options.CopyQueueTimestampQueriesSupported) == expected &&
+        (expected ? SUCCEEDED(hr) && heap.p : hr == E_NOTIMPL && !heap.p))
+        return true;
+    std::fprintf(stderr, "%s: OPTIONS3 or COPY_QUEUE_TIMESTAMP heap disagrees with Vulkan queue support (%d)\n",
+                 queue_pool, int(expected));
+    return false;
+}
+
 std::vector<std::string> lines(const std::string& s) {
     std::vector<std::string> out;
     size_t at = 0;
@@ -244,6 +258,7 @@ std::vector<std::string> lines(const std::string& s) {
 
 int main() {
     vktest::Device vk;
+    vk.all_queue_types = true;
     const auto device_status = vk.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;
     if (device_status != vktest::DeviceStatus::ready) return 1;
@@ -259,6 +274,8 @@ int main() {
         info.queue = vk.queue;
         info.queue_family = vk.family;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
+        if (!check_copy_timestamp_capability(ours.p, vk.families[vk.family].timestampValidBits != 0,
+                                             "graphics queue fallback")) return 1;
         mine = all_cases(ours.p);
         {  // A timestamp heap of the wrong kind for the list: the host refuses it at Close (E_INVALIDARG); the layer
            // checks heap types at execution, so it must refuse the list there.
@@ -282,6 +299,42 @@ int main() {
                 }
             }
         }
+    }
+    if (vk.copy_family != vk.family) {
+        Ref<ID3D12Device> ours;
+        rt::d3d12::VulkanDeviceInfo info{};
+        info.get_instance_proc = vk.instance_proc;
+        info.instance = vk.instance;
+        info.physical = vk.physical;
+        info.device = vk.device;
+        info.queue = vk.queue;
+        info.queue_family = vk.family;
+        info.command_queues = vk.queues;
+        info.copy_family = vk.copy_family;
+        info.copy_queues = {vk.copy_queue};
+        const auto& family = vk.families[vk.copy_family];
+        const bool dedicated_can_resolve = family.timestampValidBits &&
+                                          (family.queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT));
+        const bool expected = vk.families[vk.family].timestampValidBits && dedicated_can_resolve;
+        if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p))) ||
+            !check_copy_timestamp_capability(ours.p, expected, "dedicated copy queue")) return 1;
+        if (expected) {
+            Env e{ours.p};
+            if (!setup(e) || timestamp_runs(e).find("timestamps on copy: plausible\n") == std::string::npos) {
+                std::fprintf(stderr, "dedicated copy queue: advertised timestamps failed to resolve\n");
+                return 1;
+            }
+        } else if (!dedicated_can_resolve) {
+            Ref<ID3D12CommandQueue> copy_queue;
+            const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_COPY};
+            UINT64 frequency = 0;
+            if (FAILED(ours->CreateCommandQueue(&desc, IID_PPV_ARGS(&copy_queue.p))) ||
+                copy_queue->GetTimestampFrequency(&frequency) != E_FAIL) {
+                std::fprintf(stderr, "dedicated copy queue: timestamp frequency should be unavailable\n");
+                return 1;
+            }
+        }
+        std::printf("dedicated copy queue: timestamp queries %s\n", expected ? "resolved" : "refused as expected");
     }
     Ref<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) return 1;

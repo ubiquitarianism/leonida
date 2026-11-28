@@ -3,6 +3,10 @@
     python3 -I scripts/check_no_game_data.py            # every file `git ls-files` lists
     python3 -I scripts/check_no_game_data.py PATH...    # only these files
 
+Explicit PATH inputs must be regular files, not directories or symlinks. A missing, unreadable or non-regular
+explicit input is reported on stderr and causes exit 2 unless another input matches game data (exit 1).
+Default git enumeration still skips symlinks, submodules and files deleted from the working tree.
+
 The extension check in .github/workflows/no-game-data.yml misses a renamed file: a DDS saved as .bin, an executable
 as .txt. This reads the first bytes of each file and matches the magic numbers of the package's formats and the
 files the build extracts from it: RPF9 archives, TTPF texture pools, RAGE resources, XBCH/FSSM/DXBC shader
@@ -14,8 +18,8 @@ notes). Text formats (disassembly, .obj, .spvasm)
 have no magic and stay with the extension check.
 
 A compressed file hides those magics from both checks, so the script looks inside what the standard library opens:
-each member of a zip (found by its central directory too, so with bytes in front of it) or a tar, and the stream of
-a gzip, bzip2 or xz file, nested up to three levels, is matched the same way. What's inside is read into memory
+each member of a zip (found by its central directory too, so with bytes in front of it) or a tar (including V7), and
+the stream of a gzip, bzip2 or xz file, nested up to three levels, is matched the same way. What's inside is read into memory
 under a budget per checked file (64 MiB expanded, 10,000 members), so a zip bomb can't make the check run long.
 7-Zip, Zstandard and RAR files, which it can't open, archives that fail to open and archives over the budget are
 reported as archives that can't be checked.
@@ -25,10 +29,12 @@ exits 1 if there is any. It exits 2 when a file cannot be read or git cannot lis
 repository, or git not installed). Standard library only, no game files.
 """
 import bz2
+import errno
 import gzip
 import io
 import lzma
 import os
+import stat
 import subprocess
 import sys
 import tarfile
@@ -42,6 +48,7 @@ MAGICS = (
     ("RPF9 archive", 0, b"9FPR"),
     ("RPF9 archive", 0, b"RPF9"),
     ("TTPF texture pool", 0, b"TTPF"),
+    ("local BCPack predictor profile", 0, b"BCPHIST1"),
     ("RAGE resource", 0, b"RSC7"),
     ("RAGE resource", 0, b"RSC8"),
     ("RAGE resource", 0, b"RSCC"),
@@ -183,6 +190,13 @@ def archive_kind(f, head):
         return stream[0]
     if head[TAR_MAGIC[0]:TAR_MAGIC[0] + len(TAR_MAGIC[1])] == TAR_MAGIC[1]:
         return "tar archive"
+    # V7 tar has no ustar marker. Validate only its first header here; member reads still use the shared budget.
+    try:
+        tarfile.TarInfo.frombuf(head[:tarfile.BLOCKSIZE], tarfile.ENCODING, "surrogateescape")
+    except tarfile.HeaderError:
+        pass
+    else:
+        return "tar archive"
     # is_zipfile finds the end-of-central-directory record, so a zip with bytes in front of it (a self-extracting
     # archive, a spanned zip starting PK\x07\x08) is found as zipfile itself would open it.
     if head.startswith(ZIP) or zipfile.is_zipfile(f):
@@ -266,15 +280,19 @@ def git_error(e):
     return e.strerror or str(e)
 
 
-def check(paths, unreadable=None):
+def check(paths, unreadable=None, *, explicit=False):
     """[(path, format)] for every regular file in `paths` that starts like game data.
 
-    A file that exists but cannot be opened or read is appended to `unreadable` (when given) as (path, error)."""
+    Files that cannot be opened or read are appended to `unreadable` (when given) as (path, error).
+    Explicit inputs also report missing paths and non-regular entries instead of silently skipping them."""
     found = []
     for path in paths:
-        if os.path.islink(path) or not os.path.isfile(path):
-            continue  # submodules, symlinks, files deleted in the working tree
         try:
+            if explicit:
+                if not stat.S_ISREG(os.lstat(path).st_mode):
+                    raise OSError(errno.EINVAL, "not a regular file", path)
+            elif os.path.islink(path) or not os.path.isfile(path):
+                continue  # submodules, symlinks, files deleted in the working tree
             name = classify_file(path)
         except OSError as e:
             if unreadable is not None:
@@ -303,7 +321,7 @@ def main(argv):
             print(f"check_no_game_data: cannot list the tracked files with git: {git_error(e)}", file=sys.stderr)
             return 2  # not 1: that is the 'game data found' code
     unreadable = []
-    found = check(paths, unreadable)
+    found = check(paths, unreadable, explicit=bool(argv))
     for path, name in found:
         print(f"{display(path)}: {name}")
     for path, e in unreadable:

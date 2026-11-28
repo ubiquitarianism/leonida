@@ -8,7 +8,7 @@
 // list, which D3D12 orders on the queue and needs an explicit dependency for on Vulkan. Part H copies depth to colour
 // and back (D32_FLOAT <-> R32_FLOAT), which the replay stages through a scratch buffer. Part I resolves a depth
 // rectangle (MIN) and checks that the texels around it keep their values. Part J copies between disjoint regions
-// of one texture subresource.
+// of one texture subresource. Part L releases textures with a barrier into LAYOUT_UNDEFINED and uses one again.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../src/vulkan_replay.h"
@@ -1340,6 +1340,121 @@ int part_k(vktest::Device& d) {
     return 0;
 }
 
+// Part L: an enhanced barrier into LAYOUT_UNDEFINED releases a texture (D3D-BARRIER-INTO-UNDEFINED). Vulkan has no
+// transition into UNDEFINED, so the replay keeps the layout of every plane and only orders the accesses. Released
+// here: a colour target after a clear, a depth buffer whose two planes are in different layouts, and an image nothing
+// has used. The colour target is then taken from UNDEFINED again, cleared and read back. Under
+// LEONIDA_VK_VALIDATION=1 these barriers must pass the validation layer.
+int part_l(vktest::Device& d) {
+    if (!d.depth_format_usable(VK_FORMAT_D32_SFLOAT_S8_UINT)) {
+        std::printf("L: skipped, no D32_SFLOAT_S8_UINT\n");
+        return 0;
+    }
+    constexpr std::uint32_t size = 4, texels = size * size;
+    const VkImage rt = d.image(VK_FORMAT_R8G8B8A8_UNORM, size, size, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    const VkImage ds = d.image(VK_FORMAT_D32_SFLOAT_S8_UINT, size, size, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    const VkImage unused = d.image(VK_FORMAT_R8G8B8A8_UNORM, size, size, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    void* mapped = nullptr;
+    const VkBuffer buffer = d.buffer(texels * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapped);
+    EXPECT(rt && ds && unused && buffer);
+
+    const auto binding = [&](VkImage image, VkFormat format, VkImageAspectFlags aspects) {
+        ResourceBinding b{};
+        b.image = image;
+        b.format = format;
+        b.aspects = aspects;
+        b.width = b.height = size;
+        return b;
+    };
+    constexpr ResourceId rt_id = 50, ds_id = 51, unused_id = 52;
+    const std::map<ResourceId, ResourceBinding> bindings{
+        {rt_id, binding(rt, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT)},
+        {ds_id, binding(ds, VK_FORMAT_D32_SFLOAT_S8_UINT, depth_stencil_aspects)},
+        {unused_id, binding(unused, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT)},
+    };
+    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+        const auto it = bindings.find(id);
+        return it == bindings.end() ? nullptr : &it->second;
+    };
+
+    Views views{d, {}};
+    ReplayFunctions vk{};
+    vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+    vk.clear_color_image = d.fn<PFN_vkCmdClearColorImage>("vkCmdClearColorImage");
+    vk.clear_depth_stencil_image = d.fn<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage");
+    vk.pipeline_barrier2 = d.fn<PFN_vkCmdPipelineBarrier2>("vkCmdPipelineBarrier2");
+    vk.begin_rendering = d.fn<PFN_vkCmdBeginRendering>("vkCmdBeginRendering");
+    vk.end_rendering = d.fn<PFN_vkCmdEndRendering>("vkCmdEndRendering");
+    vk.clear_attachments = d.fn<PFN_vkCmdClearAttachments>("vkCmdClearAttachments");
+    vk.image_view = [&](const ResourceBinding& r, const VkImageSubresourceRange& range) { return views(r, range); };
+    vk.separate_depth_stencil_layouts = true;
+
+    LayoutTracker tracker(true);
+    tracker.track(rt_id, bindings.at(rt_id), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);         // render_target
+    tracker.track(ds_id, bindings.at(ds_id), VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);  // depth_write
+    tracker.track(unused_id, bindings.at(unused_id), VK_IMAGE_LAYOUT_UNDEFINED);                // never used
+
+    namespace y = d3d12_sync;
+    namespace a = d3d12_access;
+    namespace l = d3d12_layout;
+    const BarrierSubresourceRange all{all_subresources, 0, 0, 0, 0, 0};
+    // What the releases give up: a red target, and a depth buffer with its stencil plane moved to a read-only state.
+    CommandList written;
+    EXPECT(written.clear_render_target({rt_id, 0, 0, 1}, {1, 0, 0, 1}));
+    EXPECT(written.clear_depth_stencil({ds_id, 0, 0, 1}, clear_depth | clear_stencil, 1.0f, 0x11));
+    EXPECT(written.transition({ds_id, 1, s::depth_write, s::depth_read | s::pixel_shader_resource}));
+    EXPECT(written.close());
+    CommandList release;
+    EXPECT(release.barrier(TextureBarrier{y::render_target, y::none, a::render_target, a::no_access, l::render_target,
+                                          l::undefined, rt_id, all, 0}));
+    EXPECT(release.barrier(TextureBarrier{y::depth_stencil, y::none, a::depth_stencil_write, a::no_access,
+                                          l::depth_stencil_write, l::undefined, ds_id, all, 0}));
+    EXPECT(release.barrier(TextureBarrier{y::render_target, y::none, a::render_target, a::no_access, l::render_target,
+                                          l::undefined, unused_id, all, 0}));
+    EXPECT(release.close());
+    // D3D12 has the next barrier start from UNDEFINED, which discards; green is written after it.
+    CommandList reuse;
+    EXPECT(reuse.barrier(TextureBarrier{y::none, y::render_target, a::no_access, a::render_target, l::undefined,
+                                        l::render_target, rt_id, all, 0}));
+    EXPECT(reuse.clear_render_target({rt_id, 0, 0, 1}, {0, 1, 0, 1}));
+    EXPECT(reuse.barrier(TextureBarrier{y::render_target, y::copy, a::render_target, a::copy_source, l::render_target,
+                                        l::copy_source, rt_id, all, 0}));
+    EXPECT(reuse.close());
+
+    const unsigned errors_before = d.validation_errors();
+    VkImageLayout before[3]{}, after[3]{};
+    const auto layouts = [&](VkImageLayout* out) {
+        out[0] = tracker.layout(rt_id, 0);
+        out[1] = tracker.layout(ds_id, 0);
+        out[2] = tracker.layout(ds_id, 1);
+    };
+    const bool ok = d.run([&](VkCommandBuffer cb) {
+        d.initial_layout(cb, rt, VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        d.initial_layout(cb, ds, depth_stencil_aspects, 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        if (replay(written, cb, resolve, vk, &tracker) != ReplayResult::success) return false;
+        layouts(before);
+        if (replay(release, cb, resolve, vk, &tracker) != ReplayResult::success) return false;
+        layouts(after);
+        if (tracker.layout(unused_id, 0) != VK_IMAGE_LAYOUT_UNDEFINED) return false;  // released without a fill
+        if (replay(reuse, cb, resolve, vk, &tracker) != ReplayResult::success) return false;
+        d.read_back(cb, rt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, size, size, 1, buffer, 0);
+        return true;
+    });
+    EXPECT(ok);
+    // The release changed no layout, and the two depth planes were in different ones.
+    EXPECT(before[0] == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL && after[0] == before[0]);
+    EXPECT(before[1] == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL && after[1] == before[1]);
+    EXPECT(before[2] != before[1] && before[2] != VK_IMAGE_LAYOUT_UNDEFINED && after[2] == before[2]);
+    EXPECT(tracker.layout(rt_id, 0) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    const auto* data = static_cast<const std::uint8_t*>(mapped);
+    for (std::uint32_t i = 0; i < texels; ++i) expect_rgba("L reuse", data, i, green);
+    const unsigned errors = d.validation_errors() - errors_before;
+    std::printf("L: a target, a depth buffer in two plane layouts and an unused image released into UNDEFINED; "
+                "%u texels of the reused target%s\n", texels,
+                d.validation ? (errors ? ": validation errors" : ", no validation errors") : " (validation off)");
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -1351,7 +1466,7 @@ int main() {
     }
     EXPECT(status == vktest::DeviceStatus::ready);
     if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device) || part_f(device) ||
-        part_g(device) || part_h(device) || part_i(device) || part_j(device) || part_k(device))
+        part_g(device) || part_h(device) || part_i(device) || part_j(device) || part_k(device) || part_l(device))
         return 1;
     if (g_mismatches) return 1;
     if (device.validation_errors()) {

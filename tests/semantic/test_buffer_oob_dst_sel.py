@@ -98,6 +98,17 @@ class OobTypedLoadDstSelTests(unittest.TestCase):
             )
         return mem, spv
 
+    def test_invalid_format_with_nonempty_range_skips_backing_load(self):
+        with open(os.path.join(HERE, "fixtures", "buffer_format_unreadable.asm"), encoding="utf-8") as f:
+            lines = [line.strip() for line in f if not line.startswith(";")]
+        for code in (0, 78, 127, 20):
+            with self.subTest(code=code):
+                pcs = [0, 0, 16, OUT_V, BASE, 0, 16, word3(code, DST_X_0_1_1)] + [0] * 24
+                mem, _ = self._run_cs(lines, push_constants=pcs)
+                self.assertEqual(bool(mem.reads), code == 20)
+                self.assertEqual([dict.get(mem, i, 0) for i in (0, 4, 8, 12)],
+                                 [0x3F000000 if code == 20 else 0, 0, 1, 1])
+
     def test_all_supported_formats_preserve_dst_sel_one_when_oob(self):
         """Runtime V# sweep across every format in Gen.FORMATS (xyzw, d16_xyzw, d16_xyz, d16_x)."""
         lines = [

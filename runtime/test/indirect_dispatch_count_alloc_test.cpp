@@ -115,7 +115,7 @@ VKAPI_ATTR void VKAPI_CALL mock_cmd_bind_pipeline(VkCommandBuffer, VkPipelineBin
 
 VKAPI_ATTR void VKAPI_CALL mock_cmd_push_constants(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags,
                                                    std::uint32_t, std::uint32_t size, const void* values) {
-    if (size == 40) {
+    if (size == 48) {
         std::uint32_t records = 0;
         std::memcpy(&records, static_cast<const std::uint8_t*>(values) + 32, sizeof(records));
         g_mock->push_records.push_back(records);

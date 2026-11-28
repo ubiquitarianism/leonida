@@ -100,6 +100,25 @@ const char* const kNotHResult[] = {
 };
 const char* const kXFamilies[] = {"XAsync", "XTaskQueue", "XUser", "XStore", "XGameSave", "XPackage", "XGameUi"};
 
+static bool is_audio_hal_hresult(const std::string& dll, const std::string& name) {
+    if (dll == "chad.dll") {
+        // All five XDsp* functions return HRESULT (GDK XDspAudio reference).
+        if (starts_with(name, "XDsp")) return true;
+    } else if (dll == "xapu.dll") {
+        // XApuConnect/DequeueResult/Disconnect/EnqueueCommand return HRESULT;
+        // XApuGetResultCount returns uint32_t.
+        if (name != "XApuGetResultCount" && starts_with(name, "XApu")) return true;
+    } else if (dll == "acphal.dll") {
+        // AcpHalAllocateShapeContexts, AcpHalCreate, AcpHalReleaseShapeContexts,
+        // ApuAlloc, ApuCreateHeap return HRESULT.  ApuFree, ApuIsVirtualAddressValid,
+        // ApuMapApuAddress and ApuMapVirtualAddress return other types.
+        if (name == "AcpHalAllocateShapeContexts" || name == "AcpHalCreate" ||
+            name == "AcpHalReleaseShapeContexts" || name == "ApuAlloc" ||
+            name == "ApuCreateHeap") return true;
+    }
+    return false;
+}
+
 ReturnClass classify(const std::string& dll, const std::string& name) {
     if (dll == "d3d12.dll" || dll == "d3d12_xs.dll") {
         if (starts_with(name, "D3D12Create") || starts_with(name, "D3D12Serialize") ||
@@ -116,11 +135,8 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
         if (name == "GameInputCreate") return ReturnClass::HResult;
     } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll" || dll == "xcrdapi.dll") {
         if (name == "DStorageGetFactory") return ReturnClass::HResult;
-    } else if (dll == "acphal.dll") {
-        if (name == "AcpHalAllocateShapeContexts" || name == "AcpHalCreate" ||
-            name == "AcpHalReleaseShapeContexts" || name == "ApuAlloc" ||
-            name == "ApuCreateHeap")
-            return ReturnClass::HResult;
+    } else if (is_audio_hal_hresult(dll, name)) {
+        return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
         if (name == "XGameRuntimeInitialize" || name == "XGameEventWrite") return ReturnClass::HResult;
         for (const char* n : kNotHResult)
@@ -390,6 +406,11 @@ struct BundledLoaderEntry {
     const BundledModuleOps* ops;
 };
 
+struct XMemHooksEntry {
+    const void* owner;
+    const XMemAllocationHooks* hooks;
+};
+
 // Immortal: late mapped-DLL detach or atexit handlers may call GetProcAddress/FreeLibrary during process teardown.
 std::mutex& bundled_loader_mutex() {
     static auto* m = new std::mutex;
@@ -398,6 +419,16 @@ std::mutex& bundled_loader_mutex() {
 
 std::vector<BundledLoaderEntry>& bundled_loaders() {
     static auto* v = new std::vector<BundledLoaderEntry>;
+    return *v;
+}
+
+std::mutex& xmem_hooks_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::vector<XMemHooksEntry>& xmem_hooks_entries() {
+    static auto* v = new std::vector<XMemHooksEntry>;
     return *v;
 }
 
@@ -477,10 +508,56 @@ void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_
     return nullptr;
 }
 
+void* compat_module(const std::wstring& basename, const std::wstring& name, bool load, uint32_t flags,
+                    bool& handled) {
+    handled = false;
+    for (const auto& entry : snapshot_bundled_loaders()) {
+        if (!entry.ops->compat_module) continue;
+        bool loader_handled = false;
+        void* h = entry.ops->compat_module(entry.ctx, basename, name, load, flags, loader_handled);
+        if (loader_handled) {
+            handled = true;
+            return h;
+        }
+    }
+    return nullptr;
+}
+
+bool owns_compat_module_handle(void* module) {
+    if (!module) return false;
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (entry.ops->owns_compat_handle && entry.ops->owns_compat_handle(entry.ctx, module)) return true;
+    return false;
+}
+
 bool owns_bundled_module_handle(void* module) {
     for (const auto& entry : snapshot_bundled_loaders())
         if (entry.ops->owns_handle(entry.ctx, module)) return true;
     return false;
+}
+
+void add_xmem_allocation_hooks(const void* owner, const XMemAllocationHooks* hooks) {
+    if (!owner || !hooks) return;
+    std::lock_guard lock(xmem_hooks_mutex());
+    xmem_hooks_entries().push_back({owner, hooks});
+}
+
+void remove_xmem_allocation_hooks(const void* owner) {
+    std::lock_guard lock(xmem_hooks_mutex());
+    auto& list = xmem_hooks_entries();
+    for (auto it = list.begin(); it != list.end();) {
+        if (it->owner == owner) {
+            it = list.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+const XMemAllocationHooks* xmem_allocation_hooks() {
+    std::lock_guard lock(xmem_hooks_mutex());
+    const auto& list = xmem_hooks_entries();
+    return list.empty() ? nullptr : list.back().hooks;
 }
 
 Table::Table(const Entry* entries, size_t count) {
@@ -495,7 +572,7 @@ void* find(const std::string& dll_lower, const std::string& name) {
 bool owns_dll(const std::string& dll_lower) {
     static const char* const host[] = {"kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
                                        "vulkan-1.dll", "ntdll.dll", "user32.dll", "ws2_32.dll",
-                                       "wsock32.dll"};
+                                       "wsock32.dll", "advapi32.dll"};
     if (starts_with(dll_lower, "api-ms-") || starts_with(dll_lower, "ext-ms-")) return false;
     for (const char* h : host)
         if (dll_lower == h) return false;

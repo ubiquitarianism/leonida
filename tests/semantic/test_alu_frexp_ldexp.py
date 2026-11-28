@@ -83,6 +83,18 @@ def run(line: str, v1: int, v2: int = 0) -> int:
     return si.run_fragment(spv)["%out_mrt0"][0]
 
 
+def translated(line: str) -> str:
+    """The SPIR-V text of a pixel shader that runs ``line`` on v1 and v2 and exports v0."""
+    if _TMP_DIR is None:
+        setUpModule()
+    asm = f"; test_frexp_ldexp\n\t{line}\n\texp mrt0 v0, v0, v0, v0 done vm\n\ts_endpgm\n"
+    with open(_SRC_PATH, "w", encoding="utf-8", newline="\n") as f:
+        f.write(asm)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        return rdna2spirv.translate(_SRC_PATH)
+
+
 def ref_mant(u: int) -> int:
     if not is_normal(u):
         return (u & 0x80000000) if (u >> 23) & 0xFF == 0 else u
@@ -203,6 +215,54 @@ class LdexpTests(unittest.TestCase):
         self.assertEqual(run("v_ldexp_f32_e64 v0, |v1|, v2", f2u(-1.0), 1), f2u(2.0))
         self.assertEqual(run("v_ldexp_f32_e64 v0, v1, v2 mul:2", f2u(1.0), 1), f2u(4.0))
         self.assertEqual(run("v_ldexp_f32_e64 v0, v1, v2 clamp", f2u(1.0), 3), f2u(1.0))
+
+
+class SourceModifierBitsTests(unittest.TestCase):
+    """abs and neg on the float source of the three ops move its sign bit and nothing else (SHADER-FREXP-LDEXP-
+    SIGN-MODS). Through FAbs/OpFNegate a driver may return any NaN for a NaN: an RTX 4070 Ti gave 0x7fffffff for
+    every NaN source (cs_w32_frexp_ldexp). The interpreter negates on the bits either way, so the values below hold
+    with both lowerings and it is the missing float instructions that tell them apart."""
+    FORMS = ("v_frexp_mant_f32_e64 v0, -v1", "v_frexp_mant_f32_e64 v0, |v1|", "v_frexp_mant_f32_e64 v0, -|v1|",
+             "v_frexp_exp_i32_f32_e64 v0, -v1", "v_frexp_exp_i32_f32_e64 v0, |v1|",
+             "v_ldexp_f32_e64 v0, -v1, v2", "v_ldexp_f32_e64 v0, |v1|, v2", "v_ldexp_f32_e64 v0, -|v1|, v2")
+
+    def test_the_modifiers_are_not_float_instructions(self):
+        for line in self.FORMS:
+            with self.subTest(line=line):
+                text = translated(line)
+                self.assertNotIn("OpFNegate", text)
+                self.assertNotIn("FAbs", text)
+                self.assertIn("OpBitwiseXor" if "-" in line else "OpBitwiseAnd", text)
+
+    def test_the_check_above_tells_the_two_lowerings_apart(self):
+        # An op that computes with its source still negates the float.
+        self.assertIn("OpFNegate", translated("v_add_f32_e64 v0, -v1, v2"))
+        self.assertIn("FAbs", translated("v_add_f32_e64 v0, |v1|, v2"))
+        # And without a modifier the three ops emit neither instruction nor a sign-bit move.
+        for line in ("v_frexp_mant_f32_e32 v0, v1", "v_ldexp_f32_e64 v0, v1, v2"):
+            self.assertNotIn("OpFNegate", translated(line))
+
+    def test_a_nan_keeps_its_payload_under_a_modifier(self):
+        cases = ((0x7FC00000, 0xFFC00000, 0x7FC00000), (0x7F800001, 0xFF800001, 0x7F800001),
+                 (0xFFC12345, 0x7FC12345, 0x7FC12345), (0xFF800001, 0x7F800001, 0x7F800001))
+        for u, negated, magnitude in cases:
+            with self.subTest(u=hex(u)):
+                self.assertEqual(run("v_frexp_mant_f32_e64 v0, -v1", u), negated)
+                self.assertEqual(run("v_frexp_mant_f32_e64 v0, |v1|", u), magnitude)
+                self.assertEqual(run("v_frexp_mant_f32_e64 v0, -|v1|", u), magnitude | 0x80000000)
+                self.assertEqual(run("v_ldexp_f32_e64 v0, -v1, v2", u, 5), negated)
+                self.assertEqual(run("v_ldexp_f32_e64 v0, |v1|, v2", u, 0xFFFFFFFB), magnitude)
+                self.assertEqual(run("v_frexp_exp_i32_f32_e64 v0, -v1", u), 0)
+
+    def test_zeros_denormals_and_infinities_take_the_moved_sign(self):
+        for u in (0x00000000, 0x80000000, 0x00000001, 0x807FFFFF):       # a denormal is read as a zero of its sign
+            with self.subTest(u=hex(u)):
+                self.assertEqual(run("v_frexp_mant_f32_e64 v0, -v1", u), (u ^ 0x80000000) & 0x80000000)
+                self.assertEqual(run("v_frexp_mant_f32_e64 v0, |v1|", u), 0)
+                self.assertEqual(run("v_ldexp_f32_e64 v0, -|v1|, v2", u, 40), 0x80000000)
+        self.assertEqual(run("v_frexp_mant_f32_e64 v0, -v1", INF), NINF)
+        self.assertEqual(run("v_ldexp_f32_e64 v0, |v1|, v2", NINF, 7), INF)
+        self.assertEqual(run("v_ldexp_f32_e64 v0, -v1, v2", f2u(1.5), 0xFFFFFFFF), f2u(-0.75))
 
 
 if __name__ == "__main__":

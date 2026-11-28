@@ -213,6 +213,77 @@ class BindlessTestOnASmallPushConstantDevice(unittest.TestCase):
         self.assertNotIn("skipped", out)
 
 
+class TextureUavFixture(unittest.TestCase):
+    """Run the real filtered suite and checker, substituting only the external tools."""
+    def run_uav(self, code=0, message="", *, windows=True, compiled=True, executable=True):
+        import check
+
+        name = "cs_texture_uav"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = SimpleNamespace(filter=name, build=str(root / "build"), llvm_mc="unused")
+            exe = Path(args.build) / "d3d12_texture_uav_test.exe"
+            exe.parent.mkdir()
+            if executable:
+                exe.touch()
+            spv = root / "spirv" / f"{name}.spv"
+            spv.parent.mkdir()
+            spv.write_bytes(b"stale fixture")
+
+            def translate(cmd, env=None, gpu=True):
+                self.assertFalse(gpu)
+                self.assertEqual(cmd[2], rgt.TRANSLATOR)
+                self.assertEqual([p.name for p in Path(cmd[3]).iterdir()], [f"{name}.s"])
+                self.assertEqual(Path(cmd[cmd.index("--out") + 1]), spv.parent)
+                self.assertFalse(spv.exists(), "an old SPIR-V must not mask a failed translation")
+                if compiled:
+                    spv.touch()
+                return 0, ""
+
+            result = SimpleNamespace(returncode=code, stdout=message, stderr="")
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt, "bary_fallback", return_value=False),
+                  patch.object(rgt, "f16_interp_fallback", return_value=False),
+                  patch.object(check, "os", SimpleNamespace(name="nt" if windows else "posix", path=check.os.path,
+                                                           environ=check.os.environ)),
+                  patch.object(check, "EXE", ".exe"),
+                  patch.object(check.subprocess, "run", return_value=result) as launch,
+                  contextlib.redirect_stdout(output)):
+                rc = rgt.run_suite(args, tmp)
+            if windows and compiled and executable:
+                launch.assert_called_once()
+                self.assertEqual(tuple(launch.call_args.args[0]), (str(exe), str(spv)))
+            else:
+                launch.assert_not_called()
+            return rc, output.getvalue()
+
+    def test_translates_and_runs_the_windows_uav_fixture(self):
+        rc, out = self.run_uav()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("1/1 passed", out)
+
+    def test_unavailable_warp_and_non_windows_are_skips(self):
+        for options in (dict(code=77, message="SKIP: no D3D12 WARP adapter"), dict(windows=False)):
+            with self.subTest(options=options):
+                rc, out = self.run_uav(**options)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("SKIP  cs_texture_uav", out)
+                self.assertIn("0/1 passed, 1 skipped", out)
+
+    def test_failed_gpu_run_missing_translation_and_missing_executable_fail(self):
+        for options, detail in ((dict(code=1, message="bad texel"), "bad texel"),
+                                (dict(compiled=False), "missing .spv"),
+                                (dict(executable=False), "missing ")):
+            with self.subTest(options=options):
+                rc, out = self.run_uav(**options)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(detail, out)
+                self.assertIn("0/1 passed", out)
+                self.assertNotIn("skipped", out)
+
 class StoreHelperUnsupported(unittest.TestCase):
     """vk_store_test exits 77 when the device lacks a feature (TEST-469): a SKIP that quotes why, not a FAIL."""
 
@@ -360,11 +431,17 @@ class ComputeFeatureUnsupported(unittest.TestCase):
 
 
 class FilterWithoutRunnableCases(unittest.TestCase):
-    """A filter selecting only an input shader (cs_bench_mix) must not report 0/0 passed with exit 0."""
+    """Selecting only an input shader (cs_bench_mix) must not report 0/0 passed with exit 0."""
 
-    def run_filter(self, name, translate_rc=0, spv=True):
+    def run_filter(self, name, translate_rc=0, spv=True, *, replay=False):
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+            if replay:
+                listings = Path(tmp) / "listings"
+                listings.mkdir()
+                (listings / f"{name}.s").write_text("; synthetic\n", encoding="utf-8", newline="\n")
+                args.filter = ""
+                args.disasm_dir = str(listings)
 
             def translate(_cmd, env=None, gpu=True):
                 if spv:
@@ -388,6 +465,15 @@ class FilterWithoutRunnableCases(unittest.TestCase):
         self.assertIn("benchmark tool", err)
         self.assertIn("=== rdna2spirv.py ===", out)
         self.assertNotIn("0/0 passed", out)
+
+    def test_disassembly_replay_of_benchmark_input_reports_no_runnable_cases(self):
+        rc, out, err, assemble, run = self.run_filter("cs_bench_mix", replay=True)
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("--disasm-dir", err)
+        self.assertIn("selected cs_bench_mix but no runnable GPU test cases", err)
+        self.assertNotIn("0/0 passed", out)
+        assemble.assert_not_called()
+        run.assert_called_once()
 
     def test_translation_failure_stays_a_failure(self):
         rc, out, err, _, _ = self.run_filter("cs_bench_mix", translate_rc=1)
@@ -747,13 +833,17 @@ class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
         "ps_tex": "", "ps_imgatomic": "",
     }
 
-    def run_one(self, name, code, printed):
+    def run_one(self, name, code, printed, *, subgroup_size=None):
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(filter=name + ".asm", build=tmp, llvm_mc="unused", require_pass=False)   # one row
 
             def launch(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
                 if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
-                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    spirv = Path(tmp) / "spirv"
+                    (spirv / f"{name}.spv").touch()
+                    if subgroup_size is not None:
+                        (spirv / "index.json").write_text(
+                            json.dumps({name: {"subgroup_size": subgroup_size}}), encoding="utf-8", newline="\n")
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
                 return SimpleNamespace(returncode=code, stdout="", stderr=printed)
 
@@ -780,6 +870,14 @@ class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
         _rc, rows, out = self.run_one("ps_gather_wrap", -11, "device: X\n")
         self.assertNotIn("pixels differ", rows[0][2], out)
 
+    def test_failed_dispatch_is_not_an_unpinned_subgroup_skip(self):
+        warning = "compute subgroup size: 32 not available"
+        for code in (1, -11, 0xC0000005):
+            with self.subTest(code=code):
+                rc, rows, out = self.run_one("cs_barrier_loop", code, warning, subgroup_size=32)
+                self.assertEqual(rc, 1, out)
+                self.assertEqual([row[1:] for row in rows], [["cs_barrier_loop", f"exit {code}: {warning}"]], out)
+
     def test_a_verdict_keeps_its_line(self):
         self.assertEqual(rgt.verdict_line(0, "device: X\ncs_lds: 64 lanes mirrored"), "cs_lds: 64 lanes mirrored")
         self.assertEqual(rgt.verdict_line(0, ""), "")
@@ -787,6 +885,56 @@ class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
         rc, rows, out = self.run_one("cs_imgstore", 0, "device: X\ncs_imgstore: 64 texels match\n")
         self.assertEqual((rc, rows), (0, []), out)
         self.assertIn("PASS  cs_imgstore           cs_imgstore: 64 texels match", out)
+
+
+class DumpRowThatExitsNonZero(unittest.TestCase):
+    """A "dump" row whose program printed the right words and then exited non-zero (validation errors, under the
+    validation layer) fails with the program's output, not with the words alone (TEST-GPU-OOB-AND-HARNESS-MSG)."""
+    ERROR = "validation: vkCmdDispatch(): Out of bounds: trying to write 4 bytes"
+
+    def run_one(self, name, code, printed):
+        envs = []
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name + ".asm", build=tmp, llvm_mc="unused", require_pass=False)
+
+            def launch(cmd, **kwargs):
+                if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                envs.append(kwargs.get("env") or {})
+                return SimpleNamespace(returncode=code, stdout=printed, stderr="")
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt.subprocess, "run", side_effect=launch),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                rc = rgt.run_suite(args, tmp)
+        return rc, output.getvalue(), envs
+
+    def test_the_fail_line_keeps_the_message(self):
+        words = "out[0..7] = " + " ".join(map(str, check.PK_MUL_LO_WORDS)) + "\n"
+        for name, printed in (("cs_pk_mul_lo_const", words), ("cs_user_sgprs", "out[0..7] = "
+                              + " ".join(map(str, check.USER_SGPRS_WORDS)) + "\n")):
+            with self.subTest(name=name):
+                rc, out, _ = self.run_one(name, 1, printed + self.ERROR + "\n")
+                self.assertEqual(rc, 1, out)
+                fail = [ln for ln in out.splitlines() if ln.startswith("  FAIL")]
+                self.assertEqual(len(fail), 1, out)
+                self.assertIn("exit 1:", fail[0], out)
+                self.assertIn(self.ERROR, out)
+
+    def test_the_words_alone_still_pass(self):
+        rc, out, _ = self.run_one("cs_pk_mul_lo_const", 0,
+                                  "out[0..7] = " + " ".join(map(str, check.PK_MUL_LO_WORDS)) + "\n")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS  cs_pk_mul_lo_const", out)
+
+    def test_pk_mul_lo_const_gets_its_128_words(self):
+        # 32 lanes store 16 bytes each: the default 64-word buffer let lanes 16-31 write past its end (GPU-AV).
+        _rc, out, envs = self.run_one("cs_pk_mul_lo_const", 0,
+                                      "out[0..7] = " + " ".join(map(str, check.PK_MUL_LO_WORDS)) + "\n")
+        self.assertEqual([e.get("VKC_OUT_WORDS") for e in envs], ["128"], out)
 
 
 class FmaFusedSuite(unittest.TestCase):
@@ -852,6 +1000,53 @@ class FmaFusedSuite(unittest.TestCase):
         rc, out = self.run_fma(77, "unsupported: no VK_KHR_shader_fma", fma_env="khr")
         self.assertEqual(rc, 0, out)
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
+
+
+
+class TbufferStoreVerdict(unittest.TestCase):
+    """cs_tbuffer_store (tbuffer_store_test): its verdict must reach the summary. The branch in run_suite used to
+    drop it, so a failing run printed no row and the total still counted the test as absent."""
+    NAME = "cs_tbuffer_store"
+
+    def run_suite(self, verdict):
+        def run_cmd(cmd, env=None, gpu=True):
+            if rgt.TRANSLATOR in cmd:   # the translator publishes a module for every input
+                out = cmd[cmd.index("--out") + 1]
+                for s in os.listdir(cmd[cmd.index(rgt.TRANSLATOR) + 1]):
+                    Path(out, Path(s).stem + ".spv").touch()
+                return 0, ""
+            return 0, ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=self.NAME, build=tmp, llvm_mc="unused")
+            out = io.StringIO()
+            with (patch.object(rgt, "tbuffer_store_test", return_value=verdict),
+                  patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=run_cmd),
+                  contextlib.redirect_stdout(out), contextlib.redirect_stderr(out)):
+                rc = rgt.run_suite(args, tmp)
+        return rc, out.getvalue()
+
+    def test_a_failure_is_recorded(self):
+        rc, out = self.run_suite("word 3: expected 0x40800000, got 0x0")
+        self.assertIn(f"FAIL  {self.NAME}", out)
+        self.assertIn("word 3: expected 0x40800000, got 0x0", out)
+        self.assertIn("0/1 passed", out)
+        self.assertEqual(rc, 1, out)
+
+    def test_a_pass_is_recorded(self):
+        rc, out = self.run_suite("")
+        self.assertIn(f"PASS  {self.NAME}", out)
+        self.assertIn("128/128 dumped words exact", out)
+        self.assertIn("1/1 passed", out)
+        self.assertEqual(rc, 0, out)
+
+    def test_a_device_skip_is_recorded_as_a_skip(self):
+        rc, out = self.run_suite(check.Skip("SKIP (unsupported: no Int64)"))
+        self.assertIn(f"SKIP  {self.NAME}", out)
+        self.assertIn("1 skipped", out)
+        self.assertEqual(rc, 0, out)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@
 // writes into `spirv/index.json`, next to `<name>.spv`. This header needs no Windows, Vulkan or third-party code:
 // it carries its own inflate (RFC 1950/1951), SHA-256 (FIPS 180-4) and a minimal JSON reader.
 
+#include "descriptor_table.h"
 #include "spirv_words.h"
 
 #include <algorithm>
@@ -220,7 +221,7 @@ inline int decode(BitReader& in, const Huffman& h) {
 }
 
 inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const Huffman& lengths,
-                          const Huffman& distances, std::size_t limit) {
+                          const Huffman& distances, std::size_t limit, bool bulk = true) {
     static constexpr std::int16_t length_base[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
                                                      31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
     static constexpr std::int16_t length_extra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
@@ -247,8 +248,25 @@ inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, co
         const std::size_t distance = std::size_t(distance_base[d]) + in.bits(distance_extra[d]);
         if (in.failed() || distance > out.size()) return ZlibError::data;
         if (out.size() > limit || length > limit - out.size()) return ZlibError::limit;
-        const std::size_t from = out.size() - distance;
-        for (std::size_t i = 0; i < length; ++i) out.push_back(out[from + i]);
+        const std::size_t start = out.size();
+        if (!bulk) {
+            for (std::size_t i = 0; i < length; ++i) out.push_back(out[start - distance + i]);
+            continue;
+        }
+        out.resize(start + length);
+        auto* dest = out.data() + start;
+        if (distance == 1) {
+            std::fill_n(dest, length, dest[-1]);
+        } else {
+            // Overlapping matches repeat their first distance bytes. Each copy reads only completed output.
+            std::size_t copied = std::min(distance, length);
+            std::memcpy(dest, dest - distance, copied);
+            while (copied < length) {
+                const auto count = std::min(copied, length - copied);
+                std::memcpy(dest + copied, dest, count);
+                copied += count;
+            }
+        }
     }
 }
 
@@ -260,7 +278,7 @@ inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, co
 // dictionary), `data` for the deflate data or a missing trailer, `checksum` for an Adler-32 mismatch, `limit` for
 // output beyond `limit`. Bytes after the Adler-32 trailer are not read.
 inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint8_t>& out,
-                         std::size_t limit = std::size_t(1) << 30, ZlibError* why = nullptr) {
+                         std::size_t limit = std::size_t(1) << 30, ZlibError* why = nullptr, bool bulk = true) {
     out.clear();
     const auto fail = [why](ZlibError reason) {
         if (why) *why = reason;
@@ -303,7 +321,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 detail::build_huffman(t.second, lengths, 30);
                 return t;
             }();
-            if (const ZlibError e = detail::inflate_codes(reader, out, tables.first, tables.second, limit); e != ZlibError::none)
+            if (const ZlibError e = detail::inflate_codes(reader, out, tables.first, tables.second, limit, bulk); e != ZlibError::none)
                 return fail(e);
         } else if (type == 2) {  // dynamic Huffman
             const int literal_count = int(reader.bits(5)) + 257, distance_count = int(reader.bits(5)) + 1;
@@ -340,7 +358,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
             if (!detail::build_huffman(literal, lengths, literal_count) ||
                 !detail::build_huffman(distance, lengths + literal_count, distance_count))
                 return fail(ZlibError::data);
-            if (const ZlibError e = detail::inflate_codes(reader, out, literal, distance, limit); e != ZlibError::none)
+            if (const ZlibError e = detail::inflate_codes(reader, out, literal, distance, limit, bulk); e != ZlibError::none)
                 return fail(e);
         } else {
             return fail(ZlibError::data);
@@ -351,9 +369,23 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
     const std::size_t at = 2 + reader.position();
     if (at > in.size() || in.size() - at < 4) return fail(ZlibError::data);
     std::uint32_t a = 1, b = 0;
-    for (const std::uint8_t x : out) {
-        a = (a + x) % 65521;
-        b = (b + a) % 65521;
+    if (bulk) {
+        // At most 5,552 bytes of 0xff fit in both 32-bit accumulators between reductions.
+        for (std::span<const std::uint8_t> tail(out); !tail.empty();) {
+            const auto block = tail.first(std::min<std::size_t>(tail.size(), 5552));
+            for (const auto x : block) {
+                a += x;
+                b += a;
+            }
+            a %= 65521;
+            b %= 65521;
+            tail = tail.subspan(block.size());
+        }
+    } else {
+        for (const std::uint8_t x : out) {
+            a = (a + x) % 65521;
+            b = (b + a) % 65521;
+        }
     }
     const std::uint32_t expected = (std::uint32_t(in[at]) << 24) | (std::uint32_t(in[at + 1]) << 16) |
                                    (std::uint32_t(in[at + 2]) << 8) | in[at + 3];
@@ -808,7 +840,8 @@ struct SignatureElement {
 
 struct ShaderEntry {
     std::string name;
-    std::string stage;  // "vs", "ps", "cs", "ms", "gs"
+    std::string spv_file;  // optional "<prefix><spv>" filename when the index key is a hash
+    std::string stage;     // "vs", "ps", "cs", "ms", "gs"
     std::string fssm_sha256;
     std::string fspx_code_sha256;   // an FSPX program (docs/fspx.md): the SHA-256 of its kind-6 bytes
     std::string fspx_state_sha256;  // and of its kind-0 entry (dispatch state)
@@ -819,6 +852,7 @@ struct ShaderEntry {
     // pipeline needs it at or under the device's maxComputeSharedMemorySize (32768 on some drivers).
     std::uint32_t lds_bytes = 0;
     bool uses_code_base = false;
+    bool code_base_known = false;
     bool wave64 = false;
     // The subgroup size the translator assumed (64 for a wave64 shader, 32 otherwise); 0 when the entry says null,
     // as one translated with --wave64-emulate does, or has none.
@@ -826,7 +860,14 @@ struct ShaderEntry {
     // "workgroup" for a shader translated with --wave64-emulate: it uses no subgroup operation and is exact on any
     // subgroup size. Empty for a native translation.
     std::string wave64_exchange;
+    // Wave64 VS/PS/GS only: the translator's partition-invariance tier (index.json `wave64_graphics`; docs/design.md,
+    // "Wave64 graphics"). A and B are exact when the wave is cut into two 32-lane halves, C is not. Empty for other
+    // stages or an index written without the analysis.
+    std::string wave64_graphics;
     bool emulated() const { return wave64_exchange == "workgroup"; }
+    // Mesh shaders: the index's "root_window" is {"sgpr": 16, "dword": 8}, so the module reads its root arguments
+    // from the graphics window (push dword 8 = root dword 0, D3D-448 follow-up). False for one translated before it.
+    bool graphics_root_window = false;
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
     std::vector<std::uint32_t> inputs;              // pixel shaders: input locations declared
     std::vector<std::uint32_t> outputs;             // pixel/vertex shaders: output locations written
@@ -841,18 +882,96 @@ struct ShaderEntry {
     std::uint32_t max_primitives = 0;
 };
 
+// Which descriptor-table hash finalizer the loaded modules probe with (descriptor_table.h). Each module's index.json
+// meta may carry `"descriptor_hash": "fnv1a_fmix32"`; an absent key means the old bare `"fnv1a"`. The runtime has one
+// table for all shaders, so it counts the kinds over every loaded module (the root index and each sub-index) and picks
+// the majority; a mixed library still works, because the minority's lookups simply miss to index 0.
+struct DescriptorHashCensus {
+    std::size_t fnv1a = 0;
+    std::size_t fnv1a_fmix32 = 0;
+    std::size_t total() const { return fnv1a + fnv1a_fmix32; }
+};
+
+// The kind most modules declare. A tie (or no modules) is fnv1a, the behaviour before the marker existed.
+inline DescriptorHashKind majority_descriptor_hash_kind(const DescriptorHashCensus& census) {
+    return census.fnv1a_fmix32 > census.fnv1a ? DescriptorHashKind::fnv1a_fmix32 : DescriptorHashKind::fnv1a;
+}
+
+// Which descriptor-table entry layout the loaded modules read (descriptor_table.h, tools/rdna2spirv.py
+// --descriptor-table). A module whose meta carries `"descriptor_table": "tagged"` also reads the kind word next to
+// each index and uses it to tell which array an index belongs to; an absent key is the old plain layout, which reads
+// only the index. The runtime fills the kind word for a tagged table and leaves it alone for a plain one, so a
+// library translated before the marker (or with --descriptor-table plain) behaves exactly as it did.
+enum class DescriptorTableLayout : std::uint8_t { plain = 0, tagged = 1 };
+
+inline constexpr const char* descriptor_table_layout_name(DescriptorTableLayout layout) {
+    return layout == DescriptorTableLayout::tagged ? "tagged" : "plain";
+}
+
+struct DescriptorTableCensus {
+    std::size_t plain = 0;
+    std::size_t tagged = 0;
+    std::size_t total() const { return plain + tagged; }
+};
+
+// The tagged layout when any module reads it. The kind word is additive: a tagged module reads it and a plain
+// module ignores it (it reads the index at the same place), so one tagged module in the corpus needs the tagged
+// layout, however many plain ones there are. Counting entries would let a merged or partial index whose plain
+// modules outnumber the tagged ones hand every tagged module an all-zero kind, and every image of another
+// dimension would then fall back. No tagged module is the old plain layout.
+inline DescriptorTableLayout majority_descriptor_table_layout(const DescriptorTableCensus& census) {
+    return census.tagged > 0 ? DescriptorTableLayout::tagged : DescriptorTableLayout::plain;
+}
+
+// LEONIDA_DESCRIPTOR_TABLE=plain|tagged overrides the modules' vote. False when `value` is null, empty or not one
+// of the two layouts (an unrecognised value is ignored rather than failing startup).
+inline bool descriptor_table_layout_from_env(const char* value, DescriptorTableLayout* layout) {
+    if (!value || !*value) return false;
+    if (std::strcmp(value, "tagged") == 0) {
+        if (layout) *layout = DescriptorTableLayout::tagged;
+        return true;
+    }
+    if (std::strcmp(value, "plain") == 0) {
+        if (layout) *layout = DescriptorTableLayout::plain;
+        return true;
+    }
+    return false;
+}
+
+// LEONIDA_DESCRIPTOR_HASH=fnv1a|fnv1a_fmix32 overrides the modules' majority. False when `value` is null, empty or not
+// one of the two kinds (an unrecognised value is ignored rather than failing startup).
+inline bool descriptor_hash_kind_from_env(const char* value, DescriptorHashKind* kind) {
+    if (!value || !*value) return false;
+    if (std::strcmp(value, "fnv1a_fmix32") == 0) {
+        if (kind) *kind = DescriptorHashKind::fnv1a_fmix32;
+        return true;
+    }
+    if (std::strcmp(value, "fnv1a") == 0) {
+        if (kind) *kind = DescriptorHashKind::fnv1a;
+        return true;
+    }
+    return false;
+}
+
 class ShaderLibrary {
 public:
-    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's DLLs, each
-    // when it is there:
+    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's DLLs and the
+    // game executable, each when it is there:
     //   - <dir>/fspx/index.json, the FidelityFX DLL's FSPX programs, entries named "fspx/<name>" (docs/fspx.md);
+    //   - <dir>/fspx_compute/index.json, the compute programs from shaders.rpf's pipeline library;
+    //   - <dir>/fspx_gfx/index.json, the graphics programs from the same library;
     //   - <dir>/bvh/index.json, XboxBvhBuilder.dll's FSSM programs, entries named "bvh/<name>" and found by
     //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md);
+    //   - <dir>/exe/index.json, game_scarlett_master.exe's own DXBC containers, entries named "exe/<name>" and found
+    //     the same way (docs/embedded_shaders.md, "Retail executable");
     //   - <dir>/library/index.json, the compute programs of the pipeline library in shaders.rpf, which the executable
     //     creates with slot 67; entries named "library/<name>" and found by fspx_code_sha256 and fspx_state_sha256
     //     like the FSPX ones (docs/shader_library.md).
-    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. Both folders
-    // are optional: a missing or unreadable index there leaves the main one, and the other folder's, loaded.
+    // fspx_compute/ and library/ are two builds of the same slot-67 programs (make_game.py's library_shaders() writes
+    // library/; fspx_compute/ is the set translated from every console-path miss): both go into the same FSPX lookup
+    // by kind-6 and kind-0 SHA-256, and fspx_compute/ is read first, so its entry is the one found when both hold a
+    // program. Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The
+    // sub-indexes are optional: a missing or unreadable index there leaves the main one and the other folders loaded.
     bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
         const auto fail = [&](const std::string& why) {
             if (error) *error = why;
@@ -870,7 +989,7 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* sub_folder : {"fspx", "bvh", "library"}) {
+        for (const char* sub_folder : {"fspx", "fspx_compute", "fspx_gfx", "bvh", "exe", "library"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = folder / sub_folder;
@@ -882,17 +1001,61 @@ public:
         return true;
     }
 
+    // Loads only the optional FSPX sub-indexes (<dir>/fspx/index.json and <dir>/fspx_gfx/index.json) without parsing
+    // the 26,565-entry main index.json, for fast stage/hash lookups in the Xbox device proxy.
+    bool load_fspx_only(const std::filesystem::path& dir) {
+        dir_ = dir;
+        entries_.clear();
+        fspx_entries_.clear();
+        count_ = 0;
+        fspx_count_ = 0;
+        fspx_compute_count_ = 0;
+        fspx_gfx_count_ = 0;
+        bvh_count_ = 0;
+        exe_count_ = 0;
+        descriptor_hash_census_ = {};
+        descriptor_table_census_ = {};
+        for (const char* folder : {"fspx", "fspx_gfx"}) {
+            try {
+                const auto ignore = [](const std::string&) { return false; };
+                const std::filesystem::path sub = dir / folder;
+                if (std::ifstream(sub / "index.json", std::ios::binary))
+                    load_index(sub, std::string(folder) + "/", ignore);
+            } catch (...) {
+            }
+        }
+        return (fspx_count_ + fspx_gfx_count_) > 0;
+    }
+
     bool loaded() const { return !dir_.empty(); }
     // The folder load() read, made absolute; empty before.
     const std::filesystem::path& directory() const { return dir_; }
     std::size_t size() const { return count_; }
+    // The descriptor-hash kinds the loaded modules declare, and the kind the majority of them probe with (fnv1a when
+    // they tie or none declares one). The device takes this once, before its descriptor table's first insert, unless
+    // LEONIDA_DESCRIPTOR_HASH names a kind.
+    const DescriptorHashCensus& descriptor_hash_census() const { return descriptor_hash_census_; }
+    DescriptorHashKind descriptor_hash_kind() const { return majority_descriptor_hash_kind(descriptor_hash_census_); }
+    // The entry layouts the loaded modules read, and the layout to use: tagged as soon as one module reads the kind
+    // word (it is additive, see majority_descriptor_table_layout), plain when none does. The device takes this once,
+    // before its descriptor table's first insert, unless LEONIDA_DESCRIPTOR_TABLE names a layout.
+    const DescriptorTableCensus& descriptor_table_census() const { return descriptor_table_census_; }
+    DescriptorTableLayout descriptor_table_layout() const {
+        return majority_descriptor_table_layout(descriptor_table_census_);
+    }
     // Entries loaded from <dir>/fspx/index.json and <dir>/library/index.json. A corpus of RPF containers never
     // reaches these: their programs come from FidelityFX DLLs and the pipeline library, so callers comparing reached
     // entries with size() must leave them out.
     std::size_t fspx_size() const { return fspx_count_; }
+    std::size_t fspx_compute_size() const { return fspx_compute_count_; }
+    // Entries loaded from <dir>/fspx_gfx/index.json (graphics FSPX programs from shaders.rpf's pipeline library).
+    std::size_t fspx_gfx_size() const { return fspx_gfx_count_; }
     // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
     // their containers itself.
     std::size_t bvh_size() const { return bvh_count_; }
+    // Entries loaded from <dir>/exe/index.json: game_scarlett_master.exe's inline containers, which no shader
+    // archive holds.
+    std::size_t exe_size() const { return exe_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.
@@ -908,6 +1071,15 @@ public:
     // The entries of an FSPX program, by the SHA-256 of its kind-6 bytes (fspx_code_sha256).
     std::vector<const ShaderEntry*> fspx_candidates(std::string_view stage, std::string_view fspx_code_sha256) const {
         return lookup(fspx_entries_, stage, fspx_code_sha256);
+    }
+
+    // Finds an FSPX program by its kind-6 SHA-256 across all stages so the stage comes from the index entry itself.
+    const ShaderEntry* find_fspx_by_code(std::string_view fspx_code_sha256) const {
+        for (std::string_view st : {"vs", "ps", "ms", "gs", "cs"}) {
+            const auto all = fspx_candidates(st, fspx_code_sha256);
+            if (!all.empty()) return all.front();
+        }
+        return nullptr;
     }
 
     // The entries for a program compute_program() found, by the key of its kind (docs/fspx.md, "Build and run-time
@@ -946,11 +1118,57 @@ public:
         return all;
     }
 
+    // The module's file: <dir>/<name>.spv, or the index's spv file name when that one is missing.
+    std::filesystem::path spirv_file(const ShaderEntry& entry) const {
+        std::error_code ec;
+        auto path = dir_;
+        path += "/" + entry.name + ".spv";
+        if (!std::filesystem::exists(path, ec) && !entry.spv_file.empty()) {
+            auto alt = dir_;
+            alt += "/" + entry.spv_file;
+            return alt;
+        }
+        return path;
+    }
+
+    // The size of the module's file in bytes, or 0 when it is missing: what spirv() would read, without reading it.
+    std::size_t spirv_bytes(const ShaderEntry& entry) const {
+        std::error_code ec;
+        auto path = dir_;
+        path += "/" + entry.name + ".spv";
+        auto size = std::filesystem::file_size(path, ec);
+        if (ec && !entry.spv_file.empty()) {
+            auto alt = dir_;
+            alt += "/" + entry.spv_file;
+            size = std::filesystem::file_size(alt, ec);
+        }
+        return ec ? 0 : static_cast<std::size_t>(size);
+    }
+
+    // Every entry of `stage` once, in name order, from every index (an entry reachable both by its FSSM and its FSPX
+    // hash is one entry). gta6rt --precompile-pipelines builds them all.
+    std::vector<const ShaderEntry*> stage_entries(std::string_view stage) const {
+        std::map<std::pair<std::string_view, std::string_view>, const ShaderEntry*> unique;
+        for (const Entries* map : {&entries_, &fspx_entries_})
+            for (const auto& [key, list] : *map)
+                for (const ShaderEntry& e : list)
+                    if (e.stage == stage) unique.emplace(std::pair<std::string_view, std::string_view>{e.name, e.spv_file}, &e);
+        std::vector<const ShaderEntry*> out;
+        out.reserve(unique.size());
+        for (const auto& [key, e] : unique) out.push_back(e);
+        return out;
+    }
+
     // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
     std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const {
         auto path = dir_;
         path += "/" + entry.name + ".spv";
         std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file && !entry.spv_file.empty()) {
+            auto alt = dir_;
+            alt += "/" + entry.spv_file;
+            file.open(alt, std::ios::binary | std::ios::ate);
+        }
         return read_spirv_words(file, file.tellg());
     }
 
@@ -999,7 +1217,12 @@ private:
             fspx_entries_.clear();
             count_ = 0;
             fspx_count_ = 0;
+            fspx_compute_count_ = 0;
+            fspx_gfx_count_ = 0;
             bvh_count_ = 0;
+            exe_count_ = 0;
+            descriptor_hash_census_ = {};
+            descriptor_table_census_ = {};
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -1010,6 +1233,8 @@ private:
             if ((!by_fssm && !by_fspx) || !stage || stage->kind != Json::Kind::string) continue;
             ShaderEntry e;
             e.name = prefix + name;
+            if (const Json* spv = meta.find("spv"); spv && spv->kind == Json::Kind::string && !spv->string.empty())
+                e.spv_file = prefix + spv->string;
             e.stage = stage->string;
             if (by_fssm) e.fssm_sha256 = hash->string;
             if (by_fspx) e.fspx_code_sha256 = code_hash->string;
@@ -1020,12 +1245,26 @@ private:
             e.lds_bytes = u32(meta.find("lds_bytes"));
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)
                 for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = u32(&l->array[i]);
-            if (const Json* c = meta.find("uses_code_base"); c && c->kind == Json::Kind::boolean) e.uses_code_base = c->boolean;
+            // The paired FSPX translator emits uses_code_base only when true. Older
+            // key-only indexes have no such contract; retain their program bytes.
+            e.code_base_known = !e.fspx_state_sha256.empty();
+            if (const Json* c = meta.find("uses_code_base"); c && c->kind == Json::Kind::boolean) {
+                e.uses_code_base = c->boolean;
+                e.code_base_known = true;
+            }
             if (const Json* w = meta.find("wave64"); w && w->kind == Json::Kind::boolean) e.wave64 = w->boolean;
             if (const Json* g = meta.find("subgroup_size"); g && g->kind == Json::Kind::number)
                 e.subgroup_size = u32(g);
             if (const Json* x = meta.find("wave64_exchange"); x && x->kind == Json::Kind::string)
                 e.wave64_exchange = x->string;
+            if (const Json* r = meta.find("root_window"); r && r->kind == Json::Kind::object) {
+                const Json* sgpr = r->find("sgpr");
+                const Json* dword = r->find("dword");
+                e.graphics_root_window = sgpr && dword && sgpr->kind == Json::Kind::number &&
+                                         dword->kind == Json::Kind::number && u32(sgpr) == 16 && u32(dword) == 8;
+            }
+            if (const Json* wg = meta.find("wave64_graphics"); wg && wg->kind == Json::Kind::string)
+                e.wave64_graphics = wg->string;
             if (const Json* s = meta.find("input_signature"); s && s->kind == Json::Kind::array) {
                 for (const Json& item : s->array) {
                     SignatureElement element;
@@ -1072,10 +1311,27 @@ private:
             }
             e.max_vertices = u32(meta.find("max_vertices"));
             e.max_primitives = u32(meta.find("max_primitives"));
+            // Which finalizer this module's shader probes the descriptor table with (descriptor_table.h). Absent, or not
+            // a kind this runtime knows, is the old bare FNV-1a.
+            if (const Json* dh = meta.find("descriptor_hash");
+                dh && dh->kind == Json::Kind::string && dh->string == "fnv1a_fmix32")
+                ++descriptor_hash_census_.fnv1a_fmix32;
+            else
+                ++descriptor_hash_census_.fnv1a;
+            // Which entry layout this module reads (descriptor_table.h). Absent, or not a layout this runtime knows,
+            // is the old plain one.
+            if (const Json* dt = meta.find("descriptor_table");
+                dt && dt->kind == Json::Kind::string && dt->string == "tagged")
+                ++descriptor_table_census_.tagged;
+            else
+                ++descriptor_table_census_.plain;
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
+            if (by_fspx && prefix == "fspx_compute/") ++fspx_compute_count_;
+            if (by_fspx && prefix == "fspx_gfx/") ++fspx_gfx_count_;
             if (prefix == "bvh/") ++bvh_count_;
+            if (prefix == "exe/") ++exe_count_;
             ++count_;
         }
         return true;
@@ -1084,10 +1340,15 @@ private:
     std::filesystem::path dir_;
     std::size_t count_ = 0;
     std::size_t fspx_count_ = 0;
+    std::size_t fspx_compute_count_ = 0;
+    std::size_t fspx_gfx_count_ = 0;
     std::size_t bvh_count_ = 0;
+    std::size_t exe_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
     Entries entries_;
     Entries fspx_entries_;
+    DescriptorHashCensus descriptor_hash_census_;
+    DescriptorTableCensus descriptor_table_census_;
 };
 
 } // namespace leonida

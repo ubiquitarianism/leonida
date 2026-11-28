@@ -36,6 +36,11 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from types import SimpleNamespace
 
+TOOLS = os.path.dirname(os.path.abspath(__file__))
+if TOOLS not in sys.path:
+    sys.path.insert(0, TOOLS)
+from report_paths import same_report_path
+
 EXPECTED_EXE = "game_scarlett_master.exe"
 MANIFEST = "mod.json"
 WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
@@ -86,6 +91,9 @@ def joaat(name: str) -> int:
 
 def parse_model_id(text: str) -> int:
     if not isinstance(text, str) or not text:
+        raise ValueError("empty model name")
+    text = text.strip()
+    if not text:
         raise ValueError("empty model name")
     if text.startswith(("0x", "0X")):
         digits = text[2:]
@@ -477,15 +485,20 @@ def pack_mod(mods_dir: str, selector: str, output: str, force: bool) -> str:
         raise ModsError("the package output cannot be inside the mod being packed")
     if os.path.exists(output) and not force:
         raise ModsError(f"{output} exists; pass --force to replace it")
-    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     folder = os.path.basename(path)
+    members = []
+    for base, dirs, files in os.walk(path, followlinks=False):
+        dirs.sort()
+        for name in sorted(files):
+            full = os.path.join(base, name)
+            if same_report_path(output, full):
+                raise ModsError("the package output aliases a file in the mod being packed")
+            member = PurePosixPath(folder, os.path.relpath(full, path).replace(os.sep, "/"))
+            members.append((full, member.as_posix()))
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        for base, dirs, files in os.walk(path, followlinks=False):
-            dirs.sort()
-            for name in sorted(files):
-                full = os.path.join(base, name)
-                member = PurePosixPath(folder, os.path.relpath(full, path).replace(os.sep, "/"))
-                archive.write(full, member.as_posix())
+        for full, member in members:
+            archive.write(full, member)
     return output
 
 
@@ -548,12 +561,34 @@ def port_from_mods_dir(mods_dir: str | None) -> str | None:
     return None
 
 
+def swap_conflicts(mods: list[ModInfo]) -> tuple[dict[tuple[str, int], str], list[dict[str, str]]]:
+    """Find enabled archetype swaps that override an earlier enabled swap in load order."""
+    previous: dict[int, str] = {}
+    overrides: dict[tuple[str, int], str] = {}
+    conflicts: list[dict[str, str]] = []
+    for mod in mods:
+        if not mod.enabled:
+            continue
+        for idx, swap in enumerate(mod.swaps):
+            if swap.from_id in previous:
+                prev = previous[swap.from_id]
+                overrides[(mod.folder, idx)] = prev
+                conflicts.append({
+                    "from_hash": f"0x{swap.from_id:08X}",
+                    "from": swap.from_name,
+                    "winner": mod.folder,
+                    "overrides": prev,
+                })
+            previous[swap.from_id] = mod.folder
+    return overrides, conflicts
+
+
 def print_report(mods_dir: str, mods: list[ModInfo], errors: list[str]) -> None:
     print(f"mods dir: {mods_dir}")
     if not mods and not errors:
         print("no mods installed")
         return
-    previous = {}
+    overrides, _ = swap_conflicts(mods)
     for mod in mods:
         state = "enabled" if mod.enabled else "disabled"
         version = f", game {mod.game_version}" if mod.game_version else ""
@@ -561,19 +596,29 @@ def print_report(mods_dir: str, mods: list[ModInfo], errors: list[str]) -> None:
         print(f"{mod.folder}: {mod.name} [{state}; {swaps}{version}]")
         for warning in mod.warnings:
             print(f"  warning: {warning}")
-        for swap in mod.swaps:
-            conflict = ""
-            if mod.enabled and swap.from_id in previous:
-                conflict = f"  (overrides {previous[swap.from_id]})"
+        for idx, swap in enumerate(mod.swaps):
+            prev = overrides.get((mod.folder, idx))
+            conflict = f"  (overrides {prev})" if prev else ""
             print(f"  archetype {swap.from_name} (0x{swap.from_id:08X}) -> {swap.to_name} "
                   f"(0x{swap.to_id:08X}){conflict}")
-            if mod.enabled:
-                previous[swap.from_id] = mod.folder
     for error in errors:
         print(f"skipped {error}")
 
 
 def report_json(mods_dir: str, mods: list[ModInfo], errors: list[str]) -> str:
+    overrides, conflicts = swap_conflicts(mods)
+
+    def swap_entry(mod: ModInfo, idx: int, swap: Swap) -> dict[str, str]:
+        entry = {
+            "from": swap.from_name, "to": swap.to_name,
+            "from_hash": f"0x{swap.from_id:08X}", "to_hash": f"0x{swap.to_id:08X}",
+            "when": swap.when,
+        }
+        prev = overrides.get((mod.folder, idx))
+        if prev:
+            entry["overrides"] = prev
+        return entry
+
     data = {
         "mods_dir": mods_dir,
         "mods": [{
@@ -582,12 +627,9 @@ def report_json(mods_dir: str, mods: list[ModInfo], errors: list[str]) -> str:
             "enabled": m.enabled,
             "game_version": m.game_version,
             "warnings": m.warnings,
-            "archetype_swaps": [{
-                "from": s.from_name, "to": s.to_name,
-                "from_hash": f"0x{s.from_id:08X}", "to_hash": f"0x{s.to_id:08X}",
-                "when": s.when,
-            } for s in m.swaps],
+            "archetype_swaps": [swap_entry(m, idx, s) for idx, s in enumerate(m.swaps)],
         } for m in mods],
+        "conflicts": conflicts,
         "errors": errors,
     }
     return json.dumps(data, indent=2, ensure_ascii=False)
@@ -955,6 +997,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     check = commands.add_parser("check", help="validate installed manifests")
     check.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    check.add_argument("--strict", action="store_true",
+                       help="also fail on manifest warnings or swap conflicts")
 
     install = commands.add_parser("install", help="install a mod folder or ZIP/.leonidamod package")
     install.add_argument("source")
@@ -1026,8 +1070,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(report_json(mods_dir, mods, errors))
             else:
                 print_report(mods_dir, mods, errors)
-            if args.command == "check" and errors:
-                return 1
+            if args.command == "check":
+                if errors:
+                    return 1
+                if args.strict and (any(m.warnings for m in mods) or swap_conflicts(mods)[1]):
+                    return 1
         elif args.command == "install":
             mod, target = install_mod(args.source, mods_dir, args.name, args.force, args.set_enabled)
             print(f"installed {mod.folder}: {mod.name} -> {target}")

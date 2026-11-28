@@ -356,10 +356,19 @@ int main() {
         else if (name.rfind("bc1:", 0) == 0) recorded.add(name, kMissing);
     }
 
-    // Once per copy path: on the host with VK_EXT_host_image_copy where the GPU has it, and through a staging submit
-    // (a second D3D12 device on the same Vulkan device, told the extension is off).
-    for (const bool host_copy : {true, false}) {
-        const char* path = host_copy ? "host image copy" : "staging copy";
+    // Once per copy path: on the host with VK_EXT_host_image_copy where the GPU has it, through a staging submit
+    // (a second D3D12 device on the same Vulkan device, told the extension is off), and with host-transfer textures
+    // the driver gives no memory type (force_host_transfer_retry: made again without host-transfer usage, so they
+    // take the staging path, as on NVIDIA's Pascal driver).
+    struct CopyPath {
+        const char* name;
+        bool host_copy;
+        bool force_retry;
+    };
+    for (const CopyPath copy_path : {CopyPath{"host image copy", true, false}, CopyPath{"staging copy", false, false},
+                                     CopyPath{"host image copy refused by the driver", true, true}}) {
+        const char* path = copy_path.name;
+        const bool host_copy = copy_path.host_copy;
         if (host_copy && !d.host_image_copy) {
             std::printf("CPU copies (%s): no VK_EXT_host_image_copy, skipped\n", path);
             continue;
@@ -373,6 +382,7 @@ int main() {
         info.queue_family = d.family;
         info.texture_compression_bc = d.bc;
         info.host_image_copy = host_copy;
+        info.force_host_transfer_retry = copy_path.force_retry;
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
         Record ours;

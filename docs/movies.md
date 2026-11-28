@@ -1,15 +1,10 @@
 # Movies (`movies.rpf`)
 
-**Status: indexed. All 515 Bink 2 streams have been enumerated and their fixed headers read; the first two frames
-of every stream, and the start of every audio track, decode with the package's own Bink 2 library. The RPF9 table
-of contents is encrypted, but the streams can be named from the game's mount lists
-([section 8](#8-names-from-the-mount-lists)). Nothing here is a playback path yet.**
-**Status: indexed and decode-checked. All 515 Bink 2 streams have been enumerated, their fixed headers read, and
-frame 0 of every stream decoded with the package's own Bink 2 library (515/515). The RPF9 table of contents is
-encrypted, but the streams can be named from the game's mount lists ([section 8](#8-names-from-the-mount-lists)).
-Nothing here is a playback path yet.**
+All 515 Bink 2 streams have been indexed and their first two frames decoded with the package's library. The mount
+lists supply the stream names ([section 8](#8-names-from-the-mount-lists)). The title also plays the publisher
+stinger after the first A press on the account picker.
 
-Every number below was measured on the Xbox Series 1.0.2.1 package on 2026-11-21. The archive is read-only. No
+The archive measurements below use the Xbox Series 1.0.2.1 package. The archive is read-only. No
 game video, audio, frames, carved streams or reports that quote them are in this repository; the tools write only
 offsets and header facts. Commands are at the end.
 
@@ -119,8 +114,9 @@ and then only to a temporary file that is deleted.
 
 On this archive both tools find the same 515 streams, the same 8,831,336,892 bytes, 1,094,744 bytes of zero
 padding and 22,812 bytes after the last stream. Those 22,812 are 3,884 zero bytes and the 18,928-byte RPF trailer
-(counted by reading the tail directly); `bink_index.py` now counts them as zero padding and `rpf_trailer`, which for
-this archive gives `unread_bytes` 0 and zero padding 1,098,628 (derived from the measured tail, not a rerun). Running `bink_index.py` on the 515 carved
+(counted by reading the tail directly). A read-only rerun of `bink_index.py` at `2d53a8055` on 2026-11-23
+confirmed 1,098,628 bytes of zero padding, 18,928 trailer bytes and 0 unread bytes. The archive matched the
+1.0.2.1 manifest by size and SHA-256. Running `bink_index.py` on the 515 carved
 `.bk2` files finds 515 streams with zero unread bytes, which confirms the stored sizes cover each file exactly.
 
 ## 4. Decoding
@@ -326,9 +322,15 @@ The loader-side runs behind these numbers are recorded in [`runtime/test/bink_de
   returned 145,920 bytes on frame 0 and 7,680 bytes on frame 1 across all 229 tracks (with frame 2 also checked on
   1-, 2-, and 4-track samples; later frames were not swept and may return 7,680 or 0 bytes). Which language or mix
   role the game assigns to track IDs `0, 1, 2, 3` at run time remains unknown.
-- **Playback integration.** The executable is not in the package. Where the game calls `BinkOpen`, which flags it
-  passes, whether it uses `BinkDoFrameAsync`, `BinkGoto`, subtitles or the GPU path, and how it schedules movies
-  against streaming are all unknown.
+- **Startup playback.** In two boots the title opened the archive twice about 1.2 s after entering the loader.
+  The separately loaded `Bink2Scarlett.dll` opens the metadata from the title; playback retains the handle
+  and registers mapped frame buffers. The title's frame wrapper has a CPU
+  multi-worker decode and wait path and a synchronous fallback. Three rotating sets of linear R8 planes (one
+  3840×2160 and two 1920×1080 per set) reach the slot-133 texture uploader. `VS_Bink` / `PS_BinkNoAlpha` bind
+  the three plane descriptors at table offsets 0x20, 0x40 and 0x60 and draw to an RGBA8 intermediate. The UI
+  plane then reaches the swapchain. A capture after the first A matched an independently CPU-decoded frame of the
+  only 4K, 450-frame stream with 0.9994 spatial RGB correlation at 128×72. The preceding shell visual is a static
+  package image ([boot switches](boot.md)).
 - **Bink2Scarlett ABI.** [ABI over the archive](#abi-over-the-archive) gives the `HBINK` and `BINKSUMMARY` fields
   that match the stream header, the bytes `BinkGetSummary` writes (+0x00..+0x8F), and the return values of `BinkWait`, `BinkDoFrame` and
   `BinkCopyToBuffer`. The rest of both structures, the async API, the GPU API and the XAudio2 setup are not
@@ -342,8 +344,8 @@ The loader-side runs behind these numbers are recorded in [`runtime/test/bink_de
   project does not decode them.
 - **Whether every frame of all 515 streams decodes correctly.** All 515 open and decode their first two frames
   through the package's DLL ([coverage above](#decode-coverage-over-the-whole-archive)); nine were decoded as a
-  sample with frames viewed. No stream was decoded from its first frame to its last, and nothing compares the
-  output with a reference.
+  sample with frames viewed. The 450-frame publisher stinger also has a complete CPU decode and a swapchain comparison.
+  The other streams have partial coverage.
 - **Why 22,812 bytes at the end are unread.** They are not a `KB2` stream and not zero. They may be an RPF footer
   or leftover table data; the encrypted TOC prevents a name-level answer.
 - **Full-stream playback beyond frame 0.** All 515 streams open and decode frame 0 with `Bink2Scarlett.dll`

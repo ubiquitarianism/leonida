@@ -5,6 +5,8 @@
 Every input is built here (index.json, synthetic FSSM payloads in DXBC containers, hand-written .s
 listings). No game data, no llvm-mc: the one unlisted payload is disassembled by an injected fake.
 """
+import contextlib
+import io
 import json
 import os
 import struct
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -188,6 +191,121 @@ class TestSurvey(unittest.TestCase):
         # The CLI disassembles the unlisted ES payload with llvm-mc; a synthetic blob has no code, so the
         # marker count for hw 2 stays empty and the run still succeeds.
         self.assertIn("vs|0|2", document["by_stage_hw"])
+
+
+class TestJsonGuard(unittest.TestCase):
+    """--json is refused, before survey() reads the corpus, when it names an input or a directory."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dx = build(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def refuse(self, json_path):
+        """Run main() with survey() mocked; assert one error line, exit 2 and survey() never called."""
+        err = io.StringIO()
+        with mock.patch.object(V, "survey") as survey, contextlib.redirect_stderr(err):
+            code = V.main([self.dx, "--json", json_path])
+        survey.assert_not_called()
+        self.assertEqual(code, 2)
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("vs_layout_census: error: --json "), lines[0])
+        return lines[0]
+
+    @staticmethod
+    def read(path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    def test_listed_listing_refuses_and_is_unchanged(self):
+        listing_path = os.path.join(self.dx, "disasm", "a_vs.s")
+        before = self.read(listing_path)
+        self.assertIn("would overwrite the input", self.refuse(listing_path))
+        self.assertEqual(self.read(listing_path), before)
+
+    def test_indexed_container_refuses_and_is_unchanged(self):
+        container = os.path.join(self.dx, "b_vs.dxbc")
+        before = self.read(container)
+        self.assertIn("would overwrite the input", self.refuse(container))
+        self.assertEqual(self.read(container), before)
+
+    def test_index_refuses(self):
+        index_path = os.path.join(self.dx, "index.json")
+        before = self.read(index_path)
+        self.refuse(index_path)
+        self.assertEqual(self.read(index_path), before)
+
+    def test_directory_refuses_before_survey(self):
+        self.assertIn("is a directory", self.refuse(os.path.join(self.dx, "disasm")))
+
+    def test_directory_refuses_before_llvm_mc(self):
+        # survey() not mocked: the CLI would run llvm-mc (default_disasm) on b_vs's unlisted ES payload.
+        err = io.StringIO()
+        with mock.patch.object(V, "default_disasm", side_effect=fake_disasm) as disasm, \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = V.main([self.dx, "--json", self._tmp.name])
+        disasm.assert_not_called()
+        self.assertEqual(code, 2)
+
+    def test_other_spelling_of_an_input_refuses(self):
+        listing_path = os.path.join(self.dx, "disasm", "c_ms.s")
+        before = self.read(listing_path)
+        self.refuse(os.path.join(self.dx, "disasm", "..", "disasm", ".", "c_ms.s"))
+        self.assertEqual(self.read(listing_path), before)
+
+    def test_symlink_to_an_input_refuses(self):
+        link = os.path.join(self._tmp.name, "link.json")
+        container = os.path.join(self.dx, "a_vs.dxbc")
+        try:
+            os.symlink(container, link)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("no symlinks here")
+        before = self.read(container)
+        self.refuse(link)
+        self.assertEqual(self.read(container), before)
+
+    def test_hard_link_to_an_input_refuses(self):
+        link = os.path.join(self._tmp.name, "hard.json")
+        listing_path = os.path.join(self.dx, "disasm", "d_ps.s")
+        try:
+            os.link(listing_path, link)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("no hard links here")
+        before = self.read(listing_path)
+        self.refuse(link)
+        self.assertEqual(self.read(listing_path), before)
+
+    def test_other_case_refuses_on_a_case_folding_volume(self):
+        upper = os.path.join(self.dx, "disasm", "A_VS.S")
+        if not os.path.exists(upper):
+            self.skipTest("this volume keeps letter case apart")
+        before = self.read(os.path.join(self.dx, "disasm", "a_vs.s"))
+        self.refuse(upper)
+        self.assertEqual(self.read(os.path.join(self.dx, "disasm", "a_vs.s")), before)
+
+    def test_cli_refuses_with_one_line(self):
+        listing_path = os.path.join(self.dx, "disasm", "a_vs.s")
+        before = self.read(listing_path)
+        result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "scripts", "vs_layout_census.py"),
+                                 self.dx, "--json", listing_path],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.strip().splitlines(),
+                         [f"vs_layout_census: error: --json would overwrite the input {listing_path}"])
+        self.assertEqual(self.read(listing_path), before)
+
+    def test_separate_json_still_runs(self):
+        out = os.path.join(self._tmp.name, "report.json")
+        with mock.patch.object(V, "default_disasm", side_effect=fake_disasm), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = V.main([self.dx, "--json", out])
+        self.assertEqual(code, 0)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["payloads"], 5)
 
 
 if __name__ == "__main__":

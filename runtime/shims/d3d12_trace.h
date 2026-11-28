@@ -9,6 +9,9 @@
 namespace rt::d3d12_trace {
 
 inline std::atomic<bool> tracing{false};
+// Correlate an Xbox stream audit with its backend result, including concurrent creation jobs.
+inline thread_local unsigned long long last_sequence = 0;
+inline thread_local const char* stream_refusal = nullptr;
 
 inline void set_enabled(bool enable) noexcept {
     tracing.store(enable, std::memory_order_relaxed);
@@ -24,7 +27,8 @@ inline void record(const char* method, const char* outcome = "called") noexcept 
     static std::mutex mutex;
     static unsigned long long sequence = 0;
     const std::lock_guard lock(mutex);
-    std::fprintf(stderr, "[d3d12-trace] #%llu %s %s\n", ++sequence, method, outcome);
+    last_sequence = ++sequence;
+    std::fprintf(stderr, "[d3d12-trace] #%llu %s %s\n", last_sequence, method, outcome);
     std::fflush(stderr);
 }
 

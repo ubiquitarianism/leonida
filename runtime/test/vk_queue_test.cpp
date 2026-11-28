@@ -212,6 +212,16 @@ std::uint8_t pattern(std::uint32_t i, std::uint8_t seed) { return std::uint8_t(i
 int main() {
     if (check_picker() || check_queue_slots()) return 1;
 
+    // Even with a capable dedicated family, the graphics fallback must be usable. With only a caller-owned
+    // graphics queue, its actual family index (which need not be zero) determines support.
+    constexpr std::array<std::uint32_t, 2> copy_only_timestamps{64, 0};
+    constexpr std::array<std::uint32_t, 2> both_timestamps{64, 32};
+    static_assert(!copy_queue_timestamp_families_supported(copy_only_timestamps, 1, 0));
+    static_assert(!copy_queue_timestamp_families_supported(copy_only_timestamps, 1, std::nullopt));
+    static_assert(!copy_queue_timestamp_families_supported(copy_only_timestamps, 0, 1));
+    static_assert(copy_queue_timestamp_families_supported(both_timestamps, 1, 0));
+    static_assert(copy_queue_timestamp_families_supported(both_timestamps, 1, std::nullopt));
+
     vktest::Device d;
     d.all_queue_types = true;
     if (!d.create()) {

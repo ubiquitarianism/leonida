@@ -195,6 +195,29 @@ class RunTestTest(unittest.TestCase):
             self.assertEqual(status, "pass", detail)
             self.assertEqual(detail.splitlines()[1:], ["'inherited'", "'keep'", "None", "None"])
 
+    def test_wine_dll_overrides_reach_the_test_and_merge_with_the_callers(self) -> None:
+        exe = self.program("show_overrides.py", "import os\nprint(os.environ.get('WINEDLLOVERRIDES'))\n")
+        command = self.command_for(exe)
+        cases = (
+            (None, {}, {"winedbg.exe=d", "winemenubuilder.exe=d"}),
+            ("mscoree,mshtml=", {}, {"winedbg.exe=d", "winemenubuilder.exe=d", "mscoree,mshtml="}),
+            # The caller's entry for the same program wins, with or without its .exe.
+            ("winedbg=b;d3d12=n", {}, {"winedbg=b", "d3d12=n", "winemenubuilder.exe=d"}),
+            # So does the test's own CTest ENVIRONMENT.
+            ("mscoree=", {"ENVIRONMENT": ["WINEDLLOVERRIDES=winemenubuilder.exe,dxgi=n"]},
+             {"winedbg.exe=d", "winemenubuilder.exe,dxgi=n"}),
+        )
+        for given, props, expected in cases:
+            with self.subTest(given=given, props=props), mock.patch.dict(os.environ, {}):
+                os.environ.pop("WINEDLLOVERRIDES", None)
+                if given is not None:
+                    os.environ["WINEDLLOVERRIDES"] = given
+                status, detail = self.run_entry(ctest_entry("overrides", command, props))
+                self.assertEqual(status, "pass", detail)
+                self.assertEqual(set(detail.splitlines()[1].split(";")), expected)
+                # The runner's own environment is left as it was.
+                self.assertEqual(os.environ.get("WINEDLLOVERRIDES"), given)
+
     def test_malformed_ctest_environment_fails_before_launch(self) -> None:
         command = self.command_for(self.exiting(0))
         props = {"ENVIRONMENT": ["missing_equals"]}
@@ -463,14 +486,79 @@ class DriveMapTest(unittest.TestCase):
                         "--require", "compiled_in_path"]
                 out = io.StringIO()
                 with mock.patch.dict(os.environ, {"WINEPREFIX": str(self.prefix)}), \
+                        mock.patch.object(rwt, "find_wineserver", return_value=None, create=True), \
                         mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
                     code = rwt.main()
                 self.assertEqual(code, 0, out.getvalue())
                 self.assertIn("[PASS] compiled_in_path", out.getvalue())
                 self.assertFalse(os.path.lexists(self.link))
 
+    def test_simultaneous_runners_cannot_borrow_a_temporary_drive(self):
+        probe = self.root / "shared_prefix_probe.py"
+        probe.write_text(
+            "import os, time\nfrom pathlib import Path\n"
+            "prefix = Path(os.environ['WINEPREFIX'])\n"
+            "mapped = prefix / 'dosdevices' / 'd:' / 'win' / 'root' / 'runtime/build/generated/cs.spv'\n"
+            "assert mapped.read_text(encoding='utf-8') == 'spirv'\n"
+            "if os.environ.get('HOLD_PREFIX') == '1':\n"
+            "    (prefix / 'ready').touch()\n"
+            "    deadline = time.monotonic() + 15\n"
+            "    while not (prefix / 'release').exists():\n"
+            "        if time.monotonic() > deadline: raise TimeoutError('waiting for release')\n"
+            "        time.sleep(0.01)\n"
+            "    assert mapped.read_text(encoding='utf-8') == 'spirv'\n",
+            encoding="utf-8", newline="\n",
+        )
+        listing = self.root / "shared_prefix.json"
+        listing.write_text(json.dumps({"tests": [ctest_entry("mapping", [f"{WINDOWS_ROOT}/{probe.name}"])]}),
+                           encoding="utf-8", newline="\n")
+        command = [sys.executable, "-I", str(SCRIPTS / "run_wine_tests.py"), "--tests", str(listing),
+                   "--windows-root", WINDOWS_ROOT, "--root", str(self.root), "--wine", sys.executable,
+                   "--require", "mapping", "--timeout", "18"]
+        # Python is passed by absolute path. An empty PATH prevents looking up the machine's wineserver.
+        env = dict(os.environ, PATH="", WINESERVER="", WINEPREFIX=str(self.prefix), HOLD_PREFIX="1")
+        alias = self.prefix.with_name("same-prefix")
+        alias.symlink_to(self.prefix, target_is_directory=True)
+        other = self.prefix.with_name("other-prefix")
+        (other / "dosdevices").mkdir(parents=True)
+
+        def run(prefix):
+            return subprocess.run(command, env=dict(env, WINEPREFIX=str(prefix), HOLD_PREFIX="0"),
+                                  capture_output=True, text=True, timeout=8)
+
+        with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as owner:
+            try:
+                deadline = time.monotonic() + 5
+                while not (self.prefix / "ready").exists() and owner.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue((self.prefix / "ready").exists(), "owner never acquired the temporary mapping")
+                busy = run(alias)
+                self.assertEqual(busy.returncode, 2, busy.stdout + busy.stderr)
+                self.assertIn("already running", busy.stderr)
+                self.assertTrue(self.link.is_symlink())
+                independent = run(other)
+                self.assertEqual(independent.returncode, 0, independent.stdout + independent.stderr)
+            finally:
+                (self.prefix / "release").touch()
+                output, _ = owner.communicate(timeout=8)
+            self.assertEqual(owner.returncode, 0, output)
+        self.assertFalse(os.path.lexists(self.link))
+        retry = run(alias)
+        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+        self.assertFalse(os.path.lexists(self.link))
+
 
 class MainTest(unittest.TestCase):
+    def test_resource_lock_inventory_requires_strings(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(io.StringIO()):
+            inventory = Path(tmp) / "ctest.json"
+            for value, accepted in ((None, False), (4, False), (False, False), ([{}], False),
+                                    (["gpu", 2], False), ("gpu", True), (["gpu", "display"], True), ([], True)):
+                with self.subTest(value=value):
+                    row = ctest_entry("fixture", None, {"RESOURCE_LOCK": value})
+                    inventory.write_text(json.dumps({"tests": [row]}), encoding="utf-8", newline="\n")
+                    self.assertEqual(rwt.read_tests(str(inventory)), [row] if accepted else None)
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
@@ -482,6 +570,11 @@ class MainTest(unittest.TestCase):
         env = mock.patch.dict(os.environ, {"WINEPREFIX": str(self.root / "no-prefix")})
         env.start()
         self.addCleanup(env.stop)
+        # Never start the machine's real wineserver; the tests that need one give a fake.
+        self.real_find_wineserver = getattr(rwt, "find_wineserver", None)
+        server = mock.patch.object(rwt, "find_wineserver", return_value=None, create=True)
+        server.start()
+        self.addCleanup(server.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -510,6 +603,168 @@ class MainTest(unittest.TestCase):
         code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "ok")
         self.assertEqual(code, 0)
         self.assertIn("1 passed, 0 failed, 0 skipped under Wine (1 tests)", out)
+
+    def fake_wineserver(self, *, first_code=0):
+        """An executable `wineserver` that logs its arguments; `-p` exits with first_code the first time."""
+        log = self.root / "wineserver.log"
+        path = self.root / "bin" / "wineserver"
+        path.parent.mkdir()
+        path.write_text(f"#!{sys.executable}\nimport os, sys\n"
+                        f"log = {str(log)!r}\n"
+                        "first = not os.path.exists(log)\n"
+                        "open(log, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                        f"sys.exit({first_code} if first and sys.argv[1:] == ['-p'] else 0)\n",
+                        encoding="utf-8", newline="\n")
+        path.chmod(0o755)
+        return path, log
+
+    @unittest.skipUnless(os.name == "posix", "the fake wineserver is a script with a #! line")
+    def test_one_wineserver_is_kept_alive_and_stopped_after_the_run(self):
+        server, log = self.fake_wineserver()
+        # A "wine" that logs `wineboot` (the services start-up, which must not hold a test's output open) and runs
+        # everything else.
+        wine = self.root / "fake_wine.py"
+        wine.write_text("import runpy, sys\n"
+                        "if sys.argv[1:] == ['wineboot']:\n"
+                        f"    open({str(log)!r}, 'a').write('wine wineboot %s\\n' % sys.stdout.isatty())\n"
+                        "    sys.exit(0)\n"
+                        "sys.argv = sys.argv[1:]\n"
+                        "runpy.run_path(sys.argv[0], run_name='__main__')\n", encoding="utf-8", newline="\n")
+        entries = [ctest_entry("ok", self.command("ok.py")), ctest_entry("bad", self.command("bad.py"))]
+        with mock.patch.dict(os.environ, {"WINESERVER": str(server)}), \
+                mock.patch.object(rwt, "find_wineserver", self.real_find_wineserver):
+            code, out, _ = self.run_main(entries, "--require", "bad", wine=f"{sys.executable} {wine}")
+        self.assertEqual(code, 1)
+        self.assertIn("[PASS] ok", out)
+        self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["-p", "wine wineboot False", "-k"])
+        self.assertIn("wineserver kept alive for the run", out)
+
+    @unittest.skipUnless(os.name == "posix", "the fake wineserver is a script with a #! line")
+    def test_the_wineserver_is_stopped_when_the_run_is_interrupted(self):
+        server, log = self.fake_wineserver()
+        with mock.patch.dict(os.environ, {"WINESERVER": str(server)}), \
+                mock.patch.object(rwt, "find_wineserver", self.real_find_wineserver), \
+                mock.patch.object(rwt, "run_test", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            self.run_main([ctest_entry("ok", self.command("ok.py"))])
+        self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["-p", "-k"])
+
+    @unittest.skipUnless(os.name == "posix", "the fake wineserver is a script with a #! line")
+    def test_a_server_still_shutting_down_is_waited_for(self):
+        server, log = self.fake_wineserver(first_code=2)
+        with mock.patch.dict(os.environ, {"WINESERVER": str(server)}), \
+                mock.patch.object(rwt, "find_wineserver", self.real_find_wineserver):
+            code, _, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))])
+        self.assertEqual(code, 0)
+        self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["-p", "-w", "-p", "-k"])
+
+    def test_an_existing_persistent_server_is_warmed_but_not_stopped(self):
+        with mock.patch.object(rwt.KeptServer, "_run", side_effect=[2, 1]) as server, \
+                mock.patch.object(rwt.subprocess, "run") as warm:
+            kept = rwt.KeptServer("wineserver", [sys.executable])
+            with kept:
+                self.assertFalse(kept.started)
+                self.assertIn("used and left running", kept.note)
+        self.assertEqual(server.call_args_list, [mock.call("-p"), mock.call("-w", timeout=15.0)])
+        warm.assert_called_once()
+        self.assertEqual(warm.call_args.args[0], [sys.executable, "wineboot"])
+        self.assertIs(warm.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(warm.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertEqual(warm.call_args.kwargs["timeout"], 120)
+
+    def test_no_wineserver_is_one_line_and_the_run_goes_on(self):
+        code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "ok")
+        self.assertEqual(code, 0)
+        self.assertIn("no wineserver found: each test starts its own\n", out)
+        self.assertIn("[PASS] ok", out)
+
+    def timed(self, name, *, props=None, code=0, sleep=0.3):
+        """A test that logs when it starts and ends, to see which tests overlapped. Each test has its own log:
+        appends from several processes to one file are not atomic on Windows, so a shared log loses or merges
+        lines when tests run at the same time."""
+        timing = self.root / "timing"
+        timing.mkdir(exist_ok=True)
+        (self.artifact / f"{name}.py").write_text(
+            "import os, sys, time\n"
+            "log = os.environ['TIMING_LOG']\n"
+            f"open(log, 'a').write('{name} start %r\\n' % time.monotonic())\n"
+            f"time.sleep({sleep})\n"
+            f"open(log, 'a').write('{name} end %r\\n' % time.monotonic())\n"
+            f"sys.exit({code})\n", encoding="utf-8", newline="\n")
+        props = dict(props or {})
+        props["ENVIRONMENT"] = ["TIMING_LOG=" + str(timing / f"{name}.log")]
+        return ctest_entry(name, self.command(f"{name}.py"), props)
+
+    def intervals(self):
+        spans: dict[str, list[float]] = {}
+        for log in sorted((self.root / "timing").glob("*.log")):
+            for line in log.read_text(encoding="utf-8").splitlines():
+                name, _, when = line.split()
+                spans.setdefault(name, []).append(float(when))
+        return spans
+
+    @staticmethod
+    def overlap(a, b):
+        return a[0] < b[1] and b[0] < a[1]
+
+    @staticmethod
+    def most_at_once(spans):
+        events = sorted([(s, 1) for s, _ in spans.values()] + [(e, -1) for _, e in spans.values()])
+        level = peak = 0
+        for _, step in events:
+            level += step
+            peak = max(peak, level)
+        return peak
+
+    def test_jobs_runs_that_many_tests_at_a_time(self):
+        entries = [self.timed(f"t{i}") for i in range(6)]
+        code, out, _ = self.run_main(entries, "--jobs", "3")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.most_at_once(self.intervals()), 3)
+        self.assertIn("6 passed, 0 failed, 0 skipped under Wine (6 tests)", out)
+
+    def test_jobs_keeps_locks_serial_tests_and_dependencies(self):
+        entries = [
+            self.timed("lock_a", props={"RESOURCE_LOCK": ["shader_library"]}),
+            self.timed("lock_b", props={"RESOURCE_LOCK": ["other", "shader_library"]}),
+            self.timed("free_1"), self.timed("free_2"),
+            self.timed("alone", props={"RUN_SERIAL": "ON"}),
+            self.timed("after", props={"DEPENDS": ["free_1"]}),
+        ]
+        code, out, _ = self.run_main(entries, "--jobs", "4")
+        self.assertEqual(code, 0, out)
+        spans = self.intervals()
+        self.assertFalse(self.overlap(spans["lock_a"], spans["lock_b"]), spans)
+        for name in spans:
+            if name != "alone":
+                self.assertFalse(self.overlap(spans["alone"], spans[name]), (name, spans))
+        self.assertGreaterEqual(spans["after"][0], spans["free_1"][1])
+        self.assertGreater(self.most_at_once(spans), 1)
+
+    def test_jobs_one_and_parallel_runs_report_as_before(self):
+        entries = [self.timed("slow", sleep=0.5), self.timed("fails", code=3, sleep=0.0),
+                   self.timed("fast", sleep=0.0)]
+        outputs, summaries = [], []
+        for extra in ((), ("--jobs", "1"), ("--jobs", "3")):
+            summary = self.root / f"summary{len(summaries)}.md"
+            code, out, _ = self.run_main(entries, "--summary", str(summary), *extra)
+            self.assertEqual(code, 0)
+            # Leave out the indented detail lines, which carry each run's own timing.
+            outputs.append([line for line in out.splitlines() if not line.startswith("    ")])
+            summaries.append(summary.read_text(encoding="utf-8"))
+        self.assertEqual(outputs[0][-5:], ["[PASS] slow", "[FAIL] fails", "[PASS] fast", "",
+                                           "2 passed, 1 failed, 0 skipped under Wine (3 tests)"])
+        self.assertEqual(outputs[1], outputs[0])
+        self.assertEqual(outputs[2], outputs[0])
+        self.assertEqual(summaries[1], summaries[0])
+        self.assertEqual(summaries[2], summaries[0])
+
+    def test_jobs_must_be_a_positive_whole_number(self):
+        self.assertEqual(self.run_main([ctest_entry("ok", self.command("ok.py"))], "--jobs", "2")[0], 0)
+        for value in ("0", "-2", "two", "1.5"):
+            with self.subTest(value=value), self.assertRaises(SystemExit), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.run_main([ctest_entry("ok", self.command("ok.py"))], "--jobs", value)
 
     def test_child_sees_eof_even_when_the_runner_has_input(self):
         (self.artifact / "stdin.py").write_text(
@@ -551,6 +806,17 @@ class MainTest(unittest.TestCase):
         code, out, _ = self.run_main([ctest_entry("bad", self.command("bad.py"))], "--require", "bad")
         self.assertEqual(code, 1)
         self.assertIn("required tests that did not pass: bad", out)
+
+    def test_required_name_checks_every_result_with_that_name(self):
+        entries = [ctest_entry("shared", self.command("bad.py")),
+                   ctest_entry("shared", self.command("ok.py"))]
+        summary = self.root / "summary.md"
+        code, out, _ = self.run_main(entries, "--require", "shared", "--summary", str(summary))
+        self.assertEqual(code, 1, out)
+        self.assertIn("1 passed, 1 failed, 0 skipped under Wine (2 tests)", out)
+        self.assertIn("required tests that did not pass: shared", out)
+        table = summary.read_text(encoding="utf-8")
+        self.assertIn("| `shared` | fail | yes |\n| `shared` | pass | yes |", table)
 
     def test_a_required_test_that_is_not_listed_exits_one(self):
         code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "absent")
@@ -712,6 +978,21 @@ class MainTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as ctx:
                     self.run_main([ctest_entry("ok", self.command("ok.py"))], "--timeout", text)
                 self.assertEqual(ctx.exception.code, 2)
+
+    def test_timeout_over_process_limit_is_rejected_before_launch(self):
+        entries = [ctest_entry("ok", self.command("ok.py"))]
+        with mock.patch.object(rwt, "run_test_process", side_effect=AssertionError("test was launched")):
+            for text in ("2147484", "1e100"):
+                with self.subTest(text=text):
+                    with self.assertRaises(SystemExit) as ctx:
+                        self.run_main(entries, "--timeout", text)
+                    self.assertEqual(ctx.exception.code, 2)
+
+    def test_largest_portable_timeout_runs_a_test(self):
+        entries = [ctest_entry("ok", self.command("ok.py"))]
+        code, out, _ = self.run_main(entries, "--timeout", "2147483", "--require", "ok")
+        self.assertEqual(code, 0, out)
+        self.assertIn("[PASS] ok", out)
 
     def test_a_blank_wine_is_a_usage_error(self):
         with self.assertRaises(SystemExit) as ctx:

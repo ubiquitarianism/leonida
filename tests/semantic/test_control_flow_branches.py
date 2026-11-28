@@ -409,12 +409,18 @@ class StructuredBranchInterp:
 
         ip = 0
         steps = 0
+        block = came_from = None
         while ip < len(self.insns):
             steps += 1
             if steps > max_steps:
                 raise BranchExecutionLimitError(f"Step limit {max_steps} exceeded: possible infinite loop")
             res, op, a, _ = self.insns[ip]
-            if op in _IGNORED or op == "OpLabel":
+            if op == "OpLabel":
+                # A block is only entered through a branch, so the block left last is the predecessor.
+                came_from, block = block, res
+                ip += 1
+                continue
+            if op in _IGNORED:
                 ip += 1
                 continue
             if op in ("OpReturn", "OpFunctionEnd"):
@@ -498,6 +504,12 @@ class StructuredBranchInterp:
                 values[res] = val(a[2]) if cond else val(a[3])
             elif op == "OpCopyObject":
                 values[res] = val(a[1])
+            elif op == "OpPhi":
+                # The loop guard's iteration counter: the value paired with the predecessor block.
+                incoming = dict(zip(a[2::2], a[1::2]))
+                if came_from not in incoming:
+                    raise UnsupportedConstruct(f"OpPhi {res} has no value for predecessor {came_from}")
+                values[res] = val(incoming[came_from])
             elif op == "OpBitcast":
                 values[res] = val(a[1])
             elif op == "OpCompositeConstruct":

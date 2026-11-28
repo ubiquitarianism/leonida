@@ -1,0 +1,20 @@
+GPU:        NVIDIA GeForce GTX 1080 (Pascal, PCI 10de:1b80), subgroup 32..32
+Driver:     NVIDIA 582.78 (proprietary), Vulkan device API 1.4.312
+OS:         Windows 11 Pro, 10.0.26300
+Commit:     32950551e83760c6ccf1564cd22737dfe4852d78 (main)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools, AMDGPU target), SPIRV-Tools v2026.4,
+            CMake 4.4.4, Ninja 1.13.2, MSVC 19.44, Python 3.14.7, RelWithDebInfo
+run_gpu_tests.py: 261 shaders: 260 translated, 260 pass spirv-val
+            native:                 193/252 passed, 59 skipped, 0 failed
+            LEONIDA_W64_EMULATE=1:  224/252 passed, 28 skipped, 0 failed
+Skipped:    Both runs: six mesh shader cases (no VK_EXT_mesh_shader); five pixel shader cases
+            requiring barycentric inputs, including ps_ij_computed, which was not translated;
+            one 64-wide fragment subgroup case; and 16 cases run by other test programs.
+            Native additionally skipped 31 cases needing a 64-wide compute subgroup. The emulated
+            run passed those cases.
+Notes:
+- The Vulkan test tools were built from the same commit with LEONIDA_BUILD_WINDOWS_RUNTIME=OFF.
+  The separate D3D12 and w64_graphics tests were not run.
+- Wave64 VS/PS/GS on 32-wide subgroups: tier A: 1, tier C: 1. Tier C is not exact there.
+- No game files were used. The suite uses its handwritten fixtures.
+- AI-assisted: Codex built the tools, ran the tests and prepared this report.

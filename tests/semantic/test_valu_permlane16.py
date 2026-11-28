@@ -675,7 +675,8 @@ class EmulationAndFindingTests(unittest.TestCase):
                                      64, emulate=True)
         spv_x16, gen_x16 = translate_cs("cs_w64_emu_permx16", base + ["v_permlanex16_b32 v2, v1, s4, s5"] + tail,
                                        64, emulate=True)
-        for spv, gen in ((spv_16, gen_16), (spv_x16, gen_x16)):
+        vals64 = [100 + lane for lane in range(64)]
+        for spv, gen, x16 in ((spv_16, gen_16, False), (spv_x16, gen_x16, True)):
             self.assertTrue(gen.wave64 and gen.emulate)
             self.assertNotIn("OpGroupNonUniform", spv)
             self.assertNotIn("%sg_lane", spv)
@@ -685,13 +686,16 @@ class EmulationAndFindingTests(unittest.TestCase):
             self.assertRegex(spv, r"OpBitFieldUExtract %uint %\w+ %\w+ %c4\b")
             self.assertIn("OpBitwiseAnd %uint %", spv)
             self.assertIn("%cfffffff0", spv)
-            # spirv_mini_interp.py deliberately rejects the emulated Workgroup/loop scheduler.
-            with self.assertRaises(si.UnsupportedConstruct):
-                si.run_workgroup(
-                    spv, 64, 32,
-                    inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i % 32},
-                    push_constants=VSHARP + [0] * 28, memory={},
-                )
+            # The emulated Workgroup/loop scheduler runs in spirv_mini_interp.py (it models OpSwitch): the result
+            # must be the ISA model's.
+            mem = _Heap()
+            si.run_workgroup(
+                spv, 64, 32,
+                inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i % 32},
+                push_constants=VSHARP + [0] * 28, memory=mem,
+            )
+            got = [mem.get(lane * 4) for lane in range(64)]
+            self.assertEqual(got, ref_permlane(x16, vals64, [0] * 64, ID_S1, ID_S2, ALL64))
 
         # v_permlanex16_b32 XORs the masked half base with 16 (%c10); v_permlane16_b32 does not.
         xor16_pat = r"OpBitwiseAnd %uint %\w+ %cfffffff0\n\s*%\w+ = OpBitwiseXor %uint %\w+ %c10\b"

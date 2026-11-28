@@ -4,6 +4,7 @@
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_indirect_draw_policy.h"
 #include "../shims/d3d12_trace.h"
 #include "../src/gfx10_descriptors.h"
 
@@ -37,6 +38,16 @@ static_assert(sizeof(leonida::DrawViews::vertex_buffers) == sizeof(leonida::Vert
 static_assert(sizeof(leonida::Draw) < sizeof(leonida::DrawViews));
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--indirect-policy") == 0) {
+        // Each CTest is a fresh process. This branch creates no graphics device.
+        const bool unset = !std::strcmp(argv[2], "unset"), off = !std::strcmp(argv[2], "off");
+        if (unset) SetEnvironmentVariableA("LEONIDA_INDIRECT_DRAWS", nullptr);
+        else EXPECT(SetEnvironmentVariableA("LEONIDA_INDIRECT_DRAWS", !std::strcmp(argv[2], "uppercase") ? "OFF" : argv[2]));
+        EXPECT(rt::d3d12::indirect_draws_disabled() == off);
+        EXPECT(SetEnvironmentVariableA("LEONIDA_INDIRECT_DRAWS", off ? "on" : "off"));
+        EXPECT(rt::d3d12::indirect_draws_disabled() == off);  // process-cached, not re-read per draw
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--trace-d3d12") == 0) rt::d3d12_trace::set_enabled(true);
     else if (argc != 1) return 2;
     using namespace leonida;
@@ -54,9 +65,18 @@ int main(int argc, char** argv) {
     constexpr VkDeviceSize depth_offset = texels * 4, stencil_offset = depth_offset + texels * 4;
     const VkBuffer buffer = d.buffer(stencil_offset + texels, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapped);
     EXPECT(rt && ds && buffer && d.depth_format_usable(VK_FORMAT_D32_SFLOAT_S8_UINT));
+    // A second depth buffer, for a barrier into LAYOUT_UNDEFINED (a release) and the use that follows it.
+    const VkImage released =
+        d.image(VK_FORMAT_D32_SFLOAT_S8_UINT, size, size, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    void* released_mapped = nullptr;
+    constexpr VkDeviceSize released_stencil_offset = texels * 4;
+    const VkBuffer released_buffer =
+        d.buffer(released_stencil_offset + texels, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &released_mapped);
+    EXPECT(released && released_buffer);
     EXPECT(d.run([&](VkCommandBuffer cb) {
         d.initial_layout(cb, rt, VK_IMAGE_ASPECT_COLOR_BIT, 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         d.initial_layout(cb, ds, depth_stencil_aspects, 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        d.initial_layout(cb, released, depth_stencil_aspects, 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         return true;
     }));
 
@@ -79,6 +99,13 @@ int main(int argc, char** argv) {
     const TargetView dsv{rt::d3d12::resource_id(ds_resource), 0, 0, 1};
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle{reinterpret_cast<SIZE_T>(&rtv)};
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle{reinterpret_cast<SIZE_T>(&dsv)};
+    auto* released_resource = reinterpret_cast<ID3D12Resource*>(std::uintptr_t{0x3000});
+    ResourceBinding released_binding = ds_binding;
+    released_binding.image = released;
+    context.add_resource(rt::d3d12::resource_id(released_resource), released_binding,
+                         VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    const TargetView released_dsv{rt::d3d12::resource_id(released_resource), 0, 0, 1};
+    const D3D12_CPU_DESCRIPTOR_HANDLE released_dsv_handle{reinterpret_cast<SIZE_T>(&released_dsv)};
 
     {
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -338,6 +365,66 @@ int main(int argc, char** argv) {
         EXPECT(context.layout(rt::d3d12::resource_id(ds_resource), 0) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         EXPECT(context.layout(rt::d3d12::resource_id(ds_resource), 1) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
+        // A barrier into LAYOUT_UNDEFINED releases a texture: its contents are no longer needed (the retail title
+        // ends a depth buffer's use this way, #984). The list closes and runs. Vulkan has no transition into
+        // UNDEFINED, so both planes stay in the layout they were in.
+        const auto released_barrier = [&](D3D12_BARRIER_SYNC sync_before, D3D12_BARRIER_SYNC sync_after,
+                                          D3D12_BARRIER_ACCESS access_before, D3D12_BARRIER_ACCESS access_after,
+                                          D3D12_BARRIER_LAYOUT layout_before, D3D12_BARRIER_LAYOUT layout_after) {
+            D3D12_TEXTURE_BARRIER b{};
+            b.SyncBefore = sync_before;
+            b.SyncAfter = sync_after;
+            b.AccessBefore = access_before;
+            b.AccessAfter = access_after;
+            b.LayoutBefore = layout_before;
+            b.LayoutAfter = layout_after;
+            b.pResource = released_resource;
+            b.Subresources = {0xffffffff, 0, 0, 0, 0, 0};
+            D3D12_BARRIER_GROUP g{};
+            g.Type = D3D12_BARRIER_TYPE_TEXTURE;
+            g.NumBarriers = 1;
+            g.pTextureBarriers = &b;
+            list->Barrier(1, &g);
+        };
+        // Executes the closed list and waits until the queue has signalled `value` on `done`.
+        const auto run_list = [&](UINT64 value) {
+            queue->ExecuteCommandLists(1, lists);
+            if (rt::d3d12::last_execute_result(queue.p) != ReplayResult::success) return false;
+            if (FAILED(queue->Signal(done.p, value))) return false;
+            const HANDLE finished = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            const bool ok = finished && SUCCEEDED(done->SetEventOnCompletion(value, finished)) &&
+                            WaitForSingleObject(finished, 5000) == WAIT_OBJECT_0;
+            if (finished) CloseHandle(finished);
+            return ok;
+        };
+        const auto released_id = rt::d3d12::resource_id(released_resource);
+        const auto depth_and_stencil = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        list->ClearDepthStencilView(released_dsv_handle, depth_and_stencil, 0.25f, 0x07, 0, nullptr);
+        released_barrier(D3D12_BARRIER_SYNC_DEPTH_STENCIL, D3D12_BARRIER_SYNC_NONE,
+                         D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE, D3D12_BARRIER_ACCESS_NO_ACCESS,
+                         D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE, D3D12_BARRIER_LAYOUT_UNDEFINED);
+        EXPECT(list->Close() == S_OK);
+        EXPECT(run_list(2));
+        EXPECT(context.layout(released_id, 0) == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        EXPECT(context.layout(released_id, 1) == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+        // Its next use starts from UNDEFINED, which discards; what is written after that is what is read back.
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        released_barrier(D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_SYNC_DEPTH_STENCIL, D3D12_BARRIER_ACCESS_NO_ACCESS,
+                         D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE, D3D12_BARRIER_LAYOUT_UNDEFINED,
+                         D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE);
+        list->ClearDepthStencilView(released_dsv_handle, depth_and_stencil, 0.75f, 0x09, 0, nullptr);
+        released_barrier(D3D12_BARRIER_SYNC_DEPTH_STENCIL, D3D12_BARRIER_SYNC_COPY,
+                         D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE, D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                         D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE, D3D12_BARRIER_LAYOUT_COPY_SOURCE);
+        EXPECT(list->Close() == S_OK);
+        EXPECT(run_list(3));
+        EXPECT(context.layout(released_id, 0) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        EXPECT(context.layout(released_id, 1) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
         // A depth outside [0, 1] is recorded as given and the list closes, as on WARP (3ce953ae8;
         // d3d12_close_parity_test "ClearDepthStencilView depth 1.5", d3d12_clear_test reads the texels back).
         EXPECT(SUCCEEDED(allocator->Reset()));
@@ -383,6 +470,10 @@ int main(int argc, char** argv) {
                     depth_offset);
         d.read_back(cb, ds, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_STENCIL_BIT, size, size, 1, buffer,
                     stencil_offset);
+        d.read_back(cb, released, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT, size, size, 1,
+                    released_buffer, 0);
+        d.read_back(cb, released, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_STENCIL_BIT, size, size, 1,
+                    released_buffer, released_stencil_offset);
         return true;
     }));
     const auto* data = static_cast<const std::uint8_t*>(mapped);
@@ -404,6 +495,19 @@ int main(int argc, char** argv) {
         }
     }
     EXPECT(!mismatches);
+    // The depth buffer that was released and used again holds what was written after the release.
+    const auto* released_data = static_cast<const std::uint8_t*>(released_mapped);
+    unsigned released_mismatches = 0;
+    for (std::uint32_t i = 0; i < texels; ++i) {
+        float depth;
+        std::memcpy(&depth, released_data + i * 4, 4);
+        if (depth != 0.75f || released_data[released_stencil_offset + i] != 0x09) {
+            if (released_mismatches++ < 4)
+                std::fprintf(stderr, "released texel %u: depth %f stencil 0x%02x\n", i, depth,
+                             unsigned(released_data[released_stencil_offset + i]));
+        }
+    }
+    EXPECT(!released_mismatches);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;

@@ -304,6 +304,54 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("no tests ran", p.stderr)
 
 
+class SourceOption(unittest.TestCase):
+    """--source mutates another tools/ file; a test outside tests/semantic runs from a copy of the repository."""
+
+    def test_source_must_be_a_python_file_under_tools(self):
+        path, rel = sm.resolve_source(os.path.join("tools", "cfg_structure.py"))
+        self.assertEqual(rel, "cfg_structure.py")
+        self.assertTrue(os.path.isfile(path))
+        for bad in (os.path.join("docs", "design.md"), os.path.join("tools", "no_such_tool.py"),
+                    os.path.join("tools", os.pardir, "make_game.py")):
+            with self.subTest(source=bad), self.assertRaises(LookupError):
+                sm.resolve_source(bad)
+
+    def run_probe(self, checks):
+        # A plain script in tests/ (not tests/semantic) that imports tools/ by path, as test_cfg_structure.py does:
+        # LEONIDA_TOOLS_DIR cannot reach it, so the mutant has to sit in the tools/ of the copy it runs from.
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import cfg_structure as S
+        graphs = ([[1, 2], [3], [3], []], [[0, 1], []], [[1], [1, 2], [0, 3], []], [[1], [2], []])
+        cases = [(succ, S.depth(S.structure(succ))) for succ in graphs]
+        body = ("import os, sys\n"
+                "sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools'))\n"
+                "import cfg_structure as S\n"
+                f"CASES = {cases!r}\n"
+                "if __name__ == '__main__':\n"
+                "    for succ, want in CASES:\n"
+                + ("        assert S.depth(S.structure(succ)) == want, (succ, want)\n" if checks else "        pass\n"))
+        probe = os.path.join(ROOT, "tests", f"_semantic_mutants_source_probe_{os.getpid()}.py")
+        try:
+            with open(probe, "w", encoding="utf-8", newline="\n") as f:
+                f.write(body)
+            p = subprocess.run([sys.executable, "-I", TOOL, probe, "--source", os.path.join("tools", "cfg_structure.py"),
+                                "--function", "depth"], capture_output=True, text=True, timeout=600)
+        finally:
+            os.remove(probe)
+        return p.returncode, p.stdout + p.stderr
+
+    def test_a_script_outside_tests_semantic_sees_the_mutant(self):
+        code, out = self.run_probe(checks=True)
+        self.assertNotEqual(code, 2, out)
+        self.assertIn("cfg_structure.py lines", out)
+        self.assertRegex(out, r"caught\s+line \d+")
+
+    def test_a_script_that_checks_nothing_lets_every_mutant_survive(self):
+        code, out = self.run_probe(checks=False)
+        self.assertEqual(code, 1, out)
+        self.assertNotRegex(out, r"caught\s+line \d+")
+
+
 class RunTestEncoding(unittest.TestCase):
     def test_utf8_bytes_outside_windows_codepage_do_not_crash(self):
         with tempfile.TemporaryDirectory() as tmp:

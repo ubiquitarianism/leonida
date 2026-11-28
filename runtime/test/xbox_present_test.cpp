@@ -368,15 +368,17 @@ int main() {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
         auto presenter = rt::d3d12::create_window_presenter(inner, window);
         EXPECT(presenter);
         EXPECT(presenter->enable_capture());
 
         leonida::ManualFrameClock clock;
-        auto owner = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), &clock);
+        auto owner = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), &clock,
+                                                                   rt::d3d12_xs::device_frame_tokens(device.p));
         rt::d3d12::XboxPresentation& xbox = *owner;
+        EXPECT(xbox.pacer().token_source() == rt::d3d12_xs::device_frame_tokens(device.p));
 
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
@@ -470,6 +472,29 @@ int main() {
             return rt::d3d12::XboxPresentPlaneParameters{t, 1, &s.resource.p, rect, 0};
         };
 
+        // Shell art covers startup clears. A single coloured source texel hands off the entire frame;
+        // later black frames must stay black. These shell presents consume no Xbox frame tokens.
+        {
+            Source shell, title;
+            const FLOAT black[4] = {0, 0, 0, 1};
+            EXPECT(make_source(DXGI_FORMAT_R8G8B8A8_UNORM, shell) && fill(shell, red));
+            EXPECT(make_source(DXGI_FORMAT_R8G8B8A8_UNORM, title) && fill(title, black));
+            auto& launch = xbox.presenter();
+            EXPECT(launch.present_splash(shell.resource.p));
+            EXPECT(SUCCEEDED(launch.present(title.resource.p, 1)));
+            EXPECT(launch.read_back(frame.bytes, &frame.extent, &frame.format));
+            EXPECT(region_is(frame, 0, 0, width, height, {255, 0, 0}));
+            const D3D12_RECT corner{0, 0, 1, 1};
+            EXPECT(fill(title, blue, 1, &corner));
+            EXPECT(SUCCEEDED(launch.present(title.resource.p, 1)));
+            EXPECT(launch.read_back(frame.bytes, &frame.extent, &frame.format));
+            EXPECT(region_is(frame, 0, 0, 1, 1, {0, 0, 255}));
+            EXPECT(region_is(frame, width - 1, height - 1, width, height, {0, 0, 0}));
+            EXPECT(SUCCEEDED(launch.present_blank(1)));
+            EXPECT(launch.read_back(frame.bytes, &frame.extent, &frame.format));
+            EXPECT(region_is(frame, 0, 0, width, height, {0, 0, 0}));
+        }
+
         // 1 plane, solid colour, RGBA8.
         Source rgba;
         EXPECT(make_source(DXGI_FORMAT_R8G8B8A8_UNORM, rgba));
@@ -515,8 +540,9 @@ int main() {
         }
         EXPECT(grab(frame));
         EXPECT(region_is(frame, 0, 0, width, height, {0, 0, 0}, 0));
-        // (The blank frame is a frame in flight like any other: with latency 1 the next wait needs it shown first.)
-        EXPECT(xbox.pacer().frames_in_flight() == 2);  // the first frame and the blank one
+        // (The blank frame is a frame in flight like any other, but at most `latency` frames are: with latency 1 it
+        // replaces the first frame, which still waits for its vblank, and the next wait needs it shown first.)
+        EXPECT(xbox.pacer().frames_in_flight() == 1);
         clock.advance_us(period);
         std::printf("0 planes (blank): ok\n");
 
@@ -664,6 +690,22 @@ int main() {
         EXPECT(grab(frame));
         EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
         EXPECT(xbox.presents() == presented_before + 3);
+
+        using DeviceWaitFrameEventFn = HRESULT(WINAPI*)(void*, UINT, UINT, void*, UINT, std::uint64_t*);
+        const auto device_wait =
+            reinterpret_cast<DeviceWaitFrameEventFn>((*reinterpret_cast<void***>(device.p))[80]);
+        std::uint64_t device_token = 0;
+        EXPECT(device_wait(device.p, rt::d3d12::xbox_frame_event_origin, 0, nullptr, 0, &device_token) == S_OK);
+        EXPECT(device_token != 0 && device_token == xbox.pacer().tokens_issued());
+        plane = plane_of(second, device_token + 1);
+        EXPECT(xbox.PresentX(1, &plane, nullptr) == E_INVALIDARG);
+        EXPECT(xbox.presents() == presented_before + 3);
+        plane = plane_of(rgba, device_token);
+        EXPECT(xbox.PresentX(1, &plane, nullptr) == S_OK);
+        EXPECT(xbox.presents() == presented_before + 4);
+        EXPECT(grab(frame));
+        EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
+        std::printf("a token from device slot 80 (WaitFrameEventX) presents: ok\n");
 
         // Sources the GPU cannot blit are refused with DXGI_ERROR_UNSUPPORTED and present nothing: multisampled,
         // integer and block-compressed. The last frame stays on screen and the token is still usable afterwards.

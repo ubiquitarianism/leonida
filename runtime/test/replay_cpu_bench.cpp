@@ -625,6 +625,44 @@ int main(int argc, char** argv) {
             ++failures;
         }
 
+        // A pending PSO must skip only its own commands. Reuse the same list after
+        // publication: both direct and indirect dispatch and the draw must now emit.
+        {
+            auto vk = scene.vk;
+            auto original = scene.bare;
+            const auto ready = original.pipeline;
+            bool published = false;
+            scene.bare.pipeline = {};
+            scene.bare.async_build = true;
+            scene.bare.variant = [&](std::uint32_t) { return published ? ready : VK_NULL_HANDLE; };
+            ComputePipeline waiting{}, available{};
+            waiting.async_build = true;
+            available.pipeline = ready;
+            vk.compute_pipeline = [&](std::uintptr_t id) { return id == 1 ? &waiting : &available; };
+            static unsigned direct, indirect, draws;
+            vk.dispatch = [](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t) { ++direct; };
+            vk.dispatch_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize) { ++indirect; };
+            vk.draw = [](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) { ++draws; };
+            CommandList mixed;
+            ExecuteIndirect args{IndirectKind::dispatch, 12, 1, Scene::upload};
+            args.pipeline = 1;
+            const bool recorded_mixed = mixed.dispatch({1, {}, 1, 1, 1}) && mixed.execute_indirect(args) &&
+                mixed.draw(plain) && mixed.dispatch({2, {}, 1, 1, 1}) && mixed.close();
+            const auto run_mixed = [&] {
+                direct = indirect = draws = 0;
+                return replay(mixed, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success;
+            };
+            bool pass = recorded_mixed && run_mixed() && direct == 1 && indirect == 0 && draws == 0;
+            published = true;
+            waiting.pipeline = ready;
+            pass = run_mixed() && direct == 2 && indirect == 1 && draws == 1 && pass;
+            scene.bare = std::move(original);
+            if (!pass) {
+                std::fprintf(stderr, "FAIL pending pipelines: mixed command list skipped ready work or emitted pending work\n");
+                ++failures;
+            }
+        }
+
         // The counts don't depend on timing: a second run must make exactly the same allocations and calls.
         const Result again = run(scene, lists, frame, reps, warmup);
         if (again.emit.vk_calls != f.emit.vk_calls || again.prepare.allocations != f.prepare.allocations) {

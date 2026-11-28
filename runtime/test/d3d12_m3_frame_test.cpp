@@ -176,12 +176,12 @@ int main(int argc, char** argv) {
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
         EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                           reinterpret_cast<void**>(&device.p))));
+                                                           reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
         EXPECT(rt::d3d12::bindless_set(device.p) != VK_NULL_HANDLE);
 
-        // Pass 1: [0] eight 32-bit constants (s0..s7). Pass 2: [0] one SRV (s[0:1]), [1] one sampler (s[2:3]),
-        // [2] one constant (s4).
+        // Pass 1: [0] eight 32-bit constants (s8..s15). Pass 2: [0] one SRV (s8), [1] one sampler (s9),
+        // [2] one constant (s10). The console's graphics layout: from s8, one dword per table.
         D3D12_ROOT_PARAMETER consts1{};
         consts1.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         consts1.Constants = {0, 0, 8};

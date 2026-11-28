@@ -146,6 +146,39 @@ inline ImageWords encode(const Image& image) {
 // TYPE names an image, so these eight dwords are a T# and not a V# followed by something else.
 inline constexpr bool is_image(const ImageWords& words) { return detail::get(words[3], 28, 4) >= 8; }
 
+// Synthetic volume UAV metadata distinguishes the storage view from SRVs of the same mip, and distinct W
+// ranges from one another. Sampled fetches use it because Vulkan only applies slicing to storage views.
+// WORD4[31] is reserved on GFX10/GFX103; hardware uses WORD7 for metadata addresses. DEPTH and BASE_ARRAY
+// stay unchanged. D3D12 depth is at most 2048, so count - 1 and offset fit 11 bits.
+inline constexpr std::uint32_t volume_uav_flag = 0x80000000;
+inline constexpr std::uint32_t volume_uav_tag = 0xD7800000;
+inline constexpr std::uint32_t volume_uav_tag_mask = 0xff800000;
+// RGB9E5 emulation uses R32_UINT storage, not the logical float format in T# word 1. The same tag marks packed
+// 1D-family UAVs (without a W range). No ordinary SRV or raw hardware T# has this synthetic metadata.
+inline constexpr std::uint32_t packed_uav_flag = 0x00400000;
+inline constexpr std::uint32_t volume_uav_word(std::uint32_t offset, std::uint32_t count) {
+    return volume_uav_tag | ((count - 1) << 11) | offset;
+}
+struct VolumeUavRange {
+    std::uint32_t first_w = 0;
+    std::uint32_t w_size = 0;
+};
+// The tag stores the first W slice and the slice count minus one. Bit 22 is independent packed-format metadata.
+inline constexpr bool volume_uav_range(const ImageWords& words, const Image& image, VolumeUavRange& out) {
+    if (image.type != ImageType::image_3d || !(words[4] & volume_uav_flag) ||
+        (words[7] & volume_uav_tag_mask) != volume_uav_tag)
+        return false;
+    out.first_w = words[7] & 0x7ffu;
+    out.w_size = ((words[7] >> 11) & 0x7ffu) + 1u;
+    return true;
+}
+inline constexpr bool partial_volume_uav(const ImageWords& words, const Image& image) {
+    VolumeUavRange range{};
+    if (!volume_uav_range(words, image, range)) return false;
+    const auto mip_depth = image.depth >> image.first_mip;
+    return range.first_w != 0 || range.w_size != (mip_depth ? mip_depth : 1u);
+}
+
 inline constexpr float image_min_lod(const ImageWords& words) {
     return float(detail::get(words[1], 8, 12)) / 256.0f;
 }
@@ -203,6 +236,16 @@ inline constexpr VkImageViewType vulkan_view_type(ImageType type) {
     }
 }
 
+inline constexpr VkImageSubresourceRange vulkan_subresource_range(const Image& image, VkImageAspectFlags aspects) {
+    const bool volume = image.type == ImageType::image_3d;
+    return {aspects, image.first_mip, image.mip_count, volume ? 0u : image.first_layer,
+            volume ? 1u : image.layer_count};
+}
+
+inline constexpr bool has_hardware_volume_uav_slice_offset(const ImageWords& words, const Image& image) {
+    return image.type == ImageType::image_3d && image.first_layer != 0 && detail::get(words[5], 0, 4) == 1;
+}
+
 // ---- formats ----
 
 // One row for each Vulkan format: its GFX10_FORMAT code, and the DST_SEL that reads its channels as R, G, B, A
@@ -218,6 +261,7 @@ struct FormatRow {
 };
 
 inline constexpr Swizzle channels_r{select_x, select_zero, select_zero, select_one};
+inline constexpr Swizzle channels_a{select_zero, select_zero, select_zero, select_x};
 inline constexpr Swizzle channels_rg{select_x, select_y, select_zero, select_one};
 inline constexpr Swizzle channels_rgb{select_x, select_y, select_z, select_one};
 inline constexpr Swizzle channels_rgba = identity_swizzle;
@@ -227,6 +271,10 @@ inline constexpr Swizzle channels_abgr{select_w, select_z, select_y, select_x};
 
 inline constexpr FormatRow format_table[] = {
     {1, VK_FORMAT_R8_UNORM, channels_r},                          // GFX10_FORMAT_8_UNORM
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    // An A8 render target: the same console format as the R8 row above, in the image format that can be rendered to.
+    {1, VK_FORMAT_A8_UNORM_KHR, channels_a},                      // GFX10_FORMAT_8_UNORM
+#endif
     {2, VK_FORMAT_R8_SNORM, channels_r},                          // GFX10_FORMAT_8_SNORM
     {3, VK_FORMAT_R8_USCALED, channels_r},                        // GFX10_FORMAT_8_USCALED
     {4, VK_FORMAT_R8_SSCALED, channels_r},                        // GFX10_FORMAT_8_SSCALED
@@ -379,6 +427,13 @@ inline constexpr VkFormat vulkan_view_format(VkFormat image_format, std::uint32_
     if (!image) return VK_FORMAT_UNDEFINED;
     if (image->gfx10 == gfx10_format) return image_format;
     if (is_depth_stencil_format(image_format)) return VK_FORMAT_UNDEFINED;
+    // An R9G9B9E5 render target on a GPU that cannot render to E5B9G9R9 is an R11G11B10F image (the D3D12 device's
+    // r9g9b9e5_target_stand_in): a T# that names 5_9_9_9 views it in the image's own format. The image is not
+    // mutable, and the two formats have the same channels, so the swizzle is unchanged.
+    if (image_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && gfx10_format == 132) return image_format;
+    // The same for a B4G4R4A4 render target stored as BGRA8 (b4g4r4a4_target_stand_in): 4_4_4_4 names its channels
+    // in the order BGRA8 has them.
+    if (image_format == VK_FORMAT_B8G8R8A8_UNORM && gfx10_format == 136) return image_format;
     const FormatRow* fallback = nullptr;
     for (const FormatRow& row : format_table) {
         if (row.gfx10 != gfx10_format || is_depth_stencil_format(row.vulkan)) continue;

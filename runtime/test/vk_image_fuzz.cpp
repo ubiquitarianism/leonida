@@ -495,7 +495,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "FAILED add_image -> 0 (line %d)\n", __LINE__);
         return 1;
     }
-    set->insert_key(make_tsharp_key(spec.tsharp), index);
+    set->insert_key(make_tsharp_key(spec.tsharp), index, ImageDimension::dim_2d);
     const VkPushConstantRange push{.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .size = push_bytes};
     const VkDescriptorSetLayout set_layout = set->layout();
     VkPipelineLayoutCreateInfo pli{.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
