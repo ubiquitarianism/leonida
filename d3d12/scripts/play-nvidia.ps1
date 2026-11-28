@@ -217,6 +217,25 @@ $settings = @{
     # 20.7. Sections of 2 MiB measured the same (91.7, 91.8, 111.4). '0' in -More: one section, as before.
     LEONIDA_SECTION_MB = '16'
 }
+# The card's own memory, from its driver's key (HardwareInformation.qwMemorySize, 64-bit; Win32_VideoController's
+# AdapterRAM stops at 4 GB), the largest adapter's; 0 when unknown.
+$vram = 0
+try {
+    Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}' -ErrorAction Stop |
+        ForEach-Object {
+            $q = (Get-ItemProperty $_.PSPath -Name 'HardwareInformation.qwMemorySize' -ErrorAction SilentlyContinue).'HardwareInformation.qwMemorySize'
+            if ($q -and [uint64]$q -gt $vram) { $vram = [uint64]$q }
+        }
+} catch { }
+# Under 6 GB of it (a 4 GB card) the limits above, measured on large cards, are more than the card has: 1536 MiB of
+# buffer copies and 3 GB of windows on a 3.2 GB budget put 5.5 GB on the card, which the system pages out
+# (GTX 1050 Ti, 2026-11-28). There the runtime sizes the copies to its budget (`shadow.rs` default_card_limits_mb:
+# 512 MiB) and no windows go to the card: frames steadier, more textures drawn (eyes on the same scenes, not a capture).
+$smallCard = $vram -gt 0 -and $vram -lt 6GB
+if ($smallCard) {
+    $settings.Remove('LEONIDA_CARD_BUFFERS_MB')
+    Write-Host "$([math]::Round($vram / 1GB, 1)) GB of video memory: buffer copies sized by the runtime, no title memory windows in it"
+}
 $console = if ($SeriesX) { 'series-x' } else { 'series-s' }
 # The render scale of each DLSS mode (rendered lines over output lines; the layer picks DLSS's own mode by it).
 $dlssScale = @{ quality = '0.6667'; balanced = '0.6'; performance = '0.5'; ultra = '0.3333' }
@@ -314,7 +333,7 @@ if ($PSBoundParameters.ContainsKey('WindowsBarMB')) {
     # free and read 100-200 pages a second from the page file; with the windows in the card's memory it held 24.7
     # GB and the PC had 3 GB free. The frame took as long either way.
     $ram = try { (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory } catch { 0 }
-    if ($ram -gt 0 -and $ram -lt 48GB) {
+    if ($ram -gt 0 -and $ram -lt 48GB -and -not $smallCard) {
         $settings.LEONIDA_WINDOWS_BAR_MB = '3072'
         Write-Host "$([math]::Round($ram / 1GB)) GB of RAM: title memory windows in the card's memory the CPU maps, up to 3 GB (-WindowsBarMB 0 turns this off)"
     }
