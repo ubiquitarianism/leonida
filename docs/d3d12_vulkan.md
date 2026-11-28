@@ -400,9 +400,10 @@ What is implemented (all of it testable without the game):
 - **Device** (`runtime/shims/d3d12_vulkan_device.cpp`): an `ID3D12Device11` (PC ABI, 80 slots) that the Xbox-ABI
   proxy (`d3d12_xs_device.cpp`) forwards to, so slot 14's heap-handle conversion and slot 76's resource creation
   work unchanged. It creates the objects above, plus:
-  - descriptor heaps whose slots are 32 bytes (`GetDescriptorHandleIncrementSize`; the console's increments are
-    question 4). RTV/DSV slots hold a `TargetView`; shader-visible heaps return a GPU handle, but nothing reads it
-    yet;
+  - descriptor heaps whose slots are 32 bytes (`GetDescriptorHandleIncrementSize`). The game asks the device for the
+    increment and derives heap sizes and handle strides from the answer (measured, section 3.4), so the shim returns
+    its own host slot size. RTV/DSV slots hold a `TargetView`; shader-visible heaps return a GPU handle, but nothing
+    reads it yet;
   - `CreateRenderTargetView` / `CreateDepthStencilView` for whole resources, `TEXTURE1D`, `TEXTURE1DARRAY` (D3D-63),
     `TEXTURE2D`, `TEXTURE2DMS`, `TEXTURE2DARRAY` and `TEXTURE2DMSARRAY` (a slice range; `ArraySize` -1 is every
     slice from the first on, as on the host, `d3d12_view_slices_test`);
@@ -2213,10 +2214,34 @@ The layer's descriptor model:
   the bound heap, and cache parsed descriptors by key so unchanged slots cost nothing. **Open:** whether the game
   uses unbounded tables; the trace will show the root-signature ranges.
 - The heap stride is the value the layer returns from `GetDescriptorHandleIncrementSize`. Prior art forwards device
-  slot 15 (`GetDescriptorHandleIncrementSize`) unchanged, but the actual increment values are still **Open**. Choose
-  32 bytes for CBV/SRV/UAV (the T# size) and 32 bytes for samplers (16 bytes of S# plus padding) pending the console
-  value. The game may hardcode the console increments or infer them from shader address arithmetic; the shader's
-  shift amount gives the stride it expects, and the layer must match it.
+  slot 15 (`GetDescriptorHandleIncrementSize`) unchanged. **Measured** in the executable: every one of the 943
+  indirect calls through `[device vtable + 0x78]` was resolved by tracing `rcx` from its function's start; ten reach
+  the device itself: `rcx` is loaded rip-relative from the BSS device global `0x148759D00` or from one of its aliases
+  `0x1475DF000`-`0x1475DF048`, the same global the measured device calls in section 7.1 use (the load is
+  `mov rcx, qword ptr [rip + displacement]`, so the literal address does not appear in the instruction).
+  The other 933 call the same slot on another object (queue, factory, wrapper) and are counted but not attributed.
+
+  | site | descriptor heap type (`edx`) | what the return does |
+  | --- | --- | --- |
+  | `0x141C7456B` | 0 (`CBV_SRV_UAV`) | `add rdi, rax` in the slot loop: the increment advances the GPU handle stored in each entry |
+  | `0x141F75FDD` | 0 (`CBV_SRV_UAV`) | the same handle-stride loop |
+  | `0x142478E42` | 0 (`CBV_SRV_UAV`) | stored for later: `mov dword ptr [rip + 0x516E1AE], eax` |
+  | `0x142478E5F` | 1 (`SAMPLER`) | discarded |
+  | `0x142478E71` | 2 (`RTV`) | discarded |
+  | `0x142478E83` | 3 (`DSV`) | discarded |
+  | `0x142478E9A` | 4 (`NUM_DESCRIPTOR_HEAP_TYPES`) | discarded |
+  | `0x145C5FF2F` | 0 (`CBV_SRV_UAV`) | `imul rsi, rax` and `imul rdi, rax`: two buffer sizes, each then rounded up to 64 KiB |
+  | `0x145CABB18` | 0 (`CBV_SRV_UAV`) | `mov ecx, eax; div rcx`: slot count from a byte count, handed to the heap-size path (`0x141CF3280`) that multiplies it back |
+  | `0x141CF32BE` | `edx` argument of its wrapper | `imul rdi, r12`: size = count x increment; the callers pass type 0 (`0x145CABB00`) or forward their own argument `0x145A54700`, itself called with types 1, 2 and 3 |
+
+  So the game queries the increment and derives sizes, divisions and handles from the answer: it does not hardcode a
+  stride, and it is the getter, not the shader's shift, that decides it here. The layer must therefore return the
+  host heap's own increment per type, never a console constant, or every size and handle walk above is wrong. In the
+  two table builders the CPU-side record stride is `0x40` while the handle advances by the returned value, so the
+  increment is a slot stride and a record can be wider than one slot. The bootstrap queried all five enum values but
+  cached only type 0; types 1-4 reach the getter only through `0x141CF3280`. **Open:** the numeric console values
+  themselves, and the console slot sizes behind them (32 bytes for CBV/SRV/UAV and for samplers stays this layer's
+  choice); the shader's shift amount still has to match whatever stride the layer hands out.
 - `CopyDescriptors` copies raw bytes. If the descriptor was produced by our `Create*View`, the copy is a valid
   T#/S#; if it came from game memory, it is still valid raw data. No re-encoding is needed.
 - Handle validation: a GPU descriptor handle is an arena VA; the heap registry maps the containing range to a
@@ -3270,7 +3295,7 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
 | `ID3D12GraphicsCommandList` … `8` | `CommandList` with IR | Replay at `ExecuteCommandLists`; bundles inlined. Supports render passes, mesh dispatch, enhanced barriers; records the GCL8 front/back stencil references (applied only once a pipeline path consumes them). `Draw` views are inlined and moved into the command stream (D3D-289), eliminating per-draw heap allocations. |
 | `ID3D12RootSignature` | `RootSignature` + `VkPipelineLayout` | Deserialize the blob with the host `D3D12CreateVersionedRootSignatureDeserializer` when possible; clear the measured `0x03000000` flag byte on a copy first; fall back to a local parser. Build the user-SGPR map and static samplers. |
 | `ID3D12PipelineState` | `VkPipeline` + a `PipelineInfo` | Shader hash → SPIR-V + index entry; PSO state → Vulkan state; dynamic state where possible. The BVH builder's compute PSOs arrive at device slot 62 with a plain `D3D12_COMPUTE_PIPELINE_STATE_DESC`. |
-| `ID3D12DescriptorHeap` | `DescriptorHeap` (shadow + optional arena range) | CBV/SRV/UAV and sampler heaps can be shader-visible; RTV/DSV are host-only. Start handles use the measured RAX return at heap slots 9/10. Increments are layer-chosen (32/32) pending the console value. |
+| `ID3D12DescriptorHeap` | `DescriptorHeap` (shadow + optional arena range) | CBV/SRV/UAV and sampler heaps can be shader-visible; RTV/DSV are host-only. Start handles use the measured RAX return at heap slots 9/10. The game derives heap sizes and handle strides from `GetDescriptorHandleIncrementSize` (measured call sites, section 3.4), so the layer returns its own slot size (32/32) rather than a console value. |
 | `ID3D12Resource` | `Resource` (a range in the arena buffer; a separate `VkImage` for textures) | Committed, placed and reserved. Reserved buffers use sparse memory where supported (section 4.2). Xbox textures may arrive through device slot 76. `GetGPUVirtualAddress` returns a console VA (a buffer offset or an image key). |
 | `ID3D12Heap` | `Heap` (a reserved VA range) | Buffer ranges are backed by the arena; images get ranges of shared blocks or their own `VkDeviceMemory` (section 3.3). Residency calls are no-ops. True buffer/image aliasing inside a heap is **Open**. |
 | `ID3D12Fence` / `ID3D12Fence1` | `Fence` over a timeline `VkSemaphore` | `GetCompletedValue` = counter value; `SetEventOnCompletion` = wait thread + Win32 event; CPU `Signal` = host signal. |
@@ -5354,7 +5379,7 @@ nothing is copied from their trees.
 | 1 | The device entry point is now named `D3D12XboxCreateDevice(adapter, params, riid, out)`. What do its 24-word params and flag bits mean? | Public documentation and the executable's call sites. Log the words and accept any flag bits; do not treat a wrong params layout as fatal until the fields are understood. |
 | 2 | Which Xbox device/heap/queue/command-list slots differ? Prior art measured device slots 62 and 76 and descriptor-heap slots 9/10; slot 14 is the public `CreateDescriptorHeap`, with only the returned heap's start-handle return wrapped. **Partly measured** with the FSR DLL ([d3d12_command_objects.md §3.5a](d3d12_command_objects.md)): device slots 14, 15, 16, 18, 19, 27, 38, 62 and 76 at their expected shapes (24 in the code, not called), slot 67 a console-only pipeline call; command-list slots 14, 15, 25 and 26 at their PC positions, then shifted (+4 from `SetDescriptorHeaps` at 32, +2 at `ExecuteIndirect` at 61), with console-only methods at 85 and 141. The BVH builder's call sites add the rest of the +4 root group (37, 39, 43, 45) and console slots 71, 73, 80, 146 (the GCL7 `Barrier`) and 148 (an upload allocator whose pointer is also the GPU address) ([d3d12_command_objects.md §3.3, §3.3a](d3d12_command_objects.md)). A second, retail-title measurement adds console slots 83 (`CopyTextureRegion`), 84 (`CopyResource`), 26 (barriers), 127 (direct mesh dispatch — not the PC position, GCL6 slot 79), 59 (a second indirect/mesh dispatch path) and 96 (an async-compute budget call) (section 7). Presentation, queue and fence slots remain unknown. | Trace every `QueryInterface` and every method slot with per-slot hit counters. A wrong slot shows as an immediate crash or wrong argument; compare against the SDK vtable. |
 | 3 | How does the console map a root signature to `s0..s31` (order, per-stage visibility, spills above 32 dwords, static samplers, direct-heap base)? | **Compute partly measured** by a sibling project's console-compiler output (section 7): parameters inline in user SGPRs from `s4` in root order while each fits whole; the first that does not fit, and all after it, go into a packed array addressed by a 40-bit pointer at `s[0:1]`; thread-group ids follow the user SGPRs. That matches this repo's CS census (lowest CS pointer SGPR `s4`). VS/PS/MS bases remain open. Static samplers: no sampling instruction was found reading one from a driver table (SHADER-735, section 3.5; 0.66% undetermined); which S# is a static sampler remains open. Dump the game's root-signature blobs with the host deserializer; mask the `0x03000000` flag byte on a copy first; match against the per-shader user-SGPR read sets. If a signature exceeds 32 dwords, reverse the spill pointer from the shader. |
-| 4 | Are Xbox descriptor bytes GFX10 T#/S#, and what are the heap increments? Does the game use `Create*View` or build descriptors itself? | Dump a shader-visible heap after the first `CreateShaderResourceView` and after the first draw; compare the bytes the shader loads with the T# parser. The start-handle return ABI is known (RAX); the increment values still need measuring. |
+| 4 | Are Xbox descriptor bytes GFX10 T#/S#, and what are the heap increments? Does the game use `Create*View` or build descriptors itself? | Dump a shader-visible heap after the first `CreateShaderResourceView` and after the first draw; compare the bytes the shader loads with the T# parser. The start-handle return ABI is known (RAX). The game calls `GetDescriptorHandleIncrementSize` itself (ten device sites, all five heap types, section 3.4) and sizes heaps and handles from the answer; the numeric console values still need measuring, by hooking slot 15 and logging the answer. |
 | 5 | What is the buffer/descriptor/code VA range, and what arena capacity is needed? | Log every `GetGPUVirtualAddress` and every descriptor base; track the high-water mark. Choose a capacity; grow at a frame boundary if needed. |
 | 6 | Which swapchain/present path is used: DXGI, `PresentX`, or both? | **Partly answered from public samples (§4.5):** GDKX samples use `PresentX` + frame events and no DXGI swapchain (DXGI only for `IDXGIDevice1`→adapter→output). Hypothesis for the game, not observed: same. Still open: vtable slots, `D3D12XBOX_*` layouts, and whether the game also creates a swapchain. Check imports and the first present call. Implement the `PresentX` + frame-event presenter first; keep DXGI swapchain as fallback. |
 | 7 | Does the game build acceleration structures through the standard D3D12 calls or through `XboxBvhBuilder`'s own compute path? | Log `BuildRaytracingAccelerationStructure`, `CopyRaytracingAccelerationStructure`, `Emit...PostbuildInfo`, and the builder's command-list method calls on the first RT frame. The builder's container carries a DXIL bitcode blob and a console `XBCH` record; the record is `FSSM` and all 52 programs pass `spirv-val` ([embedded_shaders.md](embedded_shaders.md)). If the builder path is used, translate the `XBCH` record rather than the bitcode. |
