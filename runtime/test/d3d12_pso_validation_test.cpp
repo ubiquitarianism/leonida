@@ -36,6 +36,9 @@ struct HostContext {
     std::string name;
     Ref<ID3D12Device> device;
     Ref<ID3D12RootSignature> root;
+    // Feature answers on this host. Windows 10 reports both FALSE and refuses the matching PSO flags.
+    bool dynamic_depth_bias = false;            // OPTIONS16.DynamicDepthBiasSupported
+    bool dynamic_index_buffer_strip_cut = false;  // OPTIONS15.DynamicIndexBufferStripCutSupported
     D3D12_SHADER_BYTECODE vs_fullscreen{};
     D3D12_SHADER_BYTECODE vs_pos{};
     D3D12_SHADER_BYTECODE ps_unorm{};
@@ -172,6 +175,24 @@ int main() {
                         hc->ps_unorm = {hlsl_ps_unorm->GetBufferPointer(), hlsl_ps_unorm->GetBufferSize()};
                         hc->ps_uint = {hlsl_ps_uint->GetBufferPointer(), hlsl_ps_uint->GetBufferSize()};
                         hc->cs = {hlsl_cs->GetBufferPointer(), hlsl_cs->GetBufferSize()};
+                        D3D12_FEATURE_DATA_D3D12_OPTIONS16 host16{};
+                        hc->dynamic_depth_bias =
+                            SUCCEEDED(hc->device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &host16,
+                                                                      sizeof(host16))) &&
+                            host16.DynamicDepthBiasSupported;
+                        D3D12_FEATURE_DATA_D3D12_OPTIONS15 host15{};
+                        hc->dynamic_index_buffer_strip_cut =
+                            SUCCEEDED(hc->device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS15, &host15,
+                                                                      sizeof(host15))) &&
+                            host15.DynamicIndexBufferStripCutSupported;
+                        if (!hc->dynamic_depth_bias)
+                            std::printf("SKIP host comparison of DYNAMIC_DEPTH_BIAS cases on %s: OPTIONS16."
+                                        "DynamicDepthBiasSupported is FALSE there (layer-side checks still run)\n",
+                                        name.c_str());
+                        if (!hc->dynamic_index_buffer_strip_cut)
+                            std::printf("SKIP host comparison of DYNAMIC_INDEX_BUFFER_STRIP_CUT cases on %s: OPTIONS15."
+                                        "DynamicIndexBufferStripCutSupported is FALSE there (layer-side checks still run)\n",
+                                        name.c_str());
                         hosts.push_back(std::move(hc));
                     }
                 }
@@ -204,8 +225,10 @@ int main() {
 
     unsigned checked = 0, host_compared = 0;
 
-    auto check_gfx_parity = [&](const char* label, HRESULT expected, bool use_pos_vs, bool use_uint_ps,
-                                auto mutator) -> bool {
+    // need: a HostContext feature answer the case depends on (nullptr for none). The host is compared only when
+    // it reports that feature; the layer-side expectation is checked on every run.
+    auto check_gfx_parity_gated = [&](const char* label, HRESULT expected, bool use_pos_vs, bool use_uint_ps,
+                                      bool HostContext::*need, auto mutator) -> bool {
         auto desc = make_gfx(layer_root.p, use_pos_vs ? layer_vs_pos : layer_vs_fs,
                              use_uint_ps ? layer_ps_uint : layer_ps_unorm);
         if (use_uint_ps) desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UINT;
@@ -219,6 +242,7 @@ int main() {
         ++checked;
         for (const auto& hcp : hosts) {
             const HostContext& hc = *hcp;
+            if (need && !(hc.*need)) continue;
             auto hdesc = make_gfx(hc.root.p, use_pos_vs ? hc.vs_pos : hc.vs_fullscreen,
                                   use_uint_ps ? hc.ps_uint : hc.ps_unorm);
             if (use_uint_ps) hdesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UINT;
@@ -232,6 +256,10 @@ int main() {
             ++host_compared;
         }
         return true;
+    };
+    auto check_gfx_parity = [&](const char* label, HRESULT expected, bool use_pos_vs, bool use_uint_ps,
+                                auto mutator) -> bool {
+        return check_gfx_parity_gated(label, expected, use_pos_vs, use_uint_ps, nullptr, mutator);
     };
 
     auto check_gfx_layer_only = [&](const char* label, HRESULT expected, auto mutator) -> bool {
@@ -247,7 +275,7 @@ int main() {
         return true;
     };
 
-    auto check_cs_parity = [&](const char* label, HRESULT expected, auto mutator) -> bool {
+    auto check_cs_parity_gated = [&](const char* label, HRESULT expected, bool HostContext::*need, auto mutator) -> bool {
         D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
         desc.pRootSignature = layer_root.p;
         desc.CS = layer_cs;
@@ -261,6 +289,7 @@ int main() {
         ++checked;
         for (const auto& hcp : hosts) {
             const HostContext& hc = *hcp;
+            if (need && !(hc.*need)) continue;
             D3D12_COMPUTE_PIPELINE_STATE_DESC hdesc{};
             hdesc.pRootSignature = hc.root.p;
             hdesc.CS = hc.cs;
@@ -274,6 +303,9 @@ int main() {
             ++host_compared;
         }
         return true;
+    };
+    auto check_cs_parity = [&](const char* label, HRESULT expected, auto mutator) -> bool {
+        return check_cs_parity_gated(label, expected, nullptr, mutator);
     };
 
     // 1. Baseline & null pInputElementDescs crash guards.
@@ -432,10 +464,12 @@ int main() {
     EXPECT(check_gfx_parity("gfx: NodeMask=3", E_INVALIDARG, false, false, [](auto& d) { d.NodeMask = 3; }));
     EXPECT(check_gfx_parity("gfx: NodeMask=0x80000000", E_INVALIDARG, false, false,
                             [](auto& d) { d.NodeMask = 0x80000000u; }));
-    EXPECT(check_gfx_parity("gfx: Flags=DYNAMIC_DEPTH_BIAS", S_OK, false, false,
-                            [](auto& d) { d.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS; }));
-    EXPECT(check_gfx_parity("gfx: Flags=DYNAMIC_INDEX_BUFFER_STRIP_CUT", S_OK, false, false,
-                            [](auto& d) { d.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT; }));
+    EXPECT(check_gfx_parity_gated("gfx: Flags=DYNAMIC_DEPTH_BIAS", S_OK, false, false,
+                                  &HostContext::dynamic_depth_bias,
+                                  [](auto& d) { d.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS; }));
+    EXPECT(check_gfx_parity_gated("gfx: Flags=DYNAMIC_INDEX_BUFFER_STRIP_CUT", S_OK, false, false,
+                                  &HostContext::dynamic_index_buffer_strip_cut,
+                                  [](auto& d) { d.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT; }));
     EXPECT(check_gfx_parity("gfx: Flags=0x10 (unknown bit)", E_INVALIDARG, false, false,
                             [](auto& d) { d.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(0x10); }));
     EXPECT(check_gfx_parity("gfx: Flags=0x80000000 (unknown bit)", E_INVALIDARG, false, false,
@@ -449,10 +483,11 @@ int main() {
     EXPECT(check_cs_parity("cs: NodeMask=2", E_INVALIDARG, [](auto& d) { d.NodeMask = 2; }));
     EXPECT(check_cs_parity("cs: NodeMask=3", E_INVALIDARG, [](auto& d) { d.NodeMask = 3; }));
     EXPECT(check_cs_parity("cs: NodeMask=0x80000000", E_INVALIDARG, [](auto& d) { d.NodeMask = 0x80000000u; }));
-    EXPECT(check_cs_parity("cs: Flags=DYNAMIC_DEPTH_BIAS", S_OK,
-                           [](auto& d) { d.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS; }));
-    EXPECT(check_cs_parity("cs: Flags=DYNAMIC_INDEX_BUFFER_STRIP_CUT", S_OK,
-                           [](auto& d) { d.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT; }));
+    EXPECT(check_cs_parity_gated("cs: Flags=DYNAMIC_DEPTH_BIAS", S_OK, &HostContext::dynamic_depth_bias,
+                                 [](auto& d) { d.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS; }));
+    EXPECT(check_cs_parity_gated("cs: Flags=DYNAMIC_INDEX_BUFFER_STRIP_CUT", S_OK,
+                                 &HostContext::dynamic_index_buffer_strip_cut,
+                                 [](auto& d) { d.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT; }));
     EXPECT(check_cs_parity("cs: Flags=0x10 (unknown bit)", E_INVALIDARG,
                            [](auto& d) { d.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(0x10); }));
     EXPECT(check_cs_parity("cs: Flags=0x80000000 (unknown bit)", E_INVALIDARG,
