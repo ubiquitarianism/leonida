@@ -257,6 +257,61 @@ class ScanTest(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             self.assertEqual(f.read(), previous)
 
+    def test_scan_rejects_invalid_start_limit_and_max_inflate(self):
+        empty = os.path.join(self.tmp.name, "empty_bounds.rpf")
+        with open(empty, "wb"):
+            pass
+        for kwargs in [{"start": 1}, {"start": -1}]:
+            with self.subTest(empty_kwargs=kwargs), self.assertRaises(ValueError):
+                bvh_groups.scan(empty, **kwargs)
+        for kwargs in [
+            {"limit": 0},
+            {"limit": -5},
+            {"limit": False},
+            {"start": True},
+            {"max_inflate": 0},
+            {"max_inflate": True},
+        ]:
+            with self.subTest(rpf_kwargs=kwargs), self.assertRaises(ValueError):
+                bvh_groups.scan(self.rpf, **kwargs)
+
+    def test_main_validates_json_upfront_and_catches_write_oserror(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(cwd)
+                bad_paths = [
+                    "",
+                    "   ",
+                    self.tmp.name,
+                    os.path.join(self.tmp.name, "folder") + os.sep,
+                    os.path.join(self.tmp.name, "missing_parent", "r.json"),
+                ]
+                with mock.patch.object(bvh_groups, "scan", side_effect=AssertionError("should not scan")):
+                    for bad in bad_paths:
+                        with self.subTest(json_path=bad):
+                            stdout, stderr = io.StringIO(), io.StringIO()
+                            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                                code = bvh_groups.main([self.rpf, "--json", bad])
+                            self.assertEqual(code, 2)
+                            self.assertEqual(stdout.getvalue(), "")
+                            self.assertIn("bvh_groups:", stderr.getvalue())
+                self.assertEqual(os.listdir(cwd), [])
+            finally:
+                os.chdir(old_cwd)
+
+        out = os.path.join(self.tmp.name, "fail.json")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(bvh_groups, "write_json_report", side_effect=OSError("disk full")), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = bvh_groups.main([self.rpf, "--json", out])
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("disk full", stderr.getvalue())
+
+        with self.assertRaises(ValueError):
+            bvh_groups.write_json_report(out, {"bad": float("nan")})
+
     def test_main_uses_shared_same_report_path(self):
         self.assertIs(bvh_groups.same_report_path, report_paths.same_report_path)
         with open(self.rpf, "rb") as f:
