@@ -1325,11 +1325,14 @@ public:
 
     bool loaded() const { return loaded_; }
 
-    // `memory`: the physical device's memory types, for the AMD marker buffer (enabled.markers).
+    // `memory`: the physical device's memory types, for the AMD marker buffer (enabled.markers); `families`: the
+    // device's distinct queue families, which all write that buffer.
     void configure_device_fault(PFN_vkGetDeviceProcAddr get, DeviceFaultExtensions enabled,
-                                const VkPhysicalDeviceMemoryProperties* memory = nullptr) {
+                                const VkPhysicalDeviceMemoryProperties* memory = nullptr,
+                                std::vector<std::uint32_t> families = {}) {
         device_fault_ = std::make_unique<DeviceFaultDiagnostics>(get, device_, enabled, memory,
-                                                                 vk.vkCmdPipelineBarrier2 != nullptr);
+                                                                 vk.vkCmdPipelineBarrier2 != nullptr,
+                                                                 std::move(families));
         device_fault_->set_submit_lock(&submit_mutex_);
         if (fence_dispatcher_) fence_dispatcher_->set_device_fault(device_fault_.get());
         if (loaded_) progress_watch_ = std::jthread([this](std::stop_token stop) { watch_queue_progress(stop); });
@@ -1911,12 +1914,13 @@ public:
     }
 
     // D24_UNORM_S8_UINT stored as D32: copies of its depth plane run a compute pass (vulkan_depth24.h). `allocate`
-    // gives the scratch buffers device-local memory. Without this such a copy is refused as unsupported.
+    // gives the scratch buffers device-local memory, shared by `families` (the device's distinct queue families).
+    // Without this such a copy is refused as unsupported.
     void enable_depth24(PFN_vkGetDeviceProcAddr get, Depth24Converter::Allocate allocate,
-                       std::uint64_t max_storage_range = 1u << 27) {
+                       std::uint64_t max_storage_range = 1u << 27, std::vector<std::uint32_t> families = {}) {
         std::unique_lock lock(resource_mutex_);
         depth24_ = std::make_unique<Depth24Converter>(get, device_, std::move(allocate), max_storage_range,
-                                                      device_fault_.get());
+                                                      device_fault_.get(), std::move(families));
         if (!depth24_->loaded()) {
             depth24_.reset();
             return;

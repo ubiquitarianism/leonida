@@ -22,6 +22,7 @@
 
 #include "depth24.h"
 #include "depth24_convert_spv.h"
+#include "queue_families.h"
 #include "vulkan_aftermath.h"
 
 namespace leonida {
@@ -32,9 +33,13 @@ public:
     using Allocate = std::function<VkDeviceMemory(const VkMemoryRequirements&)>;
 
     // `max_range`: the device's maxStorageBufferRange; a copy is split into dispatches that stay inside it.
+    // `families`: the device's distinct queue families. A scratch chunk is reused by copies on any D3D12 queue
+    // (direct, compute or copy), so with more than one family it is made CONCURRENT over all of them.
     Depth24Converter(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate,
-                     std::uint64_t max_range = 1u << 27, DeviceFaultDiagnostics* diagnostics = nullptr)
-        : device_(device), diagnostics_(diagnostics), allocate_(std::move(allocate)), max_range_(max_range) {
+                     std::uint64_t max_range = 1u << 27, DeviceFaultDiagnostics* diagnostics = nullptr,
+                     std::vector<std::uint32_t> families = {})
+        : device_(device), diagnostics_(diagnostics), allocate_(std::move(allocate)), max_range_(max_range),
+          families_(std::move(families)) {
         loaded_ = vk_.load(get, device);
     }
 
@@ -335,6 +340,7 @@ private:
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
         info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        share_across_queue_families(info, families_);
         if (vk_.vkCreateBuffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, out.buffer, &requirements);
@@ -364,6 +370,7 @@ private:
     DeviceFaultDiagnostics* diagnostics_;
     Allocate allocate_;
     std::uint64_t max_range_;
+    std::vector<std::uint32_t> families_;
     Functions vk_;
     bool loaded_ = false;
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;

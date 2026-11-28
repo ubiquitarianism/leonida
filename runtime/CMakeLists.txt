@@ -2034,6 +2034,10 @@ if(TARGET Vulkan::Headers)
   add_executable(vulkan_device_markers_test test/vulkan_device_markers_test.cpp)
   target_link_libraries(vulkan_device_markers_test PRIVATE Vulkan::Headers)
   add_test(NAME vulkan_device_markers COMMAND vulkan_device_markers_test)
+  # The depth24 converter's scratch chunks are shared by the device's queue families, on the CPU (faked driver).
+  add_executable(depth24_scratch_sharing_test test/depth24_scratch_sharing_test.cpp)
+  target_link_libraries(depth24_scratch_sharing_test PRIVATE Vulkan::Headers)
+  add_test(NAME depth24_scratch_sharing COMMAND depth24_scratch_sharing_test)
   # The submit lock's owner tracking, waiter count, submit handoff and compile gate (SubmitMutex), on the CPU.
   if(WIN32)
     add_executable(submit_mutex_test test/submit_mutex_test.cpp)

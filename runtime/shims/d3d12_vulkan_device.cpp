@@ -15297,7 +15297,7 @@ public:
         if (info.device_fault_diagnostics) {
             state_.context->configure_device_fault(get_device,
                 {info.device_fault_info, info.device_checkpoints, info.device_diagnostics_config, info.device_markers},
-                &state_.memory);
+                &state_.memory, state_.families);
             state_.context->add_diagnostic_queue(info.queue);
             for (auto queue : info.command_queues) state_.context->add_diagnostic_queue(queue);
             for (auto queue : info.compute_queues) state_.context->add_diagnostic_queue(queue);
@@ -15597,7 +15597,7 @@ public:
             }
             state_.context->enable_depth24(get_device, [this](const VkMemoryRequirements& requirements) {
                 return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            }, max_storage_range);
+            }, max_storage_range, state_.families);
         }
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");

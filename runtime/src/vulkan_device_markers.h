@@ -21,6 +21,8 @@
 #include <span>
 #include <vector>
 
+#include "queue_families.h"
+
 namespace leonida {
 
 inline bool device_markers_requested() {
@@ -145,9 +147,9 @@ public:
         if (memory_ && free_memory_) free_memory_(device_, memory_, nullptr);
     }
 
-    // Returns the VkResult of the step that failed, or VK_SUCCESS.
+    // Returns the VkResult of the step that failed, or VK_SUCCESS. `families`: the device's distinct queue families.
     VkResult create(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceMemoryProperties& memory,
-                    bool synchronization2) {
+                    bool synchronization2, std::span<const std::uint32_t> families = {}) {
         device_ = device;
 #define LEONIDA_MARKER_LOAD(type, name) const auto name = reinterpret_cast<type>(get(device, #name))
         LEONIDA_MARKER_LOAD(PFN_vkCreateBuffer, vkCreateBuffer);
@@ -169,7 +171,10 @@ public:
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = VkDeviceSize{8} * max_queues;
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;  // written by every queue, never read on the GPU
+        // Every queue writes it (it is never read on the GPU), whichever family the queue is on: CONCURRENT over the
+        // device's families when there is more than one, as two families may not use an EXCLUSIVE buffer without an
+        // ownership transfer.
+        share_across_queue_families(info, families);
         VkResult result = vkCreateBuffer(device, &info, nullptr, &buffer_);
         if (result != VK_SUCCESS) return result;
         VkMemoryRequirements requirements{};

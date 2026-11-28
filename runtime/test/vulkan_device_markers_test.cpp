@@ -34,10 +34,14 @@ struct Write {
 std::vector<Write> writes;
 std::uint32_t words[2 * DeviceMarkers::max_queues];
 bool mapped = false, unmapped = false, freed = false;
+VkSharingMode sharing = VK_SHARING_MODE_MAX_ENUM;     // the marker buffer's, as created
+std::vector<std::uint32_t> sharing_families;
 
 VKAPI_ATTR VkResult VKAPI_CALL create_buffer(VkDevice, const VkBufferCreateInfo* info, const VkAllocationCallbacks*,
                                              VkBuffer* buffer) {
     if (info->size < sizeof(words)) return VK_ERROR_UNKNOWN;
+    sharing = info->sharingMode;
+    sharing_families.assign(info->pQueueFamilyIndices, info->pQueueFamilyIndices + info->queueFamilyIndexCount);
     *buffer = fake_handle<VkBuffer>(0x100);
     return VK_SUCCESS;
 }
@@ -288,6 +292,37 @@ int extension_request() {
     return 0;
 }
 
+// The marker buffer is written by every queue, on any of the device's families: CONCURRENT over them when there
+// are two or more (an EXCLUSIVE buffer may not be used by two families without an ownership transfer), EXCLUSIVE
+// with one family or none given.
+int queue_family_sharing() {
+    const auto memory = memory_types();
+    DeviceFaultExtensions enabled;
+    enabled.markers = true;
+    {
+        DeviceFaultDiagnostics diagnostics(get_proc, VK_NULL_HANDLE, enabled, &memory, true, {0, 1, 2});
+        EXPECT(diagnostics.markers_on());
+        EXPECT(sharing == VK_SHARING_MODE_CONCURRENT && sharing_families == std::vector<std::uint32_t>({0, 1, 2}));
+    }
+    {
+        DeviceFaultDiagnostics diagnostics(get_proc, VK_NULL_HANDLE, enabled, &memory, false, {0, 2});
+        EXPECT(diagnostics.markers_on());
+        EXPECT(sharing == VK_SHARING_MODE_CONCURRENT && sharing_families == std::vector<std::uint32_t>({0, 2}));
+    }
+    {
+        DeviceFaultDiagnostics diagnostics(get_proc, VK_NULL_HANDLE, enabled, &memory, true, {0});
+        EXPECT(diagnostics.markers_on());
+        EXPECT(sharing == VK_SHARING_MODE_EXCLUSIVE && sharing_families.empty());
+    }
+    {
+        DeviceMarkers markers;
+        const std::uint32_t families[] = {3, 1};
+        EXPECT(markers.create(get_proc, VK_NULL_HANDLE, memory, false, families) == VK_SUCCESS);
+        EXPECT(sharing == VK_SHARING_MODE_CONCURRENT && sharing_families == std::vector<std::uint32_t>({3, 1}));
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -295,6 +330,7 @@ int main() {
     if (int failed = recorded(true)) return failed;
     if (int failed = recorded(false)) return failed;
     if (int failed = extension_request()) return failed;
+    if (int failed = queue_family_sharing()) return failed;
     std::puts("vulkan_device_markers: ok");
     return 0;
 }

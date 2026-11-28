@@ -1155,10 +1155,11 @@ struct SubmitRecord {
 
 class DeviceFaultDiagnostics {
 public:
-    // `memory` and `synchronization2` are for the AMD markers (enabled.markers): where their buffer goes and whether
-    // vkCmdWriteBufferMarker2AMD may be used.
+    // `memory`, `synchronization2` and `families` are for the AMD markers (enabled.markers): where their buffer goes,
+    // whether vkCmdWriteBufferMarker2AMD may be used, and the device's distinct queue families, which all write it.
     DeviceFaultDiagnostics(PFN_vkGetDeviceProcAddr get, VkDevice device, DeviceFaultExtensions enabled,
-                           const VkPhysicalDeviceMemoryProperties* memory = nullptr, bool synchronization2 = false)
+                           const VkPhysicalDeviceMemoryProperties* memory = nullptr, bool synchronization2 = false,
+                           std::vector<std::uint32_t> families = {})
         : device_(device) {
 #define LEONIDA_FAULT_LOAD(name) name = reinterpret_cast<PFN_##name>(get(device, #name))
         if (enabled.fault) LEONIDA_FAULT_LOAD(vkGetDeviceFaultInfoEXT);
@@ -1171,7 +1172,7 @@ public:
         std::fprintf(stderr, "[rt] device-fault: enabled (fault info %s, checkpoints %s, NVIDIA diagnostics config %s)\n",
                      vkGetDeviceFaultInfoEXT ? "on" : "unavailable", checkpoint_command() ? "on" : "unavailable",
                      enabled.diagnostics_config ? "on" : "unavailable");
-        if (enabled.markers) enable_markers(get, memory, synchronization2);
+        if (enabled.markers) enable_markers(get, memory, synchronization2, families);
         else if (device_markers_requested())
             std::fprintf(stderr, "[rt] device-markers: unavailable: the device has no VK_AMD_buffer_marker\n");
     }
@@ -1452,10 +1453,10 @@ public:
 
 private:
     void enable_markers(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceMemoryProperties* memory,
-                        bool synchronization2) {
+                        bool synchronization2, std::span<const std::uint32_t> families) {
         auto markers = std::make_unique<DeviceMarkers>();
-        const VkResult result =
-            memory ? markers->create(get, device_, *memory, synchronization2) : VK_ERROR_INITIALIZATION_FAILED;
+        const VkResult result = memory ? markers->create(get, device_, *memory, synchronization2, families)
+                                       : VK_ERROR_INITIALIZATION_FAILED;
         if (result != VK_SUCCESS) {
             std::fprintf(stderr, "[rt] device-markers: unavailable: the marker buffer could not be made (%d)\n",
                          int(result));
