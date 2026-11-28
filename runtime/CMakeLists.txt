@@ -2141,6 +2141,7 @@ if(TARGET Vulkan::Headers)
              "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_cli.cmake")
     add_test(NAME vk_texture_cube_alpha COMMAND vk_texture_test --self-test-cube-alpha)
+    add_test(NAME vk_sandbox_ground_bounds COMMAND vk_sandbox --self-test-ground-bounds)
     if(WIN32)
       # Reads SizeOfStackReserve from the built file; the program is not run, so it needs no emulator.
       add_test(NAME vk_pipeline_check_stack COMMAND "${CMAKE_COMMAND}"

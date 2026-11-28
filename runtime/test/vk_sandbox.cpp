@@ -147,31 +147,41 @@ struct Ground {
     std::vector<std::vector<float>> tris;   // per cell: 9 floats a triangle
     void build(const Scene& s) {
         float lo[2] = {1e30f, 1e30f}, hi[2] = {-1e30f, -1e30f};
-        std::vector<float> all;
+        using Triangle = std::array<float, 9>;
+        const auto bounds = [](const Triangle& p) {
+            return std::array{std::min({p[0], p[3], p[6]}), std::max({p[0], p[3], p[6]}),
+                              std::min({p[1], p[4], p[7]}), std::max({p[1], p[4], p[7]})};
+        };
+        std::vector<Triangle> all;
         for (const Draw& d : s.draws) {
             const Mesh& m = s.meshes[d.mesh];
-            for (uint32_t i = 0; i + 2 < m.index_count; i += 3)
+            for (uint32_t i = 0; i + 2 < m.index_count; i += 3) {
+                Triangle p;
                 for (int k = 0; k < 3; ++k) {
                     const float* v = &s.vertices[size_t(m.first_vertex + s.indices[m.first_index + i + k]) * 8];
-                    for (int j = 0; j < 3; ++j) {
-                        const float w = v[0] * d.rows[0][j] + v[1] * d.rows[1][j] + v[2] * d.rows[2][j] + d.rows[3][j];
-                        all.push_back(w);
-                        if (j < 2) { lo[j] = std::min(lo[j], w); hi[j] = std::max(hi[j], w); }
-                    }
+                    for (int j = 0; j < 3; ++j)
+                        p[k * 3 + j] = v[0] * d.rows[0][j] + v[1] * d.rows[1][j] + v[2] * d.rows[2][j] + d.rows[3][j];
                 }
+                const auto [ax, bx, ay, by] = bounds(p);
+                if (bx - ax > 64 || by - ay > 64) continue;   // skip skydomes and water planes before sizing the grid
+                lo[0] = std::min(lo[0], ax); hi[0] = std::max(hi[0], bx);
+                lo[1] = std::min(lo[1], ay); hi[1] = std::max(hi[1], by);
+                all.push_back(p);
+            }
         }
-        if (all.empty()) return;
+        if (all.empty()) {
+            nx = ny = 0;
+            tris.clear();
+            return;
+        }
         x0 = lo[0]; y0 = lo[1];
         nx = std::min(4096, int((hi[0] - lo[0]) / cell) + 1); ny = std::min(4096, int((hi[1] - lo[1]) / cell) + 1);
         tris.assign(size_t(nx) * ny, {});
-        for (size_t t = 0; t < all.size(); t += 9) {
-            const float* p = &all[t];
-            const float ax = std::min({p[0], p[3], p[6]}), bx = std::max({p[0], p[3], p[6]});
-            const float ay = std::min({p[1], p[4], p[7]}), by = std::max({p[1], p[4], p[7]});
-            if (bx - ax > 64 || by - ay > 64) continue;   // skip huge sheets (skydomes, water planes)
+        for (const Triangle& p : all) {
+            const auto [ax, bx, ay, by] = bounds(p);
             for (int cy = std::max(0, int(std::floor((ay - y0) / cell))); cy <= std::min(ny - 1, int(std::floor((by - y0) / cell))); ++cy)
                 for (int cx = std::max(0, int(std::floor((ax - x0) / cell))); cx <= std::min(nx - 1, int(std::floor((bx - x0) / cell))); ++cx)
-                    tris[size_t(cy) * nx + cx].insert(tris[size_t(cy) * nx + cx].end(), p, p + 9);
+                    tris[size_t(cy) * nx + cx].insert(tris[size_t(cy) * nx + cx].end(), p.begin(), p.end());
         }
     }
     bool height(float x, float y, float below, float& out) const {
@@ -221,9 +231,50 @@ bool write_ppm(const char* path, const uint8_t* bgra_or_rgba, uint32_t w, uint32
     return bool(o);
 }
 
+int test_ground_bounds() {
+    Scene s{};
+    const float positions[][3] = {{0, 0, 0}, {2, 0, 0}, {0, 2, 0},
+                                  {-20000, 0, 0}, {0, 0, 0}, {0, 128, 0}};
+    for (const auto& p : positions)
+        s.vertices.insert(s.vertices.end(), {p[0], p[1], p[2], 0, 0, 0, 0, 0});
+    s.indices = {0, 1, 2, 3, 4, 5};
+    s.meshes.push_back({0, 6, 0, 6});
+    s.draws.push_back({0, -1, {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {0, 0, 0}}});
+
+    Ground ground;
+    ground.build(s);
+    float z = -1;
+    const bool hit = ground.height(0.5f, 0.5f, 1, z);
+    if (ground.tris.size() != 1 || !hit || z != 0) {
+        std::fprintf(stderr, "expected one cell with floor at z=0, got %zu cells, hit=%d, z=%g\n",
+                     ground.tris.size(), int(hit), z);
+        return 1;
+    }
+
+    // Stretch the floor in world space. A span of exactly 64 m is still eligible on either axis.
+    for (int axis = 0; axis < 2; ++axis) {
+        float& scale = s.draws[0].rows[axis][axis];
+        scale = 32;
+        ground.build(s);
+        if (ground.tris.size() != 17 || !ground.height(0.5f, 0.5f, 1, z)) {
+            std::fprintf(stderr, "64 m floor on axis %d was lost\n", axis);
+            return 1;
+        }
+        scale = 33;
+        ground.build(s);
+        if (!ground.tris.empty() || ground.height(0.5f, 0.5f, 1, z)) {
+            std::fprintf(stderr, "oversized sheets on axis %d left a nonempty grid\n", axis);
+            return 1;
+        }
+        scale = 1;
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && !std::strcmp(argv[1], "--self-test-ground-bounds")) return test_ground_bounds();
     if (argc < 4) {
         std::fprintf(stderr, "usage: vk_sandbox scene.bin vs.spv ps.spv (--out image.ppm | --window) [--size W H] "
                              "[--cam x y z yaw pitch] [--fov deg]\n");
