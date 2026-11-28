@@ -36,7 +36,8 @@ def translate(lines, *, emulate=False):
     prev = rdna2spirv.WAVE64_EMULATE
     rdna2spirv.WAVE64_EMULATE = emulate
     try:
-        return support.translate_lines("cs_img_atomic_guard", lines + ["s_endpgm"], fssm=FSSM)
+        # Narrow EXEC so rdna2spirv emits a dynamic %active lane guard instead of folding %active to %true.
+        return support.translate_lines("cs_img_atomic_guard", ["v_cmpx_ne_u32_e32 0, v7"] + lines + ["s_endpgm"], fssm=FSSM)
     finally:
         rdna2spirv.WAVE64_EMULATE = prev
 
