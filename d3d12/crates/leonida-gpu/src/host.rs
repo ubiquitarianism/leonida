@@ -12106,9 +12106,14 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // Leonida: held to a fraction of the recent mean interval (`LEONIDA_PRESENT_SMOOTH`).
+            crate::smooth::hold();
+            // Leonida: for the A/B phase lines, when each frame is handed over to be shown.
+            #[cfg(feature = "diagnostics")]
+            crate::ab::shown();
             // Leonida: with bars, frame generation is told where in the buffer the picture is.
             crate::fg::picture_box((!whole).then_some([placed.left, placed.top, width, height]));
-            crate::fg::present_start();
+            crate::fg::present_start(frame);
             if p.presents_tearing {
                 // ([`tearing`]: shown at once; a refused one ends that for the run.)
                 let shown = p.swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING);
@@ -12120,7 +12125,8 @@ impl Host {
             } else {
                 let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             }
-            crate::fg::present_end();
+            crate::smooth::presented();
+            crate::fg::present_end(frame);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
