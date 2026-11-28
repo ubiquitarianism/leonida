@@ -508,7 +508,7 @@ class PlayLinuxProtonTest(unittest.TestCase):
         dxvk = proton / "files" / "lib64" / "wine" / "dxvk"
         dxvk.mkdir(parents=True)
         (dxvk / "dxgi.dll").write_bytes(b"dxvk dxgi old layout")
-        p = self.run_script(str(self.game))
+        p = self.run_script(str(self.game), LEONIDA_PROTON=str(proton))
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("with DXVK's dxgi", p.stdout)
         system32 = self.home / ".local" / "share" / "leonida" / "prefix" / "drive_c" / "windows" / "system32"
