@@ -554,37 +554,8 @@ public:
     void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override {
         d3d12_trace::record("ID3D12GraphicsCommandList6::DispatchMesh");
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
-        if (stub_kind_ == StubPipelineKind::mesh) return;  // a mesh stub's draw: nothing to run
-        if (!graphics_pipeline_ || !graphics_.layout) return check(false);
-        // A mesh shader reads the root arguments from s16 through a 16-dword window (RootArgumentLayout::mesh_ok).
-        if (!graphics_.layout->mesh_ok) {
-            stub("DispatchMesh(root signature larger than a mesh shader's root window)");
-            return check(false);
-        }
-        // The directly indexed heaps follow the arguments (graphics_user_data). The window shows a mesh shader push
-        // dwords 8..23 only (s16..s31), so a signature that fills it leaves a heap where the mesh stage cannot read.
-        {
-            constexpr std::uint32_t window_end = rt::rootsig::stage_base(rt::rootsig::Stage::Pixel) +
-                                                 rt::rootsig::kMaxUserSgprs -
-                                                 rt::rootsig::stage_base(rt::rootsig::Stage::Mesh);
-            const auto flags = graphics_.layout->flags;
-            const bool resource = flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
-            const bool sampler = flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
-            const std::uint32_t end = graphics_.layout->graphics_arguments_end;
-            if (resource && end >= window_end)
-                note_once("mesh direct heaps: no SGPR left in the mesh window (s16..s31) for the resource heap");
-            if (sampler && end + (resource ? 1u : 0u) >= window_end)
-                note_once("mesh direct heaps: no SGPR left in the mesh window (s16..s31) for the sampler heap");
-        }
-        if (!any_nonempty_viewport()) return;  // as record_draw: nothing is rasterized
-        leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
-                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
-        note_direct_heap_indexing(graphics_.layout);
-        draw.mesh = true;
-        draw.viewports = draw_viewports();
-        draw.depth_bounds = depth_bounds_;
-        request_draw_pipeline();
-        check(list_.draw(std::move(draw)));
+        if (defer([x, y, z](GraphicsCommandList& l) { l.record_dispatch_mesh(x, y, z); }, true)) return;
+        record_dispatch_mesh(x, y, z);
     }
 
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
@@ -2230,6 +2201,40 @@ private:
         const bool recorded = indirect ? list_.draw_indirect(std::move(draw), *indirect) : list_.draw(std::move(draw));
         if (indirect && recorded) leonida::indirect_stats::note(leonida::indirect_stats::Event::recorded);
         check(recorded);
+    }
+
+    void record_dispatch_mesh(UINT x, UINT y, UINT z) {
+        if (stub_kind_ == StubPipelineKind::mesh) return;  // a mesh stub's draw: nothing to run
+        if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+        // A mesh shader reads the root arguments from s16 through a 16-dword window (RootArgumentLayout::mesh_ok).
+        if (!graphics_.layout->mesh_ok) {
+            stub("DispatchMesh(root signature larger than a mesh shader's root window)");
+            return check(false);
+        }
+        // The directly indexed heaps follow the arguments (graphics_user_data). The window shows a mesh shader push
+        // dwords 8..23 only (s16..s31), so a signature that fills it leaves a heap where the mesh stage cannot read.
+        {
+            constexpr std::uint32_t window_end = rt::rootsig::stage_base(rt::rootsig::Stage::Pixel) +
+                                                 rt::rootsig::kMaxUserSgprs -
+                                                 rt::rootsig::stage_base(rt::rootsig::Stage::Mesh);
+            const auto flags = graphics_.layout->flags;
+            const bool resource = flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+            const bool sampler = flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+            const std::uint32_t end = graphics_.layout->graphics_arguments_end;
+            if (resource && end >= window_end)
+                note_once("mesh direct heaps: no SGPR left in the mesh window (s16..s31) for the resource heap");
+            if (sampler && end + (resource ? 1u : 0u) >= window_end)
+                note_once("mesh direct heaps: no SGPR left in the mesh window (s16..s31) for the sampler heap");
+        }
+        if (!any_nonempty_viewport()) return;  // as record_draw: nothing is rasterized
+        leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
+                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
+        note_direct_heap_indexing(graphics_.layout);
+        draw.mesh = true;
+        draw.viewports = draw_viewports();
+        draw.depth_bounds = depth_bounds_;
+        request_draw_pipeline();
+        check(list_.draw(std::move(draw)));
     }
 };
 

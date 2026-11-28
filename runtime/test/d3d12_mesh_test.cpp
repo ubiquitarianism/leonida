@@ -796,6 +796,112 @@ int main(int argc, char** argv) {
             std::printf("pipelineStatisticsQuery not available: the D3D-291 statistics check is skipped\n");
         }
 
+        // Bundle DispatchMesh: a bundle starts with its creation PSO (mesh_pso) rather than the parent's (vs_pso),
+        // inherits the parent's render targets, viewport, scissor and root arguments across multiple executions, and
+        // hands its PSO and root arguments back to the parent.
+        {
+            Ref<ID3D12CommandAllocator> bundle_alloc, state_bundle_alloc, bad_bundle_alloc;
+            Ref<ID3D12GraphicsCommandList> bundle, state_bundle, bad_bundle;
+            Ref<ID3D12GraphicsCommandList6> bundle6, bad_bundle6;
+            EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                            IID_PPV_ARGS(&bundle_alloc.p))));
+            EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_alloc.p, mesh_pso.p,
+                                                       IID_PPV_ARGS(&bundle.p))));
+            EXPECT(SUCCEEDED(bundle->QueryInterface(IID_PPV_ARGS(&bundle6.p))));
+            bundle6->DispatchMesh(2, 2, 1);
+            EXPECT(bundle->Close() == S_OK);
+
+            const float down_left[2] = {0, -1};
+            EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                            IID_PPV_ARGS(&state_bundle_alloc.p))));
+            EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, state_bundle_alloc.p,
+                                                       mesh_pso.p, IID_PPV_ARGS(&state_bundle.p))));
+            state_bundle->SetGraphicsRootSignature(root.p);
+            state_bundle->SetGraphicsRoot32BitConstants(0, 2, down_left, 0);
+            state_bundle->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+            EXPECT(state_bundle->Close() == S_OK);
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, vs_pso.p)));
+            if (!d.pipeline_statistics_query) {
+                D3D12_RESOURCE_BARRIER back_to_target =
+                    transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                list->ResourceBarrier(1, &back_to_target);
+            }
+            list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+            list->SetGraphicsRootSignature(root.p);
+            list->RSSetViewports(1, &viewport);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+            list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+            list->SetGraphicsRootConstantBufferView(1, upload_va);
+            list->ExecuteBundle(bundle.p);
+
+            list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
+            list->SetGraphicsRootConstantBufferView(1, upload_va + 256);
+            list->ExecuteBundle(bundle.p);
+
+            list->ExecuteBundle(state_bundle.p);
+            list6->DispatchMesh(2, 2, 1);
+
+            list->ResourceBarrier(1, &to_copy);
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            const UINT64 bundle_fence = d.pipeline_statistics_query ? 4 : 3;
+            HANDLE bundle_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            EXPECT(bundle_event != nullptr);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, bundle_fence)) &&
+                   SUCCEEDED(fence->SetEventOnCompletion(bundle_fence, bundle_event)) &&
+                   WaitForSingleObject(bundle_event, 20000) == WAIT_OBJECT_0);
+            CloseHandle(bundle_event);
+
+            std::array<std::uint8_t, size * 256> bundle_pixels{};
+            void* bundle_mapped = nullptr;
+            EXPECT(SUCCEEDED(readback->Map(0, nullptr, &bundle_mapped)));
+            std::memcpy(bundle_pixels.data(), bundle_mapped, bundle_pixels.size());
+            readback->Unmap(0, nullptr);
+            for (UINT row = 0; row < size; ++row) {
+                for (UINT col = 0; col < size; ++col) {
+                    const bool top = row < size / 2, left = col < size / 2;
+                    using Pixel = std::array<std::uint8_t, 4>;
+                    const Pixel want = top && left     ? Pixel{255, 0, 0, 255}
+                                       : !top && !left ? Pixel{0, 255, 0, 255}
+                                       : !top && left  ? Pixel{255, 255, 0, 255}
+                                                       : Pixel{0, 0, 255, 255};
+                    const std::uint8_t* got = bundle_pixels.data() + row * 256 + col * 4;
+                    EXPECT(std::equal(want.begin(), want.end(), got));
+                }
+            }
+
+            // Negative bundle cases: oversized grid fails bundle Close, missing parent root fails parent Close, and
+            // DispatchMesh on an already-closed bundle invalidates it for ExecuteBundle.
+            EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE,
+                                                            IID_PPV_ARGS(&bad_bundle_alloc.p))));
+            EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bad_bundle_alloc.p,
+                                                       mesh_pso.p, IID_PPV_ARGS(&bad_bundle.p))));
+            EXPECT(SUCCEEDED(bad_bundle->QueryInterface(IID_PPV_ARGS(&bad_bundle6.p))));
+            bad_bundle6->DispatchMesh(65536, 1, 1);
+            EXPECT(bad_bundle->Close() == E_INVALIDARG);
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->RSSetViewports(1, &viewport);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->ExecuteBundle(bundle.p);
+            EXPECT(list->Close() == E_INVALIDARG);
+
+            bundle6->DispatchMesh(1, 1, 1);  // bundle is already closed: marks it invalid
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->SetGraphicsRootSignature(root.p);
+            list->RSSetViewports(1, &viewport);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->ExecuteBundle(bundle.p);
+            EXPECT(list->Close() == E_INVALIDARG);
+        }
+
         for (auto* r : {&upload, &readback, &target}) r->reset();
         for (auto* p : {&mesh_pso, &vs_pso, &refused}) p->reset();
         root.reset();
@@ -831,8 +937,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("D3D-29: mesh tier 1; mesh and VS PSOs from pipeline state streams (9 refused as invalid, 2 as not "
-                "implemented); DispatchMesh over X, Y and Z and a stream VS draw matched all %u pixels; wrong-kind "
-                "draws fail at execution, oversized grids at Close; statistics queries around mesh draws resolve\n",
+                "implemented); DispatchMesh over X, Y and Z, deferred bundle DispatchMesh and a stream VS draw matched "
+                "all %u pixels; wrong-kind draws fail at execution, oversized grids and invalid bundle replays at "
+                "Close; statistics queries around mesh draws resolve\n",
                 size * size);
     return 0;
 }
