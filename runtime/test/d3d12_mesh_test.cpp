@@ -15,6 +15,9 @@
 //     invalid_draw); a mesh grid beyond D3D12's limits fails at Close; an empty grid records nothing.
 //   - A DISPATCH_MESH command signature is created only with the extension; ExecuteIndirect with it draws as
 //     DispatchMesh (one record {2, 1, 1} fills two cells), and without graphics state it records nothing and closes.
+//     It records as DispatchMesh does (RT-INDIRECT-DISPATCH-MESH-PARITY): a root signature wider than the mesh window
+//     fails Close, a non-empty viewport other than viewport 0 is enough, and the viewport and scissor arrays go
+//     with the draw.
 // The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
@@ -690,6 +693,55 @@ int main(int argc, char** argv) {
             list->SetGraphicsRootSignature(root.p);
             list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
             EXPECT(list->Close() == S_OK);
+
+            // RT-INDIRECT-DISPATCH-MESH-PARITY (@kevincommits, #1608): ExecuteIndirect with DISPATCH_MESH records as
+            // DispatchMesh does. Recording only; nothing here is executed.
+            std::vector<leonida::Command> commands;  // owns the payloads `recorded` points at
+            const auto indirect_draws = [&](std::vector<const leonida::IndirectRasterPayload*>& out) {
+                out.clear();
+                commands.clear();
+                if (!rt::d3d12::recorded_commands(list.p, commands)) return false;
+                for (const auto& command : commands)
+                    if (const auto* recorded = std::get_if<leonida::IndirectRasterDraw>(&command))
+                        out.push_back(recorded->get());
+                return true;
+            };
+            std::vector<const leonida::IndirectRasterPayload*> recorded;
+            // A root signature the mesh window (s16..s31) cannot hold is a recording error, as for DispatchMesh.
+            Ref<ID3D12RootSignature> wide;
+            EXPECT(wide_root_signature(device.p, wide));
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            list->SetGraphicsRootSignature(wide.p);
+            list->RSSetViewports(1, &viewport);
+            list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
+            EXPECT(list->Close() == E_INVALIDARG);
+            // Viewport 0 empty, viewport 1 not: the draw is recorded (any_nonempty_viewport), as DispatchMesh's.
+            D3D12_VIEWPORT two[2] = {viewport, viewport};
+            two[0].Width = 0;
+            const D3D12_RECT two_scissors[2] = {scissor, scissor};
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            list->SetGraphicsRootSignature(root.p);
+            list->RSSetViewports(2, two);
+            list->RSSetScissorRects(2, two_scissors);
+            list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
+            list6->DispatchMesh(1, 1, 1);  // the direct call, for comparison
+            EXPECT(list->Close() == S_OK);
+            EXPECT(indirect_draws(recorded));
+            EXPECT(recorded.size() == 1 && recorded[0]->state.mesh);
+            // The viewport and scissor arrays travel with it (draw.viewports), not viewport 0 alone.
+            const auto* arrays = recorded[0]->state.viewports.get();
+            EXPECT(arrays && arrays->viewport_count == 2 && arrays->scissor_count == 2);
+            EXPECT(arrays->viewports[0].width == 0 && arrays->viewports[1].width == viewport.Width);
+            // Every viewport empty: still nothing recorded, and the list closes.
+            two[1].Width = 0;
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            list->SetGraphicsRootSignature(root.p);
+            list->RSSetViewports(2, two);
+            list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
+            EXPECT(list->Close() == S_OK);
+            EXPECT(indirect_draws(recorded) && recorded.empty());
+            std::printf("ExecuteIndirect DISPATCH_MESH records as DispatchMesh: root window checked, viewport 1 of 2 "
+                        "drawn, viewport and scissor arrays kept\n");
         }
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
 
